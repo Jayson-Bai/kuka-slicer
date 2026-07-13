@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kuka-slicer"
+version = "0.1.0"
+description = "STL to external source NPZ slicer for KUKA path preprocessing"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "shapely>=2.0"]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+kuka-slicer = "kuka_slicer.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["kuka_slicer*"]
