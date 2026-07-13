@@ -53,6 +53,12 @@ def main(argv: list[str] | None = None) -> int:
         default="z",
         help="source STL axis used as the layer-height/build direction",
     )
+    slice_parser.add_argument(
+        "--slicing-kernel",
+        choices=["legacy", "pyslm"],
+        default="legacy",
+        help="toolpath kernel; pyslm is experimental and requires optional dependencies",
+    )
     slice_parser.add_argument("--curve", choices=["flat", "sinusoidal"], default="flat")
     slice_parser.add_argument("--curve-amplitude", type=float, default=0.0)
     slice_parser.add_argument("--curve-period", type=float, default=50.0)
@@ -126,6 +132,7 @@ def _slice_command(args: argparse.Namespace) -> int:
         layer_height=args.layer_height,
         line_width=args.line_width,
         material=args.material,
+        slicing_kernel=args.slicing_kernel,
         build_axis=args.build_axis,
         z_min=args.z_min,
         z_max=args.z_max,

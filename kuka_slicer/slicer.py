@@ -33,6 +33,7 @@ InfillPattern = Literal[
     "zigzag",
 ]
 BuildAxis = Literal["x", "y", "z"]
+SlicingKernel = Literal["legacy", "pyslm"]
 
 DEFAULT_RESIN_LAYER_HEIGHT_MM = 0.5
 DEFAULT_RESIN_LINE_WIDTH_MM = 2.0
@@ -79,6 +80,7 @@ class SliceConfig:
     infill_density: float = DEFAULT_RESIN_INFILL_DENSITY_PERCENT
     infill_overlap: float = DEFAULT_RESIN_INFILL_OVERLAP_PERCENT
     build_axis: BuildAxis = "z"
+    slicing_kernel: SlicingKernel = "legacy"
     perimeter_count: int = DEFAULT_RESIN_PERIMETER_COUNT
     smoothing_angle: float = DEFAULT_RESIN_SMOOTHING_ANGLE_DEGREES
     smoothing_radius_factor: float = DEFAULT_RESIN_SMOOTHING_RADIUS_FACTOR
@@ -122,6 +124,8 @@ class SliceConfig:
             raise ValueError("infill_overlap must be in the range [0, 100)")
         if self.build_axis not in ("x", "y", "z"):
             raise ValueError("build_axis must be x, y, or z")
+        if self.slicing_kernel not in ("legacy", "pyslm"):
+            raise ValueError("slicing_kernel must be legacy or pyslm")
         if self.perimeter_count < 1:
             raise ValueError("perimeter_count must be at least 1")
         if self.smoothing_angle <= 0 or self.smoothing_angle >= 180:
@@ -146,6 +150,14 @@ class RaftLayerConfig:
 
 
 def slice_mesh_to_job(mesh: Mesh, config: SliceConfig) -> ExternalSourceJob:
+    if config.slicing_kernel == "pyslm":
+        from .pyslm_backend import slice_mesh_to_job_with_pyslm
+
+        return slice_mesh_to_job_with_pyslm(mesh, config)
+    return _slice_mesh_to_job_legacy(mesh, config)
+
+
+def _slice_mesh_to_job_legacy(mesh: Mesh, config: SliceConfig) -> ExternalSourceJob:
     mesh = orient_mesh_for_build_axis(mesh, config.build_axis)
     z_values = _layer_z_values(mesh, config)
     material_paths: list[MaterialPaths] = []
@@ -212,6 +224,7 @@ def slice_mesh_to_job(mesh: Mesh, config: SliceConfig) -> ExternalSourceJob:
             "infill_density": config.infill_density,
             "infill_overlap": config.infill_overlap,
             "build_axis": config.build_axis,
+            "slicing_kernel": config.slicing_kernel,
             "perimeter_count": config.perimeter_count,
             "smoothing_angle": config.smoothing_angle,
             "smoothing_radius_factor": config.smoothing_radius_factor,

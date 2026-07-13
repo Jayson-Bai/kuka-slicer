@@ -57,6 +57,26 @@ python -m kuka_slicer slice input.stl output.npz `
   --curve-period 40.0
 ```
 
+The default slicing kernel is the in-repository `legacy` path-only kernel. An
+experimental PySLM adapter can be selected from the CLI:
+
+```powershell
+python -m kuka_slicer slice input.stl output.npz --slicing-kernel pyslm
+```
+
+Install the optional dependency set first:
+
+```powershell
+python -m pip install ".[pyslm]"
+```
+
+The PySLM adapter is intended for controlled comparison work. It preserves the
+NPZ handoff contract, material grouping, build-axis handling, and curved-Z
+projection, but initially supports only contour generation plus straight
+hatch-style resin fills (`none`, `line`, `aligned_rectilinear`, `rectilinear`,
+and cap-layer `zigzag`). Keep the `legacy` kernel as the release baseline until
+output parity is proven with project fixtures.
+
 Available resin infill patterns use PrusaSlicer-style names for path-only
 centerline generation:
 

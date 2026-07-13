@@ -735,7 +735,39 @@ def test_slice_config_exposes_ui_tunable_path_parameters_in_meta():
     assert slicing["perimeter_count"] == 3
     assert slicing["smoothing_angle"] == 120.0
     assert slicing["smoothing_radius_factor"] == 0.25
+    assert slicing["slicing_kernel"] == "legacy"
     assert "forced_part_cap_layers" not in slicing
+
+
+def test_slice_config_defaults_to_legacy_kernel():
+    assert SliceConfig().slicing_kernel == "legacy"
+
+
+def test_slice_config_rejects_unknown_kernel():
+    try:
+        SliceConfig(slicing_kernel="unknown")  # type: ignore[arg-type]
+    except ValueError as exc:
+        assert "slicing_kernel" in str(exc)
+    else:
+        raise AssertionError("expected invalid slicing kernel to fail")
+
+
+def test_pyslm_kernel_rejects_unsupported_patterns_before_loading_dependency():
+    mesh = Mesh(_cube_triangles(size=10.0))
+
+    try:
+        slice_mesh_to_job(
+            mesh,
+            SliceConfig(
+                layer_height=5.0,
+                slicing_kernel="pyslm",
+                infill_pattern="gyroid",
+            ),
+        )
+    except ValueError as exc:
+        assert "PySLM slicing kernel currently supports" in str(exc)
+    else:
+        raise AssertionError("expected unsupported PySLM pattern to fail")
 
 
 def test_recommended_geometry_tolerance_tracks_print_scale():
