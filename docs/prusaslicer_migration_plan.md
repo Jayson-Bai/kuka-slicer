@@ -10,6 +10,8 @@ adopting algorithms from the PrusaSlicer/libslic3r family.
 - Keep explicit trajectory Z ownership, including non-flat Z projection.
 - Keep resin/fiber material grouping and fiber template expansion.
 - Keep raft generation as a first-class project feature.
+- Export path centerlines only; do not add extrusion amount, volumetric flow,
+  pressure, or bead-width columns unless the external NPZ contract changes.
 
 ## Migration Scope
 
@@ -19,7 +21,8 @@ The initial migration should target geometry and toolpath quality only:
 - Perimeter offset generation.
 - Infill region generation.
 - Infill overlap handling.
-- Path ordering and connection policy.
+- Independent path emission for the path-only output contract. Resin paths are
+  not globally reordered or joined with travel/connector segments.
 
 The migration should not initially replace:
 
@@ -28,6 +31,10 @@ The migration should not initially replace:
 - Fiber JSON ingestion.
 - Raft insertion and Z shifting.
 - Preview payload format.
+
+Algorithms that rely on extrusion quantity, variable-width bead accounting,
+volumetric flow, support material accounting, or G-code-only semantics should be
+skipped or reduced to path-centerline geometry before being adapted.
 
 ## Phases
 

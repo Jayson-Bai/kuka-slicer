@@ -59,17 +59,17 @@ def main(argv: list[str] | None = None) -> int:
     slice_parser.add_argument(
         "--infill-pattern",
         choices=[
-            "contour",
-            "contour_offset",
-            "lines_x",
-            "lines_y",
+            "none",
+            "rectilinear",
+            "aligned_rectilinear",
+            "line",
             "grid",
             "triangles",
             "gyroid",
-            "diagonal",
-            "alternating_diagonal",
+            "concentric",
+            "zigzag",
         ],
-        default="lines_x",
+        default="rectilinear",
         help="resin fill pattern",
     )
     slice_parser.add_argument(
@@ -83,6 +83,19 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=DEFAULT_RESIN_INFILL_OVERLAP_PERCENT,
         help="resin path overlap percent used for infill spacing and wall overlap",
+    )
+    slice_parser.add_argument("--perimeter-count", type=int, default=2)
+    slice_parser.add_argument(
+        "--smoothing-angle",
+        type=float,
+        default=150.0,
+        help="corner angle threshold in degrees for resin path smoothing",
+    )
+    slice_parser.add_argument(
+        "--smoothing-radius-factor",
+        type=float,
+        default=0.35,
+        help="resin smoothing radius as a fraction of line width",
     )
 
     template_parser = subparsers.add_parser(
@@ -122,6 +135,9 @@ def _slice_command(args: argparse.Namespace) -> int:
         infill_pattern=args.infill_pattern,
         infill_density=args.infill_density,
         infill_overlap=args.infill_overlap,
+        perimeter_count=args.perimeter_count,
+        smoothing_angle=args.smoothing_angle,
+        smoothing_radius_factor=args.smoothing_radius_factor,
     )
     job = slice_mesh_to_job(mesh, config)
     normalize_job_xy_origin(job)

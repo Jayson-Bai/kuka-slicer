@@ -7,6 +7,7 @@ name = "kuka-slicer"
 version = "0.1.0"
 description = "STL to external source NPZ slicer for KUKA path preprocessing"
 requires-python = ">=3.10"
+license = "AGPL-3.0-or-later"
 dependencies = ["numpy>=1.24", "shapely>=2.0"]
 
 [project.optional-dependencies]

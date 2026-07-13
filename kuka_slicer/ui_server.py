@@ -32,6 +32,7 @@ from .slicer import (
     normalize_job_xy_origin,
     optimize_open_path_travel,
     orient_mesh_for_build_axis,
+    recommended_geometry_tolerance,
     slice_mesh_to_job,
     _smooth_path_corners,
 )
@@ -93,6 +94,22 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         )
         line_width = _float_param(params, "line_width", DEFAULT_RESIN_LINE_WIDTH_MM)
         requested_build_axis = params.get("build_axis", ["auto"])[0]
+        z_min = _optional_float_param(params, "z_min")
+        z_max = _optional_float_param(params, "z_max")
+        tolerance = _optional_float_param(params, "tolerance")
+        if tolerance is None:
+            tolerance = recommended_geometry_tolerance(layer_height, line_width)
+        perimeter_count = _int_param(params, "perimeter_count", 2)
+        smoothing_angle = _float_param(
+            params,
+            "smoothing_angle",
+            DEFAULT_RESIN_SMOOTHING_ANGLE_DEGREES,
+        )
+        smoothing_radius_factor = _float_param(
+            params,
+            "smoothing_radius_factor",
+            DEFAULT_RESIN_SMOOTHING_RADIUS_FACTOR,
+        )
         infill_density = _float_param(
             params,
             "infill_density",
@@ -103,7 +120,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             "infill_overlap",
             DEFAULT_RESIN_INFILL_OVERLAP_PERCENT,
         )
-        infill_pattern = params.get("infill_pattern", ["lines_x"])[0]
+        infill_pattern = params.get("infill_pattern", ["rectilinear"])[0]
         curve_mode = params.get("curve_mode", ["flat"])[0]
         curve_amplitude = _float_param(params, "curve_amplitude", 0.0)
         curve_period = _float_param(params, "curve_period", 50.0)
@@ -139,6 +156,9 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             material="R",
             layer_height=layer_height,
             line_width=line_width,
+            z_min=z_min,
+            z_max=z_max,
+            tolerance=tolerance,
             build_axis=build_axis,  # type: ignore[arg-type]
             curve_mode=curve_mode,  # type: ignore[arg-type]
             curve_amplitude=curve_amplitude,
@@ -146,6 +166,9 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             infill_pattern=infill_pattern,  # type: ignore[arg-type]
             infill_density=infill_density,
             infill_overlap=infill_overlap,
+            perimeter_count=perimeter_count,
+            smoothing_angle=smoothing_angle,
+            smoothing_radius_factor=smoothing_radius_factor,
         )
         job = slice_mesh_to_job(mesh, config)
         fiber_preview_paths = {}
@@ -226,6 +249,11 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
 def _float_param(params: dict[str, list[str]], name: str, default: float) -> float:
     raw = params.get(name, [str(default)])[0]
     return float(raw if raw != "" else default)
+
+
+def _optional_float_param(params: dict[str, list[str]], name: str) -> float | None:
+    raw = params.get(name, [""])[0].strip()
+    return None if raw == "" else float(raw)
 
 
 def _int_param(params: dict[str, list[str]], name: str, default: int) -> int:
@@ -749,6 +777,23 @@ def _index_html() -> str:
       padding-top: 16px;
       border-top: 1px solid var(--line);
     }}
+    .formSection {{
+      margin-top: 18px;
+      padding-top: 16px;
+      border-top: 1px solid var(--line);
+    }}
+    .formSection:first-of-type {{
+      margin-top: 0;
+      padding-top: 0;
+      border-top: 0;
+    }}
+    .formSection h3 {{
+      margin: 0 0 4px;
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0;
+      color: var(--ink);
+    }}
     label {{
       display: block;
       margin: 14px 0 6px;
@@ -938,52 +983,98 @@ def _index_html() -> str:
     <section class="panel">
       <h2>树脂切片</h2>
       <form id="sliceForm">
-        <label for="stlFile">STL 文件</label>
-        <input id="stlFile" name="stlFile" type="file" accept=".stl" required>
+        <div class="formSection">
+          <h3>输入文件</h3>
+          <label for="stlFile">STL 文件</label>
+          <input id="stlFile" name="stlFile" type="file" accept=".stl" required>
 
-        <label for="fiberJsonFile">纤维路径 JSON</label>
-        <input id="fiberJsonFile" name="fiberJsonFile" type="file" accept=".json,application/json">
-        <div id="fiberNotice" class="notice"></div>
-
-        <div class="grid">
-          <div>
-            <label for="layerHeight">树脂层高 mm</label>
-            <input id="layerHeight" name="layerHeight" type="number" min="0.001" step="0.001" value="{DEFAULT_RESIN_LAYER_HEIGHT_MM}">
-          </div>
-          <div>
-            <label for="lineWidth">树脂线宽 mm</label>
-            <input id="lineWidth" name="lineWidth" type="number" min="0.001" step="0.001" value="{DEFAULT_RESIN_LINE_WIDTH_MM}">
-          </div>
+          <label for="fiberJsonFile">纤维路径 JSON</label>
+          <input id="fiberJsonFile" name="fiberJsonFile" type="file" accept=".json,application/json">
+          <div id="fiberNotice" class="notice"></div>
         </div>
 
-        <label for="infillPattern">树脂填充路径</label>
-        <select id="infillPattern" name="infillPattern">
-          <option value="contour_offset">轮廓偏置填充</option>
-          <option value="lines_x">直线 X 向</option>
-          <option value="lines_y">直线 Y 向</option>
-          <option value="grid">网格</option>
-          <option value="triangles">三角填充</option>
-          <option value="gyroid">Gyroid 连续曲线</option>
-          <option value="diagonal">45° 斜线</option>
-          <option value="alternating_diagonal">正负45°交替</option>
-          <option value="contour">仅轮廓</option>
-        </select>
+        <div class="formSection">
+          <h3>模型与分层</h3>
+          <div class="grid">
+            <div>
+              <label for="layerHeight">树脂层高 mm</label>
+              <input id="layerHeight" name="layerHeight" type="number" min="0.001" step="0.001" value="{DEFAULT_RESIN_LAYER_HEIGHT_MM}">
+            </div>
+            <div>
+              <label for="buildAxis">层高方向</label>
+              <select id="buildAxis" name="buildAxis">
+                <option value="auto" selected>自动</option>
+                <option value="y">Y 轴</option>
+                <option value="z">Z 轴</option>
+                <option value="x">X 轴</option>
+              </select>
+            </div>
+          </div>
+          <div class="grid">
+            <div>
+              <label for="zMin">起始 Z mm</label>
+              <input id="zMin" name="zMin" type="number" step="0.001" placeholder="自动">
+            </div>
+            <div>
+              <label for="zMax">结束 Z mm</label>
+              <input id="zMax" name="zMax" type="number" step="0.001" placeholder="自动">
+            </div>
+          </div>
+          <label for="tolerance">几何容差 mm</label>
+          <input id="tolerance" name="tolerance" type="number" min="0.000001" step="0.000001" placeholder="自动">
+        </div>
 
-        <label for="buildAxis">层高方向</label>
-        <select id="buildAxis" name="buildAxis">
-          <option value="auto" selected>自动</option>
-          <option value="y">Y 轴</option>
-          <option value="z">Z 轴</option>
-          <option value="x">X 轴</option>
-        </select>
+        <div class="formSection">
+          <h3>树脂路径内核</h3>
+          <div class="grid">
+            <div>
+              <label for="lineWidth">树脂线宽 mm</label>
+              <input id="lineWidth" name="lineWidth" type="number" min="0.001" step="0.001" value="{DEFAULT_RESIN_LINE_WIDTH_MM}">
+            </div>
+            <div>
+              <label for="perimeterCount">边界圈数</label>
+              <input id="perimeterCount" name="perimeterCount" type="number" min="1" step="1" value="2">
+            </div>
+          </div>
 
-        <label for="infillDensity">树脂填充率 %</label>
-        <input id="infillDensity" name="infillDensity" type="number" min="0" max="100" step="1" value="{DEFAULT_RESIN_INFILL_DENSITY_PERCENT:g}">
+          <label for="infillPattern">树脂填充路径</label>
+          <select id="infillPattern" name="infillPattern">
+            <option value="rectilinear">Rectilinear</option>
+            <option value="aligned_rectilinear">Aligned Rectilinear</option>
+            <option value="line">Line</option>
+            <option value="grid">Grid</option>
+            <option value="triangles">Triangles</option>
+            <option value="gyroid">Gyroid</option>
+            <option value="concentric">Concentric</option>
+            <option value="zigzag">Zig Zag</option>
+          </select>
 
-        <label for="infillOverlap">树脂填充搭边 %</label>
-        <input id="infillOverlap" name="infillOverlap" type="number" min="0" max="99" step="1" value="{DEFAULT_RESIN_INFILL_OVERLAP_PERCENT:g}">
+          <div class="grid">
+            <div>
+              <label for="infillDensity">填充率 %</label>
+              <input id="infillDensity" name="infillDensity" type="number" min="0" max="100" step="1" value="{DEFAULT_RESIN_INFILL_DENSITY_PERCENT:g}">
+            </div>
+            <div>
+              <label for="infillOverlap">填充搭边 %</label>
+              <input id="infillOverlap" name="infillOverlap" type="number" min="0" max="99" step="1" value="{DEFAULT_RESIN_INFILL_OVERLAP_PERCENT:g}">
+            </div>
+          </div>
 
-        <h2 class="subhead">筏板</h2>
+          <div class="grid">
+            <div>
+              <label for="smoothingAngle">平滑角阈值 °</label>
+              <input id="smoothingAngle" name="smoothingAngle" type="number" min="1" max="179" step="1" value="{DEFAULT_RESIN_SMOOTHING_ANGLE_DEGREES:g}">
+            </div>
+            <div>
+              <label for="smoothingRadiusFactor">平滑半径系数</label>
+              <input id="smoothingRadiusFactor" name="smoothingRadiusFactor" type="number" min="0" step="0.01" value="{DEFAULT_RESIN_SMOOTHING_RADIUS_FACTOR:g}">
+            </div>
+          </div>
+
+        </div>
+
+        <div class="formSection">
+          <h3>筏板</h3>
         <div class="grid">
           <div>
             <label for="raftLayerCount">筏板层数</label>
@@ -1003,7 +1094,10 @@ def _index_html() -> str:
 
         <label for="raftInfillDensities">每层筏板填充率 %</label>
         <input id="raftInfillDensities" name="raftInfillDensities" type="text" value="100,75" placeholder="单值或逗号分隔，例如 80,70,60">
+        </div>
 
+        <div class="formSection">
+          <h3>曲面 Z</h3>
         <label for="curveMode">Z 模式</label>
         <select id="curveMode" name="curveMode">
           <option value="flat">平面层</option>
@@ -1019,6 +1113,7 @@ def _index_html() -> str:
             <label for="curvePeriod">曲面周期 mm</label>
             <input id="curvePeriod" name="curvePeriod" type="number" min="0.001" step="0.001" value="50">
           </div>
+        </div>
         </div>
 
         <div class="actions">
@@ -1095,7 +1190,7 @@ def _index_html() -> str:
     const showPathPointsInput = document.getElementById('showPathPoints');
     const showDirectionInput = document.getElementById('showDirection');
     let previewData = null;
-    document.getElementById('infillPattern').value = 'lines_x';
+    document.getElementById('infillPattern').value = 'rectilinear';
     fiberNotice.textContent = 'JSON 中的单层纤维路径会复制到每个树脂层，最后一层树脂封顶不打印纤维。';
 
     form.addEventListener('submit', async (event) => {{
@@ -1117,9 +1212,15 @@ def _index_html() -> str:
       formData.append('layer_height', document.getElementById('layerHeight').value);
       formData.append('line_width', document.getElementById('lineWidth').value);
       formData.append('build_axis', document.getElementById('buildAxis').value);
+      formData.append('z_min', document.getElementById('zMin').value);
+      formData.append('z_max', document.getElementById('zMax').value);
+      formData.append('tolerance', document.getElementById('tolerance').value);
+      formData.append('perimeter_count', document.getElementById('perimeterCount').value);
       formData.append('infill_pattern', document.getElementById('infillPattern').value);
       formData.append('infill_density', document.getElementById('infillDensity').value);
       formData.append('infill_overlap', document.getElementById('infillOverlap').value);
+      formData.append('smoothing_angle', document.getElementById('smoothingAngle').value);
+      formData.append('smoothing_radius_factor', document.getElementById('smoothingRadiusFactor').value);
       formData.append('raft_layer_count', document.getElementById('raftLayerCount').value);
       formData.append('raft_top_gap', document.getElementById('raftTopGap').value);
       formData.append('raft_offsets', document.getElementById('raftOffsets').value);

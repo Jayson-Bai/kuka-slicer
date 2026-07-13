@@ -1,4 +1,4 @@
-import math
+﻿import math
 
 import numpy as np
 from shapely.geometry import LineString, Point, Polygon
@@ -13,23 +13,25 @@ from kuka_slicer.slicer import (
     SliceConfig,
     _build_resin_paths,
     _filter_concentric_paths_by_spacing,
+    _libslic3r_fill_surface_overlap_offset,
     _raft_lattice_infill_paths,
     _raft_zigzag_infill_paths,
+    _resin_infill_surface_geometry,
     _smooth_path_corners,
     _uniform_concentric_offsets,
     add_raft_to_job,
     normalize_job_xy_origin,
-    optimize_open_path_travel,
+    recommended_geometry_tolerance,
     slice_mesh_to_job,
 )
 from kuka_slicer.stl_io import Mesh
-from kuka_slicer.ui_server import _simplify_preview_path, expand_fiber_template_for_resin_layers
+from kuka_slicer.ui_server import _index_html, _simplify_preview_path, expand_fiber_template_for_resin_layers
 
 
 def test_cube_slice_produces_closed_square_path():
     mesh = Mesh(_cube_triangles(size=10.0))
 
-    job = slice_mesh_to_job(mesh, SliceConfig(layer_height=5.0, infill_pattern="contour"))
+    job = slice_mesh_to_job(mesh, SliceConfig(layer_height=5.0, infill_pattern="none"))
 
     assert len(job.material_paths) == 2
     group = job.material_paths[0]
@@ -42,10 +44,10 @@ def test_cube_slice_produces_closed_square_path():
     assert path.shape[0] >= 4
 
 
-def test_layer_generation_includes_top_cap_layer():
+def test_layer_generation_includes_top_z_layer():
     mesh = Mesh(_cube_triangles(size=5.0))
 
-    job = slice_mesh_to_job(mesh, SliceConfig(layer_height=0.5, infill_pattern="contour"))
+    job = slice_mesh_to_job(mesh, SliceConfig(layer_height=0.5, infill_pattern="none"))
 
     assert len(job.material_paths) == 10
     assert np.allclose([group.paths[0][0, 2] for group in job.material_paths], np.arange(0.5, 5.5, 0.5))
@@ -55,7 +57,7 @@ def test_fiber_template_z_is_offset_from_resin_layer_z():
     mesh = Mesh(_cube_triangles(size=1.5))
     job = slice_mesh_to_job(
         mesh,
-        SliceConfig(layer_height=0.5, line_width=0.1, infill_pattern="contour"),
+        SliceConfig(layer_height=0.5, line_width=0.1, infill_pattern="none"),
     )
     template_paths = [[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]]
 
@@ -74,7 +76,7 @@ def test_fiber_template_paths_are_smoothed_before_export():
     mesh = Mesh(_cube_triangles(size=1.5))
     job = slice_mesh_to_job(
         mesh,
-        SliceConfig(layer_height=0.5, line_width=0.1, infill_pattern="contour"),
+        SliceConfig(layer_height=0.5, line_width=0.1, infill_pattern="none"),
     )
     template_paths = [[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0]]]
 
@@ -90,7 +92,7 @@ def test_resin_line_infill_uses_default_overlap_spacing():
 
     job = slice_mesh_to_job(
         mesh,
-        SliceConfig(layer_height=5.0, line_width=2.0, infill_pattern="lines_x"),
+        SliceConfig(layer_height=5.0, line_width=2.0, infill_pattern="aligned_rectilinear"),
     )
 
     roles = job.meta["path_roles"]["R"]["1"]
@@ -99,11 +101,11 @@ def test_resin_line_infill_uses_default_overlap_spacing():
         path for path, role in zip(job.material_paths[1].paths, roles) if role != "infill"
     ]
     assert len(contour_paths) == 2
-    assert len(infill_paths) == 1
-    assert infill_paths[0].shape[0] > 10
+    assert len(infill_paths) == 8
+    assert all(path.shape[0] == 2 for path in infill_paths)
     assert np.allclose(
-        _horizontal_scan_ys(infill_paths[0]),
-        [5.4, 7.2, 9.0, 10.8, 12.6, 14.4, 16.2],
+        sorted(_horizontal_scan_ys(path)[0] for path in infill_paths),
+        [3.6, 5.4, 7.2, 9.0, 10.8, 12.6, 14.4, 16.2],
     )
 
 
@@ -112,12 +114,16 @@ def test_resin_line_infill_can_disable_overlap_for_legacy_spacing():
 
     job = slice_mesh_to_job(
         mesh,
-        SliceConfig(layer_height=5.0, line_width=2.0, infill_pattern="lines_x", infill_overlap=0.0),
+        SliceConfig(layer_height=5.0, line_width=2.0, infill_pattern="aligned_rectilinear", infill_overlap=0.0),
     )
 
     roles = job.meta["path_roles"]["R"]["1"]
     infill_paths = _paths_with_role(job.material_paths[1].paths, roles, "infill")
-    assert np.allclose(_horizontal_scan_ys(infill_paths[0]), [6.0, 8.0, 10.0, 12.0, 14.0])
+    assert len(infill_paths) == 5
+    assert np.allclose(
+        sorted(_horizontal_scan_ys(path)[0] for path in infill_paths),
+        [6.0, 8.0, 10.0, 12.0, 14.0],
+    )
 
 
 def test_resin_perimeters_use_overlap_spacing():
@@ -128,7 +134,7 @@ def test_resin_perimeters_use_overlap_spacing():
 
     paths, roles = _build_resin_paths(
         [contour],
-        SliceConfig(layer_height=1.0, line_width=2.0, infill_pattern="contour"),
+        SliceConfig(layer_height=1.0, line_width=2.0, infill_pattern="none"),
     )
 
     outer = _paths_with_role(paths, roles, "outer_contour")[0]
@@ -137,31 +143,76 @@ def test_resin_perimeters_use_overlap_spacing():
     assert np.isclose(float(inner[:, 0].min()), 2.8, atol=0.05)
 
 
+def test_libslic3r_fill_surface_overlap_offset_matches_spacing_formula():
+    offset = _libslic3r_fill_surface_overlap_offset(
+        line_spacing=1.8,
+        line_width=2.0,
+        overlap_percent=10.0,
+    )
+
+    assert np.isclose(offset, -0.7)
+
+
+def test_resin_infill_surface_uses_last_perimeter_and_overlap_offset():
+    geometry = Polygon([(0, 0), (20, 0), (20, 20), (0, 20)])
+    config = SliceConfig(layer_height=1.0, line_width=2.0, infill_overlap=10.0)
+
+    infill_surface = _resin_infill_surface_geometry(geometry, config)
+
+    min_x, min_y, max_x, max_y = infill_surface.bounds
+    assert np.isclose(min_x, 3.5, atol=0.05)
+    assert np.isclose(min_y, 3.5, atol=0.05)
+    assert np.isclose(max_x, 16.5, atol=0.05)
+    assert np.isclose(max_y, 16.5, atol=0.05)
+
+
+def test_resin_infill_surface_respects_configured_perimeter_count():
+    geometry = Polygon([(0, 0), (30, 0), (30, 30), (0, 30)])
+    one_wall = SliceConfig(
+        layer_height=1.0,
+        line_width=2.0,
+        infill_overlap=10.0,
+        perimeter_count=1,
+    )
+    three_walls = SliceConfig(
+        layer_height=1.0,
+        line_width=2.0,
+        infill_overlap=10.0,
+        perimeter_count=3,
+    )
+
+    one_wall_min_x = _resin_infill_surface_geometry(geometry, one_wall).bounds[0]
+    three_wall_min_x = _resin_infill_surface_geometry(geometry, three_walls).bounds[0]
+
+    assert three_wall_min_x > one_wall_min_x
+
+
 def test_resin_infill_density_changes_path_spacing():
     mesh = Mesh(_cube_triangles(size=20.0))
 
     dense = slice_mesh_to_job(
         mesh,
-        SliceConfig(layer_height=5.0, line_width=2.0, infill_pattern="lines_x", infill_density=100),
+        SliceConfig(layer_height=5.0, line_width=2.0, infill_pattern="aligned_rectilinear", infill_density=100),
     )
     sparse = slice_mesh_to_job(
         mesh,
-        SliceConfig(layer_height=5.0, line_width=2.0, infill_pattern="lines_x", infill_density=50),
+        SliceConfig(layer_height=5.0, line_width=2.0, infill_pattern="aligned_rectilinear", infill_density=50),
     )
 
     dense_roles = dense.meta["path_roles"]["R"]["1"]
     sparse_roles = sparse.meta["path_roles"]["R"]["1"]
     dense_infill = _paths_with_role(dense.material_paths[1].paths, dense_roles, "infill")
     sparse_infill = _paths_with_role(sparse.material_paths[1].paths, sparse_roles, "infill")
-    assert len(dense_infill) == 1
-    assert len(sparse_infill) == 1
-    assert len(_horizontal_scan_ys(dense_infill[0])) == 7
-    assert len(_horizontal_scan_ys(sparse_infill[0])) == 3
+    assert len(dense_infill) == 8
+    assert len(sparse_infill) == 4
+    assert all(path.shape[0] == 2 for path in dense_infill + sparse_infill)
+    assert len({_horizontal_scan_ys(path)[0] for path in dense_infill}) == 8
+    assert len({_horizontal_scan_ys(path)[0] for path in sparse_infill}) == 4
     assert dense.meta["slicing"]["infill_density"] == 100
     assert dense.meta["slicing"]["infill_overlap"] == DEFAULT_RESIN_INFILL_OVERLAP_PERCENT
 
 
-def test_part_bottom_and_top_layers_force_full_zigzag_infill():
+def test_part_bottom_and_top_layers_follow_requested_infill_density():
     mesh = Mesh(_cube_triangles(size=20.0))
 
     job = slice_mesh_to_job(
@@ -182,24 +233,13 @@ def test_part_bottom_and_top_layers_force_full_zigzag_infill():
     middle_infill = _paths_with_role(job.material_paths[1].paths, middle_roles, "infill")
     top_infill = _paths_with_role(job.material_paths[top_index].paths, top_roles, "infill")
 
-    assert bottom_infill
+    assert not bottom_infill
     assert not middle_infill
-    assert top_infill
-    assert len(bottom_infill) <= 20
-    assert len(top_infill) <= 20
-    assert _dominant_infill_angle(bottom_infill) == 45
-    assert _dominant_infill_angle(top_infill) == -45
-    assert all(not _path_has_non_adjacent_crossing(path) for path in bottom_infill)
-    assert all(not _path_has_non_adjacent_crossing(path) for path in top_infill)
-    assert job.meta["slicing"]["forced_part_cap_layers"] == {
-        "infill_pattern": "zigzag_diagonal",
-        "infill_density": 100.0,
-        "bottom_angle_degrees": 45.0,
-        "top_angle_degrees": -45.0,
-    }
+    assert not top_infill
+    assert "forced_part_cap_layers" not in job.meta["slicing"]
 
 
-def test_contour_offset_infill_generates_closed_inner_rings():
+def test_concentric_infill_generates_closed_inner_rings():
     contour = np.asarray(
         [[0, 0], [20, 0], [20, 20], [0, 20], [0, 0]],
         dtype=np.float32,
@@ -207,7 +247,7 @@ def test_contour_offset_infill_generates_closed_inner_rings():
 
     paths, roles = _build_resin_paths(
         [contour],
-        SliceConfig(layer_height=5.0, line_width=2.0, infill_pattern="contour_offset"),
+        SliceConfig(layer_height=5.0, line_width=2.0, infill_pattern="concentric"),
     )
 
     infill = _paths_with_role(paths, roles, "infill")
@@ -216,7 +256,7 @@ def test_contour_offset_infill_generates_closed_inner_rings():
     assert all(np.allclose(path[0], path[-1]) for path in infill)
 
 
-def test_contour_offset_keeps_printable_residual_ring_centered():
+def test_concentric_keeps_printable_residual_ring_centered():
     contour = np.asarray(
         [[0, 0], [21, 0], [21, 21], [0, 21], [0, 0]],
         dtype=np.float32,
@@ -224,7 +264,7 @@ def test_contour_offset_keeps_printable_residual_ring_centered():
 
     paths, roles = _build_resin_paths(
         [contour],
-        SliceConfig(layer_height=1.0, line_width=2.0, infill_pattern="contour_offset"),
+        SliceConfig(layer_height=1.0, line_width=2.0, infill_pattern="concentric"),
     )
     infill = _paths_with_role(paths, roles, "infill")
     last = infill[-1]
@@ -235,7 +275,7 @@ def test_contour_offset_keeps_printable_residual_ring_centered():
     assert np.isclose(center_y, 10.5, atol=0.05)
 
 
-def test_contour_offset_keeps_closed_residual_ring_when_narrow():
+def test_concentric_keeps_closed_residual_ring_when_narrow():
     contour = np.asarray(
         [[0, 0], [21, 0], [21, 21], [0, 21], [0, 0]],
         dtype=np.float32,
@@ -243,7 +283,7 @@ def test_contour_offset_keeps_closed_residual_ring_when_narrow():
 
     paths, roles = _build_resin_paths(
         [contour],
-        SliceConfig(layer_height=1.0, line_width=2.0, infill_pattern="contour_offset"),
+        SliceConfig(layer_height=1.0, line_width=2.0, infill_pattern="concentric"),
     )
     infill = _paths_with_role(paths, roles, "infill")
 
@@ -251,14 +291,14 @@ def test_contour_offset_keeps_closed_residual_ring_when_narrow():
     assert all(np.allclose(path[0], path[-1]) for path in infill)
 
 
-def test_contour_offset_keeps_fixed_spacing_before_residual_ring():
+def test_concentric_keeps_fixed_spacing_before_residual_ring():
     offsets = _uniform_concentric_offsets(9.5, line_width=2.0, path_spacing=1.8)
 
     assert np.allclose(np.diff(offsets[:-1]), [1.8, 1.8, 1.8, 1.8])
     assert offsets[-1] == 9.5
 
 
-def test_contour_offset_filters_paths_closer_than_line_width():
+def test_concentric_filters_paths_closer_than_line_width():
     outer = np.asarray([[0, 0], [20, 0]], dtype=np.float32)
     too_close = np.asarray([[0, 1], [20, 1]], dtype=np.float32)
     far_enough = np.asarray([[0, 2], [20, 2]], dtype=np.float32)
@@ -270,7 +310,7 @@ def test_contour_offset_filters_paths_closer_than_line_width():
     assert filtered[1] is far_enough
 
 
-def test_contour_offset_centers_residual_ring_per_local_region():
+def test_concentric_centers_residual_ring_per_local_region():
     contour = np.asarray(
         [[0, 0], [41, 0], [41, 13], [0, 13], [0, 0]],
         dtype=np.float32,
@@ -278,7 +318,7 @@ def test_contour_offset_centers_residual_ring_per_local_region():
 
     paths, roles = _build_resin_paths(
         [contour],
-        SliceConfig(layer_height=1.0, line_width=2.0, infill_pattern="contour_offset"),
+        SliceConfig(layer_height=1.0, line_width=2.0, infill_pattern="concentric"),
     )
     infill = _paths_with_role(paths, roles, "infill")
     last = infill[-1]
@@ -299,7 +339,7 @@ def test_resin_infill_respects_inner_holes():
 
     paths, roles = _build_resin_paths(
         [outer, hole],
-        SliceConfig(layer_height=1.0, line_width=0.5, infill_pattern="lines_x"),
+        SliceConfig(layer_height=1.0, line_width=0.5, infill_pattern="aligned_rectilinear"),
     )
 
     assert roles.count("outer_contour") == 2
@@ -330,7 +370,7 @@ def test_zigzag_infill_does_not_self_cross_in_concave_region():
 
     paths, roles = _build_resin_paths(
         [contour],
-        SliceConfig(layer_height=1.0, line_width=0.5, infill_pattern="lines_x"),
+        SliceConfig(layer_height=1.0, line_width=0.5, infill_pattern="aligned_rectilinear"),
     )
 
     for path, role in zip(paths, roles):
@@ -338,17 +378,18 @@ def test_zigzag_infill_does_not_self_cross_in_concave_region():
             assert not _path_has_non_adjacent_crossing(path)
 
 
-def test_zigzag_infill_connects_adjacent_annulus_segments_when_safe():
+def test_zigzag_infill_keeps_annulus_segments_independent():
     outer = _circle_path((0.0, 0.0), 20.0, 128)
     hole = _circle_path((0.0, 0.0), 10.0, 96)
 
     paths, roles = _build_resin_paths(
         [outer, hole],
-        SliceConfig(layer_height=1.0, line_width=1.0, infill_pattern="lines_x"),
+        SliceConfig(layer_height=1.0, line_width=1.0, infill_pattern="aligned_rectilinear"),
     )
     infill = _paths_with_role(paths, roles, "infill")
 
-    assert any(path.shape[0] > 6 for path in infill)
+    assert infill
+    assert all(path.shape[0] == 2 for path in infill)
     for path in infill:
         assert not _path_has_non_adjacent_crossing(path)
 
@@ -365,13 +406,13 @@ def test_perimeter_roles_mark_outer_and_inner_wall_pairs():
 
     _, roles = _build_resin_paths(
         [outer, hole],
-        SliceConfig(layer_height=1.0, line_width=0.5, infill_pattern="contour"),
+        SliceConfig(layer_height=1.0, line_width=0.5, infill_pattern="none"),
     )
 
     assert roles == ["outer_contour", "outer_contour", "inner_contour", "inner_contour"]
 
 
-def test_alternating_diagonal_infill_flips_angle_by_layer():
+def test_rectilinear_infill_flips_angle_by_layer():
     mesh = Mesh(_cube_triangles(size=20.0))
 
     job = slice_mesh_to_job(
@@ -379,7 +420,7 @@ def test_alternating_diagonal_infill_flips_angle_by_layer():
         SliceConfig(
             layer_height=5.0,
             line_width=2.0,
-            infill_pattern="alternating_diagonal",
+            infill_pattern="rectilinear",
         ),
     )
 
@@ -410,7 +451,8 @@ def test_triangular_infill_generates_single_layer_lattice_without_edge_overlaps(
     infill_paths = _paths_with_role(job.material_paths[1].paths, roles, "infill")
     directions, overlap_length, longest_segment = _infill_direction_overlap_stats(infill_paths)
     assert infill_paths
-    assert len(infill_paths) <= 12
+    assert len(infill_paths) > 12
+    assert all(path.shape[0] == 2 for path in infill_paths)
     assert directions == {0, 60, 120}
     assert overlap_length < 1e-5
     assert longest_segment > 6.0
@@ -628,6 +670,89 @@ def test_material_defaults_are_hard_coded():
     assert fiber.line_width == DEFAULT_FIBER_LINE_WIDTH_MM
 
 
+def test_slice_config_exposes_ui_tunable_path_parameters_in_meta():
+    mesh = Mesh(_cube_triangles(size=10.0))
+
+    job = slice_mesh_to_job(
+        mesh,
+        SliceConfig(
+            layer_height=5.0,
+            line_width=1.0,
+            infill_pattern="aligned_rectilinear",
+            perimeter_count=3,
+            smoothing_angle=120.0,
+            smoothing_radius_factor=0.25,
+        ),
+    )
+
+    slicing = job.meta["slicing"]
+    assert slicing["perimeter_count"] == 3
+    assert slicing["smoothing_angle"] == 120.0
+    assert slicing["smoothing_radius_factor"] == 0.25
+    assert "forced_part_cap_layers" not in slicing
+
+
+def test_recommended_geometry_tolerance_tracks_print_scale():
+    assert recommended_geometry_tolerance(layer_height=0.5, line_width=2.0) == 0.0005
+    assert recommended_geometry_tolerance(layer_height=0.001, line_width=2.0) == 1e-5
+    assert recommended_geometry_tolerance(layer_height=50.0, line_width=20.0) == 0.01
+
+
+def test_ui_uses_prusaslicer_style_infill_pattern_names():
+    html = _index_html()
+
+    for pattern in (
+        "rectilinear",
+        "aligned_rectilinear",
+        "line",
+        "grid",
+        "triangles",
+        "gyroid",
+        "concentric",
+        "zigzag",
+    ):
+        assert f'value="{pattern}"' in html
+    for legacy_pattern in (
+        "lines_x",
+        "lines_y",
+        "contour_offset",
+        "alternating_diagonal",
+    ):
+        assert legacy_pattern not in html
+
+
+def test_ui_exposes_current_path_only_kernel_inputs():
+    html = _index_html()
+
+    for control_id in (
+        "stlFile",
+        "fiberJsonFile",
+        "layerHeight",
+        "buildAxis",
+        "zMin",
+        "zMax",
+        "tolerance",
+        "lineWidth",
+        "perimeterCount",
+        "infillPattern",
+        "infillDensity",
+        "infillOverlap",
+        "smoothingAngle",
+        "smoothingRadiusFactor",
+        "raftLayerCount",
+        "raftTopGap",
+        "raftOffsets",
+        "raftLayerHeights",
+        "raftInfillDensities",
+        "curveMode",
+        "curveAmplitude",
+        "curvePeriod",
+    ):
+        assert f'id="{control_id}"' in html
+    assert "bottomCapAngle" not in html
+    assert "topCapAngle" not in html
+
+
 def test_preview_simplification_keeps_contour_corners():
     points = [[0.0, 0.0, 0.5], [0.0, 20.0, 0.5]]
     points.extend([[float(x), 20.0, 0.5] for x in range(1, 202)])
@@ -638,21 +763,19 @@ def test_preview_simplification_keeps_contour_corners():
     assert [0.0, 20.0, 0.5] in simplified
 
 
-def test_open_path_travel_optimizer_reverses_next_path_when_closer():
-    paths = [
-        np.asarray([[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]], dtype=np.float32),
-        np.asarray([[0.0, 1.0, 0.0], [10.0, 1.0, 0.0]], dtype=np.float32),
-    ]
+def test_infill_paths_remain_independent_after_generation():
+    geometry = Polygon([(0, 0), (20, 0), (20, 20), (0, 20)])
+    config = SliceConfig(layer_height=1.0, line_width=1.0, infill_pattern="aligned_rectilinear")
 
-    optimized = optimize_open_path_travel(paths)
+    paths = _raft_zigzag_infill_paths(geometry, config, infill_density=100.0)
 
-    assert np.allclose(optimized[0], paths[0])
-    assert np.allclose(optimized[1], paths[1][::-1])
+    assert len(paths) > 1
+    assert all(path.shape[0] == 2 for path in paths)
 
 
 def test_raft_layers_shift_part_layers_and_z():
     mesh = Mesh(_cube_triangles(size=10.0))
-    config = SliceConfig(layer_height=5.0, line_width=1.0, infill_pattern="lines_x")
+    config = SliceConfig(layer_height=5.0, line_width=1.0, infill_pattern="aligned_rectilinear")
     job = slice_mesh_to_job(mesh, config)
 
     z_shift = add_raft_to_job(
@@ -677,7 +800,7 @@ def test_raft_layers_shift_part_layers_and_z():
 
 def test_single_raft_layer_touching_part_uses_lattice_independent_of_part_pattern():
     mesh = Mesh(_cube_triangles(size=20.0))
-    config = SliceConfig(layer_height=5.0, line_width=2.0, infill_pattern="contour_offset")
+    config = SliceConfig(layer_height=5.0, line_width=2.0, infill_pattern="concentric")
     job = slice_mesh_to_job(mesh, config)
 
     add_raft_to_job(
@@ -691,14 +814,14 @@ def test_single_raft_layer_touching_part_uses_lattice_independent_of_part_patter
     raft_roles = job.meta["path_roles"]["R"]["0"]
     raft_infill = _paths_with_role(job.material_paths[0].paths, raft_roles, "infill")
     assert raft_infill
-    assert len(raft_infill) <= 3
-    assert max(path.shape[0] for path in raft_infill) > 100
+    assert len(raft_infill) > 1
+    assert max(path.shape[0] for path in raft_infill) >= 20
     assert all(not _path_has_non_adjacent_crossing(path) for path in raft_infill)
 
 
 def test_only_top_raft_layer_touching_part_uses_lattice():
     mesh = Mesh(_cube_triangles(size=20.0))
-    config = SliceConfig(layer_height=5.0, line_width=2.0, infill_pattern="contour_offset")
+    config = SliceConfig(layer_height=5.0, line_width=2.0, infill_pattern="concentric")
     job = slice_mesh_to_job(mesh, config)
 
     add_raft_to_job(
@@ -719,9 +842,9 @@ def test_only_top_raft_layer_touching_part_uses_lattice():
 
     assert bottom_infill
     assert top_infill
-    assert len(bottom_infill) == 1
-    assert len(top_infill) <= 3
-    assert max(path.shape[0] for path in top_infill) >= 50
+    assert len(bottom_infill) > 1
+    assert len(top_infill) > 1
+    assert max(path.shape[0] for path in top_infill) >= 20
     assert all(not _path_has_non_adjacent_crossing(path) for path in top_infill)
 
 
@@ -735,10 +858,9 @@ def test_raft_lattice_density_changes_spacing():
     assert dense
     assert sparse
     assert _infill_total_length(dense) > _infill_total_length(sparse)
-    assert dense[0].shape[0] > sparse[0].shape[0]
 
 
-def test_raft_zigzag_infill_avoids_long_sharp_connectors_near_holes():
+def test_raft_zigzag_infill_segments_do_not_add_connector_routes():
     outer = [(0, 0), (42, 0), (42, 20), (0, 20)]
     hole = list(Point(30, 10).buffer(3.0, resolution=32).exterior.coords)
     geometry = Polygon(outer, holes=[hole])
@@ -756,7 +878,7 @@ def test_raft_zigzag_infill_avoids_long_sharp_connectors_near_holes():
 
 def test_normalize_job_xy_origin_moves_lower_left_to_zero():
     mesh = Mesh(_cube_triangles(size=10.0) - np.asarray([5.0, 2.0, 0.0], dtype=np.float32))
-    job = slice_mesh_to_job(mesh, SliceConfig(layer_height=5.0, infill_pattern="contour"))
+    job = slice_mesh_to_job(mesh, SliceConfig(layer_height=5.0, infill_pattern="none"))
 
     translation = normalize_job_xy_origin(job)
     all_points = np.vstack([path for group in job.material_paths for path in group.paths])
