@@ -1702,10 +1702,53 @@ def _triangular_lattice_infill_geometry(
     )
     if not edges:
         return []
-    return [
-        np.asarray([coordinates[start], coordinates[end]], dtype=np.float32)
-        for start, end in edges
-    ]
+    return _merge_collinear_triangular_edges(edges, coordinates, tolerance)
+
+
+def _merge_collinear_triangular_edges(
+    edges: list[tuple[tuple[int, int], tuple[int, int]]],
+    coordinates: dict[tuple[int, int], tuple[float, float]],
+    tolerance: float,
+) -> list[np.ndarray]:
+    """Merge noded lattice edges without joining different directions.
+
+    The lattice is noded at every crossing so overlaps can be removed. Those
+    graph edges are not separate printing paths, however, so merge the pieces
+    back along each of the three original lattice directions.
+    """
+    direction_lines: dict[int, list[LineString]] = {0: [], 60: [], 120: []}
+    for start, end in edges:
+        start_point = coordinates[start]
+        end_point = coordinates[end]
+        angle = math.degrees(
+            math.atan2(end_point[1] - start_point[1], end_point[0] - start_point[0])
+        ) % 180.0
+        direction = min(
+            direction_lines,
+            key=lambda expected: min(
+                abs(angle - expected),
+                abs(angle - expected - 180.0),
+                abs(angle - expected + 180.0),
+            ),
+        )
+        direction_lines[direction].append(
+            LineString([start_point, end_point])
+        )
+
+    merged_paths: list[np.ndarray] = []
+    for direction in (0, 60, 120):
+        if not direction_lines[direction]:
+            continue
+        merged = linemerge(unary_union(direction_lines[direction]))
+        for segment in _extract_line_segments(merged, tolerance):
+            coords = list(segment.coords)
+            path = _dedupe_consecutive(
+                np.asarray([[float(x), float(y)] for x, y in coords], dtype=np.float32),
+                tolerance,
+            )
+            if path.shape[0] >= 2 and np.linalg.norm(path[-1] - path[0]) > tolerance:
+                merged_paths.append(path)
+    return merged_paths
 
 
 def _triangular_lattice_edges_at_phase(

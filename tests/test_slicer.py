@@ -451,8 +451,9 @@ def test_triangular_infill_generates_single_layer_lattice_without_edge_overlaps(
     infill_paths = _paths_with_role(job.material_paths[1].paths, roles, "infill")
     directions, overlap_length, longest_segment = _infill_direction_overlap_stats(infill_paths)
     assert infill_paths
-    assert len(infill_paths) > 12
-    assert all(path.shape[0] == 2 for path in infill_paths)
+    assert 6 < len(infill_paths) < 12
+    assert all(path.shape[0] >= 2 for path in infill_paths)
+    assert any(path.shape[0] > 2 for path in infill_paths)
     assert directions == {0, 60, 120}
     assert overlap_length < 1e-5
     assert longest_segment > 6.0
