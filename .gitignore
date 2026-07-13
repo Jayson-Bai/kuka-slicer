@@ -19,3 +19,4 @@ tmp_json_fiber_check/
 dist/
 build/
 *.egg-info/
+*.zip
