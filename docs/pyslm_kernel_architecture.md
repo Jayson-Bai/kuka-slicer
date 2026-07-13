@@ -4,6 +4,7 @@
 
 - `main` remains the stable release line using the `legacy` kernel by default.
 - Experimental PySLM work is isolated behind `SliceConfig.slicing_kernel`.
+- The CLI and web UI default to `legacy`; both expose an explicit kernel switch.
 - The checkpoint before this branch is tagged as
   `checkpoint-before-pyslm-20260713-2145`.
 - The PySLM dependency is optional under `.[pyslm]`; baseline installs and tests

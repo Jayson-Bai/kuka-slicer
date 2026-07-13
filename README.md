@@ -57,8 +57,14 @@ python -m kuka_slicer slice input.stl output.npz `
   --curve-period 40.0
 ```
 
-The default slicing kernel is the in-repository `legacy` path-only kernel. An
-experimental PySLM adapter can be selected from the CLI:
+The default slicing kernel is the in-repository `legacy` path-only kernel. It
+can also be selected explicitly for reproducible comparisons:
+
+```powershell
+python -m kuka_slicer slice input.stl output.npz --slicing-kernel legacy
+```
+
+An experimental PySLM adapter can be selected from the CLI:
 
 ```powershell
 python -m kuka_slicer slice input.stl output.npz --slicing-kernel pyslm
@@ -130,7 +136,7 @@ The UI groups adjustable inputs into:
 | --- | --- |
 | Input files | STL upload, optional single-layer fiber JSON |
 | Model and layers | layer height, build axis, optional `z_min`/`z_max`, geometric tolerance |
-| Resin path kernel | line width, perimeter count, PrusaSlicer-style infill pattern, density, overlap, smoothing |
+| Resin path kernel | slicing kernel (`Legacy` or `PySLM`), line width, perimeter count, PrusaSlicer-style infill pattern, density, overlap, smoothing |
 | Raft | layer count, top gap, per-layer offsets, per-layer heights, per-layer densities |
 | Curved Z | flat/sinusoidal mode, amplitude, period |
 

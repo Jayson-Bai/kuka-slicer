@@ -743,6 +743,33 @@ def test_slice_config_defaults_to_legacy_kernel():
     assert SliceConfig().slicing_kernel == "legacy"
 
 
+def test_explicit_legacy_kernel_matches_default_kernel():
+    mesh = Mesh(_cube_triangles(size=10.0))
+    base_config = SliceConfig(layer_height=5.0, infill_pattern="aligned_rectilinear")
+
+    default_job = slice_mesh_to_job(mesh, base_config)
+    explicit_legacy_job = slice_mesh_to_job(
+        mesh,
+        SliceConfig(
+            layer_height=5.0,
+            infill_pattern="aligned_rectilinear",
+            slicing_kernel="legacy",
+        ),
+    )
+
+    assert default_job.meta == explicit_legacy_job.meta
+    assert len(default_job.material_paths) == len(explicit_legacy_job.material_paths)
+    for default_group, explicit_group in zip(
+        default_job.material_paths,
+        explicit_legacy_job.material_paths,
+    ):
+        assert default_group.layer_index == explicit_group.layer_index
+        assert default_group.material == explicit_group.material
+        assert len(default_group.paths) == len(explicit_group.paths)
+        for default_path, explicit_path in zip(default_group.paths, explicit_group.paths):
+            np.testing.assert_allclose(default_path, explicit_path)
+
+
 def test_slice_config_rejects_unknown_kernel():
     try:
         SliceConfig(slicing_kernel="unknown")  # type: ignore[arg-type]
@@ -799,7 +826,7 @@ def test_ui_uses_prusaslicer_style_infill_pattern_names():
         assert legacy_pattern not in html
 
 
-def test_ui_exposes_current_path_only_kernel_inputs():
+def test_ui_exposes_slicing_kernel_input():
     html = _index_html()
 
     for control_id in (
@@ -815,6 +842,7 @@ def test_ui_exposes_current_path_only_kernel_inputs():
         "infillPattern",
         "infillDensity",
         "infillOverlap",
+        "slicingKernel",
         "smoothingAngle",
         "smoothingRadiusFactor",
         "raftLayerCount",
@@ -827,6 +855,8 @@ def test_ui_exposes_current_path_only_kernel_inputs():
         "curvePeriod",
     ):
         assert f'id="{control_id}"' in html
+    assert 'value="legacy" selected' in html
+    assert 'value="pyslm"' in html
     assert "bottomCapAngle" not in html
     assert "topCapAngle" not in html
 

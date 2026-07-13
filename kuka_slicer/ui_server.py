@@ -120,6 +120,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             "infill_overlap",
             DEFAULT_RESIN_INFILL_OVERLAP_PERCENT,
         )
+        slicing_kernel = params.get("slicing_kernel", ["legacy"])[0]
         infill_pattern = params.get("infill_pattern", ["rectilinear"])[0]
         curve_mode = params.get("curve_mode", ["flat"])[0]
         curve_amplitude = _float_param(params, "curve_amplitude", 0.0)
@@ -166,6 +167,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             infill_pattern=infill_pattern,  # type: ignore[arg-type]
             infill_density=infill_density,
             infill_overlap=infill_overlap,
+            slicing_kernel=slicing_kernel,  # type: ignore[arg-type]
             perimeter_count=perimeter_count,
             smoothing_angle=smoothing_angle,
             smoothing_radius_factor=smoothing_radius_factor,
@@ -198,6 +200,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             "recommendation": recommendation,
             "fiber_json": fiber_json_name,
             "build_axis": build_axis,
+            "slicing_kernel": config.slicing_kernel,
         }
 
     def _read_slice_request(
@@ -1037,6 +1040,12 @@ def _index_html() -> str:
             </div>
           </div>
 
+          <label for="slicingKernel">Slicing kernel</label>
+          <select id="slicingKernel" name="slicingKernel">
+            <option value="legacy" selected>Legacy (stable)</option>
+            <option value="pyslm">PySLM (experimental)</option>
+          </select>
+
           <label for="infillPattern">树脂填充路径</label>
           <select id="infillPattern" name="infillPattern">
             <option value="rectilinear">Rectilinear</option>
@@ -1219,6 +1228,7 @@ def _index_html() -> str:
       formData.append('infill_pattern', document.getElementById('infillPattern').value);
       formData.append('infill_density', document.getElementById('infillDensity').value);
       formData.append('infill_overlap', document.getElementById('infillOverlap').value);
+      formData.append('slicing_kernel', document.getElementById('slicingKernel').value);
       formData.append('smoothing_angle', document.getElementById('smoothingAngle').value);
       formData.append('smoothing_radius_factor', document.getElementById('smoothingRadiusFactor').value);
       formData.append('raft_layer_count', document.getElementById('raftLayerCount').value);
