@@ -28,7 +28,7 @@ PySLM is wrapped only as a geometry/toolpath provider:
 
 ## Current PySLM Adapter Scope
 
-Supported first:
+PySLM-native path generation:
 
 - `none`
 - `line`
@@ -36,15 +36,30 @@ Supported first:
 - `rectilinear`
 - cap-layer `zigzag` as hatch vectors
 
-Not migrated yet:
+The following patterns remain available only through the standalone legacy
+kernel:
 
 - `grid`
 - `triangles`
 - `gyroid`
 - `concentric`
-- legacy smoothing and connector semantics
+- legacy smoothing and connector semantics remain project-owned
 - full output parity for cap-layer zigzag connectivity
 
-Unsupported PySLM patterns fail fast instead of silently falling back. This
-keeps comparison results explicit and prevents mixed-kernel outputs from being
-mistaken for PySLM parity.
+The PySLM adapter fails fast for the four legacy-only patterns instead of
+silently mixing algorithms. This keeps the two kernels independently
+selectable and makes output comparisons meaningful.
+
+Native PySLM controls are grouped under `SliceConfig.pyslm` and include the
+hatcher strategy, hatch angle, layer angle increment, hatch spacing, contour
+offsets, spot compensation, volume offset, contour counts, scan ordering,
+stripe/island dimensions, polygon repair, and boundary simplification.
+
+## Native Visualization Boundary
+
+PySLM provides `pyslm.visualise.plot()` and related Matplotlib helpers for
+plotting contours, hatch vectors, point exposures, 3D layer position, arrows,
+scan order, and color mapping. The current project UI keeps its browser canvas
+preview and displays the same project-owned path arrays that are written to
+NPZ; it does not embed a Matplotlib figure. This keeps preview and export on
+the same `ExternalSourceJob` data contract.

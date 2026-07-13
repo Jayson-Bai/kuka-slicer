@@ -23,6 +23,7 @@ from .slicer import (
     DEFAULT_RESIN_INFILL_OVERLAP_PERCENT,
     DEFAULT_RESIN_LAYER_HEIGHT_MM,
     DEFAULT_RESIN_LINE_WIDTH_MM,
+    PySLMConfig,
     RaftLayerConfig,
     SliceConfig,
     _intersect_mesh_at_z,
@@ -121,6 +122,33 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             DEFAULT_RESIN_INFILL_OVERLAP_PERCENT,
         )
         slicing_kernel = params.get("slicing_kernel", ["legacy"])[0]
+        pyslm_config = PySLMConfig(
+            hatcher=params.get("pyslm_hatcher", ["basic"])[0],  # type: ignore[arg-type]
+            hatch_angle=_optional_float_param(params, "pyslm_hatch_angle"),
+            layer_angle_increment=_float_param(params, "pyslm_layer_angle_increment", 0.0),
+            hatch_distance=_optional_float_param(params, "pyslm_hatch_distance"),
+            contour_offset=_optional_float_param(params, "pyslm_contour_offset"),
+            spot_compensation=_optional_float_param(params, "pyslm_spot_compensation"),
+            volume_offset_hatch=_optional_float_param(params, "pyslm_volume_offset_hatch"),
+            num_outer_contours=_optional_int_param(params, "pyslm_num_outer_contours"),
+            num_inner_contours=_optional_int_param(params, "pyslm_num_inner_contours"),
+            scan_contour_first=_bool_param(params, "pyslm_scan_contour_first", True),
+            hatch_sort=params.get("pyslm_hatch_sort", ["none"])[0],  # type: ignore[arg-type]
+            stripe_width=_float_param(params, "pyslm_stripe_width", 5.0),
+            stripe_overlap=_float_param(params, "pyslm_stripe_overlap", 0.1),
+            stripe_offset=_float_param(params, "pyslm_stripe_offset", 0.5),
+            island_width=_float_param(params, "pyslm_island_width", 5.0),
+            island_overlap=_float_param(params, "pyslm_island_overlap", 0.1),
+            island_offset=_float_param(params, "pyslm_island_offset", 0.5),
+            fix_polygons=_bool_param(params, "pyslm_fix_polygons", True),
+            simplification_factor=_optional_float_param(params, "pyslm_simplification_factor"),
+            simplification_preserve_topology=_bool_param(
+                params,
+                "pyslm_simplification_preserve_topology",
+                True,
+            ),
+            simplification_mode=params.get("pyslm_simplification_mode", ["absolute"])[0],  # type: ignore[arg-type]
+        )
         infill_pattern = params.get("infill_pattern", ["rectilinear"])[0]
         curve_mode = params.get("curve_mode", ["flat"])[0]
         curve_amplitude = _float_param(params, "curve_amplitude", 0.0)
@@ -168,6 +196,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             infill_density=infill_density,
             infill_overlap=infill_overlap,
             slicing_kernel=slicing_kernel,  # type: ignore[arg-type]
+            pyslm=pyslm_config,
             perimeter_count=perimeter_count,
             smoothing_angle=smoothing_angle,
             smoothing_radius_factor=smoothing_radius_factor,
@@ -262,6 +291,16 @@ def _optional_float_param(params: dict[str, list[str]], name: str) -> float | No
 def _int_param(params: dict[str, list[str]], name: str, default: int) -> int:
     raw = params.get(name, [str(default)])[0]
     return int(raw if raw != "" else default)
+
+
+def _optional_int_param(params: dict[str, list[str]], name: str) -> int | None:
+    raw = params.get(name, [""])[0].strip()
+    return None if raw == "" else int(raw)
+
+
+def _bool_param(params: dict[str, list[str]], name: str, default: bool) -> bool:
+    raw = params.get(name, [str(default).lower()])[0].strip().lower()
+    return raw in ("1", "true", "yes", "on")
 
 
 def _raft_layers_from_params(
@@ -713,6 +752,7 @@ def _expand_bounds(bounds: dict[str, float | None], x: float, y: float, z: float
 
 
 def _index_html() -> str:
+    pyslm_defaults = PySLMConfig()
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -954,6 +994,16 @@ def _index_html() -> str:
       min-height: 0;
       padding: 0;
     }}
+    .checkboxLabel {{
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }}
+    .checkboxLabel input {{
+      width: auto;
+      min-height: 0;
+      padding: 0;
+    }}
     .preview {{
       margin-top: 18px;
       border: 1px solid var(--line);
@@ -1046,8 +1096,120 @@ def _index_html() -> str:
             <option value="pyslm">PySLM (experimental)</option>
           </select>
 
+          <div id="pyslmNativeSettings" hidden>
+            <h3>PySLM native settings</h3>
+            <div class="grid">
+              <div>
+                <label for="pyslmHatcher">Hatcher strategy</label>
+                <select id="pyslmHatcher" name="pyslmHatcher">
+                  <option value="basic" selected>Hatcher</option>
+                  <option value="stripe">StripeHatcher</option>
+                  <option value="island">IslandHatcher</option>
+                  <option value="basic_island">BasicIslandHatcher</option>
+                </select>
+              </div>
+              <div>
+                <label for="pyslmHatchSort">Hatch sort</label>
+                <select id="pyslmHatchSort" name="pyslmHatchSort">
+                  <option value="none" selected>PySLM default</option>
+                  <option value="alternate">Alternate</option>
+                  <option value="unidirectional">Unidirectional</option>
+                  <option value="linear">Linear</option>
+                  <option value="directional">Directional</option>
+                </select>
+              </div>
+            </div>
+            <div class="grid">
+              <div>
+                <label for="pyslmHatchAngle">Hatch angle deg</label>
+                <input id="pyslmHatchAngle" name="pyslmHatchAngle" type="number" min="-180" max="180" step="0.1" placeholder="Auto">
+              </div>
+              <div>
+                <label for="pyslmLayerAngleIncrement">Layer angle increment deg</label>
+                <input id="pyslmLayerAngleIncrement" name="pyslmLayerAngleIncrement" type="number" step="0.1" value="{pyslm_defaults.layer_angle_increment:g}">
+              </div>
+            </div>
+            <div class="grid">
+              <div>
+                <label for="pyslmHatchDistance">Hatch distance mm</label>
+                <input id="pyslmHatchDistance" name="pyslmHatchDistance" type="number" min="0" step="0.001" placeholder="Auto">
+              </div>
+              <div>
+                <label for="pyslmContourOffset">Contour offset mm</label>
+                <input id="pyslmContourOffset" name="pyslmContourOffset" type="number" min="0" step="0.001" placeholder="Auto">
+              </div>
+            </div>
+            <div class="grid">
+              <div>
+                <label for="pyslmSpotCompensation">Spot compensation mm</label>
+                <input id="pyslmSpotCompensation" name="pyslmSpotCompensation" type="number" min="0" step="0.001" placeholder="Auto">
+              </div>
+              <div>
+                <label for="pyslmVolumeOffset">Volume offset hatch mm</label>
+                <input id="pyslmVolumeOffset" name="pyslmVolumeOffset" type="number" step="0.001" placeholder="Auto">
+              </div>
+            </div>
+            <div class="grid">
+              <div>
+                <label for="pyslmOuterContours">Outer contours</label>
+                <input id="pyslmOuterContours" name="pyslmOuterContours" type="number" min="0" step="1" placeholder="Auto">
+              </div>
+              <div>
+                <label for="pyslmInnerContours">Inner contours</label>
+                <input id="pyslmInnerContours" name="pyslmInnerContours" type="number" min="0" step="1" placeholder="Auto">
+              </div>
+            </div>
+            <div class="grid">
+              <div>
+                <label for="pyslmStripeWidth">Stripe width mm</label>
+                <input id="pyslmStripeWidth" name="pyslmStripeWidth" type="number" min="0.001" step="0.1" value="{pyslm_defaults.stripe_width:g}">
+              </div>
+              <div>
+                <label for="pyslmStripeOverlap">Stripe overlap mm</label>
+                <input id="pyslmStripeOverlap" name="pyslmStripeOverlap" type="number" min="0" step="0.1" value="{pyslm_defaults.stripe_overlap:g}">
+              </div>
+            </div>
+            <div class="grid">
+              <div>
+                <label for="pyslmStripeOffset">Stripe offset mm</label>
+                <input id="pyslmStripeOffset" name="pyslmStripeOffset" type="number" min="0" step="0.1" value="{pyslm_defaults.stripe_offset:g}">
+              </div>
+              <div>
+                <label for="pyslmIslandWidth">Island width mm</label>
+                <input id="pyslmIslandWidth" name="pyslmIslandWidth" type="number" min="0.001" step="0.1" value="{pyslm_defaults.island_width:g}">
+              </div>
+            </div>
+            <div class="grid">
+              <div>
+                <label for="pyslmIslandOverlap">Island overlap mm</label>
+                <input id="pyslmIslandOverlap" name="pyslmIslandOverlap" type="number" min="0" step="0.1" value="{pyslm_defaults.island_overlap:g}">
+              </div>
+              <div>
+                <label for="pyslmIslandOffset">Island offset mm</label>
+                <input id="pyslmIslandOffset" name="pyslmIslandOffset" type="number" min="0" step="0.1" value="{pyslm_defaults.island_offset:g}">
+              </div>
+            </div>
+            <div class="grid">
+              <div>
+                <label for="pyslmSimplificationFactor">Slice simplification mm</label>
+                <input id="pyslmSimplificationFactor" name="pyslmSimplificationFactor" type="number" min="0" step="0.001" placeholder="Off">
+              </div>
+              <div>
+                <label for="pyslmSimplificationMode">Simplification mode</label>
+                <select id="pyslmSimplificationMode" name="pyslmSimplificationMode">
+                  <option value="absolute" selected>Absolute</option>
+                  <option value="line">Line</option>
+                </select>
+              </div>
+            </div>
+            <label class="checkboxLabel"><input id="pyslmScanContourFirst" type="checkbox" checked> Scan contours first</label>
+            <label class="checkboxLabel"><input id="pyslmFixPolygons" type="checkbox" checked> Fix slice polygons</label>
+            <label class="checkboxLabel"><input id="pyslmSimplificationPreserveTopology" type="checkbox" checked> Preserve topology</label>
+          </div>
+
           <label for="infillPattern">树脂填充路径</label>
           <select id="infillPattern" name="infillPattern">
+            <option value="none">None (perimeter only)</option>
             <option value="rectilinear">Rectilinear</option>
             <option value="aligned_rectilinear">Aligned Rectilinear</option>
             <option value="line">Line</option>
@@ -1198,8 +1360,47 @@ def _index_html() -> str:
     const showLineWidthInput = document.getElementById('showLineWidth');
     const showPathPointsInput = document.getElementById('showPathPoints');
     const showDirectionInput = document.getElementById('showDirection');
+    const slicingKernelInput = document.getElementById('slicingKernel');
+    const infillPatternInput = document.getElementById('infillPattern');
+    const pyslmNativeSettings = document.getElementById('pyslmNativeSettings');
+    const pyslmHatcherInput = document.getElementById('pyslmHatcher');
+    const pyslmNativePatterns = new Set(['none', 'line', 'aligned_rectilinear', 'rectilinear', 'zigzag']);
+    const pyslmSettingsIds = [
+      'pyslmHatcher', 'pyslmHatchSort', 'pyslmHatchAngle', 'pyslmLayerAngleIncrement',
+      'pyslmHatchDistance', 'pyslmContourOffset', 'pyslmSpotCompensation',
+      'pyslmVolumeOffset', 'pyslmOuterContours', 'pyslmInnerContours',
+      'pyslmStripeWidth', 'pyslmStripeOverlap', 'pyslmStripeOffset',
+      'pyslmIslandWidth', 'pyslmIslandOverlap', 'pyslmIslandOffset',
+      'pyslmSimplificationFactor', 'pyslmSimplificationMode',
+      'pyslmScanContourFirst', 'pyslmFixPolygons', 'pyslmSimplificationPreserveTopology'
+    ];
     let previewData = null;
-    document.getElementById('infillPattern').value = 'rectilinear';
+    function syncKernelControls() {{
+      const isPyslm = slicingKernelInput.value === 'pyslm';
+      pyslmNativeSettings.hidden = !isPyslm;
+      for (const option of infillPatternInput.options) {{
+        option.disabled = isPyslm && !pyslmNativePatterns.has(option.value);
+      }}
+      if (isPyslm && !pyslmNativePatterns.has(infillPatternInput.value)) {{
+        infillPatternInput.value = 'rectilinear';
+      }}
+      for (const id of pyslmSettingsIds) {{
+        document.getElementById(id).disabled = !isPyslm;
+      }}
+      const strategy = pyslmHatcherInput.value;
+      const stripeEnabled = isPyslm && strategy === 'stripe';
+      const islandEnabled = isPyslm && (strategy === 'island' || strategy === 'basic_island');
+      for (const id of ['pyslmStripeWidth', 'pyslmStripeOverlap', 'pyslmStripeOffset']) {{
+        document.getElementById(id).disabled = !stripeEnabled;
+      }}
+      for (const id of ['pyslmIslandWidth', 'pyslmIslandOverlap', 'pyslmIslandOffset']) {{
+        document.getElementById(id).disabled = !islandEnabled;
+      }}
+    }}
+    slicingKernelInput.addEventListener('change', syncKernelControls);
+    infillPatternInput.addEventListener('change', syncKernelControls);
+    pyslmHatcherInput.addEventListener('change', syncKernelControls);
+    syncKernelControls();
     fiberNotice.textContent = 'JSON 中的单层纤维路径会复制到每个树脂层，最后一层树脂封顶不打印纤维。';
 
     form.addEventListener('submit', async (event) => {{
@@ -1229,6 +1430,27 @@ def _index_html() -> str:
       formData.append('infill_density', document.getElementById('infillDensity').value);
       formData.append('infill_overlap', document.getElementById('infillOverlap').value);
       formData.append('slicing_kernel', document.getElementById('slicingKernel').value);
+      formData.append('pyslm_hatcher', document.getElementById('pyslmHatcher').value);
+      formData.append('pyslm_hatch_sort', document.getElementById('pyslmHatchSort').value);
+      formData.append('pyslm_hatch_angle', document.getElementById('pyslmHatchAngle').value);
+      formData.append('pyslm_layer_angle_increment', document.getElementById('pyslmLayerAngleIncrement').value);
+      formData.append('pyslm_hatch_distance', document.getElementById('pyslmHatchDistance').value);
+      formData.append('pyslm_contour_offset', document.getElementById('pyslmContourOffset').value);
+      formData.append('pyslm_spot_compensation', document.getElementById('pyslmSpotCompensation').value);
+      formData.append('pyslm_volume_offset_hatch', document.getElementById('pyslmVolumeOffset').value);
+      formData.append('pyslm_num_outer_contours', document.getElementById('pyslmOuterContours').value);
+      formData.append('pyslm_num_inner_contours', document.getElementById('pyslmInnerContours').value);
+      formData.append('pyslm_stripe_width', document.getElementById('pyslmStripeWidth').value);
+      formData.append('pyslm_stripe_overlap', document.getElementById('pyslmStripeOverlap').value);
+      formData.append('pyslm_stripe_offset', document.getElementById('pyslmStripeOffset').value);
+      formData.append('pyslm_island_width', document.getElementById('pyslmIslandWidth').value);
+      formData.append('pyslm_island_overlap', document.getElementById('pyslmIslandOverlap').value);
+      formData.append('pyslm_island_offset', document.getElementById('pyslmIslandOffset').value);
+      formData.append('pyslm_fix_polygons', document.getElementById('pyslmFixPolygons').checked ? 'true' : 'false');
+      formData.append('pyslm_scan_contour_first', document.getElementById('pyslmScanContourFirst').checked ? 'true' : 'false');
+      formData.append('pyslm_simplification_factor', document.getElementById('pyslmSimplificationFactor').value);
+      formData.append('pyslm_simplification_mode', document.getElementById('pyslmSimplificationMode').value);
+      formData.append('pyslm_simplification_preserve_topology', document.getElementById('pyslmSimplificationPreserveTopology').checked ? 'true' : 'false');
       formData.append('smoothing_angle', document.getElementById('smoothingAngle').value);
       formData.append('smoothing_radius_factor', document.getElementById('smoothingRadiusFactor').value);
       formData.append('raft_layer_count', document.getElementById('raftLayerCount').value);

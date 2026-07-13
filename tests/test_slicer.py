@@ -779,22 +779,31 @@ def test_slice_config_rejects_unknown_kernel():
         raise AssertionError("expected invalid slicing kernel to fail")
 
 
-def test_pyslm_kernel_rejects_unsupported_patterns_before_loading_dependency():
-    mesh = Mesh(_cube_triangles(size=10.0))
+def test_pyslm_kernel_rejects_non_native_infill_patterns():
+    from kuka_slicer.pyslm_backend import _validate_pyslm_config
 
-    try:
-        slice_mesh_to_job(
-            mesh,
-            SliceConfig(
-                layer_height=5.0,
-                slicing_kernel="pyslm",
-                infill_pattern="gyroid",
-            ),
+    fallback_patterns = ("grid", "triangles", "gyroid", "concentric")
+    for pattern in fallback_patterns:
+        config = SliceConfig(
+            layer_height=5.0,
+            slicing_kernel="pyslm",
+            infill_pattern=pattern,
         )
-    except ValueError as exc:
-        assert "PySLM slicing kernel currently supports" in str(exc)
-    else:
-        raise AssertionError("expected unsupported PySLM pattern to fail")
+        try:
+            _validate_pyslm_config(config)
+        except ValueError as exc:
+            assert "PySLM native kernel currently supports" in str(exc)
+        else:
+            raise AssertionError(f"expected PySLM to reject {pattern}")
+
+
+def test_pyslm_config_exposes_native_defaults():
+    config = SliceConfig().pyslm
+
+    assert config.hatcher == "basic"
+    assert config.hatch_sort == "none"
+    assert config.scan_contour_first is True
+    assert config.fix_polygons is True
 
 
 def test_recommended_geometry_tolerance_tracks_print_scale():
@@ -807,6 +816,7 @@ def test_ui_uses_prusaslicer_style_infill_pattern_names():
     html = _index_html()
 
     for pattern in (
+        "none",
         "rectilinear",
         "aligned_rectilinear",
         "line",
@@ -820,7 +830,6 @@ def test_ui_uses_prusaslicer_style_infill_pattern_names():
     for legacy_pattern in (
         "lines_x",
         "lines_y",
-        "contour_offset",
         "alternating_diagonal",
     ):
         assert legacy_pattern not in html
@@ -843,6 +852,28 @@ def test_ui_exposes_slicing_kernel_input():
         "infillDensity",
         "infillOverlap",
         "slicingKernel",
+        "pyslmNativeSettings",
+        "pyslmHatcher",
+        "pyslmHatchSort",
+        "pyslmHatchAngle",
+        "pyslmLayerAngleIncrement",
+        "pyslmHatchDistance",
+        "pyslmContourOffset",
+        "pyslmSpotCompensation",
+        "pyslmVolumeOffset",
+        "pyslmOuterContours",
+        "pyslmInnerContours",
+        "pyslmStripeWidth",
+        "pyslmStripeOverlap",
+        "pyslmStripeOffset",
+        "pyslmIslandWidth",
+        "pyslmIslandOverlap",
+        "pyslmIslandOffset",
+        "pyslmSimplificationFactor",
+        "pyslmSimplificationMode",
+        "pyslmScanContourFirst",
+        "pyslmFixPolygons",
+        "pyslmSimplificationPreserveTopology",
         "smoothingAngle",
         "smoothingRadiusFactor",
         "raftLayerCount",
@@ -857,6 +888,8 @@ def test_ui_exposes_slicing_kernel_input():
         assert f'id="{control_id}"' in html
     assert 'value="legacy" selected' in html
     assert 'value="pyslm"' in html
+    for hatcher in ("basic", "stripe", "island", "basic_island"):
+        assert f'value="{hatcher}"' in html
     assert "bottomCapAngle" not in html
     assert "topCapAngle" not in html
 

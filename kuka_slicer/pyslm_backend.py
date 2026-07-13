@@ -18,13 +18,14 @@ from .slicer import (
     orient_mesh_for_build_axis,
 )
 
-SUPPORTED_PYSLM_PATTERNS = {
+PYSLM_NATIVE_PATTERNS = {
     "none",
     "line",
     "aligned_rectilinear",
     "rectilinear",
     "zigzag",
 }
+SUPPORTED_PYSLM_PATTERNS = PYSLM_NATIVE_PATTERNS
 
 
 def slice_mesh_to_job_with_pyslm(mesh: Mesh, config: SliceConfig) -> ExternalSourceJob:
@@ -46,7 +47,10 @@ def slice_mesh_to_job_with_pyslm(mesh: Mesh, config: SliceConfig) -> ExternalSou
         boundary_paths = part.getVectorSlice(
             float(base_z),
             returnCoordPaths=True,
-            fixPolygons=True,
+            fixPolygons=config.pyslm.fix_polygons,
+            simplificationFactor=config.pyslm.simplification_factor,
+            simplificationPreserveTopology=config.pyslm.simplification_preserve_topology,
+            simplificationFactorMode=config.pyslm.simplification_mode,
         )
         boundary_paths = [_closed_xy_path(path, layer_config.tolerance) for path in boundary_paths]
         boundary_paths = [path for path in boundary_paths if path.shape[0] >= 3]
@@ -102,8 +106,28 @@ def slice_mesh_to_job_with_pyslm(mesh: Mesh, config: SliceConfig) -> ExternalSou
                     else None
                 ),
                 "pyslm": {
-                    "patterns": sorted(SUPPORTED_PYSLM_PATTERNS),
-                    "unsupported_patterns_use_legacy": False,
+                    "hatcher": config.pyslm.hatcher,
+                    "native_patterns": sorted(PYSLM_NATIVE_PATTERNS),
+                    "hatch_sort": config.pyslm.hatch_sort,
+                    "hatch_angle": config.pyslm.hatch_angle,
+                    "layer_angle_increment": config.pyslm.layer_angle_increment,
+                    "hatch_distance": config.pyslm.hatch_distance,
+                    "contour_offset": config.pyslm.contour_offset,
+                    "spot_compensation": config.pyslm.spot_compensation,
+                    "volume_offset_hatch": config.pyslm.volume_offset_hatch,
+                    "num_outer_contours": config.pyslm.num_outer_contours,
+                    "num_inner_contours": config.pyslm.num_inner_contours,
+                    "scan_contour_first": config.pyslm.scan_contour_first,
+                    "stripe_width": config.pyslm.stripe_width,
+                    "stripe_overlap": config.pyslm.stripe_overlap,
+                    "stripe_offset": config.pyslm.stripe_offset,
+                    "island_width": config.pyslm.island_width,
+                    "island_overlap": config.pyslm.island_overlap,
+                    "island_offset": config.pyslm.island_offset,
+                    "fix_polygons": config.pyslm.fix_polygons,
+                    "simplification_factor": config.pyslm.simplification_factor,
+                    "simplification_preserve_topology": config.pyslm.simplification_preserve_topology,
+                    "simplification_mode": config.pyslm.simplification_mode,
                 },
             },
             "path_roles": path_roles,
@@ -126,7 +150,7 @@ def _validate_pyslm_config(config: SliceConfig) -> None:
         raise ValueError("PySLM slicing kernel currently supports resin material R only")
     if config.infill_pattern not in SUPPORTED_PYSLM_PATTERNS:
         raise ValueError(
-            "PySLM slicing kernel currently supports "
+            "PySLM native kernel currently supports "
             f"{', '.join(sorted(SUPPORTED_PYSLM_PATTERNS))}; "
             f"got {config.infill_pattern!r}"
         )
@@ -172,16 +196,8 @@ def _pyslm_layer_paths(
     pyslm_hatching: Any,
     pyslm_geometry: Any,
 ) -> tuple[list[np.ndarray], list[str]]:
-    hatcher = pyslm_hatching.Hatcher()
-    hatcher.scanContourFirst = True
-    hatcher.numOuterContours = 1 if config.perimeter_count >= 1 else 0
-    hatcher.numInnerContours = max(0, config.perimeter_count - hatcher.numOuterContours)
-    hatcher.spotCompensation = config.line_width * 0.5
-    hatcher.contourOffset = _resin_path_spacing(config.line_width, config.infill_overlap)
-    hatcher.volumeOffsetHatch = _volume_offset_between_contour_and_hatch(config)
+    hatcher = _make_hatcher(pyslm_hatching, config, layer_index)
     hatcher.hatchingEnabled = config.infill_pattern != "none" and config.infill_density > 0
-    hatcher.hatchDistance = _pyslm_hatch_spacing(config)
-    hatcher.hatchAngle = _pyslm_hatch_angle(config, layer_index)
 
     layer = hatcher.hatch([_open_path_for_pyslm(path) for path in boundary_paths])
     if layer is None:
@@ -205,6 +221,72 @@ def _pyslm_layer_paths(
     return paths, roles
 
 
+def _make_hatcher(pyslm_hatching: Any, config: SliceConfig, layer_index: int) -> Any:
+    settings = config.pyslm
+    hatcher_class = {
+        "basic": pyslm_hatching.Hatcher,
+        "stripe": pyslm_hatching.StripeHatcher,
+        "island": pyslm_hatching.IslandHatcher,
+        "basic_island": pyslm_hatching.BasicIslandHatcher,
+    }[settings.hatcher]
+    hatcher = hatcher_class()
+    hatcher.scanContourFirst = settings.scan_contour_first
+    if settings.num_outer_contours is None:
+        hatcher.numOuterContours = 1 if config.perimeter_count >= 1 else 0
+    else:
+        hatcher.numOuterContours = settings.num_outer_contours
+    if settings.num_inner_contours is None:
+        hatcher.numInnerContours = max(0, config.perimeter_count - hatcher.numOuterContours)
+    else:
+        hatcher.numInnerContours = settings.num_inner_contours
+    hatcher.spotCompensation = (
+        config.line_width * 0.5
+        if settings.spot_compensation is None
+        else settings.spot_compensation
+    )
+    hatcher.contourOffset = (
+        _resin_path_spacing(config.line_width, config.infill_overlap)
+        if settings.contour_offset is None
+        else settings.contour_offset
+    )
+    hatcher.volumeOffsetHatch = (
+        _volume_offset_between_contour_and_hatch(config)
+        if settings.volume_offset_hatch is None
+        else settings.volume_offset_hatch
+    )
+    hatcher.hatchDistance = _pyslm_hatch_spacing(config)
+    hatcher.hatchAngle = _pyslm_hatch_angle(config, layer_index)
+    hatcher.layerAngleIncrement = layer_index * settings.layer_angle_increment
+
+    if settings.hatcher == "stripe":
+        hatcher.stripeWidth = settings.stripe_width
+        hatcher.stripeOverlap = settings.stripe_overlap
+        hatcher.stripeOffset = settings.stripe_offset
+    elif settings.hatcher in ("island", "basic_island"):
+        hatcher.islandWidth = settings.island_width
+        hatcher.islandOverlap = settings.island_overlap
+        hatcher.islandOffset = settings.island_offset
+
+    sort_method = _pyslm_sort_method(pyslm_hatching, settings.hatch_sort, hatcher.hatchAngle)
+    if sort_method is not None:
+        hatcher.hatchSortMethod = sort_method
+    return hatcher
+
+
+def _pyslm_sort_method(pyslm_hatching: Any, sort_name: str, hatch_angle: float) -> Any:
+    if sort_name == "none":
+        return None
+    if sort_name == "alternate":
+        return pyslm_hatching.AlternateSort()
+    if sort_name == "unidirectional":
+        return pyslm_hatching.UnidirectionalSort()
+    if sort_name == "linear":
+        return pyslm_hatching.LinearSort(hatch_angle)
+    if sort_name == "directional":
+        return pyslm_hatching.HatchDirectionalSort()
+    raise ValueError(f"unsupported PySLM hatch sort: {sort_name}")
+
+
 def _volume_offset_between_contour_and_hatch(config: SliceConfig) -> float:
     path_spacing = _resin_path_spacing(config.line_width, config.infill_overlap)
     overlap_offset = _libslic3r_fill_surface_overlap_offset(
@@ -216,6 +298,8 @@ def _volume_offset_between_contour_and_hatch(config: SliceConfig) -> float:
 
 
 def _pyslm_hatch_spacing(config: SliceConfig) -> float:
+    if config.pyslm.hatch_distance is not None:
+        return config.pyslm.hatch_distance
     if config.infill_density <= 0:
         return config.line_width
     path_spacing = _resin_path_spacing(config.line_width, config.infill_overlap)
@@ -223,9 +307,13 @@ def _pyslm_hatch_spacing(config: SliceConfig) -> float:
 
 
 def _pyslm_hatch_angle(config: SliceConfig, layer_index: int) -> float:
-    if config.infill_pattern in {"rectilinear", "zigzag"}:
-        return 45.0 if layer_index % 2 == 0 else -45.0
-    return 0.0
+    if config.pyslm.hatch_angle is None:
+        angle = 45.0 if config.infill_pattern in {"rectilinear", "zigzag"} else 0.0
+    else:
+        angle = float(config.pyslm.hatch_angle)
+    if config.infill_pattern in {"rectilinear", "zigzag"} and layer_index % 2:
+        angle = -angle
+    return angle
 
 
 def _closed_xy_path(path: Any, tolerance: float) -> np.ndarray:

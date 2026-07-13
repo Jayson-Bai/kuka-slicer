@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import math
 from typing import Callable, Literal
 
@@ -34,6 +34,9 @@ InfillPattern = Literal[
 ]
 BuildAxis = Literal["x", "y", "z"]
 SlicingKernel = Literal["legacy", "pyslm"]
+PySLMHatcher = Literal["basic", "stripe", "island", "basic_island"]
+PySLMHatchSort = Literal["none", "alternate", "unidirectional", "linear", "directional"]
+PySLMSimplificationMode = Literal["absolute", "line"]
 
 DEFAULT_RESIN_LAYER_HEIGHT_MM = 0.5
 DEFAULT_RESIN_LINE_WIDTH_MM = 2.0
@@ -59,6 +62,86 @@ DEFAULT_MATERIAL_PROCESS = {
 }
 
 
+@dataclass(frozen=True)
+class PySLMConfig:
+    """Native PySLM controls kept separate from the legacy slicer options."""
+
+    hatcher: PySLMHatcher = "basic"
+    hatch_angle: float | None = None
+    layer_angle_increment: float = 0.0
+    hatch_distance: float | None = None
+    contour_offset: float | None = None
+    spot_compensation: float | None = None
+    volume_offset_hatch: float | None = None
+    num_outer_contours: int | None = None
+    num_inner_contours: int | None = None
+    scan_contour_first: bool = True
+    hatch_sort: PySLMHatchSort = "none"
+    stripe_width: float = 5.0
+    stripe_overlap: float = 0.1
+    stripe_offset: float = 0.5
+    island_width: float = 5.0
+    island_overlap: float = 0.1
+    island_offset: float = 0.5
+    fix_polygons: bool = True
+    simplification_factor: float | None = None
+    simplification_preserve_topology: bool = True
+    simplification_mode: PySLMSimplificationMode = "absolute"
+
+    def __post_init__(self) -> None:
+        if self.hatcher not in ("basic", "stripe", "island", "basic_island"):
+            raise ValueError("pyslm hatcher must be basic, stripe, island, or basic_island")
+        if self.hatch_sort not in (
+            "none",
+            "alternate",
+            "unidirectional",
+            "linear",
+            "directional",
+        ):
+            raise ValueError("unsupported pyslm hatch_sort")
+        if self.simplification_mode not in ("absolute", "line"):
+            raise ValueError("pyslm simplification_mode must be absolute or line")
+        if self.hatch_angle is not None and (
+            not math.isfinite(self.hatch_angle) or self.hatch_angle < -180 or self.hatch_angle > 180
+        ):
+            raise ValueError("pyslm hatch_angle must be in the range [-180, 180]")
+        if not math.isfinite(self.layer_angle_increment):
+            raise ValueError("pyslm layer_angle_increment must be finite")
+        if self.hatch_distance is not None and (
+            not math.isfinite(self.hatch_distance) or self.hatch_distance <= 0
+        ):
+            raise ValueError("pyslm hatch_distance must be positive")
+        for name, value in (
+            ("contour_offset", self.contour_offset),
+            ("spot_compensation", self.spot_compensation),
+            ("simplification_factor", self.simplification_factor),
+        ):
+            if value is not None and (not math.isfinite(value) or value < 0):
+                raise ValueError(f"pyslm {name} must be non-negative")
+        if self.volume_offset_hatch is not None and not math.isfinite(self.volume_offset_hatch):
+            raise ValueError("pyslm volume_offset_hatch must be finite")
+        for name, value in (
+            ("num_outer_contours", self.num_outer_contours),
+            ("num_inner_contours", self.num_inner_contours),
+        ):
+            if value is not None and value < 0:
+                raise ValueError(f"pyslm {name} must be non-negative")
+        for name, value in (
+            ("stripe_width", self.stripe_width),
+            ("island_width", self.island_width),
+        ):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"pyslm {name} must be positive")
+        for name, value in (
+            ("stripe_overlap", self.stripe_overlap),
+            ("stripe_offset", self.stripe_offset),
+            ("island_overlap", self.island_overlap),
+            ("island_offset", self.island_offset),
+        ):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"pyslm {name} must be non-negative")
+
+
 def recommended_geometry_tolerance(layer_height: float, line_width: float) -> float:
     print_scale = min(layer_height, line_width)
     tolerance = print_scale * 0.001
@@ -81,6 +164,7 @@ class SliceConfig:
     infill_overlap: float = DEFAULT_RESIN_INFILL_OVERLAP_PERCENT
     build_axis: BuildAxis = "z"
     slicing_kernel: SlicingKernel = "legacy"
+    pyslm: PySLMConfig = field(default_factory=PySLMConfig)
     perimeter_count: int = DEFAULT_RESIN_PERIMETER_COUNT
     smoothing_angle: float = DEFAULT_RESIN_SMOOTHING_ANGLE_DEGREES
     smoothing_radius_factor: float = DEFAULT_RESIN_SMOOTHING_RADIUS_FACTOR
