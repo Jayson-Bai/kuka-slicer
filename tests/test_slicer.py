@@ -212,7 +212,7 @@ def test_resin_infill_density_changes_path_spacing():
     assert dense.meta["slicing"]["infill_overlap"] == DEFAULT_RESIN_INFILL_OVERLAP_PERCENT
 
 
-def test_part_bottom_and_top_layers_follow_requested_infill_density():
+def test_part_bottom_and_top_layers_force_zigzag_full_density():
     mesh = Mesh(_cube_triangles(size=20.0))
 
     job = slice_mesh_to_job(
@@ -233,10 +233,55 @@ def test_part_bottom_and_top_layers_follow_requested_infill_density():
     middle_infill = _paths_with_role(job.material_paths[1].paths, middle_roles, "infill")
     top_infill = _paths_with_role(job.material_paths[top_index].paths, top_roles, "infill")
 
-    assert not bottom_infill
+    assert bottom_infill
     assert not middle_infill
-    assert not top_infill
-    assert "forced_part_cap_layers" not in job.meta["slicing"]
+    assert top_infill
+    assert _dominant_infill_angle(bottom_infill) == 45
+    assert _dominant_infill_angle(top_infill) == -45
+    assert job.meta["slicing"]["infill_density"] == 0
+    assert job.meta["slicing"]["part_cap_layers"] == {
+        "bottom": 0,
+        "top": top_index,
+        "infill_pattern": "zigzag",
+        "infill_density": 100.0,
+    }
+
+
+def test_part_caps_do_not_reclassify_raft_layers():
+    mesh = Mesh(_cube_triangles(size=20.0))
+    config = SliceConfig(
+        layer_height=5.0,
+        line_width=2.0,
+        infill_pattern="gyroid",
+        infill_density=0,
+    )
+    job = slice_mesh_to_job(mesh, config)
+
+    add_raft_to_job(
+        job,
+        mesh,
+        config,
+        [
+            RaftLayerConfig(outward_offset=2.0, layer_height=0.5, infill_density=10),
+            RaftLayerConfig(outward_offset=1.0, layer_height=0.5, infill_density=50),
+        ],
+        top_gap=0.2,
+    )
+
+    raft_roles = job.meta["path_roles"]["R"]["0"]
+    part_bottom_roles = job.meta["path_roles"]["R"]["2"]
+    raft_infill = _paths_with_role(job.material_paths[0].paths, raft_roles, "infill")
+    part_bottom_infill = _paths_with_role(
+        job.material_paths[2].paths,
+        part_bottom_roles,
+        "infill",
+    )
+
+    assert raft_infill
+    assert part_bottom_infill
+    assert _has_infill_direction(raft_infill, 0.0)
+    assert _has_infill_direction(part_bottom_infill, 45.0)
+    assert job.meta["raft"]["layers"][0]["infill_density"] == 10
 
 
 def test_concentric_infill_generates_closed_inner_rings():
@@ -983,6 +1028,15 @@ def _dominant_infill_angle(paths: list[np.ndarray]) -> int:
             elif abs(normalized + 45.0) < 2.0:
                 counts[-45] = counts.get(-45, 0) + 1
     return max(counts, key=counts.get)
+
+
+def _has_infill_direction(paths: list[np.ndarray], expected_angle: float) -> bool:
+    for path in paths:
+        for delta in np.diff(path[:, :2], axis=0):
+            angle = math.degrees(math.atan2(float(delta[1]), float(delta[0]))) % 180.0
+            if abs(angle - expected_angle) < 2.0:
+                return True
+    return False
 
 
 def _path_has_non_adjacent_crossing(path: np.ndarray) -> bool:

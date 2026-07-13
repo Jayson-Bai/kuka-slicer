@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from typing import Callable, Literal
 
@@ -160,6 +160,15 @@ def slice_mesh_to_job(mesh: Mesh, config: SliceConfig) -> ExternalSourceJob:
     cached_constant_roles: list[str] | None = None
 
     for layer_index, base_z in enumerate(z_values):
+        is_part_cap_layer = config.material == "R" and layer_index in {
+            0,
+            len(z_values) - 1,
+        }
+        layer_config = (
+            replace(config, infill_pattern="zigzag", infill_density=100.0)
+            if is_part_cap_layer
+            else config
+        )
         if constant_section_paths is None:
             segments = _intersect_mesh_at_z(mesh.triangles, float(base_z), config.tolerance)
             paths_2d = _stitch_segments(segments, config.tolerance)
@@ -169,14 +178,19 @@ def slice_mesh_to_job(mesh: Mesh, config: SliceConfig) -> ExternalSourceJob:
             if (
                 constant_section_paths is not None
                 and config.infill_pattern == "triangles"
+                and not is_part_cap_layer
                 and cached_constant_resin_paths_2d is not None
                 and cached_constant_roles is not None
             ):
                 paths_2d = [path.copy() for path in cached_constant_resin_paths_2d]
                 roles = list(cached_constant_roles)
             else:
-                paths_2d, roles = _build_resin_paths(paths_2d, config, layer_index)
-                if constant_section_paths is not None and config.infill_pattern == "triangles":
+                paths_2d, roles = _build_resin_paths(paths_2d, layer_config, layer_index)
+                if (
+                    constant_section_paths is not None
+                    and config.infill_pattern == "triangles"
+                    and not is_part_cap_layer
+                ):
                     cached_constant_resin_paths_2d = [path.copy() for path in paths_2d]
                     cached_constant_roles = list(roles)
             path_roles["R"][str(layer_index)] = roles
@@ -201,6 +215,16 @@ def slice_mesh_to_job(mesh: Mesh, config: SliceConfig) -> ExternalSourceJob:
             "perimeter_count": config.perimeter_count,
             "smoothing_angle": config.smoothing_angle,
             "smoothing_radius_factor": config.smoothing_radius_factor,
+            "part_cap_layers": (
+                {
+                    "bottom": 0 if len(z_values) else None,
+                    "top": len(z_values) - 1 if len(z_values) else None,
+                    "infill_pattern": "zigzag",
+                    "infill_density": 100.0,
+                }
+                if config.material == "R"
+                else None
+            ),
         },
         "path_roles": path_roles,
         "process_defaults": {
