@@ -12,6 +12,7 @@ from kuka_slicer.slicer import (
     RaftLayerConfig,
     SliceConfig,
     _build_resin_paths,
+    _connect_resin_infill_paths,
     _filter_concentric_paths_by_spacing,
     _libslic3r_fill_surface_overlap_offset,
     _raft_lattice_infill_paths,
@@ -101,10 +102,10 @@ def test_resin_line_infill_uses_default_overlap_spacing():
         path for path, role in zip(job.material_paths[1].paths, roles) if role != "infill"
     ]
     assert len(contour_paths) == 2
-    assert len(infill_paths) == 8
-    assert all(path.shape[0] == 2 for path in infill_paths)
+    assert len(infill_paths) == 1
+    assert infill_paths[0].shape[0] > 8
     assert np.allclose(
-        sorted(_horizontal_scan_ys(path)[0] for path in infill_paths),
+        _horizontal_scan_ys(infill_paths[0]),
         [3.6, 5.4, 7.2, 9.0, 10.8, 12.6, 14.4, 16.2],
     )
 
@@ -119,9 +120,9 @@ def test_resin_line_infill_can_disable_overlap_for_legacy_spacing():
 
     roles = job.meta["path_roles"]["R"]["1"]
     infill_paths = _paths_with_role(job.material_paths[1].paths, roles, "infill")
-    assert len(infill_paths) == 5
+    assert len(infill_paths) == 1
     assert np.allclose(
-        sorted(_horizontal_scan_ys(path)[0] for path in infill_paths),
+        _horizontal_scan_ys(infill_paths[0]),
         [6.0, 8.0, 10.0, 12.0, 14.0],
     )
 
@@ -203,11 +204,10 @@ def test_resin_infill_density_changes_path_spacing():
     sparse_roles = sparse.meta["path_roles"]["R"]["1"]
     dense_infill = _paths_with_role(dense.material_paths[1].paths, dense_roles, "infill")
     sparse_infill = _paths_with_role(sparse.material_paths[1].paths, sparse_roles, "infill")
-    assert len(dense_infill) == 8
-    assert len(sparse_infill) == 4
-    assert all(path.shape[0] == 2 for path in dense_infill + sparse_infill)
-    assert len({_horizontal_scan_ys(path)[0] for path in dense_infill}) == 8
-    assert len({_horizontal_scan_ys(path)[0] for path in sparse_infill}) == 4
+    assert len(dense_infill) == 1
+    assert len(sparse_infill) == 1
+    assert len(_horizontal_scan_ys(dense_infill[0])) == 8
+    assert len(_horizontal_scan_ys(sparse_infill[0])) == 4
     assert dense.meta["slicing"]["infill_density"] == 100
     assert dense.meta["slicing"]["infill_overlap"] == DEFAULT_RESIN_INFILL_OVERLAP_PERCENT
 
@@ -378,7 +378,7 @@ def test_zigzag_infill_does_not_self_cross_in_concave_region():
             assert not _path_has_non_adjacent_crossing(path)
 
 
-def test_zigzag_infill_keeps_annulus_segments_independent():
+def test_zigzag_infill_connects_annulus_segments_without_crossing_hole():
     outer = _circle_path((0.0, 0.0), 20.0, 128)
     hole = _circle_path((0.0, 0.0), 10.0, 96)
 
@@ -389,7 +389,7 @@ def test_zigzag_infill_keeps_annulus_segments_independent():
     infill = _paths_with_role(paths, roles, "infill")
 
     assert infill
-    assert all(path.shape[0] == 2 for path in infill)
+    assert any(path.shape[0] > 2 for path in infill)
     for path in infill:
         assert not _path_has_non_adjacent_crossing(path)
 
@@ -763,14 +763,36 @@ def test_preview_simplification_keeps_contour_corners():
     assert [0.0, 20.0, 0.5] in simplified
 
 
-def test_infill_paths_remain_independent_after_generation():
+def test_infill_paths_connect_safe_neighbors_after_generation():
     geometry = Polygon([(0, 0), (20, 0), (20, 20), (0, 20)])
     config = SliceConfig(layer_height=1.0, line_width=1.0, infill_pattern="aligned_rectilinear")
 
     paths = _raft_zigzag_infill_paths(geometry, config, infill_density=100.0)
 
-    assert len(paths) > 1
-    assert all(path.shape[0] == 2 for path in paths)
+    assert len(paths) == 2
+    assert any(path.shape[0] > 2 for path in paths)
+    assert all(geometry.buffer(0.2).covers(LineString(path[:, :2])) for path in paths)
+
+
+def test_resin_path_connector_keeps_closed_paths_separate():
+    geometry = Polygon([(0, 0), (20, 0), (20, 20), (0, 20)])
+    closed = np.asarray(
+        [[4, 4], [6, 4], [6, 6], [4, 6], [4, 4]],
+        dtype=np.float32,
+    )
+    paths = _connect_resin_infill_paths(
+        [
+            closed,
+            np.asarray([[1, 8], [19, 8]], dtype=np.float32),
+            np.asarray([[19, 9], [1, 9]], dtype=np.float32),
+        ],
+        geometry,
+        spacing=1.0,
+        tolerance=1e-5,
+    )
+
+    assert any(np.array_equal(path, closed) for path in paths)
+    assert any(path.shape[0] > 2 for path in paths if not np.array_equal(path, closed))
 
 
 def test_raft_layers_shift_part_layers_and_z():
@@ -842,8 +864,6 @@ def test_only_top_raft_layer_touching_part_uses_lattice():
 
     assert bottom_infill
     assert top_infill
-    assert len(bottom_infill) > 1
-    assert len(top_infill) > 1
     assert max(path.shape[0] for path in top_infill) >= 20
     assert all(not _path_has_non_adjacent_crossing(path) for path in top_infill)
 

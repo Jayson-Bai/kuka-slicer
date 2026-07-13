@@ -12,6 +12,7 @@ from shapely.geometry import (
     LineString,
     MultiLineString,
     MultiPolygon,
+    Point,
     Polygon,
 )
 from shapely.ops import linemerge, unary_union
@@ -447,6 +448,12 @@ def _raft_zigzag_infill_paths(
         0.0,
         config.tolerance,
     )
+    filled = _connect_resin_infill_paths(
+        filled,
+        geometry,
+        spacing,
+        config.tolerance,
+    )
     filled = _smooth_resin_infill_paths(
         filled,
         geometry,
@@ -716,6 +723,20 @@ def _infill_paths_for_geometry(
     elif config.infill_pattern == "gyroid":
         filled.extend(_gyroid_infill_geometry(geometry, line_spacing, config.tolerance))
 
+    if config.infill_pattern in (
+        "rectilinear",
+        "aligned_rectilinear",
+        "line",
+        "zigzag",
+        "grid",
+    ):
+        filled = _connect_resin_infill_paths(
+            filled,
+            geometry,
+            grid_spacing if config.infill_pattern == "grid" else line_spacing,
+            config.tolerance,
+        )
+
     if config.infill_pattern not in ("triangles", "gyroid"):
         smoothing_radius = config.line_width * config.smoothing_radius_factor
         smoothing_cut_fraction = 0.35
@@ -922,6 +943,228 @@ def _smooth_resin_infill_paths(
             )
         )
     return smoothed
+
+
+def _connect_resin_infill_paths(
+    paths: list[np.ndarray],
+    geometry,
+    spacing: float,
+    tolerance: float,
+) -> list[np.ndarray]:
+    """Chain safe open infill paths using a geometry-only endpoint graph.
+
+    This adapts the chaining part of PrusaSlicer's ``Fill::connect_infill``
+    for the path-only contract. Perimeter hooks and extrusion-dependent
+    decisions are intentionally omitted.
+    """
+    if len(paths) < 2 or spacing <= 0 or geometry.is_empty:
+        return paths
+
+    open_indices = [
+        index
+        for index, path in enumerate(paths)
+        if path.shape[0] >= 2 and not _is_closed_path(path, tolerance)
+    ]
+    if len(open_indices) < 2:
+        return paths
+
+    safe_geometry = geometry.buffer(max(tolerance * 10.0, 1e-7), join_style="round")
+    path_lines = {
+        index: LineString(
+            [(float(point[0]), float(point[1])) for point in paths[index][:, :2]]
+        )
+        for index in open_indices
+    }
+    max_connector_length = max(spacing * 1.5, tolerance * 10.0)
+    endpoint_points = {
+        2 * index + side: np.asarray(
+            paths[index][0 if side == 0 else -1, :2], dtype=np.float32
+        )
+        for index in open_indices
+        for side in (0, 1)
+    }
+
+    candidates: list[tuple[float, int, int]] = []
+    for first_position, first_index in enumerate(open_indices):
+        for second_index in open_indices[first_position + 1 :]:
+            for first_side in (0, 1):
+                first_endpoint = 2 * first_index + first_side
+                first_point = endpoint_points[first_endpoint]
+                for second_side in (0, 1):
+                    second_endpoint = 2 * second_index + second_side
+                    distance = float(
+                        np.linalg.norm(first_point - endpoint_points[second_endpoint])
+                    )
+                    if tolerance < distance <= max_connector_length:
+                        candidates.append((distance, first_endpoint, second_endpoint))
+    if not candidates:
+        return paths
+    candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+
+    parent = {index: index for index in open_indices}
+    endpoint_used: set[int] = set()
+
+    def find(index: int) -> int:
+        root = index
+        while parent[root] != root:
+            root = parent[root]
+        while parent[index] != index:
+            next_index = parent[index]
+            parent[index] = root
+            index = next_index
+        return root
+
+    accepted: list[tuple[int, int, np.ndarray]] = []
+    connector_by_endpoint: dict[int, tuple[int, np.ndarray]] = {}
+
+    for distance, first_endpoint, second_endpoint in candidates:
+        if first_endpoint in endpoint_used or second_endpoint in endpoint_used:
+            continue
+        first_index = first_endpoint // 2
+        second_index = second_endpoint // 2
+        if find(first_index) == find(second_index):
+            # Do not close a chain into a loop. Closed contours are kept as
+            # their own paths because the output has no travel/extrusion data.
+            continue
+
+        first_point = endpoint_points[first_endpoint]
+        second_point = endpoint_points[second_endpoint]
+        connector = LineString(
+            [
+                (float(first_point[0]), float(first_point[1])),
+                (float(second_point[0]), float(second_point[1])),
+            ]
+        )
+        if not safe_geometry.covers(connector):
+            continue
+        if not _resin_connector_is_clear(
+            connector,
+            paths,
+            path_lines,
+            first_endpoint,
+            second_endpoint,
+            accepted,
+            tolerance,
+        ):
+            continue
+
+        endpoint_used.update((first_endpoint, second_endpoint))
+        connector_points = np.asarray([first_point, second_point], dtype=np.float32)
+        accepted.append((first_endpoint, second_endpoint, connector_points))
+        connector_by_endpoint[first_endpoint] = (second_endpoint, connector_points)
+        connector_by_endpoint[second_endpoint] = (first_endpoint, connector_points)
+        parent[find(first_index)] = find(second_index)
+
+    if not accepted:
+        return paths
+
+    components: dict[int, list[int]] = defaultdict(list)
+    for index in open_indices:
+        components.setdefault(find(index), []).append(index)
+    component_starts = sorted(components.values(), key=lambda indexes: min(indexes))
+    connected_paths: list[np.ndarray] = []
+    connected_indices: set[int] = set()
+
+    for component in component_starts:
+        start_endpoint = next(
+            (
+                endpoint
+                for index in component
+                for endpoint in (2 * index, 2 * index + 1)
+                if endpoint not in connector_by_endpoint
+            ),
+            None,
+        )
+        if start_endpoint is None:
+            continue
+
+        chain_points: list[np.ndarray] = []
+        current_endpoint = start_endpoint
+        while current_endpoint is not None:
+            index = current_endpoint // 2
+            side = current_endpoint % 2
+            if index in connected_indices:
+                break
+            connected_indices.add(index)
+            path = np.asarray(paths[index][:, :2], dtype=np.float32)
+            oriented = path if side == 0 else path[::-1].copy()
+            if not chain_points:
+                chain_points.extend(oriented)
+            else:
+                chain_points.extend(oriented[1:])
+
+            mate_endpoint = 2 * index + (1 - side)
+            connection = connector_by_endpoint.get(mate_endpoint)
+            if connection is None:
+                current_endpoint = None
+                continue
+            next_endpoint, connector_points = connection
+            if np.allclose(connector_points[0], endpoint_points[mate_endpoint]):
+                oriented_connector = connector_points
+            else:
+                oriented_connector = connector_points[::-1].copy()
+            chain_points.extend(oriented_connector[1:])
+            current_endpoint = next_endpoint
+
+        if len(chain_points) >= 2:
+            connected_paths.append(np.asarray(chain_points, dtype=np.float32))
+
+    # Preserve any closed paths and any malformed/singleton paths untouched.
+    for index, path in enumerate(paths):
+        if index not in connected_indices:
+            connected_paths.append(path)
+    return connected_paths
+
+
+def _resin_connector_is_clear(
+    connector: LineString,
+    paths: list[np.ndarray],
+    path_lines: dict[int, LineString],
+    first_endpoint: int,
+    second_endpoint: int,
+    accepted: list[tuple[int, int, np.ndarray]],
+    tolerance: float,
+) -> bool:
+    first_index = first_endpoint // 2
+    second_index = second_endpoint // 2
+    allowed_intersections = {
+        first_index: Point(
+            tuple(
+                float(value)
+                for value in paths[first_index][0 if first_endpoint % 2 == 0 else -1, :2]
+            )
+        ),
+        second_index: Point(
+            tuple(
+                float(value)
+                for value in paths[second_index][0 if second_endpoint % 2 == 0 else -1, :2]
+            )
+        ),
+    }
+    endpoint_buffer = max(tolerance * 10.0, 1e-7)
+
+    for index, path_line in path_lines.items():
+        intersection = connector.intersection(path_line)
+        if intersection.is_empty:
+            continue
+        if index not in allowed_intersections:
+            return False
+        residual = intersection.difference(
+            allowed_intersections[index].buffer(endpoint_buffer, join_style="round")
+        )
+        if not residual.is_empty:
+            return False
+
+    for _, _, existing_connector in accepted:
+        existing_line = LineString(
+            [
+                (float(existing_connector[0, 0]), float(existing_connector[0, 1])),
+                (float(existing_connector[1, 0]), float(existing_connector[1, 1])),
+            ]
+        )
+        if not connector.disjoint(existing_line):
+            return False
+    return True
 
 
 def _smooth_path_corners_into_paths(
