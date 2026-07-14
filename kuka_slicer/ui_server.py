@@ -1090,134 +1090,134 @@ def _index_html() -> str:
             </div>
           </div>
 
-          <label for="slicingKernel">Slicing kernel</label>
+          <label for="slicingKernel">切片内核</label>
           <select id="slicingKernel" name="slicingKernel">
-            <option value="legacy" selected>Legacy (stable)</option>
-            <option value="pyslm">PySLM (experimental)</option>
+            <option value="legacy" selected>原始内核（稳定）</option>
+            <option value="pyslm">PySLM（实验）</option>
           </select>
 
           <div id="pyslmNativeSettings" hidden>
-            <h3>PySLM native settings</h3>
+            <h3>PySLM 原生参数</h3>
             <div class="grid">
               <div>
-                <label for="pyslmHatcher">Hatcher strategy</label>
+                <label for="pyslmHatcher">填充策略</label>
                 <select id="pyslmHatcher" name="pyslmHatcher">
-                  <option value="basic" selected>Hatcher</option>
-                  <option value="stripe">StripeHatcher</option>
-                  <option value="island">IslandHatcher</option>
-                  <option value="basic_island">BasicIslandHatcher</option>
+                  <option value="basic" selected>基础直线填充</option>
+                  <option value="stripe">条带填充</option>
+                  <option value="island">岛状填充</option>
+                  <option value="basic_island">基础岛状填充</option>
                 </select>
               </div>
               <div>
-                <label for="pyslmHatchSort">Hatch sort</label>
+                <label for="pyslmHatchSort">扫描线排序</label>
                 <select id="pyslmHatchSort" name="pyslmHatchSort">
-                  <option value="none" selected>PySLM default</option>
-                  <option value="alternate">Alternate</option>
-                  <option value="unidirectional">Unidirectional</option>
-                  <option value="linear">Linear</option>
-                  <option value="directional">Directional</option>
+                  <option value="none" selected>PySLM 默认</option>
+                  <option value="alternate">交替方向</option>
+                  <option value="unidirectional">单向扫描</option>
+                  <option value="linear">线性排序</option>
+                  <option value="directional">方向交替</option>
                 </select>
               </div>
             </div>
             <div class="grid">
               <div>
-                <label for="pyslmHatchAngle">Hatch angle deg</label>
-                <input id="pyslmHatchAngle" name="pyslmHatchAngle" type="number" min="-180" max="180" step="0.1" placeholder="Auto">
+                <label for="pyslmHatchAngle">填充角度 °</label>
+                <input id="pyslmHatchAngle" name="pyslmHatchAngle" type="number" min="-180" max="180" step="0.1" placeholder="自动">
               </div>
               <div>
-                <label for="pyslmLayerAngleIncrement">Layer angle increment deg</label>
+                <label for="pyslmLayerAngleIncrement">层间角度增量 °</label>
                 <input id="pyslmLayerAngleIncrement" name="pyslmLayerAngleIncrement" type="number" step="0.1" value="{pyslm_defaults.layer_angle_increment:g}">
               </div>
             </div>
             <div class="grid">
               <div>
-                <label for="pyslmHatchDistance">Hatch distance mm</label>
-                <input id="pyslmHatchDistance" name="pyslmHatchDistance" type="number" min="0" step="0.001" placeholder="Auto">
+                <label for="pyslmHatchDistance">填充线间距 mm</label>
+                <input id="pyslmHatchDistance" name="pyslmHatchDistance" type="number" min="0" step="0.001" placeholder="自动">
               </div>
               <div>
-                <label for="pyslmContourOffset">Contour offset mm</label>
-                <input id="pyslmContourOffset" name="pyslmContourOffset" type="number" min="0" step="0.001" placeholder="Auto">
-              </div>
-            </div>
-            <div class="grid">
-              <div>
-                <label for="pyslmSpotCompensation">Spot compensation mm</label>
-                <input id="pyslmSpotCompensation" name="pyslmSpotCompensation" type="number" min="0" step="0.001" placeholder="Auto">
-              </div>
-              <div>
-                <label for="pyslmVolumeOffset">Volume offset hatch mm</label>
-                <input id="pyslmVolumeOffset" name="pyslmVolumeOffset" type="number" step="0.001" placeholder="Auto">
+                <label for="pyslmContourOffset">轮廓偏移 mm</label>
+                <input id="pyslmContourOffset" name="pyslmContourOffset" type="number" min="0" step="0.001" placeholder="自动">
               </div>
             </div>
             <div class="grid">
               <div>
-                <label for="pyslmOuterContours">Outer contours</label>
-                <input id="pyslmOuterContours" name="pyslmOuterContours" type="number" min="0" step="1" placeholder="Auto">
+                <label for="pyslmSpotCompensation">光斑补偿 mm</label>
+                <input id="pyslmSpotCompensation" name="pyslmSpotCompensation" type="number" min="0" step="0.001" placeholder="自动">
               </div>
               <div>
-                <label for="pyslmInnerContours">Inner contours</label>
-                <input id="pyslmInnerContours" name="pyslmInnerContours" type="number" min="0" step="1" placeholder="Auto">
+                <label for="pyslmVolumeOffset">体积填充偏移 mm</label>
+                <input id="pyslmVolumeOffset" name="pyslmVolumeOffset" type="number" step="0.001" placeholder="自动">
               </div>
             </div>
             <div class="grid">
               <div>
-                <label for="pyslmStripeWidth">Stripe width mm</label>
+                <label for="pyslmOuterContours">外轮廓数量</label>
+                <input id="pyslmOuterContours" name="pyslmOuterContours" type="number" min="0" step="1" placeholder="自动">
+              </div>
+              <div>
+                <label for="pyslmInnerContours">内轮廓数量</label>
+                <input id="pyslmInnerContours" name="pyslmInnerContours" type="number" min="0" step="1" placeholder="自动">
+              </div>
+            </div>
+            <div class="grid">
+              <div>
+                <label for="pyslmStripeWidth">条带宽度 mm</label>
                 <input id="pyslmStripeWidth" name="pyslmStripeWidth" type="number" min="0.001" step="0.1" value="{pyslm_defaults.stripe_width:g}">
               </div>
               <div>
-                <label for="pyslmStripeOverlap">Stripe overlap mm</label>
+                <label for="pyslmStripeOverlap">条带重叠 mm</label>
                 <input id="pyslmStripeOverlap" name="pyslmStripeOverlap" type="number" min="0" step="0.1" value="{pyslm_defaults.stripe_overlap:g}">
               </div>
             </div>
             <div class="grid">
               <div>
-                <label for="pyslmStripeOffset">Stripe offset mm</label>
+                <label for="pyslmStripeOffset">条带偏移 mm</label>
                 <input id="pyslmStripeOffset" name="pyslmStripeOffset" type="number" min="0" step="0.1" value="{pyslm_defaults.stripe_offset:g}">
               </div>
               <div>
-                <label for="pyslmIslandWidth">Island width mm</label>
+                <label for="pyslmIslandWidth">岛状宽度 mm</label>
                 <input id="pyslmIslandWidth" name="pyslmIslandWidth" type="number" min="0.001" step="0.1" value="{pyslm_defaults.island_width:g}">
               </div>
             </div>
             <div class="grid">
               <div>
-                <label for="pyslmIslandOverlap">Island overlap mm</label>
+                <label for="pyslmIslandOverlap">岛状重叠 mm</label>
                 <input id="pyslmIslandOverlap" name="pyslmIslandOverlap" type="number" min="0" step="0.1" value="{pyslm_defaults.island_overlap:g}">
               </div>
               <div>
-                <label for="pyslmIslandOffset">Island offset mm</label>
+                <label for="pyslmIslandOffset">岛状偏移 mm</label>
                 <input id="pyslmIslandOffset" name="pyslmIslandOffset" type="number" min="0" step="0.1" value="{pyslm_defaults.island_offset:g}">
               </div>
             </div>
             <div class="grid">
               <div>
-                <label for="pyslmSimplificationFactor">Slice simplification mm</label>
-                <input id="pyslmSimplificationFactor" name="pyslmSimplificationFactor" type="number" min="0" step="0.001" placeholder="Off">
+                <label for="pyslmSimplificationFactor">切层边界简化 mm</label>
+                <input id="pyslmSimplificationFactor" name="pyslmSimplificationFactor" type="number" min="0" step="0.001" placeholder="关闭">
               </div>
               <div>
-                <label for="pyslmSimplificationMode">Simplification mode</label>
+                <label for="pyslmSimplificationMode">简化模式</label>
                 <select id="pyslmSimplificationMode" name="pyslmSimplificationMode">
-                  <option value="absolute" selected>Absolute</option>
-                  <option value="line">Line</option>
+                  <option value="absolute" selected>绝对距离</option>
+                  <option value="line">按线宽</option>
                 </select>
               </div>
             </div>
-            <label class="checkboxLabel"><input id="pyslmScanContourFirst" type="checkbox" checked> Scan contours first</label>
-            <label class="checkboxLabel"><input id="pyslmFixPolygons" type="checkbox" checked> Fix slice polygons</label>
-            <label class="checkboxLabel"><input id="pyslmSimplificationPreserveTopology" type="checkbox" checked> Preserve topology</label>
+            <label class="checkboxLabel"><input id="pyslmScanContourFirst" type="checkbox" checked> 轮廓优先扫描</label>
+            <label class="checkboxLabel"><input id="pyslmFixPolygons" type="checkbox" checked> 修复切层多边形</label>
+            <label class="checkboxLabel"><input id="pyslmSimplificationPreserveTopology" type="checkbox" checked> 保持拓扑结构</label>
           </div>
 
           <label for="infillPattern">树脂填充路径</label>
           <select id="infillPattern" name="infillPattern">
-            <option value="none">None (perimeter only)</option>
-            <option value="rectilinear">Rectilinear</option>
-            <option value="aligned_rectilinear">Aligned Rectilinear</option>
-            <option value="line">Line</option>
-            <option value="grid">Grid</option>
-            <option value="triangles">Triangles</option>
-            <option value="gyroid">Gyroid</option>
-            <option value="concentric">Concentric</option>
-            <option value="zigzag">Zig Zag</option>
+            <option value="none">仅轮廓</option>
+            <option value="rectilinear">交替直线填充</option>
+            <option value="aligned_rectilinear">对齐直线填充</option>
+            <option value="line">单向线填充</option>
+            <option value="grid">网格填充</option>
+            <option value="triangles">三角形填充</option>
+            <option value="gyroid">陀螺曲线填充</option>
+            <option value="concentric">同心轮廓填充</option>
+            <option value="zigzag">之字形填充</option>
           </select>
 
           <div class="grid">

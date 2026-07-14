@@ -834,9 +834,81 @@ def test_ui_uses_prusaslicer_style_infill_pattern_names():
     ):
         assert legacy_pattern not in html
 
+    for translated_label in (
+        "仅轮廓",
+        "交替直线填充",
+        "对齐直线填充",
+        "单向线填充",
+        "网格填充",
+        "三角形填充",
+        "陀螺曲线填充",
+        "同心轮廓填充",
+        "之字形填充",
+    ):
+        assert translated_label in html
+
+    for untranslated_label in (
+        "None (perimeter only)",
+        "Rectilinear",
+        "Aligned Rectilinear",
+        "Triangles",
+        "Gyroid",
+        "Concentric",
+        "Zig Zag",
+    ):
+        assert untranslated_label not in html
+
 
 def test_ui_exposes_slicing_kernel_input():
     html = _index_html()
+
+    for translated_label in (
+        "切片内核",
+        "原始内核（稳定）",
+        "PySLM（实验）",
+        "PySLM 原生参数",
+        "填充策略",
+        "扫描线排序",
+        "填充角度 °",
+        "层间角度增量 °",
+        "填充线间距 mm",
+        "轮廓偏移 mm",
+        "光斑补偿 mm",
+        "体积填充偏移 mm",
+        "外轮廓数量",
+        "内轮廓数量",
+        "条带宽度 mm",
+        "岛状宽度 mm",
+        "切层边界简化 mm",
+        "简化模式",
+        "轮廓优先扫描",
+        "修复切层多边形",
+        "保持拓扑结构",
+    ):
+        assert translated_label in html
+
+    for untranslated_label in (
+        "Slicing kernel",
+        "Legacy (stable)",
+        "PySLM (experimental)",
+        "PySLM native settings",
+        "Hatcher strategy",
+        "Hatch sort",
+        "Hatch angle deg",
+        "Layer angle increment deg",
+        "Hatch distance mm",
+        "Contour offset mm",
+        "Spot compensation mm",
+        "Volume offset hatch mm",
+        "Outer contours",
+        "Inner contours",
+        "Slice simplification mm",
+        "Simplification mode",
+        "Scan contours first",
+        "Fix slice polygons",
+        "Preserve topology",
+    ):
+        assert untranslated_label not in html
 
     for control_id in (
         "stlFile",
