@@ -48,7 +48,7 @@ DEFAULT_FIBER_LINE_WIDTH_MM = 1.0
 DEFAULT_RESIN_PERIMETER_COUNT = 2
 DEFAULT_RESIN_SMOOTHING_ANGLE_DEGREES = 150.0
 DEFAULT_RESIN_SMOOTHING_RADIUS_FACTOR = 0.35
-DEFAULT_TRIANGLE_PATH_MERGE_TOLERANCE_MM = 0.1
+DEFAULT_TRIANGLE_PATH_MERGE_TOLERANCE_MM = 0.7
 MIN_GEOMETRY_TOLERANCE_MM = 1e-5
 MAX_GEOMETRY_TOLERANCE_MM = 1e-2
 
@@ -1162,7 +1162,7 @@ def _open_path_travel_length(paths: list[np.ndarray]) -> float:
 def _triangle_path_merge_tolerance(line_width: float, tolerance: float) -> float:
     return max(
         tolerance,
-        min(DEFAULT_TRIANGLE_PATH_MERGE_TOLERANCE_MM, line_width * 0.05),
+        min(DEFAULT_TRIANGLE_PATH_MERGE_TOLERANCE_MM, line_width * 0.35),
     )
 
 
