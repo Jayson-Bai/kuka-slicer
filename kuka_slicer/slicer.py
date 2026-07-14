@@ -48,7 +48,7 @@ DEFAULT_FIBER_LINE_WIDTH_MM = 1.0
 DEFAULT_RESIN_PERIMETER_COUNT = 2
 DEFAULT_RESIN_SMOOTHING_ANGLE_DEGREES = 150.0
 DEFAULT_RESIN_SMOOTHING_RADIUS_FACTOR = 0.35
-DEFAULT_TRIANGLE_PATH_MERGE_TOLERANCE_MM = 0.7
+DEFAULT_LEGACY_PATH_MERGE_TOLERANCE_MM = 0.7
 MIN_GEOMETRY_TOLERANCE_MM = 1e-5
 MAX_GEOMETRY_TOLERANCE_MM = 1e-2
 
@@ -204,6 +204,7 @@ class SliceConfig:
     smoothing_angle: float = DEFAULT_RESIN_SMOOTHING_ANGLE_DEGREES
     smoothing_radius_factor: float = DEFAULT_RESIN_SMOOTHING_RADIUS_FACTOR
     triangle_path_optimization: bool = True
+    zigzag_path_optimization: bool = True
 
     def __post_init__(self) -> None:
         if self.material not in ("R", "F"):
@@ -348,8 +349,14 @@ def _slice_mesh_to_job_legacy(mesh: Mesh, config: SliceConfig) -> ExternalSource
             "infill_overlap": config.infill_overlap,
             "triangle_path_optimization": config.triangle_path_optimization,
             "triangle_path_merge_tolerance": (
-                _triangle_path_merge_tolerance(config.line_width, config.tolerance)
+                _legacy_path_merge_tolerance(config.line_width, config.tolerance)
                 if config.triangle_path_optimization and config.infill_pattern == "triangles"
+                else None
+            ),
+            "zigzag_path_optimization": config.zigzag_path_optimization,
+            "zigzag_path_merge_tolerance": (
+                _legacy_path_merge_tolerance(config.line_width, config.tolerance)
+                if config.zigzag_path_optimization
                 else None
             ),
             "build_axis": config.build_axis,
@@ -644,6 +651,14 @@ def _raft_zigzag_infill_paths(
         0.0,
         config.tolerance,
     )
+    zigzag_merge_tolerance = None
+    if config.zigzag_path_optimization:
+        zigzag_merge_tolerance = _legacy_path_merge_tolerance(
+            config.line_width,
+            config.tolerance,
+        )
+        filled = optimize_open_path_travel(filled, config.tolerance)
+        filled = merge_adjacent_connected_paths(filled, zigzag_merge_tolerance)
     filled = _connect_resin_infill_paths(
         filled,
         geometry,
@@ -656,6 +671,7 @@ def _raft_zigzag_infill_paths(
         config.line_width * DEFAULT_RESIN_SMOOTHING_RADIUS_FACTOR,
         DEFAULT_RESIN_SMOOTHING_ANGLE_DEGREES,
         config.tolerance,
+        merge_tolerance=zigzag_merge_tolerance,
     )
     return filled
 
@@ -844,7 +860,7 @@ def _build_resin_paths(
         config.infill_density,
     )
     if config.infill_pattern == "triangles" and config.triangle_path_optimization:
-        triangle_merge_tolerance = _triangle_path_merge_tolerance(
+        triangle_merge_tolerance = _legacy_path_merge_tolerance(
             config.line_width,
             config.tolerance,
         )
@@ -934,6 +950,15 @@ def _infill_paths_for_geometry(
     elif config.infill_pattern == "gyroid":
         filled.extend(_gyroid_infill_geometry(geometry, line_spacing, config.tolerance))
 
+    zigzag_merge_tolerance = None
+    if config.infill_pattern == "zigzag" and config.zigzag_path_optimization:
+        zigzag_merge_tolerance = _legacy_path_merge_tolerance(
+            config.line_width,
+            config.tolerance,
+        )
+        filled = optimize_open_path_travel(filled, config.tolerance)
+        filled = merge_adjacent_connected_paths(filled, zigzag_merge_tolerance)
+
     if config.infill_pattern in (
         "rectilinear",
         "aligned_rectilinear",
@@ -963,6 +988,7 @@ def _infill_paths_for_geometry(
             config.smoothing_angle,
             config.tolerance,
             cut_fraction=smoothing_cut_fraction,
+            merge_tolerance=zigzag_merge_tolerance,
         )
     return filled
 
@@ -1159,10 +1185,10 @@ def _open_path_travel_length(paths: list[np.ndarray]) -> float:
     )
 
 
-def _triangle_path_merge_tolerance(line_width: float, tolerance: float) -> float:
+def _legacy_path_merge_tolerance(line_width: float, tolerance: float) -> float:
     return max(
         tolerance,
-        min(DEFAULT_TRIANGLE_PATH_MERGE_TOLERANCE_MM, line_width * 0.35),
+        min(DEFAULT_LEGACY_PATH_MERGE_TOLERANCE_MM, line_width * 0.35),
     )
 
 

@@ -128,6 +128,11 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             "triangle_path_optimization",
             True,
         )
+        zigzag_path_optimization = _bool_param(
+            params,
+            "zigzag_path_optimization",
+            True,
+        )
         slicing_kernel = params.get("slicing_kernel", ["legacy"])[0]
         pyslm_config = PySLMConfig(
             hatcher=params.get("pyslm_hatcher", ["basic"])[0],  # type: ignore[arg-type]
@@ -227,6 +232,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             infill_density=infill_density,
             infill_overlap=infill_overlap,
             triangle_path_optimization=triangle_path_optimization,
+            zigzag_path_optimization=zigzag_path_optimization,
             slicing_kernel=slicing_kernel,  # type: ignore[arg-type]
             pyslm=pyslm_config,
             perimeter_count=perimeter_count,
@@ -1305,6 +1311,7 @@ def _index_html() -> str:
             <option value="zigzag">之字形填充</option>
           </select>
           <label class="checkboxLabel" title="仅 legacy 三角形填充生效；先排序/反向，再合并端点间隙小于0.7 mm的路径，最后执行平滑优化，不添加长连接线。"><input id="trianglePathOptimization" type="checkbox" checked> 三角形填充路径优化</label>
+          <label class="checkboxLabel" title="仅 legacy 之字形填充生效；先排序/反向，再合并端点间隙小于0.7 mm的路径，最后执行平滑优化，不添加长连接线。"><input id="zigzagPathOptimization" type="checkbox" checked> 之字形填充路径优化</label>
           </div>
 
           <div class="grid">
@@ -1550,6 +1557,7 @@ def _index_html() -> str:
       formData.append('infill_density', document.getElementById('infillDensity').value);
       formData.append('infill_overlap', document.getElementById('infillOverlap').value);
       formData.append('triangle_path_optimization', document.getElementById('trianglePathOptimization').checked ? 'true' : 'false');
+      formData.append('zigzag_path_optimization', document.getElementById('zigzagPathOptimization').checked ? 'true' : 'false');
       formData.append('slicing_kernel', document.getElementById('slicingKernel').value);
       formData.append('pyslm_hatcher', document.getElementById('pyslmHatcher').value);
       formData.append('pyslm_hatch_sort', document.getElementById('pyslmHatchSort').value);

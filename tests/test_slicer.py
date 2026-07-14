@@ -616,6 +616,33 @@ def test_legacy_triangle_path_optimization_reduces_open_travel():
     assert enabled_travel <= disabled_travel
 
 
+def test_legacy_zigzag_path_optimization_reduces_part_cap_paths():
+    mesh = Mesh(_cube_triangles(size=30.0))
+
+    def infill_counts(optimized: bool) -> list[int]:
+        job = slice_mesh_to_job(
+            mesh,
+            SliceConfig(
+                layer_height=5.0,
+                line_width=2.0,
+                infill_pattern="zigzag",
+                infill_density=70.0,
+                zigzag_path_optimization=optimized,
+            ),
+        )
+        return [
+            sum(role == "infill" for role in job.meta["path_roles"]["R"][str(group.layer_index)])
+            for group in job.material_paths
+        ]
+
+    disabled = infill_counts(False)
+    enabled = infill_counts(True)
+
+    assert enabled[0] < disabled[0]
+    assert enabled[-1] <= disabled[-1]
+    assert all(current <= original for current, original in zip(enabled, disabled))
+
+
 def test_triangle_path_optimizer_reorders_and_reverses_open_paths():
     paths = [
         np.asarray([[0.0, 0.0, 0.5], [1.0, 0.0, 0.5]], dtype=np.float32),
@@ -961,6 +988,7 @@ def test_pyslm_config_exposes_native_defaults():
     config = SliceConfig().pyslm
 
     assert SliceConfig().triangle_path_optimization is True
+    assert SliceConfig().zigzag_path_optimization is True
     assert config.hatcher == "basic"
     assert config.hatch_sort == "none"
     assert config.scan_contour_first is True
@@ -1063,6 +1091,7 @@ def test_ui_exposes_slicing_kernel_input():
         "保持拓扑结构",
         "原始内核填充路径",
         "三角形填充路径优化",
+        "之字形填充路径优化",
     ):
         assert translated_label in html
 
@@ -1104,6 +1133,7 @@ def test_ui_exposes_slicing_kernel_input():
         "infillDensity",
         "infillOverlap",
         "trianglePathOptimization",
+        "zigzagPathOptimization",
         "slicingKernel",
         "pyslmNativeSettings",
         "pyslmPatternSettings",
@@ -1171,7 +1201,7 @@ def test_infill_paths_connect_safe_neighbors_after_generation():
 
     paths = _raft_zigzag_infill_paths(geometry, config, infill_density=100.0)
 
-    assert len(paths) == 2
+    assert 1 <= len(paths) <= 2
     assert any(path.shape[0] > 2 for path in paths)
     assert all(geometry.buffer(0.2).covers(LineString(path[:, :2])) for path in paths)
 

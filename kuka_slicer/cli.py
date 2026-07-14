@@ -144,6 +144,12 @@ def main(argv: list[str] | None = None) -> int:
         default=True,
         help="reorder and reverse legacy triangle paths to reduce travel",
     )
+    slice_parser.add_argument(
+        "--zigzag-path-optimization",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="reorder, reverse, and merge legacy zigzag paths",
+    )
     slice_parser.add_argument("--perimeter-count", type=int, default=2)
     slice_parser.add_argument(
         "--smoothing-angle",
@@ -259,6 +265,7 @@ def _slice_command(args: argparse.Namespace) -> int:
         infill_density=args.infill_density,
         infill_overlap=args.infill_overlap,
         triangle_path_optimization=args.triangle_path_optimization,
+        zigzag_path_optimization=args.zigzag_path_optimization,
         perimeter_count=args.perimeter_count,
         smoothing_angle=args.smoothing_angle,
         smoothing_radius_factor=args.smoothing_radius_factor,
