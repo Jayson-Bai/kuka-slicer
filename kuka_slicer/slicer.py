@@ -656,7 +656,7 @@ def _raft_zigzag_infill_paths(
         if config.zigzag_path_optimization
         else None
     )
-    filled = _connect_resin_infill_paths(
+    filled = _connect_zigzag_infill_paths(
         filled,
         geometry,
         spacing,
@@ -954,13 +954,19 @@ def _infill_paths_for_geometry(
         "rectilinear",
         "aligned_rectilinear",
         "line",
-        "zigzag",
         "grid",
     ):
         filled = _connect_resin_infill_paths(
             filled,
             geometry,
             grid_spacing if config.infill_pattern == "grid" else line_spacing,
+            config.tolerance,
+        )
+    elif config.infill_pattern == "zigzag":
+        filled = _connect_zigzag_infill_paths(
+            filled,
+            geometry,
+            line_spacing,
             config.tolerance,
         )
 
@@ -1256,6 +1262,138 @@ def _smooth_resin_infill_paths(
     if merge_tolerance is not None:
         return merge_adjacent_connected_paths(smoothed, merge_tolerance)
     return smoothed
+
+
+def _connect_zigzag_infill_paths(
+    paths: list[np.ndarray],
+    geometry,
+    spacing: float,
+    tolerance: float,
+) -> list[np.ndarray]:
+    """Grow safe zigzag chains from both free ends.
+
+    The generic connector greedily consumes the shortest endpoint pair. That
+    can strand a connected scanline component as many short chains. Zigzag
+    paths instead extend both ends of each chain while keeping the same
+    boundary, intersection, and connector-length checks.
+    """
+
+    if len(paths) < 2 or spacing <= 0 or geometry.is_empty:
+        return paths
+
+    open_indices = [
+        index
+        for index, path in enumerate(paths)
+        if path.shape[0] >= 2 and not _is_closed_path(path, tolerance)
+    ]
+    if len(open_indices) < 2:
+        return paths
+
+    safe_geometry = geometry.buffer(max(tolerance * 10.0, 1e-7), join_style="round")
+    path_lines = {
+        index: LineString(
+            [(float(point[0]), float(point[1])) for point in paths[index][:, :2]]
+        )
+        for index in open_indices
+    }
+    max_connector_length = max(spacing * 1.5, tolerance * 10.0)
+    endpoint_points = {
+        2 * index + side: np.asarray(
+            paths[index][0 if side == 0 else -1, :2], dtype=np.float32
+        )
+        for index in open_indices
+        for side in (0, 1)
+    }
+
+    unused = set(open_indices)
+    accepted: list[tuple[int, int, np.ndarray]] = []
+    connected_paths: list[np.ndarray] = []
+
+    while unused:
+        start_index = min(unused)
+        unused.remove(start_index)
+        chain: list[tuple[int, bool]] = [(start_index, False)]
+        left_endpoint = 2 * start_index
+        right_endpoint = 2 * start_index + 1
+
+        while True:
+            candidates: list[tuple[float, str, int, int]] = []
+            for side, current_endpoint in (("left", left_endpoint), ("right", right_endpoint)):
+                current_point = endpoint_points[current_endpoint]
+                for next_index in unused:
+                    for next_side in (0, 1):
+                        next_endpoint = 2 * next_index + next_side
+                        distance = float(
+                            np.linalg.norm(current_point - endpoint_points[next_endpoint])
+                        )
+                        if not (tolerance < distance <= max_connector_length):
+                            continue
+                        connector = LineString(
+                            [
+                                (float(current_point[0]), float(current_point[1])),
+                                (
+                                    float(endpoint_points[next_endpoint][0]),
+                                    float(endpoint_points[next_endpoint][1]),
+                                ),
+                            ]
+                        )
+                        if not safe_geometry.covers(connector):
+                            continue
+                        if not _resin_connector_is_clear(
+                            connector,
+                            paths,
+                            path_lines,
+                            current_endpoint,
+                            next_endpoint,
+                            accepted,
+                            tolerance,
+                        ):
+                            continue
+                        candidates.append((distance, side, next_index, next_endpoint))
+
+            if not candidates:
+                break
+
+            distance, side, next_index, next_endpoint = min(
+                candidates,
+                key=lambda item: (item[0], item[2], item[3]),
+            )
+            current_endpoint = left_endpoint if side == "left" else right_endpoint
+            accepted.append(
+                (
+                    current_endpoint,
+                    next_endpoint,
+                    np.asarray(
+                        [endpoint_points[current_endpoint], endpoint_points[next_endpoint]],
+                        dtype=np.float32,
+                    ),
+                )
+            )
+            unused.remove(next_index)
+
+            opposite_endpoint = 2 * next_index + (1 if next_endpoint % 2 == 0 else 0)
+            if side == "left":
+                reverse = next_endpoint % 2 == 0
+                chain.insert(0, (next_index, reverse))
+                left_endpoint = opposite_endpoint
+            else:
+                reverse = next_endpoint % 2 == 1
+                chain.append((next_index, reverse))
+                right_endpoint = opposite_endpoint
+
+        connected_path: np.ndarray | None = None
+        for path_index, reverse in chain:
+            path = paths[path_index][::-1].copy() if reverse else paths[path_index]
+            connected_path = (
+                np.asarray(path, dtype=np.float32).copy()
+                if connected_path is None
+                else np.vstack((connected_path, path))
+            )
+        if connected_path is not None:
+            connected_paths.append(connected_path)
+
+    closed_paths = [paths[index] for index in range(len(paths)) if index not in open_indices]
+    return connected_paths + closed_paths
 
 
 def _connect_resin_infill_paths(
