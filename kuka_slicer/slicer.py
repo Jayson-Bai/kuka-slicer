@@ -37,6 +37,7 @@ SlicingKernel = Literal["legacy", "pyslm"]
 PySLMHatcher = Literal["basic", "stripe", "island", "basic_island"]
 PySLMHatchSort = Literal["none", "alternate", "unidirectional", "linear", "directional"]
 PySLMSimplificationMode = Literal["absolute", "line"]
+RaftInfillPattern = Literal["concentric", "zigzag"]
 
 DEFAULT_RESIN_LAYER_HEIGHT_MM = 0.5
 DEFAULT_RESIN_LINE_WIDTH_MM = 2.0
@@ -256,6 +257,7 @@ class RaftLayerConfig:
     outward_offset: float = 5.0
     layer_height: float = DEFAULT_RESIN_LAYER_HEIGHT_MM
     infill_density: float = DEFAULT_RESIN_INFILL_DENSITY_PERCENT
+    infill_pattern: RaftInfillPattern | None = None
 
     def __post_init__(self) -> None:
         if self.outward_offset < 0:
@@ -264,6 +266,8 @@ class RaftLayerConfig:
             raise ValueError("raft layer height must be positive")
         if self.infill_density <= 0 or self.infill_density > 100:
             raise ValueError("raft infill density must be in the range (0, 100]")
+        if self.infill_pattern not in (None, "concentric", "zigzag"):
+            raise ValueError("raft infill pattern must be concentric or zigzag")
 
 
 def slice_mesh_to_job(mesh: Mesh, config: SliceConfig) -> ExternalSourceJob:
@@ -462,8 +466,13 @@ def add_raft_to_job(
                 "outward_offset": layer.outward_offset,
                 "layer_height": layer.layer_height,
                 "infill_density": layer.infill_density,
+                "infill_pattern": (
+                    layer.infill_pattern
+                    if layer.infill_pattern is not None
+                    else ("lattice" if index == raft_count - 1 else "zigzag")
+                ),
             }
-            for layer in raft_layers
+            for index, layer in enumerate(raft_layers)
         ],
     }
     return z_shift
@@ -561,11 +570,36 @@ def _raft_paths_for_layer(
         -_infill_geometry_inset(config),
         join_style="round",
     )
-    if contact_layer:
+    if raft_layer.infill_pattern is not None:
+        filled = _raft_legacy_infill_paths(
+            infill_geometry,
+            config,
+            layer_index,
+            raft_layer.infill_pattern,
+            raft_layer.infill_density,
+        )
+    elif contact_layer:
         filled = _raft_lattice_infill_paths(infill_geometry, config, raft_layer.infill_density)
     else:
         filled = _raft_zigzag_infill_paths(infill_geometry, config, raft_layer.infill_density)
     return perimeters + filled, roles + ["infill"] * len(filled)
+
+
+def _raft_legacy_infill_paths(
+    geometry,
+    config: SliceConfig,
+    layer_index: int,
+    infill_pattern: RaftInfillPattern,
+    infill_density: float,
+) -> list[np.ndarray]:
+    """Use the legacy resin infill implementation for an explicit raft pattern."""
+
+    raft_config = replace(
+        config,
+        infill_pattern=infill_pattern,
+        infill_density=infill_density,
+    )
+    return _infill_paths_for_geometry(geometry, raft_config, layer_index, infill_density)
 
 
 def _raft_lattice_infill_paths(

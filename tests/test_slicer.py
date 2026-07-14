@@ -27,7 +27,12 @@ from kuka_slicer.slicer import (
     slice_mesh_to_job,
 )
 from kuka_slicer.stl_io import Mesh
-from kuka_slicer.ui_server import _index_html, _simplify_preview_path, expand_fiber_template_for_resin_layers
+from kuka_slicer.ui_server import (
+    _index_html,
+    _raft_layers_from_params,
+    _simplify_preview_path,
+    expand_fiber_template_for_resin_layers,
+)
 
 
 def test_cube_slice_produces_closed_square_path():
@@ -283,6 +288,68 @@ def test_part_caps_do_not_reclassify_raft_layers():
     assert _has_infill_direction(raft_infill, 0.0)
     assert _has_infill_direction(part_bottom_infill, 45.0)
     assert job.meta["raft"]["layers"][0]["infill_density"] == 10
+
+
+def test_explicit_raft_patterns_use_legacy_concentric_then_zigzag_defaults():
+    mesh = Mesh(_cube_triangles(size=20.0))
+    config = SliceConfig(layer_height=5.0, line_width=2.0, infill_pattern="gyroid")
+    job = slice_mesh_to_job(mesh, config)
+
+    add_raft_to_job(
+        job,
+        mesh,
+        config,
+        [
+            RaftLayerConfig(
+                outward_offset=2.0,
+                layer_height=0.5,
+                infill_density=100,
+                infill_pattern="concentric",
+            ),
+            RaftLayerConfig(
+                outward_offset=1.0,
+                layer_height=0.5,
+                infill_density=70,
+                infill_pattern="zigzag",
+            ),
+        ],
+        top_gap=0.0,
+    )
+
+    first_roles = job.meta["path_roles"]["R"]["0"]
+    second_roles = job.meta["path_roles"]["R"]["1"]
+    first_infill = _paths_with_role(job.material_paths[0].paths, first_roles, "infill")
+    second_infill = _paths_with_role(job.material_paths[1].paths, second_roles, "infill")
+
+    assert first_infill
+    assert second_infill
+    assert all(np.allclose(path[0, :2], path[-1, :2]) for path in first_infill)
+    assert any(not np.allclose(path[0, :2], path[-1, :2]) for path in second_infill)
+    assert job.meta["raft"]["top_gap"] == 0.0
+    assert job.meta["raft"]["layers"] == [
+        {
+            "outward_offset": 2.0,
+            "layer_height": 0.5,
+            "infill_density": 100,
+            "infill_pattern": "concentric",
+        },
+        {
+            "outward_offset": 1.0,
+            "layer_height": 0.5,
+            "infill_density": 70,
+            "infill_pattern": "zigzag",
+        },
+    ]
+
+
+def test_ui_raft_defaults_parse_chinese_pattern_names():
+    layers = _raft_layers_from_params(
+        {"raft_infill_patterns": ["同心轮廓,之字形"]},
+        layer_count=2,
+    )
+
+    assert [layer.infill_pattern for layer in layers] == ["concentric", "zigzag"]
+    assert [layer.infill_density for layer in layers] == [100.0, 70.0]
 
 
 def test_concentric_infill_generates_closed_inner_rings():
@@ -975,6 +1042,7 @@ def test_ui_exposes_slicing_kernel_input():
         "raftOffsets",
         "raftLayerHeights",
         "raftInfillDensities",
+        "raftInfillPatterns",
         "curveMode",
         "curveAmplitude",
         "curvePeriod",
@@ -982,6 +1050,9 @@ def test_ui_exposes_slicing_kernel_input():
         assert f'id="{control_id}"' in html
     assert 'value="legacy" selected' in html
     assert 'value="pyslm"' in html
+    assert 'id="raftTopGap" name="raftTopGap" type="number" min="0" step="0.001" value="0"' in html
+    assert 'id="raftInfillDensities" name="raftInfillDensities" type="text" value="100,70"' in html
+    assert 'id="raftInfillPatterns" name="raftInfillPatterns" type="text" value="同心轮廓,之字形"' in html
     for hatcher in ("basic", "stripe", "island", "basic_island"):
         assert f'value="{hatcher}"' in html
     assert "bottomCapAngle" not in html

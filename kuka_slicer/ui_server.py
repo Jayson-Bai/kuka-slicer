@@ -180,7 +180,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         curve_amplitude = _float_param(params, "curve_amplitude", 0.0)
         curve_period = _float_param(params, "curve_period", 50.0)
         raft_layer_count = _int_param(params, "raft_layer_count", 2)
-        raft_top_gap = _float_param(params, "raft_top_gap", 0.2)
+        raft_top_gap = _float_param(params, "raft_top_gap", 0.0)
         raft_layers = _raft_layers_from_params(params, raft_layer_count)
 
         stl_upload = files.get("stl_file")
@@ -337,12 +337,14 @@ def _raft_layers_from_params(
         return []
     offsets = _float_list_param(params, "raft_offsets", "15,10", layer_count)
     heights = _float_list_param(params, "raft_layer_heights", DEFAULT_RESIN_LAYER_HEIGHT_MM, layer_count)
-    densities = _float_list_param(params, "raft_infill_densities", "100,75", layer_count)
+    densities = _float_list_param(params, "raft_infill_densities", "100,70", layer_count)
+    patterns = _string_list_param(params, "raft_infill_patterns", "concentric,zigzag", layer_count)
     return [
         RaftLayerConfig(
             outward_offset=offsets[index],
             layer_height=heights[index],
             infill_density=densities[index],
+            infill_pattern=patterns[index],  # type: ignore[arg-type]
         )
         for index in range(layer_count)
     ]
@@ -361,6 +363,33 @@ def _float_list_param(
         return values * layer_count
     if len(values) != layer_count:
         raise ValueError(f"{name} must contain either 1 value or {layer_count} comma-separated values")
+    return values
+
+
+def _string_list_param(
+    params: dict[str, list[str]],
+    name: str,
+    default: str,
+    layer_count: int,
+) -> list[str]:
+    raw = params.get(name, [default])[0].strip()
+    values = [part.strip() for part in raw.split(",") if part.strip()] if raw else []
+    aliases = {
+        "concentric": "concentric",
+        "zigzag": "zigzag",
+        "同心轮廓": "concentric",
+        "同心轮廓填充": "concentric",
+        "之字形": "zigzag",
+        "之字形填充": "zigzag",
+    }
+    values = [aliases.get(value, value) for value in values]
+    if len(values) == 1:
+        values *= layer_count
+    if len(values) != layer_count:
+        raise ValueError(f"{name} must contain either 1 value or {layer_count} comma-separated values")
+    unsupported = [value for value in values if value not in ("concentric", "zigzag")]
+    if unsupported:
+        raise ValueError(f"{name} contains unsupported pattern: {unsupported[0]}")
     return values
 
 
@@ -1304,7 +1333,7 @@ def _index_html() -> str:
           </div>
           <div>
             <label for="raftTopGap">筏板顶层间隙 mm</label>
-            <input id="raftTopGap" name="raftTopGap" type="number" min="0" step="0.001" value="0.2">
+            <input id="raftTopGap" name="raftTopGap" type="number" min="0" step="0.001" value="0">
           </div>
         </div>
 
@@ -1315,7 +1344,10 @@ def _index_html() -> str:
         <input id="raftLayerHeights" name="raftLayerHeights" type="text" value="0.5" placeholder="单值或逗号分隔，例如 0.3,0.25,0.2">
 
         <label for="raftInfillDensities">每层筏板填充率 %</label>
-        <input id="raftInfillDensities" name="raftInfillDensities" type="text" value="100,75" placeholder="单值或逗号分隔，例如 80,70,60">
+        <input id="raftInfillDensities" name="raftInfillDensities" type="text" value="100,70" placeholder="单值或逗号分隔，例如 80,70,60">
+
+        <label for="raftInfillPatterns">每层筏板填充策略</label>
+        <input id="raftInfillPatterns" name="raftInfillPatterns" type="text" value="同心轮廓,之字形" placeholder="同心轮廓或之字形，单值或逗号分隔">
         </div>
 
         <div class="formSection">
@@ -1539,6 +1571,7 @@ def _index_html() -> str:
       formData.append('raft_offsets', document.getElementById('raftOffsets').value);
       formData.append('raft_layer_heights', document.getElementById('raftLayerHeights').value);
       formData.append('raft_infill_densities', document.getElementById('raftInfillDensities').value);
+      formData.append('raft_infill_patterns', document.getElementById('raftInfillPatterns').value);
       formData.append('curve_mode', document.getElementById('curveMode').value);
       formData.append('curve_amplitude', document.getElementById('curveAmplitude').value);
       formData.append('curve_period', document.getElementById('curvePeriod').value);

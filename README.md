@@ -168,7 +168,7 @@ The UI groups adjustable inputs into:
 | Input files | STL upload, optional single-layer fiber JSON |
 | Model and layers | layer height, build axis, optional `z_min`/`z_max`, geometric tolerance |
 | Resin path kernel | slicing kernel (`Legacy` or `PySLM`), line width, perimeter count, infill pattern, density, overlap, smoothing, PySLM native settings |
-| Raft | layer count, top gap, per-layer offsets, per-layer heights, per-layer densities |
+| Raft | layer count, top gap, per-layer offsets, per-layer heights, per-layer densities, legacy per-layer infill patterns |
 | Curved Z | flat/sinusoidal mode, amplitude, period |
 
 Generate the documented two-layer resin/fiber template:
