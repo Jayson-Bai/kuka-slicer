@@ -651,20 +651,20 @@ def _raft_zigzag_infill_paths(
         0.0,
         config.tolerance,
     )
-    zigzag_merge_tolerance = None
-    if config.zigzag_path_optimization:
-        zigzag_merge_tolerance = _legacy_path_merge_tolerance(
-            config.line_width,
-            config.tolerance,
-        )
-        filled = optimize_open_path_travel(filled, config.tolerance)
-        filled = merge_adjacent_connected_paths(filled, zigzag_merge_tolerance)
+    zigzag_merge_tolerance = (
+        _legacy_path_merge_tolerance(config.line_width, config.tolerance)
+        if config.zigzag_path_optimization
+        else None
+    )
     filled = _connect_resin_infill_paths(
         filled,
         geometry,
         spacing,
         config.tolerance,
     )
+    if config.zigzag_path_optimization:
+        filled = optimize_open_path_travel(filled, config.tolerance)
+        filled = merge_adjacent_connected_paths(filled, zigzag_merge_tolerance)
     filled = _smooth_resin_infill_paths(
         filled,
         geometry,
@@ -950,15 +950,6 @@ def _infill_paths_for_geometry(
     elif config.infill_pattern == "gyroid":
         filled.extend(_gyroid_infill_geometry(geometry, line_spacing, config.tolerance))
 
-    zigzag_merge_tolerance = None
-    if config.infill_pattern == "zigzag" and config.zigzag_path_optimization:
-        zigzag_merge_tolerance = _legacy_path_merge_tolerance(
-            config.line_width,
-            config.tolerance,
-        )
-        filled = optimize_open_path_travel(filled, config.tolerance)
-        filled = merge_adjacent_connected_paths(filled, zigzag_merge_tolerance)
-
     if config.infill_pattern in (
         "rectilinear",
         "aligned_rectilinear",
@@ -972,6 +963,15 @@ def _infill_paths_for_geometry(
             grid_spacing if config.infill_pattern == "grid" else line_spacing,
             config.tolerance,
         )
+
+    zigzag_merge_tolerance = (
+        _legacy_path_merge_tolerance(config.line_width, config.tolerance)
+        if config.infill_pattern == "zigzag" and config.zigzag_path_optimization
+        else None
+    )
+    if config.infill_pattern == "zigzag" and config.zigzag_path_optimization:
+        filled = optimize_open_path_travel(filled, config.tolerance)
+        filled = merge_adjacent_connected_paths(filled, zigzag_merge_tolerance)
 
     if config.infill_pattern not in ("triangles", "gyroid"):
         smoothing_radius = config.line_width * config.smoothing_radius_factor

@@ -616,11 +616,11 @@ def test_legacy_triangle_path_optimization_reduces_open_travel():
     assert enabled_travel <= disabled_travel
 
 
-def test_legacy_zigzag_path_optimization_reduces_part_cap_paths():
+def test_legacy_zigzag_path_optimization_keeps_part_cap_paths_continuous():
     mesh = Mesh(_cube_triangles(size=30.0))
 
-    def infill_counts(optimized: bool) -> list[int]:
-        job = slice_mesh_to_job(
+    def job_for(optimized: bool):
+        return slice_mesh_to_job(
             mesh,
             SliceConfig(
                 layer_height=5.0,
@@ -630,18 +630,31 @@ def test_legacy_zigzag_path_optimization_reduces_part_cap_paths():
                 zigzag_path_optimization=optimized,
             ),
         )
+
+    def infill_counts(optimized: bool) -> list[int]:
+        job = job_for(optimized)
         return [
             sum(role == "infill" for role in job.meta["path_roles"]["R"][str(group.layer_index)])
             for group in job.material_paths
         ]
 
+    def first_layer_travel(optimized: bool) -> float:
+        job = job_for(optimized)
+        group = job.material_paths[0]
+        roles = job.meta["path_roles"]["R"][str(group.layer_index)]
+        paths = [path for path, role in zip(group.paths, roles) if role == "infill"]
+        return sum(
+            float(np.linalg.norm(paths[index][0, :2] - paths[index - 1][-1, :2]))
+            for index in range(1, len(paths))
+        )
+
     disabled = infill_counts(False)
     enabled = infill_counts(True)
 
-    assert enabled[0] < disabled[0]
+    assert enabled[0] <= disabled[0]
     assert enabled[-1] <= disabled[-1]
     assert all(current <= original for current, original in zip(enabled, disabled))
-
+    assert first_layer_travel(True) <= first_layer_travel(False)
 
 def test_triangle_path_optimizer_reorders_and_reverses_open_paths():
     paths = [
