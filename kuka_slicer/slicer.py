@@ -48,6 +48,7 @@ DEFAULT_FIBER_LINE_WIDTH_MM = 1.0
 DEFAULT_RESIN_PERIMETER_COUNT = 2
 DEFAULT_RESIN_SMOOTHING_ANGLE_DEGREES = 150.0
 DEFAULT_RESIN_SMOOTHING_RADIUS_FACTOR = 0.35
+DEFAULT_TRIANGLE_PATH_MERGE_TOLERANCE_MM = 0.1
 MIN_GEOMETRY_TOLERANCE_MM = 1e-5
 MAX_GEOMETRY_TOLERANCE_MM = 1e-2
 
@@ -346,6 +347,11 @@ def _slice_mesh_to_job_legacy(mesh: Mesh, config: SliceConfig) -> ExternalSource
             "infill_density": config.infill_density,
             "infill_overlap": config.infill_overlap,
             "triangle_path_optimization": config.triangle_path_optimization,
+            "triangle_path_merge_tolerance": (
+                _triangle_path_merge_tolerance(config.line_width, config.tolerance)
+                if config.triangle_path_optimization and config.infill_pattern == "triangles"
+                else None
+            ),
             "build_axis": config.build_axis,
             "slicing_kernel": config.slicing_kernel,
             "perimeter_count": config.perimeter_count,
@@ -838,14 +844,19 @@ def _build_resin_paths(
         config.infill_density,
     )
     if config.infill_pattern == "triangles" and config.triangle_path_optimization:
+        triangle_merge_tolerance = _triangle_path_merge_tolerance(
+            config.line_width,
+            config.tolerance,
+        )
         filled = optimize_triangle_infill_travel(filled, config.tolerance)
-        filled = merge_adjacent_connected_paths(filled, config.tolerance)
+        filled = merge_adjacent_connected_paths(filled, triangle_merge_tolerance)
         filled = _smooth_resin_infill_paths(
             filled,
             infill_geometry,
             config.line_width * config.smoothing_radius_factor,
             config.smoothing_angle,
             config.tolerance,
+            merge_tolerance=triangle_merge_tolerance,
         )
     return perimeters + filled, roles + ["infill"] * len(filled)
 
@@ -1148,6 +1159,13 @@ def _open_path_travel_length(paths: list[np.ndarray]) -> float:
     )
 
 
+def _triangle_path_merge_tolerance(line_width: float, tolerance: float) -> float:
+    return max(
+        tolerance,
+        min(DEFAULT_TRIANGLE_PATH_MERGE_TOLERANCE_MM, line_width * 0.05),
+    )
+
+
 def merge_adjacent_connected_paths(
     paths: list[np.ndarray],
     tolerance: float = 1e-5,
@@ -1185,9 +1203,14 @@ def _smooth_resin_infill_paths(
     angle_threshold_degrees: float,
     tolerance: float,
     cut_fraction: float = 0.35,
+    merge_tolerance: float | None = None,
 ) -> list[np.ndarray]:
     if max_radius <= tolerance or not paths:
-        return paths
+        return (
+            merge_adjacent_connected_paths(paths, merge_tolerance)
+            if merge_tolerance is not None
+            else paths
+        )
 
     # Allow the tool centerline to use the material carried by the line width
     # near a boundary, while still keeping the transition out of holes.
@@ -1204,6 +1227,8 @@ def _smooth_resin_infill_paths(
                 cut_fraction,
             )
         )
+    if merge_tolerance is not None:
+        return merge_adjacent_connected_paths(smoothed, merge_tolerance)
     return smoothed
 
 

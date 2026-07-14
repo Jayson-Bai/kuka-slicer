@@ -137,7 +137,9 @@ lower densities produce larger triangles rather than three over-dense line sets.
 Legacy triangle infill enables endpoint-based path optimization by default. It
 first reverses or reorders open triangle paths, then merges consecutive paths
 whose endpoints already coincide, and finally applies the existing smoothing
-optimization. It never adds connector segments; disable it with
+optimization. A small automatic endpoint tolerance of up to `0.1 mm` is also
+applied after smoothing to coalesce numerical gaps below the safe threshold;
+it never adds long connector segments. Disable it with
 `--no-triangle-path-optimization` or the UI checkbox when the original path
 order is required. This option is ignored by the PySLM kernel.
 `gyroid` uses continuous clipped contour curves, which usually reduces resin

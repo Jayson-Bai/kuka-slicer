@@ -649,6 +649,20 @@ def test_triangle_path_optimizer_merges_only_sequentially_connected_paths():
     assert np.allclose(merged[1][:, :2], [[4.0, 0.0], [5.0, 0.0], [6.0, 0.0]])
 
 
+def test_triangle_path_optimizer_merges_small_endpoint_gaps_within_tolerance():
+    paths = [
+        np.asarray([[0.0, 0.0, 0.5], [1.0, 0.0, 0.5]], dtype=np.float32),
+        np.asarray([[1.08, 0.0, 0.5], [2.0, 0.0, 0.5]], dtype=np.float32),
+        np.asarray([[2.08, 0.0, 0.5], [3.0, 0.0, 0.5]], dtype=np.float32),
+    ]
+
+    merged = merge_adjacent_connected_paths(paths, tolerance=0.1)
+
+    assert len(merged) == 1
+    assert np.allclose(merged[0][0, :2], [0.0, 0.0])
+    assert np.allclose(merged[0][-1, :2], [3.0, 0.0])
+
+
 def test_triangular_infill_supports_zero_density_without_infill_paths():
     mesh = Mesh(_cube_triangles(size=30.0))
 
