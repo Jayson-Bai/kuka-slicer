@@ -63,6 +63,39 @@ DEFAULT_MATERIAL_PROCESS = {
 
 
 @dataclass(frozen=True)
+class PySLMStrategyDefaults:
+    """Recommended stripe/island dimensions for the current resin scale."""
+
+    width: float
+    overlap: float
+    offset: float = 0.5
+
+
+def recommended_pyslm_strategy_defaults(
+    layer_height: float,
+    line_width: float,
+) -> PySLMStrategyDefaults:
+    """Return scale-aware defaults for PySLM stripe and island strategies.
+
+    Stripe/island dimensions are XY scan settings, so line width is the primary
+    scale. Layer height provides a lower bound for very small line widths. The
+    offset is PySLM's dimensionless half-hatch-spacing default, not a distance.
+    """
+
+    if (
+        not math.isfinite(layer_height)
+        or not math.isfinite(line_width)
+        or layer_height <= 0
+        or line_width <= 0
+    ):
+        raise ValueError("layer_height and line_width must be positive")
+    return PySLMStrategyDefaults(
+        width=max(line_width * 5.0, layer_height * 10.0),
+        overlap=min(0.1, line_width * 0.05, layer_height * 0.2),
+    )
+
+
+@dataclass(frozen=True)
 class PySLMConfig:
     """Native PySLM controls kept separate from the legacy slicer options."""
 

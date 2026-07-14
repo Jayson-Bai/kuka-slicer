@@ -83,6 +83,15 @@ NPZ handoff contract. Its native pattern set is `none`, `line`,
 `triangles`, `gyroid`, and `concentric` remain available in the standalone
 `legacy` kernel and are rejected explicitly by the PySLM kernel.
 
+The PySLM hatcher strategy is separate from the legacy `infill-pattern` option:
+the former selects PySLM's scan organization (`Hatcher`, `StripeHatcher`, or
+an island strategy), while the latter is only used by the legacy kernel. The
+UI hides the legacy control when PySLM is selected. Stripe/island width,
+overlap, and offset use scale-aware defaults; for the default resin process
+(0.5 mm layer height and 2 mm line width), the defaults are 10 mm, 0.1 mm,
+and 0.5 hatch-spacing units. The UI keeps these controls collapsed and lets
+the user switch off automatic values before editing them.
+
 PySLM-native controls are available through `--pyslm-*` CLI options and the UI:
 Hatcher/StripeHatcher/IslandHatcher/BasicIslandHatcher, hatch angle and layer
 angle increment, hatch distance, contour and spot offsets, volume offset,
@@ -101,7 +110,7 @@ python -m kuka_slicer slice input.stl output.npz `
   --pyslm-layer-angle-increment 67 `
   --pyslm-hatch-distance 1.8 `
   --pyslm-hatch-sort alternate `
-  --pyslm-stripe-width 5.0 `
+  --pyslm-stripe-width 10.0 `
   --pyslm-stripe-overlap 0.1
 ```
 

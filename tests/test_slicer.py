@@ -23,6 +23,7 @@ from kuka_slicer.slicer import (
     add_raft_to_job,
     normalize_job_xy_origin,
     recommended_geometry_tolerance,
+    recommended_pyslm_strategy_defaults,
     slice_mesh_to_job,
 )
 from kuka_slicer.stl_io import Mesh
@@ -812,6 +813,18 @@ def test_recommended_geometry_tolerance_tracks_print_scale():
     assert recommended_geometry_tolerance(layer_height=50.0, line_width=20.0) == 0.01
 
 
+def test_recommended_pyslm_strategy_defaults_follow_resin_scale():
+    defaults = recommended_pyslm_strategy_defaults(layer_height=0.5, line_width=2.0)
+
+    assert defaults.width == 10.0
+    assert defaults.overlap == 0.1
+    assert defaults.offset == 0.5
+
+    smaller = recommended_pyslm_strategy_defaults(layer_height=0.1, line_width=1.0)
+    assert smaller.width == 5.0
+    assert math.isclose(smaller.overlap, 0.02)
+
+
 def test_ui_uses_prusaslicer_style_infill_pattern_names():
     html = _index_html()
 
@@ -866,8 +879,10 @@ def test_ui_exposes_slicing_kernel_input():
         "切片内核",
         "原始内核（稳定）",
         "PySLM（实验）",
-        "PySLM 原生参数",
-        "填充策略",
+        "PySLM 原生扫描参数",
+        "PySLM 填充策略",
+        "条带/岛状参数（自动）",
+        "自动设置条带/岛状参数",
         "扫描线排序",
         "填充角度 °",
         "层间角度增量 °",
@@ -878,12 +893,15 @@ def test_ui_exposes_slicing_kernel_input():
         "外轮廓数量",
         "内轮廓数量",
         "条带宽度 mm",
+        "条带平移系数",
         "岛状宽度 mm",
+        "岛状平移系数",
         "切层边界简化 mm",
         "简化模式",
         "轮廓优先扫描",
         "修复切层多边形",
         "保持拓扑结构",
+        "原始内核填充路径",
     ):
         assert translated_label in html
 
@@ -893,6 +911,7 @@ def test_ui_exposes_slicing_kernel_input():
         "PySLM (experimental)",
         "PySLM native settings",
         "Hatcher strategy",
+        "树脂填充路径",
         "Hatch sort",
         "Hatch angle deg",
         "Layer angle increment deg",
@@ -925,6 +944,9 @@ def test_ui_exposes_slicing_kernel_input():
         "infillOverlap",
         "slicingKernel",
         "pyslmNativeSettings",
+        "pyslmPatternSettings",
+        "pyslmPatternAuto",
+        "legacyInfillControl",
         "pyslmHatcher",
         "pyslmHatchSort",
         "pyslmHatchAngle",

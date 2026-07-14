@@ -34,6 +34,7 @@ from .slicer import (
     optimize_open_path_travel,
     orient_mesh_for_build_axis,
     recommended_geometry_tolerance,
+    recommended_pyslm_strategy_defaults,
     slice_mesh_to_job,
     _smooth_path_corners,
 )
@@ -94,6 +95,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             DEFAULT_RESIN_LAYER_HEIGHT_MM,
         )
         line_width = _float_param(params, "line_width", DEFAULT_RESIN_LINE_WIDTH_MM)
+        pyslm_strategy_defaults = recommended_pyslm_strategy_defaults(layer_height, line_width)
         requested_build_axis = params.get("build_axis", ["auto"])[0]
         z_min = _optional_float_param(params, "z_min")
         z_max = _optional_float_param(params, "z_max")
@@ -134,12 +136,36 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             num_inner_contours=_optional_int_param(params, "pyslm_num_inner_contours"),
             scan_contour_first=_bool_param(params, "pyslm_scan_contour_first", True),
             hatch_sort=params.get("pyslm_hatch_sort", ["none"])[0],  # type: ignore[arg-type]
-            stripe_width=_float_param(params, "pyslm_stripe_width", 5.0),
-            stripe_overlap=_float_param(params, "pyslm_stripe_overlap", 0.1),
-            stripe_offset=_float_param(params, "pyslm_stripe_offset", 0.5),
-            island_width=_float_param(params, "pyslm_island_width", 5.0),
-            island_overlap=_float_param(params, "pyslm_island_overlap", 0.1),
-            island_offset=_float_param(params, "pyslm_island_offset", 0.5),
+            stripe_width=_float_param(
+                params,
+                "pyslm_stripe_width",
+                pyslm_strategy_defaults.width,
+            ),
+            stripe_overlap=_float_param(
+                params,
+                "pyslm_stripe_overlap",
+                pyslm_strategy_defaults.overlap,
+            ),
+            stripe_offset=_float_param(
+                params,
+                "pyslm_stripe_offset",
+                pyslm_strategy_defaults.offset,
+            ),
+            island_width=_float_param(
+                params,
+                "pyslm_island_width",
+                pyslm_strategy_defaults.width,
+            ),
+            island_overlap=_float_param(
+                params,
+                "pyslm_island_overlap",
+                pyslm_strategy_defaults.overlap,
+            ),
+            island_offset=_float_param(
+                params,
+                "pyslm_island_offset",
+                pyslm_strategy_defaults.offset,
+            ),
             fix_polygons=_bool_param(params, "pyslm_fix_polygons", True),
             simplification_factor=_optional_float_param(params, "pyslm_simplification_factor"),
             simplification_preserve_topology=_bool_param(
@@ -753,6 +779,10 @@ def _expand_bounds(bounds: dict[str, float | None], x: float, y: float, z: float
 
 def _index_html() -> str:
     pyslm_defaults = PySLMConfig()
+    pyslm_strategy_defaults = recommended_pyslm_strategy_defaults(
+        DEFAULT_RESIN_LAYER_HEIGHT_MM,
+        DEFAULT_RESIN_LINE_WIDTH_MM,
+    )
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -894,6 +924,21 @@ def _index_html() -> str:
       color: var(--muted);
     }}
     .notice.warning {{ color: #9a5b00; }}
+    .advancedSettings {{
+      margin-top: 12px;
+      padding-top: 10px;
+      border-top: 1px solid var(--line);
+    }}
+    .advancedSettings summary {{
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 650;
+      user-select: none;
+    }}
+    .advancedSettings[open] summary {{
+      margin-bottom: 8px;
+    }}
     .summary {{
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -1097,10 +1142,10 @@ def _index_html() -> str:
           </select>
 
           <div id="pyslmNativeSettings" hidden>
-            <h3>PySLM 原生参数</h3>
+            <h3>PySLM 原生扫描参数</h3>
             <div class="grid">
               <div>
-                <label for="pyslmHatcher">填充策略</label>
+                <label for="pyslmHatcher" title="决定 PySLM 使用基础、条带或岛状扫描组织方式。">PySLM 填充策略</label>
                 <select id="pyslmHatcher" name="pyslmHatcher">
                   <option value="basic" selected>基础直线填充</option>
                   <option value="stripe">条带填充</option>
@@ -1159,36 +1204,40 @@ def _index_html() -> str:
                 <input id="pyslmInnerContours" name="pyslmInnerContours" type="number" min="0" step="1" placeholder="自动">
               </div>
             </div>
-            <div class="grid">
+            <details id="pyslmPatternSettings" class="advancedSettings">
+              <summary>条带/岛状参数（自动）</summary>
+              <label class="checkboxLabel" title="启用后根据树脂层高和线宽重新计算下面的推荐值。"><input id="pyslmPatternAuto" type="checkbox" checked> 自动设置条带/岛状参数</label>
+              <div class="grid">
               <div>
                 <label for="pyslmStripeWidth">条带宽度 mm</label>
-                <input id="pyslmStripeWidth" name="pyslmStripeWidth" type="number" min="0.001" step="0.1" value="{pyslm_defaults.stripe_width:g}">
+                <input id="pyslmStripeWidth" name="pyslmStripeWidth" type="number" min="0.001" step="0.1" value="{pyslm_strategy_defaults.width:g}">
               </div>
               <div>
                 <label for="pyslmStripeOverlap">条带重叠 mm</label>
-                <input id="pyslmStripeOverlap" name="pyslmStripeOverlap" type="number" min="0" step="0.1" value="{pyslm_defaults.stripe_overlap:g}">
+                <input id="pyslmStripeOverlap" name="pyslmStripeOverlap" type="number" min="0" step="0.1" value="{pyslm_strategy_defaults.overlap:g}">
               </div>
-            </div>
-            <div class="grid">
+              </div>
+              <div class="grid">
               <div>
-                <label for="pyslmStripeOffset">条带偏移 mm</label>
-                <input id="pyslmStripeOffset" name="pyslmStripeOffset" type="number" min="0" step="0.1" value="{pyslm_defaults.stripe_offset:g}">
+                <label for="pyslmStripeOffset">条带平移系数</label>
+                <input id="pyslmStripeOffset" name="pyslmStripeOffset" type="number" min="0" step="0.05" value="{pyslm_strategy_defaults.offset:g}">
               </div>
               <div>
                 <label for="pyslmIslandWidth">岛状宽度 mm</label>
-                <input id="pyslmIslandWidth" name="pyslmIslandWidth" type="number" min="0.001" step="0.1" value="{pyslm_defaults.island_width:g}">
+                <input id="pyslmIslandWidth" name="pyslmIslandWidth" type="number" min="0.001" step="0.1" value="{pyslm_strategy_defaults.width:g}">
               </div>
-            </div>
-            <div class="grid">
+              </div>
+              <div class="grid">
               <div>
                 <label for="pyslmIslandOverlap">岛状重叠 mm</label>
-                <input id="pyslmIslandOverlap" name="pyslmIslandOverlap" type="number" min="0" step="0.1" value="{pyslm_defaults.island_overlap:g}">
+                <input id="pyslmIslandOverlap" name="pyslmIslandOverlap" type="number" min="0" step="0.1" value="{pyslm_strategy_defaults.overlap:g}">
               </div>
               <div>
-                <label for="pyslmIslandOffset">岛状偏移 mm</label>
-                <input id="pyslmIslandOffset" name="pyslmIslandOffset" type="number" min="0" step="0.1" value="{pyslm_defaults.island_offset:g}">
+                <label for="pyslmIslandOffset">岛状平移系数</label>
+                <input id="pyslmIslandOffset" name="pyslmIslandOffset" type="number" min="0" step="0.05" value="{pyslm_strategy_defaults.offset:g}">
               </div>
-            </div>
+              </div>
+            </details>
             <div class="grid">
               <div>
                 <label for="pyslmSimplificationFactor">切层边界简化 mm</label>
@@ -1207,7 +1256,8 @@ def _index_html() -> str:
             <label class="checkboxLabel"><input id="pyslmSimplificationPreserveTopology" type="checkbox" checked> 保持拓扑结构</label>
           </div>
 
-          <label for="infillPattern">树脂填充路径</label>
+          <div id="legacyInfillControl">
+          <label for="infillPattern" title="仅原始内核使用；PySLM 模式由上方的原生填充策略决定。">原始内核填充路径</label>
           <select id="infillPattern" name="infillPattern">
             <option value="none">仅轮廓</option>
             <option value="rectilinear">交替直线填充</option>
@@ -1219,6 +1269,7 @@ def _index_html() -> str:
             <option value="concentric">同心轮廓填充</option>
             <option value="zigzag">之字形填充</option>
           </select>
+          </div>
 
           <div class="grid">
             <div>
@@ -1361,9 +1412,15 @@ def _index_html() -> str:
     const showPathPointsInput = document.getElementById('showPathPoints');
     const showDirectionInput = document.getElementById('showDirection');
     const slicingKernelInput = document.getElementById('slicingKernel');
+    const layerHeightInput = document.getElementById('layerHeight');
+    const lineWidthInput = document.getElementById('lineWidth');
+    const legacyInfillControl = document.getElementById('legacyInfillControl');
     const infillPatternInput = document.getElementById('infillPattern');
     const pyslmNativeSettings = document.getElementById('pyslmNativeSettings');
     const pyslmHatcherInput = document.getElementById('pyslmHatcher');
+    const pyslmPatternAutoInput = document.getElementById('pyslmPatternAuto');
+    const stripeParameterIds = ['pyslmStripeWidth', 'pyslmStripeOverlap', 'pyslmStripeOffset'];
+    const islandParameterIds = ['pyslmIslandWidth', 'pyslmIslandOverlap', 'pyslmIslandOffset'];
     const pyslmNativePatterns = new Set(['none', 'line', 'aligned_rectilinear', 'rectilinear', 'zigzag']);
     const pyslmSettingsIds = [
       'pyslmHatcher', 'pyslmHatchSort', 'pyslmHatchAngle', 'pyslmLayerAngleIncrement',
@@ -1375,9 +1432,28 @@ def _index_html() -> str:
       'pyslmScanContourFirst', 'pyslmFixPolygons', 'pyslmSimplificationPreserveTopology'
     ];
     let previewData = null;
+    function updatePyslmStrategyDefaults() {{
+      if (!pyslmPatternAutoInput.checked) return;
+      const layerHeight = Number(layerHeightInput.value);
+      const lineWidth = Number(lineWidthInput.value);
+      if (!(layerHeight > 0) || !(lineWidth > 0)) return;
+      const width = Math.max(lineWidth * 5.0, layerHeight * 10.0);
+      const overlap = Math.min(0.1, lineWidth * 0.05, layerHeight * 0.2);
+      for (const id of ['pyslmStripeWidth', 'pyslmIslandWidth']) {{
+        document.getElementById(id).value = width.toFixed(3).replace(/\\.0+$/, '').replace(/(\\.\\d*?)0+$/, '$1');
+      }}
+      for (const id of ['pyslmStripeOverlap', 'pyslmIslandOverlap']) {{
+        document.getElementById(id).value = overlap.toFixed(3).replace(/\\.0+$/, '').replace(/(\\.\\d*?)0+$/, '$1');
+      }}
+      for (const id of ['pyslmStripeOffset', 'pyslmIslandOffset']) {{
+        document.getElementById(id).value = '0.5';
+      }}
+    }}
     function syncKernelControls() {{
       const isPyslm = slicingKernelInput.value === 'pyslm';
       pyslmNativeSettings.hidden = !isPyslm;
+      legacyInfillControl.hidden = isPyslm;
+      infillPatternInput.disabled = isPyslm;
       for (const option of infillPatternInput.options) {{
         option.disabled = isPyslm && !pyslmNativePatterns.has(option.value);
       }}
@@ -1387,19 +1463,24 @@ def _index_html() -> str:
       for (const id of pyslmSettingsIds) {{
         document.getElementById(id).disabled = !isPyslm;
       }}
+      pyslmPatternAutoInput.disabled = !isPyslm;
+      updatePyslmStrategyDefaults();
       const strategy = pyslmHatcherInput.value;
       const stripeEnabled = isPyslm && strategy === 'stripe';
       const islandEnabled = isPyslm && (strategy === 'island' || strategy === 'basic_island');
-      for (const id of ['pyslmStripeWidth', 'pyslmStripeOverlap', 'pyslmStripeOffset']) {{
-        document.getElementById(id).disabled = !stripeEnabled;
+      for (const id of stripeParameterIds) {{
+        document.getElementById(id).disabled = !stripeEnabled || pyslmPatternAutoInput.checked;
       }}
-      for (const id of ['pyslmIslandWidth', 'pyslmIslandOverlap', 'pyslmIslandOffset']) {{
-        document.getElementById(id).disabled = !islandEnabled;
+      for (const id of islandParameterIds) {{
+        document.getElementById(id).disabled = !islandEnabled || pyslmPatternAutoInput.checked;
       }}
     }}
     slicingKernelInput.addEventListener('change', syncKernelControls);
     infillPatternInput.addEventListener('change', syncKernelControls);
     pyslmHatcherInput.addEventListener('change', syncKernelControls);
+    pyslmPatternAutoInput.addEventListener('change', syncKernelControls);
+    layerHeightInput.addEventListener('input', syncKernelControls);
+    lineWidthInput.addEventListener('input', syncKernelControls);
     syncKernelControls();
     fiberNotice.textContent = 'JSON 中的单层纤维路径会复制到每个树脂层，最后一层树脂封顶不打印纤维。';
 

@@ -16,6 +16,7 @@ from .slicer import (
     PySLMConfig,
     SliceConfig,
     normalize_job_xy_origin,
+    recommended_pyslm_strategy_defaults,
     slice_mesh_to_job,
 )
 from .stl_io import load_stl
@@ -84,12 +85,12 @@ def main(argv: list[str] | None = None) -> int:
         choices=["none", "alternate", "unidirectional", "linear", "directional"],
         default="none",
     )
-    slice_parser.add_argument("--pyslm-stripe-width", type=float, default=5.0)
-    slice_parser.add_argument("--pyslm-stripe-overlap", type=float, default=0.1)
-    slice_parser.add_argument("--pyslm-stripe-offset", type=float, default=0.5)
-    slice_parser.add_argument("--pyslm-island-width", type=float, default=5.0)
-    slice_parser.add_argument("--pyslm-island-overlap", type=float, default=0.1)
-    slice_parser.add_argument("--pyslm-island-offset", type=float, default=0.5)
+    slice_parser.add_argument("--pyslm-stripe-width", type=float)
+    slice_parser.add_argument("--pyslm-stripe-overlap", type=float)
+    slice_parser.add_argument("--pyslm-stripe-offset", type=float)
+    slice_parser.add_argument("--pyslm-island-width", type=float)
+    slice_parser.add_argument("--pyslm-island-overlap", type=float)
+    slice_parser.add_argument("--pyslm-island-offset", type=float)
     slice_parser.add_argument(
         "--pyslm-fix-polygons",
         action=argparse.BooleanOptionalAction,
@@ -175,9 +176,24 @@ def main(argv: list[str] | None = None) -> int:
 
 def _slice_command(args: argparse.Namespace) -> int:
     mesh = load_stl(args.input_stl)
+    material_defaults = {
+        "R": (DEFAULT_RESIN_LAYER_HEIGHT_MM, DEFAULT_RESIN_LINE_WIDTH_MM),
+        "F": (DEFAULT_FIBER_LAYER_HEIGHT_MM, DEFAULT_FIBER_LINE_WIDTH_MM),
+    }
+    layer_height = (
+        material_defaults[args.material][0]
+        if args.layer_height is None
+        else args.layer_height
+    )
+    line_width = (
+        material_defaults[args.material][1]
+        if args.line_width is None
+        else args.line_width
+    )
+    pyslm_strategy_defaults = recommended_pyslm_strategy_defaults(layer_height, line_width)
     config = SliceConfig(
-        layer_height=args.layer_height,
-        line_width=args.line_width,
+        layer_height=layer_height,
+        line_width=line_width,
         material=args.material,
         slicing_kernel=args.slicing_kernel,
         pyslm=PySLMConfig(
@@ -192,12 +208,36 @@ def _slice_command(args: argparse.Namespace) -> int:
             num_inner_contours=args.pyslm_num_inner_contours,
             scan_contour_first=args.pyslm_scan_contour_first,
             hatch_sort=args.pyslm_hatch_sort,
-            stripe_width=args.pyslm_stripe_width,
-            stripe_overlap=args.pyslm_stripe_overlap,
-            stripe_offset=args.pyslm_stripe_offset,
-            island_width=args.pyslm_island_width,
-            island_overlap=args.pyslm_island_overlap,
-            island_offset=args.pyslm_island_offset,
+            stripe_width=(
+                pyslm_strategy_defaults.width
+                if args.pyslm_stripe_width is None
+                else args.pyslm_stripe_width
+            ),
+            stripe_overlap=(
+                pyslm_strategy_defaults.overlap
+                if args.pyslm_stripe_overlap is None
+                else args.pyslm_stripe_overlap
+            ),
+            stripe_offset=(
+                pyslm_strategy_defaults.offset
+                if args.pyslm_stripe_offset is None
+                else args.pyslm_stripe_offset
+            ),
+            island_width=(
+                pyslm_strategy_defaults.width
+                if args.pyslm_island_width is None
+                else args.pyslm_island_width
+            ),
+            island_overlap=(
+                pyslm_strategy_defaults.overlap
+                if args.pyslm_island_overlap is None
+                else args.pyslm_island_overlap
+            ),
+            island_offset=(
+                pyslm_strategy_defaults.offset
+                if args.pyslm_island_offset is None
+                else args.pyslm_island_offset
+            ),
             fix_polygons=args.pyslm_fix_polygons,
             simplification_factor=args.pyslm_simplification_factor,
             simplification_preserve_topology=args.pyslm_simplification_preserve_topology,

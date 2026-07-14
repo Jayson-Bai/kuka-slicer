@@ -55,6 +55,16 @@ hatcher strategy, hatch angle, layer angle increment, hatch spacing, contour
 offsets, spot compensation, volume offset, contour counts, scan ordering,
 stripe/island dimensions, polygon repair, and boundary simplification.
 
+The hatcher strategy is intentionally separate from the project's legacy
+`infill_pattern`: the hatcher selects PySLM's scan organization, while the
+legacy pattern selects project-owned fill algorithms. The web UI hides the
+legacy pattern selector while PySLM is active. Stripe and island dimensions
+have scale-aware UI/CLI defaults from `recommended_pyslm_strategy_defaults()`;
+for the default resin process (0.5 mm layer height, 2 mm line width), these
+are 10 mm width, 0.1 mm overlap, and a 0.5 hatch-spacing offset. The UI keeps
+the controls collapsed and permits manual overrides by disabling automatic
+mode.
+
 ## Native Visualization Boundary
 
 PySLM provides `pyslm.visualise.plot()` and related Matplotlib helpers for
