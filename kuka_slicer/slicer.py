@@ -202,6 +202,7 @@ class SliceConfig:
     perimeter_count: int = DEFAULT_RESIN_PERIMETER_COUNT
     smoothing_angle: float = DEFAULT_RESIN_SMOOTHING_ANGLE_DEGREES
     smoothing_radius_factor: float = DEFAULT_RESIN_SMOOTHING_RADIUS_FACTOR
+    triangle_path_optimization: bool = True
 
     def __post_init__(self) -> None:
         if self.material not in ("R", "F"):
@@ -344,6 +345,7 @@ def _slice_mesh_to_job_legacy(mesh: Mesh, config: SliceConfig) -> ExternalSource
             "infill_pattern": config.infill_pattern,
             "infill_density": config.infill_density,
             "infill_overlap": config.infill_overlap,
+            "triangle_path_optimization": config.triangle_path_optimization,
             "build_axis": config.build_axis,
             "slicing_kernel": config.slicing_kernel,
             "perimeter_count": config.perimeter_count,
@@ -835,6 +837,8 @@ def _build_resin_paths(
         layer_index,
         config.infill_density,
     )
+    if config.infill_pattern == "triangles" and config.triangle_path_optimization:
+        filled = optimize_triangle_infill_travel(filled, config.tolerance)
     return perimeters + filled, roles + ["infill"] * len(filled)
 
 
@@ -1102,6 +1106,38 @@ def optimize_open_path_travel(paths: list[np.ndarray], tolerance: float = 1e-5) 
         ordered.append(selected)
 
     return ordered
+
+
+def optimize_triangle_infill_travel(
+    paths: list[np.ndarray],
+    tolerance: float = 1e-5,
+) -> list[np.ndarray]:
+    """Choose the best greedy open-path order for legacy triangle infill.
+
+    Triangle lattice paths are intentionally kept as separate open paths so
+    different 0/60/120 degree families are never joined with an extrusion
+    connector. Trying representative starting points improves endpoint
+    ordering without changing path geometry or adding travel segments.
+    """
+
+    if len(paths) <= 2:
+        return optimize_open_path_travel(paths, tolerance)
+
+    step = max(1, len(paths) // 8)
+    starts = set(range(0, len(paths), step))
+    starts.update((0, len(paths) // 2, len(paths) - 1))
+    candidates = [
+        optimize_open_path_travel(paths[start:] + paths[:start], tolerance)
+        for start in sorted(starts)
+    ]
+    return min(candidates, key=_open_path_travel_length)
+
+
+def _open_path_travel_length(paths: list[np.ndarray]) -> float:
+    return sum(
+        float(np.linalg.norm(paths[index][0, :2] - paths[index - 1][-1, :2]))
+        for index in range(1, len(paths))
+    )
 
 
 def _smooth_resin_infill_paths(

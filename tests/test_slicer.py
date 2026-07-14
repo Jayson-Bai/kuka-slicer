@@ -22,6 +22,7 @@ from kuka_slicer.slicer import (
     _uniform_concentric_offsets,
     add_raft_to_job,
     normalize_job_xy_origin,
+    optimize_triangle_infill_travel,
     recommended_geometry_tolerance,
     recommended_pyslm_strategy_defaults,
     slice_mesh_to_job,
@@ -572,6 +573,69 @@ def test_triangular_infill_generates_single_layer_lattice_without_edge_overlaps(
     assert longest_segment > 6.0
 
 
+def test_legacy_triangle_path_optimization_reduces_open_travel():
+    mesh = Mesh(_cube_triangles(size=30.0))
+
+    def travel_for(config: SliceConfig) -> tuple[float, list[np.ndarray]]:
+        job = slice_mesh_to_job(mesh, config)
+        roles = job.meta["path_roles"]["R"]["0"]
+        paths = [
+            path
+            for path, role in zip(job.material_paths[0].paths, roles)
+            if role == "infill"
+        ]
+        travel = sum(
+            float(np.linalg.norm(paths[index][0, :2] - paths[index - 1][-1, :2]))
+            for index in range(1, len(paths))
+        )
+        return travel, paths
+
+    disabled_travel, disabled_paths = travel_for(
+        SliceConfig(
+            layer_height=5.0,
+            line_width=2.0,
+            infill_pattern="triangles",
+            infill_density=70.0,
+            triangle_path_optimization=False,
+        )
+    )
+    enabled_travel, enabled_paths = travel_for(
+        SliceConfig(
+            layer_height=5.0,
+            line_width=2.0,
+            infill_pattern="triangles",
+            infill_density=70.0,
+            triangle_path_optimization=True,
+        )
+    )
+
+    assert disabled_paths
+    assert len(enabled_paths) == len(disabled_paths)
+    assert np.isclose(
+        sum(np.sum(np.linalg.norm(np.diff(path[:, :2], axis=0), axis=1)) for path in enabled_paths),
+        sum(np.sum(np.linalg.norm(np.diff(path[:, :2], axis=0), axis=1)) for path in disabled_paths),
+    )
+    assert enabled_travel <= disabled_travel
+
+
+def test_triangle_path_optimizer_reorders_and_reverses_open_paths():
+    paths = [
+        np.asarray([[0.0, 0.0, 0.5], [1.0, 0.0, 0.5]], dtype=np.float32),
+        np.asarray([[10.0, 0.0, 0.5], [11.0, 0.0, 0.5]], dtype=np.float32),
+        np.asarray([[2.0, 0.0, 0.5], [3.0, 0.0, 0.5]], dtype=np.float32),
+    ]
+    optimized = optimize_triangle_infill_travel(paths)
+
+    def travel(paths: list[np.ndarray]) -> float:
+        return sum(
+            float(np.linalg.norm(paths[index][0, :2] - paths[index - 1][-1, :2]))
+            for index in range(1, len(paths))
+        )
+
+    assert travel(optimized) < travel(paths)
+    assert sum(len(path) for path in optimized) == sum(len(path) for path in paths)
+
+
 def test_triangular_infill_supports_zero_density_without_infill_paths():
     mesh = Mesh(_cube_triangles(size=30.0))
 
@@ -868,6 +932,7 @@ def test_pyslm_kernel_rejects_non_native_infill_patterns():
 def test_pyslm_config_exposes_native_defaults():
     config = SliceConfig().pyslm
 
+    assert SliceConfig().triangle_path_optimization is True
     assert config.hatcher == "basic"
     assert config.hatch_sort == "none"
     assert config.scan_contour_first is True
@@ -969,6 +1034,7 @@ def test_ui_exposes_slicing_kernel_input():
         "修复切层多边形",
         "保持拓扑结构",
         "原始内核填充路径",
+        "三角形填充路径优化",
     ):
         assert translated_label in html
 
@@ -1009,6 +1075,7 @@ def test_ui_exposes_slicing_kernel_input():
         "infillPattern",
         "infillDensity",
         "infillOverlap",
+        "trianglePathOptimization",
         "slicingKernel",
         "pyslmNativeSettings",
         "pyslmPatternSettings",
@@ -1050,6 +1117,7 @@ def test_ui_exposes_slicing_kernel_input():
         assert f'id="{control_id}"' in html
     assert 'value="legacy" selected' in html
     assert 'value="pyslm"' in html
+    assert 'id="trianglePathOptimization" type="checkbox" checked' in html
     assert 'id="raftTopGap" name="raftTopGap" type="number" min="0" step="0.001" value="0"' in html
     assert 'id="raftInfillDensities" name="raftInfillDensities" type="text" value="100,70"' in html
     assert 'id="raftInfillPatterns" name="raftInfillPatterns" type="text" value="之字形,之字形"' in html

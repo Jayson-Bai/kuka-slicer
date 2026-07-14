@@ -134,6 +134,11 @@ the generated path spacing together with resin line width and
 `--infill-overlap`.
 For `triangles`, density is converted across the three lattice directions, so
 lower densities produce larger triangles rather than three over-dense line sets.
+Legacy triangle infill enables endpoint-based path ordering by default. It may
+reverse or reorder open triangle paths to reduce travel without adding
+connector segments; disable it with `--no-triangle-path-optimization` or the
+UI checkbox when the original path order is required. This option is ignored
+by the PySLM kernel.
 `gyroid` uses continuous clipped contour curves, which usually reduces resin
 path start/stop count at high densities while keeping a more balanced direction
 distribution than one-direction line fill.
@@ -167,7 +172,7 @@ The UI groups adjustable inputs into:
 | --- | --- |
 | Input files | STL upload, optional single-layer fiber JSON |
 | Model and layers | layer height, build axis, optional `z_min`/`z_max`, geometric tolerance |
-| Resin path kernel | slicing kernel (`Legacy` or `PySLM`), line width, perimeter count, infill pattern, density, overlap, smoothing, PySLM native settings |
+| Resin path kernel | slicing kernel (`Legacy` or `PySLM`), line width, perimeter count, infill pattern, density, overlap, triangle path optimization, smoothing, PySLM native settings |
 | Raft | layer count, top gap, per-layer offsets, per-layer heights, per-layer densities, legacy per-layer infill patterns |
 | Curved Z | flat/sinusoidal mode, amplitude, period |
 

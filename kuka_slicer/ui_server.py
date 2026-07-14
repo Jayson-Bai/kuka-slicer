@@ -123,6 +123,11 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             "infill_overlap",
             DEFAULT_RESIN_INFILL_OVERLAP_PERCENT,
         )
+        triangle_path_optimization = _bool_param(
+            params,
+            "triangle_path_optimization",
+            True,
+        )
         slicing_kernel = params.get("slicing_kernel", ["legacy"])[0]
         pyslm_config = PySLMConfig(
             hatcher=params.get("pyslm_hatcher", ["basic"])[0],  # type: ignore[arg-type]
@@ -221,6 +226,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             infill_pattern=infill_pattern,  # type: ignore[arg-type]
             infill_density=infill_density,
             infill_overlap=infill_overlap,
+            triangle_path_optimization=triangle_path_optimization,
             slicing_kernel=slicing_kernel,  # type: ignore[arg-type]
             pyslm=pyslm_config,
             perimeter_count=perimeter_count,
@@ -1298,6 +1304,7 @@ def _index_html() -> str:
             <option value="concentric">同心轮廓填充</option>
             <option value="zigzag">之字形填充</option>
           </select>
+          <label class="checkboxLabel" title="仅 legacy 三角形填充生效；只重新排序和反转路径，不添加连接线。"><input id="trianglePathOptimization" type="checkbox" checked> 三角形填充路径优化</label>
           </div>
 
           <div class="grid">
@@ -1542,6 +1549,7 @@ def _index_html() -> str:
       formData.append('infill_pattern', document.getElementById('infillPattern').value);
       formData.append('infill_density', document.getElementById('infillDensity').value);
       formData.append('infill_overlap', document.getElementById('infillOverlap').value);
+      formData.append('triangle_path_optimization', document.getElementById('trianglePathOptimization').checked ? 'true' : 'false');
       formData.append('slicing_kernel', document.getElementById('slicingKernel').value);
       formData.append('pyslm_hatcher', document.getElementById('pyslmHatcher').value);
       formData.append('pyslm_hatch_sort', document.getElementById('pyslmHatchSort').value);
