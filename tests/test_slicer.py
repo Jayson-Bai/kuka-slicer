@@ -290,7 +290,7 @@ def test_part_caps_do_not_reclassify_raft_layers():
     assert job.meta["raft"]["layers"][0]["infill_density"] == 10
 
 
-def test_explicit_raft_patterns_use_legacy_concentric_then_zigzag_defaults():
+def test_explicit_raft_patterns_use_opposite_legacy_zigzag_directions():
     mesh = Mesh(_cube_triangles(size=20.0))
     config = SliceConfig(layer_height=5.0, line_width=2.0, infill_pattern="gyroid")
     job = slice_mesh_to_job(mesh, config)
@@ -304,7 +304,7 @@ def test_explicit_raft_patterns_use_legacy_concentric_then_zigzag_defaults():
                 outward_offset=2.0,
                 layer_height=0.5,
                 infill_density=100,
-                infill_pattern="concentric",
+                infill_pattern="zigzag",
             ),
             RaftLayerConfig(
                 outward_offset=1.0,
@@ -323,15 +323,15 @@ def test_explicit_raft_patterns_use_legacy_concentric_then_zigzag_defaults():
 
     assert first_infill
     assert second_infill
-    assert all(np.allclose(path[0, :2], path[-1, :2]) for path in first_infill)
-    assert any(not np.allclose(path[0, :2], path[-1, :2]) for path in second_infill)
+    assert _dominant_infill_angle(first_infill) == 45
+    assert _dominant_infill_angle(second_infill) == -45
     assert job.meta["raft"]["top_gap"] == 0.0
     assert job.meta["raft"]["layers"] == [
         {
             "outward_offset": 2.0,
             "layer_height": 0.5,
             "infill_density": 100,
-            "infill_pattern": "concentric",
+            "infill_pattern": "zigzag",
         },
         {
             "outward_offset": 1.0,
@@ -342,13 +342,13 @@ def test_explicit_raft_patterns_use_legacy_concentric_then_zigzag_defaults():
     ]
 
 
-def test_ui_raft_defaults_parse_chinese_pattern_names():
+def test_ui_raft_defaults_parse_chinese_zigzag_names():
     layers = _raft_layers_from_params(
-        {"raft_infill_patterns": ["同心轮廓,之字形"]},
+        {"raft_infill_patterns": ["之字形,之字形"]},
         layer_count=2,
     )
 
-    assert [layer.infill_pattern for layer in layers] == ["concentric", "zigzag"]
+    assert [layer.infill_pattern for layer in layers] == ["zigzag", "zigzag"]
     assert [layer.infill_density for layer in layers] == [100.0, 70.0]
 
 
@@ -1052,7 +1052,7 @@ def test_ui_exposes_slicing_kernel_input():
     assert 'value="pyslm"' in html
     assert 'id="raftTopGap" name="raftTopGap" type="number" min="0" step="0.001" value="0"' in html
     assert 'id="raftInfillDensities" name="raftInfillDensities" type="text" value="100,70"' in html
-    assert 'id="raftInfillPatterns" name="raftInfillPatterns" type="text" value="同心轮廓,之字形"' in html
+    assert 'id="raftInfillPatterns" name="raftInfillPatterns" type="text" value="之字形,之字形"' in html
     for hatcher in ("basic", "stripe", "island", "basic_island"):
         assert f'value="{hatcher}"' in html
     assert "bottomCapAngle" not in html

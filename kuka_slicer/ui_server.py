@@ -338,7 +338,7 @@ def _raft_layers_from_params(
     offsets = _float_list_param(params, "raft_offsets", "15,10", layer_count)
     heights = _float_list_param(params, "raft_layer_heights", DEFAULT_RESIN_LAYER_HEIGHT_MM, layer_count)
     densities = _float_list_param(params, "raft_infill_densities", "100,70", layer_count)
-    patterns = _string_list_param(params, "raft_infill_patterns", "concentric,zigzag", layer_count)
+    patterns = _string_list_param(params, "raft_infill_patterns", "zigzag,zigzag", layer_count)
     return [
         RaftLayerConfig(
             outward_offset=offsets[index],
@@ -1347,7 +1347,7 @@ def _index_html() -> str:
         <input id="raftInfillDensities" name="raftInfillDensities" type="text" value="100,70" placeholder="单值或逗号分隔，例如 80,70,60">
 
         <label for="raftInfillPatterns">每层筏板填充策略</label>
-        <input id="raftInfillPatterns" name="raftInfillPatterns" type="text" value="同心轮廓,之字形" placeholder="同心轮廓或之字形，单值或逗号分隔">
+        <input id="raftInfillPatterns" name="raftInfillPatterns" type="text" value="之字形,之字形" placeholder="同心轮廓或之字形，单值或逗号分隔">
         </div>
 
         <div class="formSection">
