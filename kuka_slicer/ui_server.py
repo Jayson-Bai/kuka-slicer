@@ -1304,7 +1304,7 @@ def _index_html() -> str:
             <option value="concentric">同心轮廓填充</option>
             <option value="zigzag">之字形填充</option>
           </select>
-          <label class="checkboxLabel" title="仅 legacy 三角形填充生效；只重新排序和反转路径，不添加连接线。"><input id="trianglePathOptimization" type="checkbox" checked> 三角形填充路径优化</label>
+          <label class="checkboxLabel" title="仅 legacy 三角形填充生效；先排序/反向，再合并端点相接的路径，最后执行平滑优化，不添加连接线。"><input id="trianglePathOptimization" type="checkbox" checked> 三角形填充路径优化</label>
           </div>
 
           <div class="grid">

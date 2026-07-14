@@ -839,6 +839,14 @@ def _build_resin_paths(
     )
     if config.infill_pattern == "triangles" and config.triangle_path_optimization:
         filled = optimize_triangle_infill_travel(filled, config.tolerance)
+        filled = merge_adjacent_connected_paths(filled, config.tolerance)
+        filled = _smooth_resin_infill_paths(
+            filled,
+            infill_geometry,
+            config.line_width * config.smoothing_radius_factor,
+            config.smoothing_angle,
+            config.tolerance,
+        )
     return perimeters + filled, roles + ["infill"] * len(filled)
 
 
@@ -1138,6 +1146,36 @@ def _open_path_travel_length(paths: list[np.ndarray]) -> float:
         float(np.linalg.norm(paths[index][0, :2] - paths[index - 1][-1, :2]))
         for index in range(1, len(paths))
     )
+
+
+def merge_adjacent_connected_paths(
+    paths: list[np.ndarray],
+    tolerance: float = 1e-5,
+) -> list[np.ndarray]:
+    """Merge consecutive open paths whose endpoints already coincide.
+
+    This deliberately does not search for nearby paths or add connector
+    segments. The caller is responsible for ordering and orienting paths
+    before this sequential merge pass.
+    """
+
+    merged: list[np.ndarray] = []
+    for path in paths:
+        current = np.asarray(path, dtype=np.float32)
+        if current.shape[0] == 0:
+            continue
+        if (
+            merged
+            and current.shape[0] >= 2
+            and merged[-1].shape[0] >= 2
+            and not _is_closed_path(merged[-1], tolerance)
+            and not _is_closed_path(current, tolerance)
+            and _close(merged[-1][-1, :2], current[0, :2], tolerance)
+        ):
+            merged[-1] = np.vstack((merged[-1], current[1:]))
+        else:
+            merged.append(current)
+    return merged
 
 
 def _smooth_resin_infill_paths(

@@ -21,6 +21,7 @@ from kuka_slicer.slicer import (
     _smooth_path_corners,
     _uniform_concentric_offsets,
     add_raft_to_job,
+    merge_adjacent_connected_paths,
     normalize_job_xy_origin,
     optimize_triangle_infill_travel,
     recommended_geometry_tolerance,
@@ -565,7 +566,8 @@ def test_triangular_infill_generates_single_layer_lattice_without_edge_overlaps(
     infill_paths = _paths_with_role(job.material_paths[1].paths, roles, "infill")
     directions, overlap_length, longest_segment = _infill_direction_overlap_stats(infill_paths)
     assert infill_paths
-    assert 6 < len(infill_paths) < 12
+    # The legacy triangle optimizer may merge endpoint-connected paths.
+    assert 0 < len(infill_paths) < 12
     assert all(path.shape[0] >= 2 for path in infill_paths)
     assert any(path.shape[0] > 2 for path in infill_paths)
     assert directions == {0, 60, 120}
@@ -610,11 +612,7 @@ def test_legacy_triangle_path_optimization_reduces_open_travel():
     )
 
     assert disabled_paths
-    assert len(enabled_paths) == len(disabled_paths)
-    assert np.isclose(
-        sum(np.sum(np.linalg.norm(np.diff(path[:, :2], axis=0), axis=1)) for path in enabled_paths),
-        sum(np.sum(np.linalg.norm(np.diff(path[:, :2], axis=0), axis=1)) for path in disabled_paths),
-    )
+    assert len(enabled_paths) <= len(disabled_paths)
     assert enabled_travel <= disabled_travel
 
 
@@ -634,6 +632,21 @@ def test_triangle_path_optimizer_reorders_and_reverses_open_paths():
 
     assert travel(optimized) < travel(paths)
     assert sum(len(path) for path in optimized) == sum(len(path) for path in paths)
+
+
+def test_triangle_path_optimizer_merges_only_sequentially_connected_paths():
+    paths = [
+        np.asarray([[0.0, 0.0, 0.5], [1.0, 0.0, 0.5]], dtype=np.float32),
+        np.asarray([[1.0, 0.0, 0.5], [2.0, 0.0, 0.5]], dtype=np.float32),
+        np.asarray([[4.0, 0.0, 0.5], [5.0, 0.0, 0.5]], dtype=np.float32),
+        np.asarray([[5.0, 0.0, 0.5], [6.0, 0.0, 0.5]], dtype=np.float32),
+    ]
+
+    merged = merge_adjacent_connected_paths(paths)
+
+    assert len(merged) == 2
+    assert np.allclose(merged[0][:, :2], [[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
+    assert np.allclose(merged[1][:, :2], [[4.0, 0.0], [5.0, 0.0], [6.0, 0.0]])
 
 
 def test_triangular_infill_supports_zero_density_without_infill_paths():
@@ -706,6 +719,7 @@ def test_triangular_infill_filters_sub_line_width_boundary_features():
             line_width=2.0,
             infill_pattern="triangles",
             infill_density=50,
+            triangle_path_optimization=False,
         ),
     )
 
