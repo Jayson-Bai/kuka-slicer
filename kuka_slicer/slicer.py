@@ -43,6 +43,13 @@ DEFAULT_FIBER_LINE_WIDTH_MM = 1.0
 DEFAULT_RESIN_PERIMETER_COUNT = 2
 DEFAULT_RESIN_SMOOTHING_ANGLE_DEGREES = 150.0
 DEFAULT_RESIN_SMOOTHING_RADIUS_FACTOR = 0.35
+DEFAULT_RAFT_LAYER_COUNT = 2
+DEFAULT_RAFT_OUTWARD_OFFSETS_MM = (15.0, 10.0)
+DEFAULT_RAFT_TOP_GAP_MM = 0.0
+RAFT_BOTTOM_ZIGZAG_ANGLE_DEGREES = 45.0
+RAFT_TOP_ZIGZAG_ANGLE_DEGREES = -45.0
+PART_BOTTOM_ZIGZAG_ANGLE_DEGREES = 0.0
+PART_TOP_ZIGZAG_ANGLE_DEGREES = 90.0
 MIN_GEOMETRY_TOLERANCE_MM = 1e-5
 MAX_GEOMETRY_TOLERANCE_MM = 1e-2
 
@@ -164,6 +171,11 @@ def slice_mesh_to_job(mesh: Mesh, config: SliceConfig) -> ExternalSourceJob:
             0,
             len(z_values) - 1,
         }
+        forced_cap_angle = None
+        if config.material == "R" and layer_index == 0:
+            forced_cap_angle = PART_BOTTOM_ZIGZAG_ANGLE_DEGREES
+        elif config.material == "R" and layer_index == len(z_values) - 1:
+            forced_cap_angle = PART_TOP_ZIGZAG_ANGLE_DEGREES
         layer_config = (
             replace(config, infill_pattern="zigzag", infill_density=100.0)
             if is_part_cap_layer
@@ -185,7 +197,12 @@ def slice_mesh_to_job(mesh: Mesh, config: SliceConfig) -> ExternalSourceJob:
                 paths_2d = [path.copy() for path in cached_constant_resin_paths_2d]
                 roles = list(cached_constant_roles)
             else:
-                paths_2d, roles = _build_resin_paths(paths_2d, layer_config, layer_index)
+                paths_2d, roles = _build_resin_paths(
+                    paths_2d,
+                    layer_config,
+                    layer_index,
+                    forced_zigzag_angle=forced_cap_angle,
+                )
                 if (
                     constant_section_paths is not None
                     and config.infill_pattern == "triangles"
@@ -221,6 +238,8 @@ def slice_mesh_to_job(mesh: Mesh, config: SliceConfig) -> ExternalSourceJob:
                     "top": len(z_values) - 1 if len(z_values) else None,
                     "infill_pattern": "zigzag",
                     "infill_density": 100.0,
+                    "bottom_angle_degrees": PART_BOTTOM_ZIGZAG_ANGLE_DEGREES,
+                    "top_angle_degrees": PART_TOP_ZIGZAG_ANGLE_DEGREES,
                 }
                 if config.material == "R"
                 else None
@@ -264,14 +283,19 @@ def add_raft_to_job(
     mesh: Mesh,
     config: SliceConfig,
     raft_layers: list[RaftLayerConfig],
-    top_gap: float,
+    top_gap: float = DEFAULT_RAFT_TOP_GAP_MM,
 ) -> float:
     """Insert resin raft layers before the part and shift existing paths upward."""
 
     if not raft_layers:
         return 0.0
-    if top_gap < 0:
-        raise ValueError("raft top gap must be non-negative")
+    if len(raft_layers) != DEFAULT_RAFT_LAYER_COUNT:
+        raise ValueError(f"raft layer count is fixed at {DEFAULT_RAFT_LAYER_COUNT}")
+    top_gap = DEFAULT_RAFT_TOP_GAP_MM
+    raft_layers = [
+        RaftLayerConfig(outward_offset=layer.outward_offset)
+        for layer in raft_layers
+    ]
 
     oriented_mesh = orient_mesh_for_build_axis(mesh, config.build_axis)
     footprint = _raft_footprint_geometry(oriented_mesh, config)
@@ -315,7 +339,6 @@ def add_raft_to_job(
             config,
             raft_layer,
             layer_index,
-            contact_layer=layer_index == raft_count - 1,
         )
         paths_3d = [_path_2d_to_constant_z(path, current_z) for path in paths_2d]
         if paths_3d:
@@ -327,6 +350,18 @@ def add_raft_to_job(
     job.meta["raft"] = {
         "layer_count": raft_count,
         "top_gap": top_gap,
+        "fixed_patterns": [
+            {
+                "layer_index": 0,
+                "infill_pattern": "zigzag",
+                "angle_degrees": RAFT_BOTTOM_ZIGZAG_ANGLE_DEGREES,
+            },
+            {
+                "layer_index": 1,
+                "infill_pattern": "zigzag",
+                "angle_degrees": RAFT_TOP_ZIGZAG_ANGLE_DEGREES,
+            },
+        ],
         "layers": [
             {
                 "outward_offset": layer.outward_offset,
@@ -414,9 +449,8 @@ def _raft_paths_for_layer(
     config: SliceConfig,
     raft_layer: RaftLayerConfig,
     layer_index: int,
-    contact_layer: bool = False,
 ) -> tuple[list[np.ndarray], list[str]]:
-    geometry = footprint.buffer(raft_layer.outward_offset, join_style="round")
+    geometry = _raft_geometry_for_layer(footprint, raft_layer.outward_offset, config.tolerance)
     if geometry.is_empty:
         return [], []
 
@@ -431,11 +465,41 @@ def _raft_paths_for_layer(
         -_infill_geometry_inset(config),
         join_style="round",
     )
-    if contact_layer:
-        filled = _raft_lattice_infill_paths(infill_geometry, config, raft_layer.infill_density)
-    else:
-        filled = _raft_zigzag_infill_paths(infill_geometry, config, raft_layer.infill_density)
+    angle = (
+        RAFT_BOTTOM_ZIGZAG_ANGLE_DEGREES
+        if layer_index == 0
+        else RAFT_TOP_ZIGZAG_ANGLE_DEGREES
+    )
+    filled = _raft_zigzag_infill_paths(
+        infill_geometry,
+        config,
+        raft_layer.infill_density,
+        angle_degrees=angle,
+    )
     return perimeters + filled, roles + ["infill"] * len(filled)
+
+
+def _raft_geometry_for_layer(footprint, outward_offset: float, tolerance: float):
+    geometry = footprint.buffer(outward_offset, join_style="round")
+    holes = _interior_holes_geometry(footprint, tolerance)
+    if holes.is_empty:
+        return geometry
+    geometry = geometry.difference(holes)
+    if not geometry.is_valid:
+        geometry = geometry.buffer(0)
+    return geometry
+
+
+def _interior_holes_geometry(geometry, tolerance: float):
+    holes: list[Polygon] = []
+    for polygon in _iter_polygons(geometry):
+        for interior in polygon.interiors:
+            hole = Polygon(interior.coords)
+            if hole.area > tolerance * tolerance:
+                holes.append(hole)
+    if not holes:
+        return Polygon()
+    return unary_union(holes)
 
 
 def _raft_lattice_infill_paths(
@@ -453,10 +517,13 @@ def _raft_lattice_infill_paths(
     )
     filled = _gyroid_infill_geometry(geometry, spacing, config.tolerance)
     return filled
+
+
 def _raft_zigzag_infill_paths(
     geometry,
     config: SliceConfig,
     infill_density: float,
+    angle_degrees: float = 0.0,
 ) -> list[np.ndarray]:
     if geometry.is_empty:
         return []
@@ -469,7 +536,7 @@ def _raft_zigzag_infill_paths(
     filled = _zigzag_infill_geometry(
         geometry,
         spacing,
-        0.0,
+        angle_degrees,
         config.tolerance,
     )
     filled = _connect_resin_infill_paths(
@@ -647,7 +714,10 @@ def _apply_resin_infill(
 
 
 def _build_resin_paths(
-    paths: list[np.ndarray], config: SliceConfig, layer_index: int = 0
+    paths: list[np.ndarray],
+    config: SliceConfig,
+    layer_index: int = 0,
+    forced_zigzag_angle: float | None = None,
 ) -> tuple[list[np.ndarray], list[str]]:
     contours = [path for path in paths if path.shape[0] >= 3]
     solid_geometry = _solid_geometry_from_contours(contours)
@@ -670,6 +740,7 @@ def _build_resin_paths(
         config,
         layer_index,
         config.infill_density,
+        forced_zigzag_angle=forced_zigzag_angle,
     )
     return perimeters + filled, roles + ["infill"] * len(filled)
 
@@ -679,6 +750,7 @@ def _infill_paths_for_geometry(
     config: SliceConfig,
     layer_index: int,
     infill_density: float,
+    forced_zigzag_angle: float | None = None,
 ) -> list[np.ndarray]:
     if geometry.is_empty:
         return []
@@ -720,7 +792,9 @@ def _infill_paths_for_geometry(
             )
         )
     elif config.infill_pattern == "zigzag":
-        angle = 45.0 if layer_index % 2 == 0 else -45.0
+        angle = forced_zigzag_angle
+        if angle is None:
+            angle = 45.0 if layer_index % 2 == 0 else -45.0
         filled.extend(
             _zigzag_infill_geometry(
                 geometry,

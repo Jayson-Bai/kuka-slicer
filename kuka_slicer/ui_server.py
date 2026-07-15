@@ -23,6 +23,9 @@ from .slicer import (
     DEFAULT_RESIN_INFILL_OVERLAP_PERCENT,
     DEFAULT_RESIN_LAYER_HEIGHT_MM,
     DEFAULT_RESIN_LINE_WIDTH_MM,
+    DEFAULT_RAFT_LAYER_COUNT,
+    DEFAULT_RAFT_OUTWARD_OFFSETS_MM,
+    DEFAULT_RAFT_TOP_GAP_MM,
     RaftLayerConfig,
     SliceConfig,
     _intersect_mesh_at_z,
@@ -124,9 +127,8 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         curve_mode = params.get("curve_mode", ["flat"])[0]
         curve_amplitude = _float_param(params, "curve_amplitude", 0.0)
         curve_period = _float_param(params, "curve_period", 50.0)
-        raft_layer_count = _int_param(params, "raft_layer_count", 2)
-        raft_top_gap = _float_param(params, "raft_top_gap", 0.2)
-        raft_layers = _raft_layers_from_params(params, raft_layer_count)
+        raft_top_gap = DEFAULT_RAFT_TOP_GAP_MM
+        raft_layers = _raft_layers_from_params(params)
 
         stl_upload = files.get("stl_file")
         if stl_upload is None:
@@ -261,20 +263,15 @@ def _int_param(params: dict[str, list[str]], name: str, default: int) -> int:
     return int(raw if raw != "" else default)
 
 
-def _raft_layers_from_params(
-    params: dict[str, list[str]],
-    layer_count: int,
-) -> list[RaftLayerConfig]:
-    if layer_count <= 0:
-        return []
-    offsets = _float_list_param(params, "raft_offsets", "15,10", layer_count)
-    heights = _float_list_param(params, "raft_layer_heights", DEFAULT_RESIN_LAYER_HEIGHT_MM, layer_count)
-    densities = _float_list_param(params, "raft_infill_densities", "100,75", layer_count)
+def _raft_layers_from_params(params: dict[str, list[str]]) -> list[RaftLayerConfig]:
+    layer_count = DEFAULT_RAFT_LAYER_COUNT
+    default_offsets = ",".join(f"{offset:g}" for offset in DEFAULT_RAFT_OUTWARD_OFFSETS_MM)
+    offsets = _float_list_param(params, "raft_offsets", default_offsets, layer_count)
     return [
         RaftLayerConfig(
             outward_offset=offsets[index],
-            layer_height=heights[index],
-            infill_density=densities[index],
+            layer_height=DEFAULT_RESIN_LAYER_HEIGHT_MM,
+            infill_density=DEFAULT_RESIN_INFILL_DENSITY_PERCENT,
         )
         for index in range(layer_count)
     ]
@@ -1075,25 +1072,8 @@ def _index_html() -> str:
 
         <div class="formSection">
           <h3>筏板</h3>
-        <div class="grid">
-          <div>
-            <label for="raftLayerCount">筏板层数</label>
-            <input id="raftLayerCount" name="raftLayerCount" type="number" min="0" step="1" value="2">
-          </div>
-          <div>
-            <label for="raftTopGap">筏板顶层间隙 mm</label>
-            <input id="raftTopGap" name="raftTopGap" type="number" min="0" step="0.001" value="0.2">
-          </div>
-        </div>
-
         <label for="raftOffsets">每层外扩距离 mm</label>
         <input id="raftOffsets" name="raftOffsets" type="text" value="15,10" placeholder="单值或逗号分隔，例如 8,6,4">
-
-        <label for="raftLayerHeights">每层筏板层高 mm</label>
-        <input id="raftLayerHeights" name="raftLayerHeights" type="text" value="0.5" placeholder="单值或逗号分隔，例如 0.3,0.25,0.2">
-
-        <label for="raftInfillDensities">每层筏板填充率 %</label>
-        <input id="raftInfillDensities" name="raftInfillDensities" type="text" value="100,75" placeholder="单值或逗号分隔，例如 80,70,60">
         </div>
 
         <div class="formSection">
@@ -1221,11 +1201,7 @@ def _index_html() -> str:
       formData.append('infill_overlap', document.getElementById('infillOverlap').value);
       formData.append('smoothing_angle', document.getElementById('smoothingAngle').value);
       formData.append('smoothing_radius_factor', document.getElementById('smoothingRadiusFactor').value);
-      formData.append('raft_layer_count', document.getElementById('raftLayerCount').value);
-      formData.append('raft_top_gap', document.getElementById('raftTopGap').value);
       formData.append('raft_offsets', document.getElementById('raftOffsets').value);
-      formData.append('raft_layer_heights', document.getElementById('raftLayerHeights').value);
-      formData.append('raft_infill_densities', document.getElementById('raftInfillDensities').value);
       formData.append('curve_mode', document.getElementById('curveMode').value);
       formData.append('curve_amplitude', document.getElementById('curveAmplitude').value);
       formData.append('curve_period', document.getElementById('curvePeriod').value);

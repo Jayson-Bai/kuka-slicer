@@ -15,6 +15,7 @@ from kuka_slicer.slicer import (
     _connect_resin_infill_paths,
     _filter_concentric_paths_by_spacing,
     _libslic3r_fill_surface_overlap_offset,
+    _raft_geometry_for_layer,
     _raft_lattice_infill_paths,
     _raft_zigzag_infill_paths,
     _resin_infill_surface_geometry,
@@ -236,15 +237,16 @@ def test_part_bottom_and_top_layers_force_zigzag_full_density():
     assert bottom_infill
     assert not middle_infill
     assert top_infill
-    assert _dominant_infill_angle(bottom_infill) == 45
-    assert _dominant_infill_angle(top_infill) == -45
+    assert _has_infill_direction(bottom_infill, 0.0)
+    assert _has_infill_direction(top_infill, 90.0)
     assert job.meta["slicing"]["infill_density"] == 0
-    assert job.meta["slicing"]["part_cap_layers"] == {
-        "bottom": 0,
-        "top": top_index,
-        "infill_pattern": "zigzag",
-        "infill_density": 100.0,
-    }
+    cap_layers = job.meta["slicing"]["part_cap_layers"]
+    assert cap_layers["bottom"] == 0
+    assert cap_layers["top"] == top_index
+    assert cap_layers["infill_pattern"] == "zigzag"
+    assert cap_layers["infill_density"] == 100.0
+    assert cap_layers["bottom_angle_degrees"] == 0.0
+    assert cap_layers["top_angle_degrees"] == 90.0
 
 
 def test_part_caps_do_not_reclassify_raft_layers():
@@ -279,9 +281,10 @@ def test_part_caps_do_not_reclassify_raft_layers():
 
     assert raft_infill
     assert part_bottom_infill
-    assert _has_infill_direction(raft_infill, 0.0)
-    assert _has_infill_direction(part_bottom_infill, 45.0)
-    assert job.meta["raft"]["layers"][0]["infill_density"] == 10
+    assert _has_infill_direction(raft_infill, 45.0)
+    assert _has_infill_direction(part_bottom_infill, 0.0)
+    assert job.meta["raft"]["layers"][0]["infill_density"] == 100.0
+    assert job.meta["raft"]["top_gap"] == 0.0
 
 
 def test_concentric_infill_generates_closed_inner_rings():
@@ -785,16 +788,19 @@ def test_ui_exposes_current_path_only_kernel_inputs():
         "infillOverlap",
         "smoothingAngle",
         "smoothingRadiusFactor",
-        "raftLayerCount",
-        "raftTopGap",
         "raftOffsets",
-        "raftLayerHeights",
-        "raftInfillDensities",
         "curveMode",
         "curveAmplitude",
         "curvePeriod",
     ):
         assert f'id="{control_id}"' in html
+    for removed_raft_control in (
+        "raftLayerCount",
+        "raftTopGap",
+        "raftLayerHeights",
+        "raftInfillDensities",
+    ):
+        assert f'id="{removed_raft_control}"' not in html
     assert "bottomCapAngle" not in html
     assert "topCapAngle" not in html
 
@@ -858,36 +864,34 @@ def test_raft_layers_shift_part_layers_and_z():
     )
 
     resin_groups = [group for group in job.material_paths if group.material == "R"]
-    assert np.isclose(z_shift, 0.9)
+    assert np.isclose(z_shift, 1.0)
     assert [group.layer_index for group in resin_groups[:4]] == [0, 1, 2, 3]
-    assert np.isclose(resin_groups[0].paths[0][0, 2], 0.3)
-    assert np.isclose(resin_groups[1].paths[0][0, 2], 0.5)
-    assert np.isclose(resin_groups[2].paths[0][0, 2], 5.9)
+    assert np.isclose(resin_groups[0].paths[0][0, 2], 0.5)
+    assert np.isclose(resin_groups[1].paths[0][0, 2], 1.0)
+    assert np.isclose(resin_groups[2].paths[0][0, 2], 6.0)
     assert job.meta["raft"]["layer_count"] == 2
+    assert job.meta["raft"]["top_gap"] == 0.0
 
 
-def test_single_raft_layer_touching_part_uses_lattice_independent_of_part_pattern():
+def test_add_raft_rejects_non_two_layer_raft():
     mesh = Mesh(_cube_triangles(size=20.0))
     config = SliceConfig(layer_height=5.0, line_width=2.0, infill_pattern="concentric")
     job = slice_mesh_to_job(mesh, config)
 
-    add_raft_to_job(
-        job,
-        mesh,
-        config,
-        [RaftLayerConfig(outward_offset=2.0, layer_height=0.5, infill_density=100)],
-        top_gap=0.2,
-    )
-
-    raft_roles = job.meta["path_roles"]["R"]["0"]
-    raft_infill = _paths_with_role(job.material_paths[0].paths, raft_roles, "infill")
-    assert raft_infill
-    assert len(raft_infill) > 1
-    assert max(path.shape[0] for path in raft_infill) >= 20
-    assert all(not _path_has_non_adjacent_crossing(path) for path in raft_infill)
+    try:
+        add_raft_to_job(
+            job,
+            mesh,
+            config,
+            [RaftLayerConfig(outward_offset=2.0)],
+        )
+    except ValueError as exc:
+        assert "fixed at 2" in str(exc)
+    else:
+        raise AssertionError("expected non-two-layer raft to fail")
 
 
-def test_only_top_raft_layer_touching_part_uses_lattice():
+def test_two_raft_layers_use_fixed_zigzag_angles():
     mesh = Mesh(_cube_triangles(size=20.0))
     config = SliceConfig(layer_height=5.0, line_width=2.0, infill_pattern="concentric")
     job = slice_mesh_to_job(mesh, config)
@@ -910,8 +914,23 @@ def test_only_top_raft_layer_touching_part_uses_lattice():
 
     assert bottom_infill
     assert top_infill
-    assert max(path.shape[0] for path in top_infill) >= 20
-    assert all(not _path_has_non_adjacent_crossing(path) for path in top_infill)
+    assert _has_infill_direction(bottom_infill, 45.0)
+    assert _has_infill_direction(top_infill, 135.0)
+    assert job.meta["raft"]["layers"][0]["infill_density"] == 100.0
+    assert job.meta["raft"]["layers"][1]["infill_density"] == 100.0
+    assert job.meta["raft"]["fixed_patterns"][0]["angle_degrees"] == 45.0
+    assert job.meta["raft"]["fixed_patterns"][1]["angle_degrees"] == -45.0
+
+
+def test_raft_outward_offset_preserves_part_holes():
+    outer = [(0, 0), (40, 0), (40, 30), (0, 30)]
+    hole = list(Point(20, 15).buffer(4.0, resolution=32).exterior.coords)
+    footprint = Polygon(outer, holes=[hole])
+
+    raft_geometry = _raft_geometry_for_layer(footprint, outward_offset=5.0, tolerance=1e-5)
+    hole_polygon = Polygon(hole)
+
+    assert not raft_geometry.intersects(hole_polygon.buffer(-0.05))
 
 
 def test_raft_lattice_density_changes_spacing():
