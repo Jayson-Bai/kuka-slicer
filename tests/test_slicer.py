@@ -13,6 +13,7 @@ from kuka_slicer.slicer import (
     SliceConfig,
     _build_resin_paths,
     _connect_resin_infill_paths,
+    _connect_zigzag_infill_paths,
     _filter_concentric_paths_by_spacing,
     _libslic3r_fill_surface_overlap_offset,
     _raft_lattice_infill_paths,
@@ -23,7 +24,9 @@ from kuka_slicer.slicer import (
     add_raft_to_job,
     merge_adjacent_connected_paths,
     normalize_job_xy_origin,
+    plan_legacy_infill_envelope_continuity,
     optimize_triangle_infill_travel,
+    plan_triangle_infill_envelope_endpoints,
     recommended_geometry_tolerance,
     recommended_pyslm_strategy_defaults,
     slice_mesh_to_job,
@@ -509,6 +512,33 @@ def test_zigzag_infill_connects_annulus_segments_without_crossing_hole():
         assert not _path_has_non_adjacent_crossing(path)
 
 
+def test_legacy_zigzag_connector_uses_tool_width_overlap_envelope():
+    geometry = Polygon([(0, 0), (10, 0), (10, 10), (0, 10)])
+    paths = [
+        np.asarray([[2.0, 9.8], [5.0, 9.8]], dtype=np.float32),
+        np.asarray([[5.0, 10.15], [8.0, 10.15]], dtype=np.float32),
+    ]
+
+    without_envelope = _connect_zigzag_infill_paths(
+        paths,
+        geometry,
+        spacing=1.0,
+        tolerance=1e-5,
+    )
+    with_envelope = _connect_zigzag_infill_paths(
+        paths,
+        geometry,
+        spacing=1.0,
+        tolerance=1e-5,
+        envelope_overlap=0.2,
+    )
+
+    assert len(without_envelope) == 2
+    assert len(with_envelope) == 1
+    assert np.allclose(with_envelope[0][1], [5.0, 9.8])
+    assert np.allclose(with_envelope[0][2], [5.0, 10.15])
+
+
 def test_perimeter_roles_mark_outer_and_inner_wall_pairs():
     outer = np.asarray(
         [[0, 0], [20, 0], [20, 20], [0, 20], [0, 0]],
@@ -655,6 +685,78 @@ def test_legacy_zigzag_path_optimization_keeps_part_cap_paths_continuous():
     assert enabled[-1] <= disabled[-1]
     assert all(current <= original for current, original in zip(enabled, disabled))
     assert first_layer_travel(True) <= first_layer_travel(False)
+
+
+def test_triangle_endpoint_planner_snaps_within_tool_overlap_envelope():
+    geometry = Polygon([(0, 0), (10, 0), (10, 10), (0, 10)])
+    paths = [
+        np.asarray([[1.0, 1.0], [5.0, 5.0]], dtype=np.float32),
+        np.asarray([[5.15, 5.0], [9.0, 9.0]], dtype=np.float32),
+    ]
+
+    unchanged = plan_triangle_infill_envelope_endpoints(
+        paths,
+        geometry,
+        line_width=2.0,
+        overlap_percent=0.0,
+        tolerance=1e-5,
+    )
+    planned = plan_triangle_infill_envelope_endpoints(
+        paths,
+        geometry,
+        line_width=2.0,
+        overlap_percent=10.0,
+        tolerance=1e-5,
+    )
+
+    assert np.allclose(unchanged[0][-1], [5.0, 5.0])
+    assert np.allclose(unchanged[1][0], [5.15, 5.0])
+    assert np.allclose(planned[0][-1], planned[1][0])
+    assert np.allclose(planned[0][-1], [5.075, 5.0])
+
+
+def test_triangle_endpoint_planner_merges_close_paths_with_short_connector():
+    geometry = Polygon([(0, 0), (10, 0), (10, 10), (0, 10)])
+    paths = [
+        np.asarray([[1.0, 1.0], [3.0, 3.0]], dtype=np.float32),
+        np.asarray([[4.0, 3.0], [6.0, 1.0]], dtype=np.float32),
+    ]
+
+    planned = plan_triangle_infill_envelope_endpoints(
+        paths,
+        geometry,
+        line_width=2.0,
+        overlap_percent=10.0,
+        tolerance=1e-5,
+    )
+
+    assert len(planned) == 1
+    assert np.allclose(planned[0], [[1.0, 1.0], [3.0, 3.0], [4.0, 3.0], [6.0, 1.0]])
+
+
+def test_legacy_infill_continuity_planner_preserves_closed_paths():
+    geometry = Polygon([(0, 0), (10, 0), (10, 10), (0, 10)])
+    closed = np.asarray(
+        [[2.0, 2.0], [4.0, 2.0], [4.0, 4.0], [2.0, 2.0]],
+        dtype=np.float32,
+    )
+    open_paths = [
+        closed,
+        np.asarray([[1.0, 8.0], [3.0, 8.0]], dtype=np.float32),
+        np.asarray([[4.0, 8.0], [6.0, 8.0]], dtype=np.float32),
+    ]
+
+    planned = plan_legacy_infill_envelope_continuity(
+        open_paths,
+        geometry,
+        line_width=2.0,
+        overlap_percent=10.0,
+        tolerance=1e-5,
+    )
+
+    assert any(np.array_equal(path, closed) for path in planned)
+    assert any(path.shape[0] == 4 and np.allclose(path[-2], [4.0, 8.0]) for path in planned)
+
 
 def test_triangle_path_optimizer_reorders_and_reverses_open_paths():
     paths = [

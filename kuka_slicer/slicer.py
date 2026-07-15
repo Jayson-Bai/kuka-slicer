@@ -864,6 +864,13 @@ def _build_resin_paths(
             config.line_width,
             config.tolerance,
         )
+        filled = plan_triangle_infill_envelope_endpoints(
+            filled,
+            infill_geometry,
+            config.line_width,
+            config.infill_overlap,
+            config.tolerance,
+        )
         filled = optimize_triangle_infill_travel(filled, config.tolerance)
         filled = merge_adjacent_connected_paths(filled, triangle_merge_tolerance)
         filled = _smooth_resin_infill_paths(
@@ -968,6 +975,19 @@ def _infill_paths_for_geometry(
             geometry,
             line_spacing,
             config.tolerance,
+            envelope_overlap=_legacy_infill_envelope_overlap_width(
+                config.line_width,
+                config.infill_overlap,
+            ),
+        )
+
+    if config.infill_pattern != "triangles":
+        filled = plan_legacy_infill_envelope_continuity(
+            filled,
+            geometry,
+            config.line_width,
+            config.infill_overlap,
+            config.tolerance,
         )
 
     zigzag_merge_tolerance = (
@@ -995,6 +1015,15 @@ def _infill_paths_for_geometry(
             config.tolerance,
             cut_fraction=smoothing_cut_fraction,
             merge_tolerance=zigzag_merge_tolerance,
+            safe_expansion=(
+                _legacy_infill_envelope_overlap_width(
+                    config.line_width,
+                    config.infill_overlap,
+                )
+                if config.infill_pattern
+                in ("rectilinear", "aligned_rectilinear", "line", "grid", "zigzag", "concentric")
+                else None
+            ),
         )
     return filled
 
@@ -1184,6 +1213,171 @@ def optimize_triangle_infill_travel(
     return min(candidates, key=_open_path_travel_length)
 
 
+def plan_triangle_infill_envelope_endpoints(
+    paths: list[np.ndarray],
+    geometry,
+    line_width: float,
+    overlap_percent: float,
+    tolerance: float = 1e-5,
+) -> list[np.ndarray]:
+    """Snap nearby triangle endpoints inside the print-width overlap envelope.
+
+    This is intentionally a pre-pass before the existing triangle optimizer:
+    it only relocates compatible open-path endpoints to a shared point. The
+    established ordering, sequential merge, and smoothing passes still decide
+    final path order and consolidation.
+    """
+
+    return plan_legacy_infill_envelope_continuity(
+        paths,
+        geometry,
+        line_width,
+        overlap_percent,
+        tolerance,
+    )
+
+
+def plan_legacy_infill_envelope_continuity(
+    paths: list[np.ndarray],
+    geometry,
+    line_width: float,
+    overlap_percent: float,
+    tolerance: float = 1e-5,
+) -> list[np.ndarray]:
+    """Snap or merge nearby open infill endpoints using the print-width envelope."""
+
+    envelope_overlap = _legacy_infill_envelope_overlap_width(
+        line_width,
+        overlap_percent,
+    )
+    if len(paths) < 2 or geometry.is_empty or envelope_overlap <= tolerance:
+        return [np.asarray(path, dtype=np.float32).copy() for path in paths]
+
+    adjusted = [np.asarray(path, dtype=np.float32).copy() for path in paths]
+    open_indices = [
+        index
+        for index, path in enumerate(adjusted)
+        if path.shape[0] >= 2 and not _is_closed_path(path, tolerance)
+    ]
+    if len(open_indices) < 2:
+        return adjusted
+
+    safety_margin = max(tolerance * 10.0, 1e-7)
+    safe_geometry = geometry.buffer(envelope_overlap + safety_margin, join_style="round")
+    path_lines = {
+        index: LineString(
+            [(float(point[0]), float(point[1])) for point in adjusted[index][:, :2]]
+        )
+        for index in open_indices
+    }
+    endpoint_points = {
+        2 * index + side: np.asarray(
+            adjusted[index][0 if side == 0 else -1, :2],
+            dtype=np.float32,
+        )
+        for index in open_indices
+        for side in (0, 1)
+    }
+
+    max_connector_length = max(envelope_overlap, min(line_width, line_width * 0.75))
+    candidates: list[tuple[float, int, int]] = []
+    for first_position, first_index in enumerate(open_indices):
+        for second_index in open_indices[first_position + 1 :]:
+            for first_side in (0, 1):
+                first_endpoint = 2 * first_index + first_side
+                first_point = endpoint_points[first_endpoint]
+                for second_side in (0, 1):
+                    second_endpoint = 2 * second_index + second_side
+                    distance = float(
+                        np.linalg.norm(first_point - endpoint_points[second_endpoint])
+                    )
+                    if tolerance < distance <= max_connector_length + tolerance:
+                        candidates.append((distance, first_endpoint, second_endpoint))
+    candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+
+    used_endpoints: set[int] = set()
+    used_paths: set[int] = set()
+    accepted: list[tuple[int, int, np.ndarray]] = []
+    merged_paths: list[np.ndarray] = []
+    for _, first_endpoint, second_endpoint in candidates:
+        if first_endpoint in used_endpoints or second_endpoint in used_endpoints:
+            continue
+        first_index = first_endpoint // 2
+        second_index = second_endpoint // 2
+        if first_index in used_paths or second_index in used_paths:
+            continue
+        first_point = endpoint_points[first_endpoint]
+        second_point = endpoint_points[second_endpoint]
+        connector_points = np.asarray([first_point, second_point], dtype=np.float32)
+        connector = LineString([(float(point[0]), float(point[1])) for point in connector_points])
+        if not safe_geometry.covers(connector):
+            continue
+        if not _resin_connector_is_clear(
+            connector,
+            adjusted,
+            path_lines,
+            first_endpoint,
+            second_endpoint,
+            accepted,
+            tolerance,
+        ):
+            continue
+
+        if np.linalg.norm(first_point - second_point) <= envelope_overlap + tolerance:
+            snap_point = ((first_point + second_point) * 0.5).astype(np.float32)
+            _set_path_endpoint_xy(adjusted[first_index], first_endpoint % 2, snap_point)
+            _set_path_endpoint_xy(adjusted[second_index], second_endpoint % 2, snap_point)
+            connector_points = np.asarray([snap_point, snap_point], dtype=np.float32)
+            accepted.append((first_endpoint, second_endpoint, connector_points))
+            used_endpoints.update((first_endpoint, second_endpoint))
+            endpoint_points[first_endpoint] = snap_point
+            endpoint_points[second_endpoint] = snap_point
+            continue
+
+        merged_paths.append(
+            _merge_triangle_paths_with_connector(
+                adjusted[first_index],
+                first_endpoint % 2,
+                adjusted[second_index],
+                second_endpoint % 2,
+                connector_points,
+                tolerance,
+            )
+        )
+        accepted.append((first_endpoint, second_endpoint, connector_points))
+        used_endpoints.update((first_endpoint, second_endpoint))
+        used_paths.update((first_index, second_index))
+
+    return [
+        path
+        for index, path in enumerate(adjusted)
+        if index not in used_paths
+    ] + merged_paths
+
+
+def _set_path_endpoint_xy(path: np.ndarray, side: int, point: np.ndarray) -> None:
+    path[0 if side == 0 else -1, :2] = point[:2]
+
+
+def _merge_triangle_paths_with_connector(
+    first_path: np.ndarray,
+    first_side: int,
+    second_path: np.ndarray,
+    second_side: int,
+    connector_points: np.ndarray,
+    tolerance: float,
+) -> np.ndarray:
+    first = first_path[::-1].copy() if first_side == 0 else first_path.copy()
+    second = second_path.copy() if second_side == 0 else second_path[::-1].copy()
+    connector = np.asarray(connector_points, dtype=np.float32)
+    if not _close(first[-1, :2], connector[0, :2], tolerance):
+        connector = connector[::-1].copy()
+    return _dedupe_consecutive(
+        np.vstack((first, connector[1:], second[1:])),
+        tolerance,
+    )
+
+
 def _open_path_travel_length(paths: list[np.ndarray]) -> float:
     return sum(
         float(np.linalg.norm(paths[index][0, :2] - paths[index - 1][-1, :2]))
@@ -1236,6 +1430,7 @@ def _smooth_resin_infill_paths(
     tolerance: float,
     cut_fraction: float = 0.35,
     merge_tolerance: float | None = None,
+    safe_expansion: float | None = None,
 ) -> list[np.ndarray]:
     if max_radius <= tolerance or not paths:
         return (
@@ -1246,7 +1441,11 @@ def _smooth_resin_infill_paths(
 
     # Allow the tool centerline to use the material carried by the line width
     # near a boundary, while still keeping the transition out of holes.
-    safe_geometry = geometry.buffer(max(tolerance * 10.0, min(max_radius * 0.25, max_radius)), join_style="round")
+    if safe_expansion is None:
+        expansion = max(tolerance * 10.0, min(max_radius * 0.25, max_radius))
+    else:
+        expansion = safe_expansion + max(tolerance * 10.0, 1e-7)
+    safe_geometry = geometry.buffer(expansion, join_style="round")
     smoothed: list[np.ndarray] = []
     for path in paths:
         smoothed.extend(
@@ -1269,6 +1468,7 @@ def _connect_zigzag_infill_paths(
     geometry,
     spacing: float,
     tolerance: float,
+    envelope_overlap: float = 0.0,
 ) -> list[np.ndarray]:
     """Grow safe zigzag chains from both free ends.
 
@@ -1289,7 +1489,10 @@ def _connect_zigzag_infill_paths(
     if len(open_indices) < 2:
         return paths
 
-    safe_geometry = geometry.buffer(max(tolerance * 10.0, 1e-7), join_style="round")
+    safe_geometry = geometry.buffer(
+        envelope_overlap + max(tolerance * 10.0, 1e-7),
+        join_style="round",
+    )
     path_lines = {
         index: LineString(
             [(float(point[0]), float(point[1])) for point in paths[index][:, :2]]
@@ -1861,6 +2064,20 @@ def _libslic3r_fill_surface_overlap_offset(
     overlap_percent: float,
 ) -> float:
     return _resin_overlap_width(line_width, overlap_percent) - 0.5 * line_spacing
+
+
+def _legacy_infill_envelope_overlap_width(line_width: float, overlap_percent: float) -> float:
+    if line_width <= 0 or overlap_percent <= 0:
+        return 0.0
+    return min(line_width * 0.5, _resin_overlap_width(line_width, overlap_percent))
+
+
+def _legacy_zigzag_envelope_overlap_width(line_width: float, overlap_percent: float) -> float:
+    return _legacy_infill_envelope_overlap_width(line_width, overlap_percent)
+
+
+def _legacy_triangle_envelope_overlap_width(line_width: float, overlap_percent: float) -> float:
+    return _legacy_infill_envelope_overlap_width(line_width, overlap_percent)
 
 
 def _open_ring(contour: np.ndarray) -> list[tuple[float, float]]:
