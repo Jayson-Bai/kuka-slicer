@@ -64,6 +64,67 @@ python -m kuka_slicer slice input.stl output.npz `
   --curve-period 40.0
 ```
 
+The default slicing kernel is the in-repository `legacy` path-only kernel. It
+can also be selected explicitly for reproducible comparisons:
+
+```powershell
+python -m kuka_slicer slice input.stl output.npz --slicing-kernel legacy
+```
+
+An experimental PySLM adapter can be selected from the CLI:
+
+```powershell
+python -m kuka_slicer slice input.stl output.npz --slicing-kernel pyslm
+```
+
+Install the optional dependency set first:
+
+```powershell
+python -m pip install ".[pyslm]"
+```
+
+The PySLM adapter keeps the same `ExternalSourceJob` and NPZ handoff contract.
+Its native hatch patterns are `none`, `line`, `aligned_rectilinear`, and
+`rectilinear`. For `zigzag` and `isotropic`, PySLM supplies slicing and
+contours while the project bead-aware planner supplies the continuous infill.
+`grid`, `triangles`, `gyroid`, and `concentric` remain available in the Prusa
+kernel and are rejected explicitly by the PySLM kernel.
+
+The shared infill-pattern selector remains visible for both kernels; the UI
+disables patterns unsupported by PySLM. The PySLM hatcher strategy selects its
+native scan organization (`Hatcher`, `StripeHatcher`, or an island strategy).
+Stripe/island width, overlap, and offset use scale-aware defaults; for the
+default resin process (0.5 mm layer height and 2 mm line width), the defaults
+are 10 mm, 0.1 mm, and 0.5 hatch-spacing units. The UI keeps these controls
+collapsed and lets the user switch off automatic values before editing them.
+
+PySLM-native controls are available through `--pyslm-*` CLI options and the UI:
+Hatcher/StripeHatcher/IslandHatcher/BasicIslandHatcher, hatch angle and layer
+angle increment, hatch distance, contour and spot offsets, volume offset,
+contour counts, scan ordering, stripe/island dimensions, polygon repair, and
+boundary simplification (`absolute` or boundary-scaled `bound`). Project-owned
+`zigzag`/`isotropic` reject contour-geometry overrides so their generated
+infill cannot drift inside the required bead-aware contour clearance. Native
+patterns may use those overrides on middle layers, while the fixed full-density
+top and bottom caps reset contour and hatch-distance overrides to the safe
+print schedule. Keep the standalone Prusa kernel as the release baseline until
+output parity is proven with fixtures.
+
+Example native PySLM configuration:
+
+```powershell
+python -m kuka_slicer slice input.stl output.npz `
+  --slicing-kernel pyslm `
+  --infill-pattern rectilinear `
+  --pyslm-hatcher stripe `
+  --pyslm-hatch-angle 0 `
+  --pyslm-layer-angle-increment 67 `
+  --pyslm-hatch-distance 1.8 `
+  --pyslm-hatch-sort alternate `
+  --pyslm-stripe-width 10.0 `
+  --pyslm-stripe-overlap 0.1
+```
+
 Available resin infill patterns use PrusaSlicer-style names for path-only
 centerline generation:
 
@@ -108,6 +169,21 @@ planner keeps separate paths instead of forcing a one-stroke result. Boundary
 safety and avoidance of material pile-up take priority over eliminating every
 start/stop.
 
+Legacy triangle infill enables endpoint-based path optimization by default. It
+first reverses or reorders open triangle paths, then merges consecutive paths
+whose endpoints already coincide, and finally applies the existing smoothing
+optimization. Post-planning merges are limited to the configured numerical
+geometry tolerance; material-bearing joins remain subject to the bead-aware
+safe-connector checks. Disable it with
+`--no-triangle-path-optimization` or the UI checkbox when the original path
+order is required. This option is ignored by the PySLM kernel.
+Legacy zigzag infill, including forced part cap layers and explicit raft
+zigzag layers, uses the same ordering, reversal, endpoint merge, and final
+smoothing cleanup by default. It can be disabled with
+`--no-zigzag-path-optimization` or its UI checkbox.
+`gyroid` uses continuous clipped contour curves, which usually reduces resin
+path start/stop count at high densities while keeping a more balanced direction
+distribution than one-direction line fill.
 Only path centerlines are exported. PrusaSlicer behaviors that depend on
 extrusion amount, variable bead width, volumetric flow, or support/tree-specific
 material accounting are not serialized into this NPZ format.
@@ -138,8 +214,8 @@ The UI groups adjustable inputs into:
 | --- | --- |
 | Input files | STL upload, optional single-layer fiber JSON |
 | Model and layers | layer height, build axis, optional `z_min`/`z_max`, geometric tolerance |
-| Resin path kernel | line width, perimeter count, PrusaSlicer-style infill pattern, density, overlap, smoothing |
-| Raft | layer count, top gap, per-layer offsets, per-layer heights, per-layer densities |
+| Resin path kernel | slicing kernel (`Prusa` or `PySLM`), line width, perimeter count, infill pattern, density, overlap, triangle/zigzag path optimization, smoothing, PySLM native settings |
+| Raft | fixed two-layer raft with editable outward offsets; layer height, density, gap, and zigzag angles follow the fixed print schedule |
 | Curved Z | flat/sinusoidal mode, amplitude, period |
 
 Generate the documented two-layer resin/fiber template:

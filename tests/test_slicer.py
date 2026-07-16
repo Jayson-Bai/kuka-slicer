@@ -20,19 +20,30 @@ from kuka_slicer.slicer import (
     _connect_resin_infill_paths,
     _filter_concentric_paths_by_spacing,
     _libslic3r_fill_surface_overlap_offset,
+    _perimeter_paths_from_geometry,
+    _raft_geometry_for_layer,
     _raft_lattice_infill_paths,
+    _raft_reserved_void_geometry,
     _raft_zigzag_infill_paths,
     _resin_infill_surface_geometry,
     _smooth_path_corners_into_paths,
     _smooth_path_corners,
     _uniform_concentric_offsets,
     add_raft_to_job,
+    merge_adjacent_connected_paths,
     normalize_job_xy_origin,
+    optimize_triangle_infill_travel,
     recommended_geometry_tolerance,
+    recommended_pyslm_strategy_defaults,
     slice_mesh_to_job,
 )
 from kuka_slicer.stl_io import Mesh
-from kuka_slicer.ui_server import _index_html, _simplify_preview_path, expand_fiber_template_for_resin_layers
+from kuka_slicer.ui_server import (
+    _index_html,
+    _raft_layers_from_params,
+    _simplify_preview_path,
+    expand_fiber_template_for_resin_layers,
+)
 
 
 def test_cube_slice_produces_closed_square_path():
@@ -241,15 +252,143 @@ def test_part_bottom_and_top_layers_force_zigzag_full_density():
     assert bottom_infill
     assert not middle_infill
     assert top_infill
-    assert _dominant_infill_angle(bottom_infill) == 45
-    assert _dominant_infill_angle(top_infill) == -45
+    assert _has_infill_direction(bottom_infill, 0.0)
+    assert _has_infill_direction(top_infill, 45.0)
     assert job.meta["slicing"]["infill_density"] == 0
-    assert job.meta["slicing"]["part_cap_layers"] == {
-        "bottom": 0,
-        "top": top_index,
-        "infill_pattern": "zigzag",
-        "infill_density": 100.0,
-    }
+    cap_layers = job.meta["slicing"]["part_cap_layers"]
+    assert cap_layers["bottom"] == 0
+    assert cap_layers["top"] == top_index
+    assert cap_layers["infill_pattern"] == "zigzag"
+    assert cap_layers["infill_density"] == 100.0
+    assert cap_layers["bottom_angle_degrees"] == 0.0
+    assert cap_layers["top_angle_degrees"] == 45.0
+
+
+def test_isotropic_infill_repeats_four_direction_zigzag_schedule():
+    triangles = _cube_triangles(size=20.0)
+    triangles[:, :, 2] *= 0.25
+    mesh = Mesh(triangles)
+    config = SliceConfig(
+        layer_height=0.5,
+        line_width=2.0,
+        infill_pattern="isotropic",
+        infill_density=60.0,
+    )
+
+    job = slice_mesh_to_job(mesh, config)
+
+    expected_angles = [0.0, 45.0, 0.0, 135.0, 90.0, 45.0, 0.0, 135.0, 90.0, 45.0]
+    assert [group.layer_index for group in job.material_paths] == list(range(10))
+    for group, expected_angle in zip(job.material_paths, expected_angles):
+        roles = job.meta["path_roles"]["R"][str(group.layer_index)]
+        infill = _paths_with_role(group.paths, roles, "infill")
+        assert infill
+        assert _has_infill_direction(infill, expected_angle)
+
+    schedule = job.meta["slicing"]["isotropic_schedule"]
+    assert schedule["repeat_count"] == 2
+    assert schedule["repeat_angles_degrees"] == [45.0, 0.0, -45.0, 90.0]
+    assert schedule["layer_angles_degrees"] == [
+        0.0,
+        45.0,
+        0.0,
+        -45.0,
+        90.0,
+        45.0,
+        0.0,
+        -45.0,
+        90.0,
+        45.0,
+    ]
+
+
+def test_isotropic_infill_explicit_z_bounds_keep_four_direction_schedule():
+    triangles = _cube_triangles(size=20.0)
+    triangles[:, :, 2] *= 0.25
+    job = slice_mesh_to_job(
+        Mesh(triangles),
+        SliceConfig(
+            layer_height=0.5,
+            line_width=2.0,
+            infill_pattern="isotropic",
+            infill_density=60.0,
+            z_min=0.0,
+            z_max=5.0,
+        ),
+    )
+
+    assert [group.layer_index for group in job.material_paths] == list(range(10))
+    assert np.allclose(
+        [group.paths[0][0, 2] for group in job.material_paths],
+        np.arange(0.5, 5.5, 0.5),
+    )
+    assert job.meta["slicing"]["isotropic_schedule"]["repeat_count"] == 2
+
+
+def test_isotropic_infill_with_raft_has_complete_fixed_layer_sequence():
+    triangles = _cube_triangles(size=20.0)
+    triangles[:, :, 2] *= 0.25
+    mesh = Mesh(triangles)
+    config = SliceConfig(
+        layer_height=0.5,
+        line_width=2.0,
+        infill_pattern="isotropic",
+        infill_density=60.0,
+    )
+    job = slice_mesh_to_job(mesh, config)
+
+    add_raft_to_job(
+        job,
+        mesh,
+        config,
+        [
+            RaftLayerConfig(outward_offset=2.0, infill_density=60.0),
+            RaftLayerConfig(outward_offset=1.0, infill_density=60.0),
+        ],
+        top_gap=0.0,
+    )
+
+    expected_angles = [90.0, 135.0, 0.0, 45.0, 0.0, 135.0, 90.0, 45.0, 0.0, 135.0, 90.0, 45.0]
+    assert [group.layer_index for group in job.material_paths] == list(range(12))
+    for group, expected_angle in zip(job.material_paths, expected_angles):
+        roles = job.meta["path_roles"]["R"][str(group.layer_index)]
+        infill = _paths_with_role(group.paths, roles, "infill")
+        assert infill
+        assert _has_infill_direction(infill, expected_angle)
+
+
+def test_isotropic_infill_rejects_incomplete_height_cycle():
+    triangles = _cube_triangles(size=20.0)
+    triangles[:, :, 2] *= 0.2
+    mesh = Mesh(triangles)
+
+    try:
+        slice_mesh_to_job(
+            mesh,
+            SliceConfig(layer_height=0.5, infill_pattern="isotropic"),
+        )
+    except ValueError as exc:
+        assert "2N+1 mm" in str(exc)
+        assert "拒绝切片" in str(exc)
+    else:
+        raise AssertionError("expected incomplete isotropic height cycle to fail")
+
+
+def test_isotropic_infill_rejects_non_default_layer_height():
+    triangles = _cube_triangles(size=20.0)
+    triangles[:, :, 2] *= 0.25
+    mesh = Mesh(triangles)
+
+    try:
+        slice_mesh_to_job(
+            mesh,
+            SliceConfig(layer_height=0.4, infill_pattern="isotropic"),
+        )
+    except ValueError as exc:
+        assert "0.5 mm" in str(exc)
+        assert "拒绝切片" in str(exc)
+    else:
+        raise AssertionError("expected isotropic layer height validation to fail")
 
 
 def test_part_caps_do_not_reclassify_raft_layers():
@@ -284,9 +423,72 @@ def test_part_caps_do_not_reclassify_raft_layers():
 
     assert raft_infill
     assert part_bottom_infill
-    assert _has_infill_direction(raft_infill, 0.0)
-    assert _has_infill_direction(part_bottom_infill, 45.0)
-    assert job.meta["raft"]["layers"][0]["infill_density"] == 10
+    assert _has_infill_direction(raft_infill, 90.0)
+    assert _has_infill_direction(part_bottom_infill, 0.0)
+    assert job.meta["raft"]["layers"][0]["infill_density"] == 100.0
+    assert job.meta["raft"]["top_gap"] == 0.0
+
+
+def test_raft_ignores_user_patterns_and_uses_fixed_zigzag_directions():
+    mesh = Mesh(_cube_triangles(size=20.0))
+    config = SliceConfig(layer_height=5.0, line_width=2.0, infill_pattern="gyroid")
+    job = slice_mesh_to_job(mesh, config)
+
+    add_raft_to_job(
+        job,
+        mesh,
+        config,
+        [
+            RaftLayerConfig(
+                outward_offset=2.0,
+                layer_height=0.5,
+                infill_density=100,
+                infill_pattern="zigzag",
+            ),
+            RaftLayerConfig(
+                outward_offset=1.0,
+                layer_height=0.5,
+                infill_density=70,
+                infill_pattern="zigzag",
+            ),
+        ],
+        top_gap=0.0,
+    )
+
+    first_roles = job.meta["path_roles"]["R"]["0"]
+    second_roles = job.meta["path_roles"]["R"]["1"]
+    first_infill = _paths_with_role(job.material_paths[0].paths, first_roles, "infill")
+    second_infill = _paths_with_role(job.material_paths[1].paths, second_roles, "infill")
+
+    assert first_infill
+    assert second_infill
+    assert _has_infill_direction(first_infill, 90.0)
+    assert _dominant_infill_angle(second_infill) == -45
+    assert job.meta["raft"]["top_gap"] == 0.0
+    assert job.meta["raft"]["layers"] == [
+        {
+            "outward_offset": 2.0,
+            "layer_height": 0.5,
+            "infill_density": 100.0,
+            "infill_pattern": "zigzag",
+            "angle_degrees": 90.0,
+        },
+        {
+            "outward_offset": 1.0,
+            "layer_height": 0.5,
+            "infill_density": 100.0,
+            "infill_pattern": "zigzag",
+            "angle_degrees": -45.0,
+        },
+    ]
+
+
+def test_ui_raft_params_only_accept_offsets():
+    layers = _raft_layers_from_params({"raft_offsets": ["2,1"]})
+
+    assert [layer.outward_offset for layer in layers] == [2.0, 1.0]
+    assert [layer.infill_pattern for layer in layers] == [None, None]
+    assert [layer.infill_density for layer in layers] == [100.0, 100.0]
 
 
 def test_concentric_infill_connects_all_rings_without_losing_coverage():
@@ -479,6 +681,26 @@ def test_zigzag_infill_does_not_self_cross_in_concave_region():
             assert not _path_has_non_adjacent_crossing(path)
 
 
+def test_zigzag_post_optimization_stays_in_bead_aware_concave_corridor():
+    contour = np.asarray(
+        [[0, 0], [20, 0], [20, 8], [12, 8], [12, 14], [20, 14], [20, 20], [0, 20], [0, 0]],
+        dtype=np.float32,
+    )
+    config = SliceConfig(
+        layer_height=1.0,
+        line_width=2.0,
+        infill_pattern="zigzag",
+        zigzag_path_optimization=True,
+    )
+    safe_corridor = _resin_infill_surface_geometry(Polygon(contour[:-1]), config)
+
+    paths, roles = _build_resin_paths([contour], config, layer_index=1)
+
+    for path, role in zip(paths, roles):
+        if role == "infill":
+            assert safe_corridor.buffer(1e-5).covers(LineString(path[:, :2]))
+
+
 def test_zigzag_infill_connects_annulus_segments_without_crossing_hole():
     outer = _circle_path((0.0, 0.0), 20.0, 128)
     hole = _circle_path((0.0, 0.0), 10.0, 96)
@@ -560,6 +782,196 @@ def test_triangular_infill_generates_single_layer_lattice_without_edge_overlaps(
     assert longest_segment > 6.0
 
 
+def test_legacy_triangle_path_optimization_reduces_open_travel():
+    mesh = Mesh(_cube_triangles(size=30.0))
+
+    def travel_for(config: SliceConfig) -> tuple[float, list[np.ndarray]]:
+        job = slice_mesh_to_job(mesh, config)
+        roles = job.meta["path_roles"]["R"]["0"]
+        paths = [
+            path
+            for path, role in zip(job.material_paths[0].paths, roles)
+            if role == "infill"
+        ]
+        travel = sum(
+            float(np.linalg.norm(paths[index][0, :2] - paths[index - 1][-1, :2]))
+            for index in range(1, len(paths))
+        )
+        return travel, paths
+
+    disabled_travel, disabled_paths = travel_for(
+        SliceConfig(
+            layer_height=5.0,
+            line_width=2.0,
+            infill_pattern="triangles",
+            infill_density=70.0,
+            triangle_path_optimization=False,
+        )
+    )
+    enabled_travel, enabled_paths = travel_for(
+        SliceConfig(
+            layer_height=5.0,
+            line_width=2.0,
+            infill_pattern="triangles",
+            infill_density=70.0,
+            triangle_path_optimization=True,
+        )
+    )
+
+    assert disabled_paths
+    assert len(enabled_paths) <= len(disabled_paths)
+    assert enabled_travel <= disabled_travel
+
+
+def test_legacy_zigzag_path_optimization_keeps_part_cap_paths_continuous():
+    mesh = Mesh(_cube_triangles(size=30.0))
+
+    def job_for(optimized: bool):
+        return slice_mesh_to_job(
+            mesh,
+            SliceConfig(
+                layer_height=5.0,
+                line_width=2.0,
+                infill_pattern="zigzag",
+                infill_density=70.0,
+                zigzag_path_optimization=optimized,
+            ),
+        )
+
+    def infill_counts(optimized: bool) -> list[int]:
+        job = job_for(optimized)
+        return [
+            sum(role == "infill" for role in job.meta["path_roles"]["R"][str(group.layer_index)])
+            for group in job.material_paths
+        ]
+
+    def first_layer_travel(optimized: bool) -> float:
+        job = job_for(optimized)
+        group = job.material_paths[0]
+        roles = job.meta["path_roles"]["R"][str(group.layer_index)]
+        paths = [path for path, role in zip(group.paths, roles) if role == "infill"]
+        return sum(
+            float(np.linalg.norm(paths[index][0, :2] - paths[index - 1][-1, :2]))
+            for index in range(1, len(paths))
+        )
+
+    disabled = infill_counts(False)
+    enabled = infill_counts(True)
+
+    assert enabled[0] <= disabled[0]
+    assert enabled[-1] <= disabled[-1]
+    assert all(current <= original for current, original in zip(enabled, disabled))
+    assert first_layer_travel(True) <= first_layer_travel(False)
+
+def test_triangle_path_optimizer_reorders_and_reverses_open_paths():
+    paths = [
+        np.asarray([[0.0, 0.0, 0.5], [1.0, 0.0, 0.5]], dtype=np.float32),
+        np.asarray([[10.0, 0.0, 0.5], [11.0, 0.0, 0.5]], dtype=np.float32),
+        np.asarray([[2.0, 0.0, 0.5], [3.0, 0.0, 0.5]], dtype=np.float32),
+    ]
+    optimized = optimize_triangle_infill_travel(paths)
+
+    def travel(paths: list[np.ndarray]) -> float:
+        return sum(
+            float(np.linalg.norm(paths[index][0, :2] - paths[index - 1][-1, :2]))
+            for index in range(1, len(paths))
+        )
+
+    assert travel(optimized) < travel(paths)
+    assert sum(len(path) for path in optimized) == sum(len(path) for path in paths)
+
+
+def test_triangle_path_optimizer_merges_only_sequentially_connected_paths():
+    paths = [
+        np.asarray([[0.0, 0.0, 0.5], [1.0, 0.0, 0.5]], dtype=np.float32),
+        np.asarray([[1.0, 0.0, 0.5], [2.0, 0.0, 0.5]], dtype=np.float32),
+        np.asarray([[4.0, 0.0, 0.5], [5.0, 0.0, 0.5]], dtype=np.float32),
+        np.asarray([[5.0, 0.0, 0.5], [6.0, 0.0, 0.5]], dtype=np.float32),
+    ]
+
+    merged = merge_adjacent_connected_paths(paths)
+
+    assert len(merged) == 2
+    assert np.allclose(merged[0][:, :2], [[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
+    assert np.allclose(merged[1][:, :2], [[4.0, 0.0], [5.0, 0.0], [6.0, 0.0]])
+
+
+def test_triangle_path_optimizer_merges_small_endpoint_gaps_within_tolerance():
+    paths = [
+        np.asarray([[0.0, 0.0, 0.5], [1.0, 0.0, 0.5]], dtype=np.float32),
+        np.asarray([[1.08, 0.0, 0.5], [2.0, 0.0, 0.5]], dtype=np.float32),
+        np.asarray([[2.08, 0.0, 0.5], [3.0, 0.0, 0.5]], dtype=np.float32),
+    ]
+
+    merged = merge_adjacent_connected_paths(paths, tolerance=0.1)
+
+    assert len(merged) == 1
+    assert np.allclose(
+        merged[0][:, :2],
+        [
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [1.08, 0.0],
+            [2.0, 0.0],
+            [2.08, 0.0],
+            [3.0, 0.0],
+        ],
+    )
+
+
+def test_legacy_triangle_path_optimization_preserves_planned_linework():
+    contour = _square_contour(40.0)
+
+    def infill_linework(optimized: bool):
+        paths, roles = _build_resin_paths(
+            [contour],
+            SliceConfig(
+                layer_height=1.0,
+                line_width=2.0,
+                infill_pattern="triangles",
+                infill_density=70.0,
+                triangle_path_optimization=optimized,
+                smoothing_radius_factor=0.0,
+            ),
+            layer_index=1,
+        )
+        return unary_union(
+            [
+                LineString(path[:, :2])
+                for path, role in zip(paths, roles)
+                if role == "infill"
+            ]
+        )
+
+    original = infill_linework(False)
+    optimized = infill_linework(True)
+
+    assert original.difference(optimized.buffer(1e-5)).length <= 1e-4
+    assert optimized.difference(original.buffer(1e-5)).length <= 1e-4
+
+
+def test_zero_smoothing_radius_keeps_zigzag_turns_sharp():
+    paths, roles = _build_resin_paths(
+        [_square_contour(20.0)],
+        SliceConfig(
+            layer_height=1.0,
+            line_width=2.0,
+            infill_pattern="aligned_rectilinear",
+            smoothing_radius_factor=0.0,
+        ),
+        layer_index=1,
+    )
+    infill = _paths_with_role(paths, roles, "infill")
+
+    assert len(infill) == 1
+    deltas = np.diff(infill[0][:, :2], axis=0)
+    assert all(abs(float(delta[0])) <= 1e-6 or abs(float(delta[1])) <= 1e-6 for delta in deltas)
+    assert any(
+        abs(float(np.dot(first, second))) <= 1e-6
+        for first, second in zip(deltas, deltas[1:])
+    )
+
+
 def test_triangular_infill_supports_zero_density_without_infill_paths():
     mesh = Mesh(_cube_triangles(size=30.0))
 
@@ -630,6 +1042,7 @@ def test_triangular_infill_filters_sub_line_width_boundary_features():
             line_width=2.0,
             infill_pattern="triangles",
             infill_density=50,
+            triangle_path_optimization=False,
         ),
     )
 
@@ -936,7 +1349,85 @@ def test_slice_config_exposes_ui_tunable_path_parameters_in_meta():
     assert slicing["perimeter_count"] == 3
     assert slicing["smoothing_angle"] == 120.0
     assert slicing["smoothing_radius_factor"] == 0.25
+    assert slicing["slicing_kernel"] == "legacy"
     assert "forced_part_cap_layers" not in slicing
+
+
+def test_slice_config_defaults_to_legacy_kernel():
+    assert SliceConfig().slicing_kernel == "legacy"
+
+
+def test_explicit_legacy_kernel_matches_default_kernel():
+    mesh = Mesh(_cube_triangles(size=10.0))
+    base_config = SliceConfig(layer_height=5.0, infill_pattern="aligned_rectilinear")
+
+    default_job = slice_mesh_to_job(mesh, base_config)
+    explicit_legacy_job = slice_mesh_to_job(
+        mesh,
+        SliceConfig(
+            layer_height=5.0,
+            infill_pattern="aligned_rectilinear",
+            slicing_kernel="legacy",
+        ),
+    )
+
+    assert default_job.meta == explicit_legacy_job.meta
+    assert len(default_job.material_paths) == len(explicit_legacy_job.material_paths)
+    for default_group, explicit_group in zip(
+        default_job.material_paths,
+        explicit_legacy_job.material_paths,
+    ):
+        assert default_group.layer_index == explicit_group.layer_index
+        assert default_group.material == explicit_group.material
+        assert len(default_group.paths) == len(explicit_group.paths)
+        for default_path, explicit_path in zip(default_group.paths, explicit_group.paths):
+            np.testing.assert_allclose(default_path, explicit_path)
+
+
+def test_slice_config_rejects_unknown_kernel():
+    try:
+        SliceConfig(slicing_kernel="unknown")  # type: ignore[arg-type]
+    except ValueError as exc:
+        assert "slicing_kernel" in str(exc)
+    else:
+        raise AssertionError("expected invalid slicing kernel to fail")
+
+
+def test_pyslm_kernel_rejects_non_native_infill_patterns():
+    from kuka_slicer.pyslm_backend import _validate_pyslm_config
+
+    fallback_patterns = ("grid", "triangles", "gyroid", "concentric")
+    for pattern in fallback_patterns:
+        config = SliceConfig(
+            layer_height=5.0,
+            slicing_kernel="pyslm",
+            infill_pattern=pattern,
+        )
+        try:
+            _validate_pyslm_config(config)
+        except ValueError as exc:
+            assert "PySLM kernel currently supports" in str(exc)
+        else:
+            raise AssertionError(f"expected PySLM to reject {pattern}")
+
+    _validate_pyslm_config(
+        SliceConfig(
+            layer_height=0.5,
+            slicing_kernel="pyslm",
+            infill_pattern="isotropic",
+        )
+    )
+
+
+def test_pyslm_config_exposes_native_defaults():
+    config = SliceConfig().pyslm
+
+    assert SliceConfig().triangle_path_optimization is True
+    assert SliceConfig().zigzag_path_optimization is True
+    assert config.hatcher == "basic"
+    assert config.hatch_sort == "none"
+    assert config.scan_contour_first is True
+    assert config.fix_polygons is True
 
 
 def test_recommended_geometry_tolerance_tracks_print_scale():
@@ -945,10 +1436,23 @@ def test_recommended_geometry_tolerance_tracks_print_scale():
     assert recommended_geometry_tolerance(layer_height=50.0, line_width=20.0) == 0.01
 
 
+def test_recommended_pyslm_strategy_defaults_follow_resin_scale():
+    defaults = recommended_pyslm_strategy_defaults(layer_height=0.5, line_width=2.0)
+
+    assert defaults.width == 10.0
+    assert defaults.overlap == 0.1
+    assert defaults.offset == 0.5
+
+    smaller = recommended_pyslm_strategy_defaults(layer_height=0.1, line_width=1.0)
+    assert smaller.width == 5.0
+    assert math.isclose(smaller.overlap, 0.02)
+
+
 def test_ui_uses_prusaslicer_style_infill_pattern_names():
     html = _index_html()
 
     for pattern in (
+        "none",
         "rectilinear",
         "aligned_rectilinear",
         "line",
@@ -962,14 +1466,99 @@ def test_ui_uses_prusaslicer_style_infill_pattern_names():
     for legacy_pattern in (
         "lines_x",
         "lines_y",
-        "contour_offset",
         "alternating_diagonal",
     ):
         assert legacy_pattern not in html
 
+    for translated_label in (
+        "仅轮廓",
+        "交替直线填充",
+        "对齐直线填充",
+        "单向线填充",
+        "网格填充",
+        "三角形填充",
+        "陀螺曲线填充",
+        "同心轮廓填充",
+        "之字形填充",
+    ):
+        assert translated_label in html
 
-def test_ui_exposes_current_path_only_kernel_inputs():
+    for untranslated_label in (
+        "None (perimeter only)",
+        "Rectilinear",
+        "Aligned Rectilinear",
+        "Triangles",
+        "Gyroid",
+        "Concentric",
+        "Zig Zag",
+    ):
+        assert untranslated_label not in html
+
+
+def test_ui_exposes_slicing_kernel_input():
     html = _index_html()
+
+    for translated_label in (
+        "机械臂空间复合材料增材制造系统切片器",
+        "模型切片",
+        "切片内核",
+        ">Prusa<",
+        ">PySLM<",
+        "PySLM 原生扫描参数",
+        "PySLM 填充策略",
+        "条带/岛状参数（自动）",
+        "自动设置条带/岛状参数",
+        "扫描线排序",
+        "填充角度 °",
+        "层间角度增量 °",
+        "填充线间距 mm",
+        "轮廓偏移 mm",
+        "光斑补偿 mm",
+        "体积填充偏移 mm",
+        "外轮廓数量",
+        "内轮廓数量",
+        "条带宽度 mm",
+        "条带平移系数",
+        "岛状宽度 mm",
+        "岛状平移系数",
+        "切层边界简化 mm",
+        "简化模式",
+        "轮廓优先扫描",
+        "修复切层多边形",
+        "保持拓扑结构",
+        "树脂填充路径",
+        "各向同性填充",
+        "三角形填充路径优化",
+        "之字形填充路径优化",
+    ):
+        assert translated_label in html
+
+    for untranslated_label in (
+        "KUKA Slicer",
+        "树脂切片",
+        "原始内核（稳定）",
+        "PySLM（实验）",
+        "Slicing kernel",
+        "Legacy (stable)",
+        "PySLM (experimental)",
+        "PySLM native settings",
+        "Hatcher strategy",
+        "Hatch sort",
+        "Hatch angle deg",
+        "Layer angle increment deg",
+        "Hatch distance mm",
+        "Contour offset mm",
+        "Spot compensation mm",
+        "Volume offset hatch mm",
+        "Outer contours",
+        "Inner contours",
+        "Slice simplification mm",
+        "Simplification mode",
+        "Scan contours first",
+        "Fix slice polygons",
+        "Preserve topology",
+    ):
+        assert untranslated_label not in html
 
     for control_id in (
         "stlFile",
@@ -984,20 +1573,101 @@ def test_ui_exposes_current_path_only_kernel_inputs():
         "infillPattern",
         "infillDensity",
         "infillOverlap",
+        "trianglePathOptimization",
+        "zigzagPathOptimization",
+        "slicingKernel",
+        "pyslmNativeSettings",
+        "pyslmPatternSettings",
+        "pyslmPatternAuto",
+        "legacyInfillControl",
+        "pyslmHatcher",
+        "pyslmHatchSort",
+        "pyslmHatchAngle",
+        "pyslmLayerAngleIncrement",
+        "pyslmHatchDistance",
+        "pyslmContourOffset",
+        "pyslmSpotCompensation",
+        "pyslmVolumeOffset",
+        "pyslmOuterContours",
+        "pyslmInnerContours",
+        "pyslmStripeWidth",
+        "pyslmStripeOverlap",
+        "pyslmStripeOffset",
+        "pyslmIslandWidth",
+        "pyslmIslandOverlap",
+        "pyslmIslandOffset",
+        "pyslmSimplificationFactor",
+        "pyslmSimplificationMode",
+        "pyslmScanContourFirst",
+        "pyslmFixPolygons",
+        "pyslmSimplificationPreserveTopology",
         "smoothingAngle",
         "smoothingRadiusFactor",
-        "raftLayerCount",
-        "raftTopGap",
         "raftOffsets",
-        "raftLayerHeights",
-        "raftInfillDensities",
         "curveMode",
         "curveAmplitude",
         "curvePeriod",
+        "pathProgressControl",
+        "pathProgressSlider",
+        "pathProgressLabel",
+        "showOuterContour",
+        "showInnerContour",
+        "showResinInfill",
+        "showFiberPaths",
+        "printSizeLabel",
+        "previewSurface",
+        "previewCanvas",
     ):
         assert f'id="{control_id}"' in html
+    assert 'value="legacy" selected' in html
+    assert 'value="pyslm"' in html
+    assert 'id="trianglePathOptimization" type="checkbox" checked' in html
+    assert 'value="isotropic"' in html
+    for hatcher in ("basic", "stripe", "island", "basic_island"):
+        assert f'value="{hatcher}"' in html
+    for removed_raft_control in (
+        "raftLayerCount",
+        "raftTopGap",
+        "raftLayerHeights",
+        "raftInfillDensities",
+        "raftInfillPatterns",
+    ):
+        assert f'id="{removed_raft_control}"' not in html
     assert "bottomCapAngle" not in html
     assert "topCapAngle" not in html
+    assert 'id="resinPathSlider"' not in html
+    assert 'id="fiberPathSlider"' not in html
+
+
+def test_ui_preview_supports_filtered_ordered_progress_pan_zoom_and_rulers():
+    html = _index_html()
+
+    for label in (
+        "所选路径进度",
+        "外轮廓",
+        "内轮廓",
+        "树脂填充",
+        "纤维路径",
+        "打印范围",
+        "X (mm)",
+        "Y (mm)",
+    ):
+        assert label in html
+    for interaction in (
+        "selectedPrintEntries",
+        "drawMeasurementGrid",
+        "niceGridStep",
+        "addEventListener('wheel'",
+        "addEventListener('pointerdown'",
+        "addEventListener('pointermove'",
+        "addEventListener('contextmenu'",
+        "event.button",
+        "viewerState.centerX",
+        "viewerState.centerY",
+    ):
+        assert interaction in html
+    assert "const isContour" not in html
+    assert "pathIndex >= visiblePaths" not in html
 
 
 def test_preview_simplification_keeps_contour_corners():
@@ -1010,7 +1680,7 @@ def test_preview_simplification_keeps_contour_corners():
     assert [0.0, 20.0, 0.5] in simplified
 
 
-def test_infill_paths_connect_safe_neighbors_after_generation():
+def test_raft_infill_paths_are_clipped_to_geometry():
     geometry = Polygon([(0, 0), (20, 0), (20, 20), (0, 20)])
     config = SliceConfig(layer_height=1.0, line_width=1.0, infill_pattern="aligned_rectilinear")
 
@@ -1101,36 +1771,34 @@ def test_raft_layers_shift_part_layers_and_z():
     )
 
     resin_groups = [group for group in job.material_paths if group.material == "R"]
-    assert np.isclose(z_shift, 0.9)
+    assert np.isclose(z_shift, 1.0)
     assert [group.layer_index for group in resin_groups[:4]] == [0, 1, 2, 3]
-    assert np.isclose(resin_groups[0].paths[0][0, 2], 0.3)
-    assert np.isclose(resin_groups[1].paths[0][0, 2], 0.5)
-    assert np.isclose(resin_groups[2].paths[0][0, 2], 5.9)
+    assert np.isclose(resin_groups[0].paths[0][0, 2], 0.5)
+    assert np.isclose(resin_groups[1].paths[0][0, 2], 1.0)
+    assert np.isclose(resin_groups[2].paths[0][0, 2], 6.0)
     assert job.meta["raft"]["layer_count"] == 2
+    assert job.meta["raft"]["top_gap"] == 0.0
 
 
-def test_single_raft_layer_touching_part_uses_lattice_independent_of_part_pattern():
+def test_add_raft_rejects_non_two_layer_raft():
     mesh = Mesh(_cube_triangles(size=20.0))
     config = SliceConfig(layer_height=5.0, line_width=2.0, infill_pattern="concentric")
     job = slice_mesh_to_job(mesh, config)
 
-    add_raft_to_job(
-        job,
-        mesh,
-        config,
-        [RaftLayerConfig(outward_offset=2.0, layer_height=0.5, infill_density=100)],
-        top_gap=0.2,
-    )
-
-    raft_roles = job.meta["path_roles"]["R"]["0"]
-    raft_infill = _paths_with_role(job.material_paths[0].paths, raft_roles, "infill")
-    assert raft_infill
-    assert len(raft_infill) > 1
-    assert max(path.shape[0] for path in raft_infill) >= 20
-    assert all(not _path_has_non_adjacent_crossing(path) for path in raft_infill)
+    try:
+        add_raft_to_job(
+            job,
+            mesh,
+            config,
+            [RaftLayerConfig(outward_offset=2.0)],
+        )
+    except ValueError as exc:
+        assert "fixed at 2" in str(exc)
+    else:
+        raise AssertionError("expected non-two-layer raft to fail")
 
 
-def test_only_top_raft_layer_touching_part_uses_lattice():
+def test_two_raft_layers_use_fixed_zigzag_angles():
     mesh = Mesh(_cube_triangles(size=20.0))
     config = SliceConfig(layer_height=5.0, line_width=2.0, infill_pattern="concentric")
     job = slice_mesh_to_job(mesh, config)
@@ -1153,8 +1821,267 @@ def test_only_top_raft_layer_touching_part_uses_lattice():
 
     assert bottom_infill
     assert top_infill
-    assert max(path.shape[0] for path in top_infill) >= 20
-    assert all(not _path_has_non_adjacent_crossing(path) for path in top_infill)
+    assert _has_infill_direction(bottom_infill, 90.0)
+    assert _has_infill_direction(top_infill, 135.0)
+    assert job.meta["raft"]["layers"][0]["infill_density"] == 100.0
+    assert job.meta["raft"]["layers"][1]["infill_density"] == 100.0
+    assert job.meta["raft"]["fixed_patterns"][0]["angle_degrees"] == 90.0
+    assert job.meta["raft"]["fixed_patterns"][1]["angle_degrees"] == -45.0
+
+
+def test_raft_infill_density_follows_part_infill_density():
+    mesh = Mesh(_cube_triangles(size=20.0))
+    config = SliceConfig(
+        layer_height=5.0,
+        line_width=2.0,
+        infill_pattern="zigzag",
+        infill_density=40.0,
+    )
+    job = slice_mesh_to_job(mesh, config)
+
+    add_raft_to_job(
+        job,
+        mesh,
+        config,
+        [
+            RaftLayerConfig(outward_offset=2.0, infill_density=100.0),
+            RaftLayerConfig(outward_offset=1.0, infill_density=80.0),
+        ],
+    )
+
+    assert job.meta["raft"]["layers"][0]["infill_density"] == 40.0
+    assert job.meta["raft"]["layers"][1]["infill_density"] == 40.0
+
+
+def test_raft_outward_offset_preserves_part_holes():
+    outer = [(0, 0), (40, 0), (40, 30), (0, 30)]
+    hole = list(Point(20, 15).buffer(4.0, resolution=32).exterior.coords)
+    footprint = Polygon(outer, holes=[hole])
+    reserved_voids = _raft_reserved_void_geometry(footprint, tolerance=1e-5)
+
+    raft_geometry = _raft_geometry_for_layer(
+        footprint,
+        reserved_voids,
+        outward_offset=5.0,
+        tolerance=1e-5,
+    )
+    hole_polygon = Polygon(hole)
+
+    assert not raft_geometry.intersects(hole_polygon.buffer(-0.05))
+
+
+def test_raft_boundary_paths_respect_nozzle_width_at_true_voids():
+    hole = list(Point(20, 15).buffer(4.0, resolution=32).exterior.coords)
+    geometry = Polygon([(0, 0), (40, 0), (40, 30), (0, 30)], holes=[hole])
+
+    paths, roles = _perimeter_paths_from_geometry(
+        geometry,
+        line_width=2.0,
+        path_spacing=1.8,
+        perimeter_count=2,
+        tolerance=1e-5,
+    )
+    inner_paths = _paths_with_role(paths, roles, "inner_contour")
+    hole_boundary = LineString(hole)
+
+    assert len(inner_paths) >= 2
+    assert np.isclose(min(LineString(path).distance(hole_boundary) for path in paths), 1.0, atol=0.05)
+
+
+def test_raft_infill_does_not_cross_true_void_boundaries():
+    hole = list(Point(20, 15).buffer(4.0, resolution=32).exterior.coords)
+    geometry = Polygon([(0, 0), (40, 0), (40, 30), (0, 30)], holes=[hole])
+    config = SliceConfig(layer_height=1.0, line_width=2.0, infill_overlap=10.0)
+
+    hole_polygon = Polygon(hole)
+    safe_geometry = _resin_infill_surface_geometry(geometry, config)
+
+    paths = _raft_zigzag_infill_paths(
+        safe_geometry,
+        config,
+        infill_density=100.0,
+        angle_degrees=45.0,
+    )
+
+    assert paths
+    for path in paths:
+        line = LineString(path)
+        assert (
+            line.difference(
+                safe_geometry.buffer(config.tolerance * 10.0, join_style="round")
+            ).length
+            <= 1e-4
+        )
+        assert not line.intersects(hole_polygon.buffer(config.line_width * 0.5))
+
+
+def test_raft_zigzag_infill_connects_adjacent_scanlines():
+    geometry = Polygon([(0, 0), (30, 0), (30, 20), (0, 20)])
+    config = SliceConfig(layer_height=1.0, line_width=2.0, infill_overlap=10.0)
+
+    paths = _raft_zigzag_infill_paths(
+        geometry.buffer(-config.line_width * 0.5, join_style="round"),
+        config,
+        infill_density=100.0,
+        angle_degrees=45.0,
+    )
+
+    assert len(paths) == 1
+    assert paths[0].shape[0] > 2
+    assert LineString(paths[0]).is_simple
+
+
+def test_raft_zigzag_follows_hole_boundary_with_few_full_width_strokes():
+    hole_polygon = Point(30, 20).buffer(7.0, resolution=32)
+    geometry = Polygon(
+        [(0, 0), (60, 0), (60, 40), (0, 40)],
+        holes=[list(hole_polygon.exterior.coords)],
+    )
+    config = SliceConfig(
+        layer_height=1.0,
+        line_width=2.0,
+        perimeter_count=2,
+        infill_overlap=10.0,
+    )
+    safe_geometry = _resin_infill_surface_geometry(geometry, config)
+
+    paths = _raft_zigzag_infill_paths(
+        safe_geometry,
+        config,
+        infill_density=100.0,
+        angle_degrees=0.0,
+    )
+    full_width_stroke = unary_union(
+        [
+            LineString(path).buffer(
+                config.line_width * 0.5,
+                cap_style="round",
+                join_style="round",
+            )
+            for path in paths
+        ]
+    )
+
+    # Reducing this to two paths requires a hole-boundary bridge whose center
+    # comes within about 1.588 mm of an incident line, below the 1.8 mm pitch.
+    assert 1 <= len(paths) <= 3
+    assert all(LineString(path).is_simple for path in paths)
+    assert all(safe_geometry.buffer(1e-5).covers(LineString(path)) for path in paths)
+    assert geometry.buffer(1e-5).covers(full_width_stroke)
+    assert not full_width_stroke.intersects(hole_polygon)
+
+
+def test_raft_zigzag_full_density_covers_printable_surface():
+    hole = list(Point(28, 16).buffer(3.0, resolution=32).exterior.coords)
+    geometry = Polygon([(0, 0), (60, 0), (60, 40), (0, 40)], holes=[hole])
+    config = SliceConfig(layer_height=1.0, line_width=2.0, infill_overlap=10.0)
+    safe_geometry = _resin_infill_surface_geometry(geometry, config)
+
+    paths = _raft_zigzag_infill_paths(
+        safe_geometry,
+        config,
+        infill_density=100.0,
+        angle_degrees=45.0,
+    )
+    stroke_area = unary_union(
+        [
+            LineString(path[:, :2]).buffer(
+                config.line_width * 0.5,
+                cap_style="round",
+                join_style="round",
+            )
+            for path in paths
+        ]
+    )
+
+    assert paths
+    assert stroke_area.intersection(safe_geometry).area / safe_geometry.area > 0.98
+
+
+def test_raft_voids_include_openings_from_later_part_sections():
+    part_projection = Polygon(
+        [
+            (0, 0),
+            (50, 0),
+            (50, 30),
+            (34, 30),
+            (34, 18),
+            (16, 18),
+            (16, 30),
+            (0, 30),
+        ]
+    )
+    opening = Polygon([(16, 18), (34, 18), (34, 35), (16, 35)])
+
+    reserved_voids = _raft_reserved_void_geometry(part_projection, tolerance=1e-5)
+    raft_geometry = _raft_geometry_for_layer(
+        part_projection,
+        reserved_voids,
+        outward_offset=5.0,
+        tolerance=1e-5,
+    )
+
+    assert reserved_voids.covers(
+        Polygon([(16, 18), (34, 18), (34, 30), (16, 30)]).buffer(-0.05)
+    )
+    assert not raft_geometry.intersects(opening.buffer(-0.05))
+
+
+def test_raft_opening_perimeters_keep_configured_spacing_through_outward_band():
+    part_projection = Polygon(
+        [
+            (0, 0),
+            (40, 0),
+            (40, 30),
+            (0, 30),
+            (0, 20),
+            (20, 20),
+            (20, 10),
+            (0, 10),
+        ]
+    )
+    reserved_voids = _raft_reserved_void_geometry(part_projection, tolerance=1e-5)
+    raft_geometry = _raft_geometry_for_layer(
+        part_projection,
+        reserved_voids,
+        outward_offset=5.0,
+        tolerance=1e-5,
+    )
+
+    paths, roles = _perimeter_paths_from_geometry(
+        raft_geometry,
+        line_width=2.0,
+        path_spacing=1.8,
+        perimeter_count=2,
+        tolerance=1e-5,
+    )
+    outer_contour = LineString(_paths_with_role(paths, roles, "outer_contour")[0])
+    inner_contour = LineString(_paths_with_role(paths, roles, "inner_contour")[0])
+
+    assert not raft_geometry.intersects(
+        Polygon([(-4.9, 10.05), (19.9, 10.05), (19.9, 19.95), (-4.9, 19.95)])
+    )
+    assert np.isclose(
+        outer_contour.distance(Point(-2.0, 7.2)),
+        1.8,
+        atol=0.05,
+    )
+    assert inner_contour.distance(Point(-2.0, 7.2)) <= 0.05
+
+
+def test_raft_reserved_voids_filter_degenerate_projection_fragments():
+    part_projection = Polygon(
+        [(0, 0), (30, 0), (30, 30), (0, 30)],
+        holes=[
+            [(10, 10), (10.2, 10), (10.2, 10.001), (10, 10.001)],
+            [(14, 14), (18, 14), (18, 18), (14, 18)],
+        ],
+    )
+
+    reserved_voids = _raft_reserved_void_geometry(part_projection, tolerance=1e-5)
+
+    assert reserved_voids.area > 15.0
+    assert reserved_voids.area < 17.0
 
 
 def test_raft_lattice_density_changes_spacing():
@@ -1169,7 +2096,7 @@ def test_raft_lattice_density_changes_spacing():
     assert _infill_total_length(dense) > _infill_total_length(sparse)
 
 
-def test_raft_zigzag_infill_segments_do_not_add_connector_routes():
+def test_raft_zigzag_infill_connectors_stay_inside_printable_geometry():
     outer = [(0, 0), (42, 0), (42, 20), (0, 20)]
     hole = list(Point(30, 10).buffer(3.0, quad_segs=32).exterior.coords)
     geometry = Polygon(outer, holes=[hole])
@@ -1178,11 +2105,11 @@ def test_raft_zigzag_infill_segments_do_not_add_connector_routes():
     paths = _raft_zigzag_infill_paths(geometry, config, infill_density=100.0)
 
     assert paths
+    safe_geometry = geometry.buffer(1e-4, join_style="round")
     for path in paths:
         for start, end in zip(path[:-1], path[1:]):
-            delta = end[:2] - start[:2]
-            if abs(float(delta[0])) > 0.1 and abs(float(delta[1])) > 0.1:
-                assert np.linalg.norm(delta) <= 3.0
+            segment = LineString([tuple(start[:2]), tuple(end[:2])])
+            assert safe_geometry.covers(segment)
 
 
 def test_normalize_job_xy_origin_moves_lower_left_to_zero():

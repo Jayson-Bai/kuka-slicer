@@ -23,6 +23,10 @@ from .slicer import (
     DEFAULT_RESIN_INFILL_OVERLAP_PERCENT,
     DEFAULT_RESIN_LAYER_HEIGHT_MM,
     DEFAULT_RESIN_LINE_WIDTH_MM,
+    DEFAULT_RAFT_LAYER_COUNT,
+    DEFAULT_RAFT_OUTWARD_OFFSETS_MM,
+    DEFAULT_RAFT_TOP_GAP_MM,
+    PySLMConfig,
     RaftLayerConfig,
     SliceConfig,
     _intersect_mesh_at_z,
@@ -33,6 +37,7 @@ from .slicer import (
     optimize_open_path_travel,
     orient_mesh_for_build_axis,
     recommended_geometry_tolerance,
+    recommended_pyslm_strategy_defaults,
     slice_mesh_to_job,
     _smooth_path_corners,
 )
@@ -93,6 +98,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             DEFAULT_RESIN_LAYER_HEIGHT_MM,
         )
         line_width = _float_param(params, "line_width", DEFAULT_RESIN_LINE_WIDTH_MM)
+        pyslm_strategy_defaults = recommended_pyslm_strategy_defaults(layer_height, line_width)
         requested_build_axis = params.get("build_axis", ["auto"])[0]
         z_min = _optional_float_param(params, "z_min")
         z_max = _optional_float_param(params, "z_max")
@@ -120,13 +126,74 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             "infill_overlap",
             DEFAULT_RESIN_INFILL_OVERLAP_PERCENT,
         )
+        triangle_path_optimization = _bool_param(
+            params,
+            "triangle_path_optimization",
+            True,
+        )
+        zigzag_path_optimization = _bool_param(
+            params,
+            "zigzag_path_optimization",
+            True,
+        )
+        slicing_kernel = params.get("slicing_kernel", ["legacy"])[0]
+        pyslm_config = PySLMConfig(
+            hatcher=params.get("pyslm_hatcher", ["basic"])[0],  # type: ignore[arg-type]
+            hatch_angle=_optional_float_param(params, "pyslm_hatch_angle"),
+            layer_angle_increment=_float_param(params, "pyslm_layer_angle_increment", 0.0),
+            hatch_distance=_optional_float_param(params, "pyslm_hatch_distance"),
+            contour_offset=_optional_float_param(params, "pyslm_contour_offset"),
+            spot_compensation=_optional_float_param(params, "pyslm_spot_compensation"),
+            volume_offset_hatch=_optional_float_param(params, "pyslm_volume_offset_hatch"),
+            num_outer_contours=_optional_int_param(params, "pyslm_num_outer_contours"),
+            num_inner_contours=_optional_int_param(params, "pyslm_num_inner_contours"),
+            scan_contour_first=_bool_param(params, "pyslm_scan_contour_first", True),
+            hatch_sort=params.get("pyslm_hatch_sort", ["none"])[0],  # type: ignore[arg-type]
+            stripe_width=_float_param(
+                params,
+                "pyslm_stripe_width",
+                pyslm_strategy_defaults.width,
+            ),
+            stripe_overlap=_float_param(
+                params,
+                "pyslm_stripe_overlap",
+                pyslm_strategy_defaults.overlap,
+            ),
+            stripe_offset=_float_param(
+                params,
+                "pyslm_stripe_offset",
+                pyslm_strategy_defaults.offset,
+            ),
+            island_width=_float_param(
+                params,
+                "pyslm_island_width",
+                pyslm_strategy_defaults.width,
+            ),
+            island_overlap=_float_param(
+                params,
+                "pyslm_island_overlap",
+                pyslm_strategy_defaults.overlap,
+            ),
+            island_offset=_float_param(
+                params,
+                "pyslm_island_offset",
+                pyslm_strategy_defaults.offset,
+            ),
+            fix_polygons=_bool_param(params, "pyslm_fix_polygons", True),
+            simplification_factor=_optional_float_param(params, "pyslm_simplification_factor"),
+            simplification_preserve_topology=_bool_param(
+                params,
+                "pyslm_simplification_preserve_topology",
+                True,
+            ),
+            simplification_mode=params.get("pyslm_simplification_mode", ["absolute"])[0],  # type: ignore[arg-type]
+        )
         infill_pattern = params.get("infill_pattern", ["rectilinear"])[0]
         curve_mode = params.get("curve_mode", ["flat"])[0]
         curve_amplitude = _float_param(params, "curve_amplitude", 0.0)
         curve_period = _float_param(params, "curve_period", 50.0)
-        raft_layer_count = _int_param(params, "raft_layer_count", 2)
-        raft_top_gap = _float_param(params, "raft_top_gap", 0.2)
-        raft_layers = _raft_layers_from_params(params, raft_layer_count)
+        raft_top_gap = DEFAULT_RAFT_TOP_GAP_MM
+        raft_layers = _raft_layers_from_params(params)
 
         stl_upload = files.get("stl_file")
         if stl_upload is None:
@@ -166,6 +233,10 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             infill_pattern=infill_pattern,  # type: ignore[arg-type]
             infill_density=infill_density,
             infill_overlap=infill_overlap,
+            triangle_path_optimization=triangle_path_optimization,
+            zigzag_path_optimization=zigzag_path_optimization,
+            slicing_kernel=slicing_kernel,  # type: ignore[arg-type]
+            pyslm=pyslm_config,
             perimeter_count=perimeter_count,
             smoothing_angle=smoothing_angle,
             smoothing_radius_factor=smoothing_radius_factor,
@@ -198,6 +269,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             "recommendation": recommendation,
             "fiber_json": fiber_json_name,
             "build_axis": build_axis,
+            "slicing_kernel": config.slicing_kernel,
         }
 
     def _read_slice_request(
@@ -261,20 +333,25 @@ def _int_param(params: dict[str, list[str]], name: str, default: int) -> int:
     return int(raw if raw != "" else default)
 
 
-def _raft_layers_from_params(
-    params: dict[str, list[str]],
-    layer_count: int,
-) -> list[RaftLayerConfig]:
-    if layer_count <= 0:
-        return []
-    offsets = _float_list_param(params, "raft_offsets", "15,10", layer_count)
-    heights = _float_list_param(params, "raft_layer_heights", DEFAULT_RESIN_LAYER_HEIGHT_MM, layer_count)
-    densities = _float_list_param(params, "raft_infill_densities", "100,75", layer_count)
+def _optional_int_param(params: dict[str, list[str]], name: str) -> int | None:
+    raw = params.get(name, [""])[0].strip()
+    return None if raw == "" else int(raw)
+
+
+def _bool_param(params: dict[str, list[str]], name: str, default: bool) -> bool:
+    raw = params.get(name, [str(default).lower()])[0].strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _raft_layers_from_params(params: dict[str, list[str]]) -> list[RaftLayerConfig]:
+    layer_count = DEFAULT_RAFT_LAYER_COUNT
+    default_offsets = ",".join(f"{offset:g}" for offset in DEFAULT_RAFT_OUTWARD_OFFSETS_MM)
+    offsets = _float_list_param(params, "raft_offsets", default_offsets, layer_count)
     return [
         RaftLayerConfig(
             outward_offset=offsets[index],
-            layer_height=heights[index],
-            infill_density=densities[index],
+            layer_height=DEFAULT_RESIN_LAYER_HEIGHT_MM,
+            infill_density=DEFAULT_RESIN_INFILL_DENSITY_PERCENT,
         )
         for index in range(layer_count)
     ]
@@ -293,6 +370,33 @@ def _float_list_param(
         return values * layer_count
     if len(values) != layer_count:
         raise ValueError(f"{name} must contain either 1 value or {layer_count} comma-separated values")
+    return values
+
+
+def _string_list_param(
+    params: dict[str, list[str]],
+    name: str,
+    default: str,
+    layer_count: int,
+) -> list[str]:
+    raw = params.get(name, [default])[0].strip()
+    values = [part.strip() for part in raw.split(",") if part.strip()] if raw else []
+    aliases = {
+        "concentric": "concentric",
+        "zigzag": "zigzag",
+        "同心轮廓": "concentric",
+        "同心轮廓填充": "concentric",
+        "之字形": "zigzag",
+        "之字形填充": "zigzag",
+    }
+    values = [aliases.get(value, value) for value in values]
+    if len(values) == 1:
+        values *= layer_count
+    if len(values) != layer_count:
+        raise ValueError(f"{name} must contain either 1 value or {layer_count} comma-separated values")
+    unsupported = [value for value in values if value not in ("concentric", "zigzag")]
+    if unsupported:
+        raise ValueError(f"{name} contains unsupported pattern: {unsupported[0]}")
     return values
 
 
@@ -710,12 +814,17 @@ def _expand_bounds(bounds: dict[str, float | None], x: float, y: float, z: float
 
 
 def _index_html() -> str:
+    pyslm_defaults = PySLMConfig()
+    pyslm_strategy_defaults = recommended_pyslm_strategy_defaults(
+        DEFAULT_RESIN_LAYER_HEIGHT_MM,
+        DEFAULT_RESIN_LINE_WIDTH_MM,
+    )
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>KUKA Slicer</title>
+  <title>机械臂空间复合材料增材制造系统切片器</title>
   <style>
     :root {{
       color-scheme: light;
@@ -736,17 +845,18 @@ def _index_html() -> str:
       background: #ffffff;
     }}
     header {{
-      height: 64px;
+      min-height: 64px;
       display: flex;
       align-items: center;
-      padding: 0 28px;
+      padding: 12px 28px;
       border-bottom: 1px solid var(--line);
       background: #ffffff;
     }}
     h1 {{
       margin: 0;
-      font-size: 20px;
+      font-size: 19px;
       font-weight: 650;
+      line-height: 1.35;
       letter-spacing: 0;
     }}
     main {{
@@ -851,6 +961,21 @@ def _index_html() -> str:
       color: var(--muted);
     }}
     .notice.warning {{ color: #9a5b00; }}
+    .advancedSettings {{
+      margin-top: 12px;
+      padding-top: 10px;
+      border-top: 1px solid var(--line);
+    }}
+    .advancedSettings summary {{
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 650;
+      user-select: none;
+    }}
+    .advancedSettings[open] summary {{
+      margin-bottom: 8px;
+    }}
     .summary {{
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -919,6 +1044,14 @@ def _index_html() -> str:
       align-items: center;
       gap: 6px;
       white-space: nowrap;
+      margin: 0;
+      color: var(--muted);
+      cursor: pointer;
+    }}
+    .legendItem input {{
+      width: auto;
+      min-height: 0;
+      padding: 0;
     }}
     .swatch {{
       width: 18px;
@@ -951,18 +1084,31 @@ def _index_html() -> str:
       min-height: 0;
       padding: 0;
     }}
+    .checkboxLabel {{
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }}
+    .checkboxLabel input {{
+      width: auto;
+      min-height: 0;
+      padding: 0;
+    }}
     .preview {{
       margin-top: 18px;
       border: 1px solid var(--line);
       border-radius: 8px;
-      height: 360px;
-      background:
-        linear-gradient(90deg, rgba(23,32,38,.08) 1px, transparent 1px),
-        linear-gradient(0deg, rgba(23,32,38,.08) 1px, transparent 1px),
-        #ffffff;
-      background-size: 28px 28px;
+      height: min(68vh, 620px);
+      min-height: 480px;
+      background: #ffffff;
       position: relative;
-      overflow: visible;
+      overflow: hidden;
+      cursor: grab;
+      user-select: none;
+      touch-action: none;
+    }}
+    .preview.dragging {{
+      cursor: grabbing;
     }}
     .preview canvas {{
       width: 100%;
@@ -974,14 +1120,15 @@ def _index_html() -> str:
       .summary {{ grid-template-columns: 1fr; }}
       .viewerControls {{ grid-template-columns: 1fr; }}
       header {{ padding: 0 18px; }}
+      .preview {{ height: 460px; min-height: 420px; }}
     }}
   </style>
 </head>
 <body>
-  <header><h1>KUKA Slicer</h1></header>
+  <header><h1>机械臂空间复合材料增材制造系统切片器</h1></header>
   <main>
     <section class="panel">
-      <h2>树脂切片</h2>
+      <h2>模型切片</h2>
       <form id="sliceForm">
         <div class="formSection">
           <h3>输入文件</h3>
@@ -1037,17 +1184,144 @@ def _index_html() -> str:
             </div>
           </div>
 
-          <label for="infillPattern">树脂填充路径</label>
-          <select id="infillPattern" name="infillPattern">
-            <option value="rectilinear">Rectilinear</option>
-            <option value="aligned_rectilinear">Aligned Rectilinear</option>
-            <option value="line">Line</option>
-            <option value="grid">Grid</option>
-            <option value="triangles">Triangles</option>
-            <option value="gyroid">Gyroid</option>
-            <option value="concentric">Concentric</option>
-            <option value="zigzag">Zig Zag</option>
+          <label for="slicingKernel">切片内核</label>
+          <select id="slicingKernel" name="slicingKernel">
+            <option value="legacy" selected>Prusa</option>
+            <option value="pyslm">PySLM</option>
           </select>
+
+          <div id="pyslmNativeSettings" hidden>
+            <h3>PySLM 原生扫描参数</h3>
+            <div class="grid">
+              <div>
+                <label for="pyslmHatcher" title="决定 PySLM 使用基础、条带或岛状扫描组织方式。">PySLM 填充策略</label>
+                <select id="pyslmHatcher" name="pyslmHatcher">
+                  <option value="basic" selected>基础直线填充</option>
+                  <option value="stripe">条带填充</option>
+                  <option value="island">岛状填充</option>
+                  <option value="basic_island">基础岛状填充</option>
+                </select>
+              </div>
+              <div>
+                <label for="pyslmHatchSort">扫描线排序</label>
+                <select id="pyslmHatchSort" name="pyslmHatchSort">
+                  <option value="none" selected>PySLM 默认</option>
+                  <option value="alternate">交替方向</option>
+                  <option value="unidirectional">单向扫描</option>
+                  <option value="linear">线性排序</option>
+                  <option value="directional">方向交替</option>
+                </select>
+              </div>
+            </div>
+            <div class="grid">
+              <div>
+                <label for="pyslmHatchAngle">填充角度 °</label>
+                <input id="pyslmHatchAngle" name="pyslmHatchAngle" type="number" min="-180" max="180" step="0.1" placeholder="自动">
+              </div>
+              <div>
+                <label for="pyslmLayerAngleIncrement">层间角度增量 °</label>
+                <input id="pyslmLayerAngleIncrement" name="pyslmLayerAngleIncrement" type="number" step="0.1" value="{pyslm_defaults.layer_angle_increment:g}">
+              </div>
+            </div>
+            <div class="grid">
+              <div>
+                <label for="pyslmHatchDistance">填充线间距 mm</label>
+                <input id="pyslmHatchDistance" name="pyslmHatchDistance" type="number" min="0" step="0.001" placeholder="自动">
+              </div>
+              <div>
+                <label for="pyslmContourOffset">轮廓偏移 mm</label>
+                <input id="pyslmContourOffset" name="pyslmContourOffset" type="number" min="0" step="0.001" placeholder="自动">
+              </div>
+            </div>
+            <div class="grid">
+              <div>
+                <label for="pyslmSpotCompensation">光斑补偿 mm</label>
+                <input id="pyslmSpotCompensation" name="pyslmSpotCompensation" type="number" min="0" step="0.001" placeholder="自动">
+              </div>
+              <div>
+                <label for="pyslmVolumeOffset">体积填充偏移 mm</label>
+                <input id="pyslmVolumeOffset" name="pyslmVolumeOffset" type="number" step="0.001" placeholder="自动">
+              </div>
+            </div>
+            <div class="grid">
+              <div>
+                <label for="pyslmOuterContours">外轮廓数量</label>
+                <input id="pyslmOuterContours" name="pyslmOuterContours" type="number" min="0" step="1" placeholder="自动">
+              </div>
+              <div>
+                <label for="pyslmInnerContours">内轮廓数量</label>
+                <input id="pyslmInnerContours" name="pyslmInnerContours" type="number" min="0" step="1" placeholder="自动">
+              </div>
+            </div>
+            <details id="pyslmPatternSettings" class="advancedSettings">
+              <summary>条带/岛状参数（自动）</summary>
+              <label class="checkboxLabel" title="启用后根据树脂层高和线宽重新计算下面的推荐值。"><input id="pyslmPatternAuto" type="checkbox" checked> 自动设置条带/岛状参数</label>
+              <div class="grid">
+              <div>
+                <label for="pyslmStripeWidth">条带宽度 mm</label>
+                <input id="pyslmStripeWidth" name="pyslmStripeWidth" type="number" min="0.001" step="0.1" value="{pyslm_strategy_defaults.width:g}">
+              </div>
+              <div>
+                <label for="pyslmStripeOverlap">条带重叠 mm</label>
+                <input id="pyslmStripeOverlap" name="pyslmStripeOverlap" type="number" min="0" step="0.1" value="{pyslm_strategy_defaults.overlap:g}">
+              </div>
+              </div>
+              <div class="grid">
+              <div>
+                <label for="pyslmStripeOffset">条带平移系数</label>
+                <input id="pyslmStripeOffset" name="pyslmStripeOffset" type="number" min="0" step="0.05" value="{pyslm_strategy_defaults.offset:g}">
+              </div>
+              <div>
+                <label for="pyslmIslandWidth">岛状宽度 mm</label>
+                <input id="pyslmIslandWidth" name="pyslmIslandWidth" type="number" min="0.001" step="0.1" value="{pyslm_strategy_defaults.width:g}">
+              </div>
+              </div>
+              <div class="grid">
+              <div>
+                <label for="pyslmIslandOverlap">岛状重叠 mm</label>
+                <input id="pyslmIslandOverlap" name="pyslmIslandOverlap" type="number" min="0" step="0.1" value="{pyslm_strategy_defaults.overlap:g}">
+              </div>
+              <div>
+                <label for="pyslmIslandOffset">岛状平移系数</label>
+                <input id="pyslmIslandOffset" name="pyslmIslandOffset" type="number" min="0" step="0.05" value="{pyslm_strategy_defaults.offset:g}">
+              </div>
+              </div>
+            </details>
+            <div class="grid">
+              <div>
+                <label for="pyslmSimplificationFactor">切层边界简化 mm</label>
+                <input id="pyslmSimplificationFactor" name="pyslmSimplificationFactor" type="number" min="0" step="0.001" placeholder="关闭">
+              </div>
+              <div>
+                <label for="pyslmSimplificationMode">简化模式</label>
+                <select id="pyslmSimplificationMode" name="pyslmSimplificationMode">
+                  <option value="absolute" selected>绝对距离</option>
+                  <option value="bound">按边界尺度</option>
+                </select>
+              </div>
+            </div>
+            <label class="checkboxLabel"><input id="pyslmScanContourFirst" type="checkbox" checked> 轮廓优先扫描</label>
+            <label class="checkboxLabel"><input id="pyslmFixPolygons" type="checkbox" checked> 修复切层多边形</label>
+            <label class="checkboxLabel"><input id="pyslmSimplificationPreserveTopology" type="checkbox" checked> 保持拓扑结构</label>
+          </div>
+
+          <div id="legacyInfillControl">
+          <label for="infillPattern" title="原始内核与 PySLM 共用；各向同性填充使用固定的四方向之字形循环。">树脂填充路径</label>
+          <select id="infillPattern" name="infillPattern">
+            <option value="none">仅轮廓</option>
+            <option value="rectilinear">交替直线填充</option>
+            <option value="aligned_rectilinear">对齐直线填充</option>
+            <option value="line">单向线填充</option>
+            <option value="grid">网格填充</option>
+            <option value="triangles">三角形填充</option>
+            <option value="gyroid">陀螺曲线填充</option>
+            <option value="concentric">同心轮廓填充</option>
+            <option value="zigzag">之字形填充</option>
+            <option value="isotropic">各向同性填充</option>
+          </select>
+          <label class="checkboxLabel" title="仅 Prusa 三角形填充生效；先排序/反向，再合并数值上共点的路径，所有实体连接仍需通过线宽净距检查。"><input id="trianglePathOptimization" type="checkbox" checked> 三角形填充路径优化</label>
+          <label class="checkboxLabel" title="相邻扫描线在安全填充区域内沿外边界或孔洞边界连续折返；legacy 与 PySLM 均使用该连接路径。"><input id="zigzagPathOptimization" type="checkbox" checked> 之字形填充路径优化</label>
+          </div>
 
           <div class="grid">
             <div>
@@ -1075,25 +1349,8 @@ def _index_html() -> str:
 
         <div class="formSection">
           <h3>筏板</h3>
-        <div class="grid">
-          <div>
-            <label for="raftLayerCount">筏板层数</label>
-            <input id="raftLayerCount" name="raftLayerCount" type="number" min="0" step="1" value="2">
-          </div>
-          <div>
-            <label for="raftTopGap">筏板顶层间隙 mm</label>
-            <input id="raftTopGap" name="raftTopGap" type="number" min="0" step="0.001" value="0.2">
-          </div>
-        </div>
-
         <label for="raftOffsets">每层外扩距离 mm</label>
         <input id="raftOffsets" name="raftOffsets" type="text" value="15,10" placeholder="单值或逗号分隔，例如 8,6,4">
-
-        <label for="raftLayerHeights">每层筏板层高 mm</label>
-        <input id="raftLayerHeights" name="raftLayerHeights" type="text" value="0.5" placeholder="单值或逗号分隔，例如 0.3,0.25,0.2">
-
-        <label for="raftInfillDensities">每层筏板填充率 %</label>
-        <input id="raftInfillDensities" name="raftInfillDensities" type="text" value="100,75" placeholder="单值或逗号分隔，例如 80,70,60">
         </div>
 
         <div class="formSection">
@@ -1138,33 +1395,27 @@ def _index_html() -> str:
             <output id="layerLabel">-</output>
           </div>
         </div>
-        <div>
-          <label for="resinPathSlider">树脂路径进度</label>
+        <div id="pathProgressControl">
+          <label for="pathProgressSlider">所选路径进度</label>
           <div class="rangeRow">
-            <input id="resinPathSlider" type="range" min="0" max="0" value="0" disabled>
-            <output id="resinPathLabel">-</output>
-          </div>
-        </div>
-        <div>
-          <label for="fiberPathSlider">纤维路径进度</label>
-          <div class="rangeRow">
-            <input id="fiberPathSlider" type="range" min="0" max="0" value="0" disabled>
-            <output id="fiberPathLabel">-</output>
+            <input id="pathProgressSlider" type="range" min="0" max="0" value="0" disabled>
+            <output id="pathProgressLabel">-</output>
           </div>
         </div>
       </div>
       <div class="legend" aria-label="预览图例">
-        <span class="legendItem"><span class="swatch outerSwatch"></span>外轮廓</span>
-        <span class="legendItem"><span class="swatch innerSwatch"></span>内轮廓</span>
-        <span class="legendItem"><span class="swatch infillSwatch"></span>树脂填充</span>
-        <span class="legendItem"><span class="swatch fiberSwatch"></span>纤维路径</span>
+        <label class="legendItem"><input id="showOuterContour" type="checkbox" checked><span class="swatch outerSwatch"></span>外轮廓</label>
+        <label class="legendItem"><input id="showInnerContour" type="checkbox" checked><span class="swatch innerSwatch"></span>内轮廓</label>
+        <label class="legendItem"><input id="showResinInfill" type="checkbox" checked><span class="swatch infillSwatch"></span>树脂填充</label>
+        <label class="legendItem"><input id="showFiberPaths" type="checkbox" checked><span class="swatch fiberSwatch"></span>纤维路径</label>
       </div>
       <div class="viewOptions" aria-label="显示选项">
         <label><input id="showLineWidth" type="checkbox">按线宽显示</label>
         <label><input id="showPathPoints" type="checkbox">显示当前路径点</label>
         <label><input id="showDirection" type="checkbox" checked>显示打印方向</label>
+        <span id="printSizeLabel">打印范围 -</span>
       </div>
-      <div class="preview" aria-hidden="true"><canvas id="previewCanvas"></canvas></div>
+      <div id="previewSurface" class="preview"><canvas id="previewCanvas" title="滚轮缩放；鼠标左键、右键或中键拖动视图"></canvas></div>
     </section>
   </main>
 
@@ -1176,21 +1427,104 @@ def _index_html() -> str:
     const layersEl = document.getElementById('layers');
     const pathsEl = document.getElementById('paths');
     const outputNameEl = document.getElementById('outputName');
+    const previewSurface = document.getElementById('previewSurface');
     const previewCanvas = document.getElementById('previewCanvas');
     const layerSlider = document.getElementById('layerSlider');
-    const resinPathSlider = document.getElementById('resinPathSlider');
-    const fiberPathSlider = document.getElementById('fiberPathSlider');
+    const pathProgressControl = document.getElementById('pathProgressControl');
+    const pathProgressSlider = document.getElementById('pathProgressSlider');
     const layerLabel = document.getElementById('layerLabel');
-    const resinPathLabel = document.getElementById('resinPathLabel');
-    const fiberPathLabel = document.getElementById('fiberPathLabel');
+    const pathProgressLabel = document.getElementById('pathProgressLabel');
+    const printSizeLabel = document.getElementById('printSizeLabel');
     const stlFileInput = document.getElementById('stlFile');
     const fiberJsonInput = document.getElementById('fiberJsonFile');
     const fiberNotice = document.getElementById('fiberNotice');
     const showLineWidthInput = document.getElementById('showLineWidth');
     const showPathPointsInput = document.getElementById('showPathPoints');
     const showDirectionInput = document.getElementById('showDirection');
+    const showOuterContourInput = document.getElementById('showOuterContour');
+    const showInnerContourInput = document.getElementById('showInnerContour');
+    const showResinInfillInput = document.getElementById('showResinInfill');
+    const showFiberPathsInput = document.getElementById('showFiberPaths');
+    const slicingKernelInput = document.getElementById('slicingKernel');
+    const layerHeightInput = document.getElementById('layerHeight');
+    const lineWidthInput = document.getElementById('lineWidth');
+    const legacyInfillControl = document.getElementById('legacyInfillControl');
+    const infillPatternInput = document.getElementById('infillPattern');
+    const pyslmNativeSettings = document.getElementById('pyslmNativeSettings');
+    const pyslmHatcherInput = document.getElementById('pyslmHatcher');
+    const pyslmPatternAutoInput = document.getElementById('pyslmPatternAuto');
+    const stripeParameterIds = ['pyslmStripeWidth', 'pyslmStripeOverlap', 'pyslmStripeOffset'];
+    const islandParameterIds = ['pyslmIslandWidth', 'pyslmIslandOverlap', 'pyslmIslandOffset'];
+    const pyslmSupportedPatterns = new Set(['none', 'line', 'aligned_rectilinear', 'rectilinear', 'zigzag', 'isotropic']);
+    const pyslmSettingsIds = [
+      'pyslmHatcher', 'pyslmHatchSort', 'pyslmHatchAngle', 'pyslmLayerAngleIncrement',
+      'pyslmHatchDistance', 'pyslmContourOffset', 'pyslmSpotCompensation',
+      'pyslmVolumeOffset', 'pyslmOuterContours', 'pyslmInnerContours',
+      'pyslmStripeWidth', 'pyslmStripeOverlap', 'pyslmStripeOffset',
+      'pyslmIslandWidth', 'pyslmIslandOverlap', 'pyslmIslandOffset',
+      'pyslmSimplificationFactor', 'pyslmSimplificationMode',
+      'pyslmScanContourFirst', 'pyslmFixPolygons', 'pyslmSimplificationPreserveTopology'
+    ];
     let previewData = null;
-    document.getElementById('infillPattern').value = 'rectilinear';
+    const viewerState = {{
+      zoom: 1.0,
+      centerX: null,
+      centerY: null,
+      dragging: false,
+      pointerId: null,
+      lastX: 0,
+      lastY: 0
+    }};
+    function updatePyslmStrategyDefaults() {{
+      if (!pyslmPatternAutoInput.checked) return;
+      const layerHeight = Number(layerHeightInput.value);
+      const lineWidth = Number(lineWidthInput.value);
+      if (!(layerHeight > 0) || !(lineWidth > 0)) return;
+      const width = Math.max(lineWidth * 5.0, layerHeight * 10.0);
+      const overlap = Math.min(0.1, lineWidth * 0.05, layerHeight * 0.2);
+      for (const id of ['pyslmStripeWidth', 'pyslmIslandWidth']) {{
+        document.getElementById(id).value = width.toFixed(3).replace(/\\.0+$/, '').replace(/(\\.\\d*?)0+$/, '$1');
+      }}
+      for (const id of ['pyslmStripeOverlap', 'pyslmIslandOverlap']) {{
+        document.getElementById(id).value = overlap.toFixed(3).replace(/\\.0+$/, '').replace(/(\\.\\d*?)0+$/, '$1');
+      }}
+      for (const id of ['pyslmStripeOffset', 'pyslmIslandOffset']) {{
+        document.getElementById(id).value = '0.5';
+      }}
+    }}
+    function syncKernelControls() {{
+      const isPyslm = slicingKernelInput.value === 'pyslm';
+      pyslmNativeSettings.hidden = !isPyslm;
+      legacyInfillControl.hidden = false;
+      infillPatternInput.disabled = false;
+      for (const option of infillPatternInput.options) {{
+        option.disabled = isPyslm && !pyslmSupportedPatterns.has(option.value);
+      }}
+      if (isPyslm && !pyslmSupportedPatterns.has(infillPatternInput.value)) {{
+        infillPatternInput.value = 'rectilinear';
+      }}
+      for (const id of pyslmSettingsIds) {{
+        document.getElementById(id).disabled = !isPyslm;
+      }}
+      pyslmPatternAutoInput.disabled = !isPyslm;
+      updatePyslmStrategyDefaults();
+      const strategy = pyslmHatcherInput.value;
+      const stripeEnabled = isPyslm && strategy === 'stripe';
+      const islandEnabled = isPyslm && (strategy === 'island' || strategy === 'basic_island');
+      for (const id of stripeParameterIds) {{
+        document.getElementById(id).disabled = !stripeEnabled || pyslmPatternAutoInput.checked;
+      }}
+      for (const id of islandParameterIds) {{
+        document.getElementById(id).disabled = !islandEnabled || pyslmPatternAutoInput.checked;
+      }}
+    }}
+    slicingKernelInput.addEventListener('change', syncKernelControls);
+    infillPatternInput.addEventListener('change', syncKernelControls);
+    pyslmHatcherInput.addEventListener('change', syncKernelControls);
+    pyslmPatternAutoInput.addEventListener('change', syncKernelControls);
+    layerHeightInput.addEventListener('input', syncKernelControls);
+    lineWidthInput.addEventListener('input', syncKernelControls);
+    syncKernelControls();
     fiberNotice.textContent = 'JSON 中的单层纤维路径会复制到每个树脂层，最后一层树脂封顶不打印纤维。';
 
     form.addEventListener('submit', async (event) => {{
@@ -1219,13 +1553,33 @@ def _index_html() -> str:
       formData.append('infill_pattern', document.getElementById('infillPattern').value);
       formData.append('infill_density', document.getElementById('infillDensity').value);
       formData.append('infill_overlap', document.getElementById('infillOverlap').value);
+      formData.append('triangle_path_optimization', document.getElementById('trianglePathOptimization').checked ? 'true' : 'false');
+      formData.append('zigzag_path_optimization', document.getElementById('zigzagPathOptimization').checked ? 'true' : 'false');
+      formData.append('slicing_kernel', document.getElementById('slicingKernel').value);
+      formData.append('pyslm_hatcher', document.getElementById('pyslmHatcher').value);
+      formData.append('pyslm_hatch_sort', document.getElementById('pyslmHatchSort').value);
+      formData.append('pyslm_hatch_angle', document.getElementById('pyslmHatchAngle').value);
+      formData.append('pyslm_layer_angle_increment', document.getElementById('pyslmLayerAngleIncrement').value);
+      formData.append('pyslm_hatch_distance', document.getElementById('pyslmHatchDistance').value);
+      formData.append('pyslm_contour_offset', document.getElementById('pyslmContourOffset').value);
+      formData.append('pyslm_spot_compensation', document.getElementById('pyslmSpotCompensation').value);
+      formData.append('pyslm_volume_offset_hatch', document.getElementById('pyslmVolumeOffset').value);
+      formData.append('pyslm_num_outer_contours', document.getElementById('pyslmOuterContours').value);
+      formData.append('pyslm_num_inner_contours', document.getElementById('pyslmInnerContours').value);
+      formData.append('pyslm_stripe_width', document.getElementById('pyslmStripeWidth').value);
+      formData.append('pyslm_stripe_overlap', document.getElementById('pyslmStripeOverlap').value);
+      formData.append('pyslm_stripe_offset', document.getElementById('pyslmStripeOffset').value);
+      formData.append('pyslm_island_width', document.getElementById('pyslmIslandWidth').value);
+      formData.append('pyslm_island_overlap', document.getElementById('pyslmIslandOverlap').value);
+      formData.append('pyslm_island_offset', document.getElementById('pyslmIslandOffset').value);
+      formData.append('pyslm_fix_polygons', document.getElementById('pyslmFixPolygons').checked ? 'true' : 'false');
+      formData.append('pyslm_scan_contour_first', document.getElementById('pyslmScanContourFirst').checked ? 'true' : 'false');
+      formData.append('pyslm_simplification_factor', document.getElementById('pyslmSimplificationFactor').value);
+      formData.append('pyslm_simplification_mode', document.getElementById('pyslmSimplificationMode').value);
+      formData.append('pyslm_simplification_preserve_topology', document.getElementById('pyslmSimplificationPreserveTopology').checked ? 'true' : 'false');
       formData.append('smoothing_angle', document.getElementById('smoothingAngle').value);
       formData.append('smoothing_radius_factor', document.getElementById('smoothingRadiusFactor').value);
-      formData.append('raft_layer_count', document.getElementById('raftLayerCount').value);
-      formData.append('raft_top_gap', document.getElementById('raftTopGap').value);
       formData.append('raft_offsets', document.getElementById('raftOffsets').value);
-      formData.append('raft_layer_heights', document.getElementById('raftLayerHeights').value);
-      formData.append('raft_infill_densities', document.getElementById('raftInfillDensities').value);
       formData.append('curve_mode', document.getElementById('curveMode').value);
       formData.append('curve_amplitude', document.getElementById('curveAmplitude').value);
       formData.append('curve_period', document.getElementById('curvePeriod').value);
@@ -1264,21 +1618,16 @@ def _index_html() -> str:
       const layers = previewData?.layers || [];
       layerSlider.disabled = layers.length === 0;
       layerSlider.max = Math.max(0, layers.length - 1);
-      layerSlider.value = layers.length ? 0 : 0;
-      updatePathSlider();
+      layerSlider.value = 0;
+      resetPreviewView();
+      updatePrintSizeLabel();
+      updatePathSlider(true);
     }}
 
-    function updatePathSlider() {{
-      const layer = currentLayer();
-      const resinPathCount = layer ? layer.paths.length : 0;
-      const fiberPathCount = layer ? (layer.fiber_paths || []).length : 0;
-      resinPathSlider.disabled = resinPathCount === 0;
-      resinPathSlider.max = resinPathCount;
-      resinPathSlider.value = resinPathCount;
-      fiberPathSlider.disabled = fiberPathCount === 0;
-      fiberPathSlider.max = fiberPathCount;
-      fiberPathSlider.value = fiberPathCount;
-      updateViewerLabels();
+    function resetPreviewView() {{
+      viewerState.zoom = 1.0;
+      viewerState.centerX = null;
+      viewerState.centerY = null;
     }}
 
     function currentLayer() {{
@@ -1286,136 +1635,295 @@ def _index_html() -> str:
       return layers[Number(layerSlider.value)] || null;
     }}
 
+    function roleIsSelected(role) {{
+      if (role === 'outer_contour') return showOuterContourInput.checked;
+      if (role === 'inner_contour') return showInnerContourInput.checked;
+      if (role === 'fiber') return showFiberPathsInput.checked;
+      return showResinInfillInput.checked;
+    }}
+
+    function selectedPrintEntries(layer) {{
+      if (!layer) return [];
+      const entries = [];
+      const resinEntries = layer.resin_paths
+        || (layer.paths || []).map((points) => ({{ role: 'infill', points }}));
+      for (const rawEntry of resinEntries) {{
+        const role = rawEntry.role || 'infill';
+        const points = rawEntry.points || rawEntry;
+        if (roleIsSelected(role) && points && points.length >= 2) {{
+          entries.push({{ role, points }});
+        }}
+      }}
+      if (showFiberPathsInput.checked) {{
+        for (const points of layer.fiber_paths || []) {{
+          if (points && points.length >= 2) entries.push({{ role: 'fiber', points }});
+        }}
+      }}
+      return entries;
+    }}
+
+    function updatePathSlider(resetToEnd = false) {{
+      const pathCount = selectedPrintEntries(currentLayer()).length;
+      const previousValue = Number(pathProgressSlider.value);
+      const previousMax = Number(pathProgressSlider.max);
+      const wasAtEnd = previousValue >= previousMax;
+      pathProgressSlider.disabled = pathCount === 0;
+      pathProgressControl.hidden = pathCount === 0;
+      pathProgressSlider.max = pathCount;
+      pathProgressSlider.value = resetToEnd || wasAtEnd
+        ? pathCount
+        : Math.min(previousValue, pathCount);
+      updateViewerLabels();
+    }}
+
     function updateViewerLabels() {{
       const layer = currentLayer();
       const layerCount = previewData?.layers?.length || 0;
-      const resinPathCount = layer ? layer.paths.length : 0;
-      const fiberPathCount = layer ? (layer.fiber_paths || []).length : 0;
+      const pathCount = selectedPrintEntries(layer).length;
       layerLabel.textContent = layer ? `${{Number(layerSlider.value) + 1}} / ${{layerCount}}` : '-';
-      resinPathLabel.textContent = resinPathCount ? `${{resinPathSlider.value}} / ${{resinPathCount}}` : '-';
-      fiberPathLabel.textContent = fiberPathCount ? `${{fiberPathSlider.value}} / ${{fiberPathCount}}` : '-';
+      pathProgressLabel.textContent = pathCount
+        ? `${{pathProgressSlider.value}} / ${{pathCount}}`
+        : '-';
+    }}
+
+    function updatePrintSizeLabel() {{
+      const bounds = previewData?.bounds;
+      if (!bounds || [bounds.min_x, bounds.max_x, bounds.min_y, bounds.max_y]
+        .some((value) => value === null || value === undefined)) {{
+        printSizeLabel.textContent = '打印范围 -';
+        return;
+      }}
+      const width = Math.max(0, Number(bounds.max_x) - Number(bounds.min_x));
+      const height = Math.max(0, Number(bounds.max_y) - Number(bounds.min_y));
+      printSizeLabel.textContent = `打印范围 X ${{formatDimension(width)}} mm × Y ${{formatDimension(height)}} mm`;
+    }}
+
+    function formatDimension(value) {{
+      const decimals = value >= 100 ? 1 : 2;
+      return Number(value.toFixed(decimals)).toString();
+    }}
+
+    function buildViewport(rect, bounds) {{
+      const plot = {{
+        left: 56,
+        top: 18,
+        right: Math.max(80, rect.width - 18),
+        bottom: Math.max(80, rect.height - 38)
+      }};
+      plot.width = Math.max(1, plot.right - plot.left);
+      plot.height = Math.max(1, plot.bottom - plot.top);
+      const spanX = Math.max(0.001, Number(bounds.max_x) - Number(bounds.min_x));
+      const spanY = Math.max(0.001, Number(bounds.max_y) - Number(bounds.min_y));
+      const baseScale = Math.max(
+        1e-6,
+        Math.min(
+          Math.max(1, plot.width - 24) / spanX,
+          Math.max(1, plot.height - 24) / spanY
+        )
+      );
+      if (viewerState.centerX === null || viewerState.centerY === null) {{
+        viewerState.centerX = (Number(bounds.min_x) + Number(bounds.max_x)) * 0.5;
+        viewerState.centerY = (Number(bounds.min_y) + Number(bounds.max_y)) * 0.5;
+      }}
+      const pixelsPerMm = baseScale * viewerState.zoom;
+      const plotCenterX = (plot.left + plot.right) * 0.5;
+      const plotCenterY = (plot.top + plot.bottom) * 0.5;
+      const project = (point) => [
+        plotCenterX + (Number(point[0]) - viewerState.centerX) * pixelsPerMm,
+        plotCenterY - (Number(point[1]) - viewerState.centerY) * pixelsPerMm
+      ];
+      const unproject = (x, y) => [
+        viewerState.centerX + (x - plotCenterX) / pixelsPerMm,
+        viewerState.centerY - (y - plotCenterY) / pixelsPerMm
+      ];
+      return {{ plot, baseScale, pixelsPerMm, plotCenterX, plotCenterY, project, unproject }};
+    }}
+
+    function niceGridStep(pixelsPerMm) {{
+      const targetWorldStep = 72 / Math.max(pixelsPerMm, 1e-9);
+      const exponent = Math.floor(Math.log10(targetWorldStep));
+      const magnitude = 10 ** exponent;
+      const normalized = targetWorldStep / magnitude;
+      const factor = normalized <= 1 ? 1 : normalized <= 2 ? 2 : normalized <= 5 ? 5 : 10;
+      return factor * magnitude;
+    }}
+
+    function forEachGridValue(minimum, maximum, step, callback) {{
+      const first = Math.ceil((minimum - step * 1e-8) / step);
+      const last = Math.floor((maximum + step * 1e-8) / step);
+      for (let index = first; index <= last && index - first < 1200; index++) {{
+        callback(index * step);
+      }}
+    }}
+
+    function formatRulerValue(value, step) {{
+      const decimals = step < 0.1 ? 2 : step < 1 ? 1 : 0;
+      const normalized = Math.abs(value) < step * 1e-6 ? 0 : value;
+      return normalized.toFixed(decimals);
+    }}
+
+    function drawMeasurementGrid(ctx, viewport, rect) {{
+      const {{ plot, project, unproject, pixelsPerMm }} = viewport;
+      const topLeft = unproject(plot.left, plot.top);
+      const bottomRight = unproject(plot.right, plot.bottom);
+      const minVisibleX = Math.min(topLeft[0], bottomRight[0]);
+      const maxVisibleX = Math.max(topLeft[0], bottomRight[0]);
+      const minVisibleY = Math.min(topLeft[1], bottomRight[1]);
+      const maxVisibleY = Math.max(topLeft[1], bottomRight[1]);
+      const majorStep = niceGridStep(pixelsPerMm);
+      const minorStep = majorStep / 5;
+
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(plot.left, plot.top, plot.width, plot.height);
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(plot.left, plot.top, plot.width, plot.height);
+      ctx.clip();
+
+      ctx.strokeStyle = '#edf0f2';
+      ctx.lineWidth = 1;
+      forEachGridValue(minVisibleX, maxVisibleX, minorStep, (value) => {{
+        const x = project([value, 0])[0];
+        ctx.beginPath();
+        ctx.moveTo(x, plot.top);
+        ctx.lineTo(x, plot.bottom);
+        ctx.stroke();
+      }});
+      forEachGridValue(minVisibleY, maxVisibleY, minorStep, (value) => {{
+        const y = project([0, value])[1];
+        ctx.beginPath();
+        ctx.moveTo(plot.left, y);
+        ctx.lineTo(plot.right, y);
+        ctx.stroke();
+      }});
+
+      ctx.strokeStyle = '#d5dbe0';
+      forEachGridValue(minVisibleX, maxVisibleX, majorStep, (value) => {{
+        const x = project([value, 0])[0];
+        ctx.beginPath();
+        ctx.moveTo(x, plot.top);
+        ctx.lineTo(x, plot.bottom);
+        ctx.stroke();
+      }});
+      forEachGridValue(minVisibleY, maxVisibleY, majorStep, (value) => {{
+        const y = project([0, value])[1];
+        ctx.beginPath();
+        ctx.moveTo(plot.left, y);
+        ctx.lineTo(plot.right, y);
+        ctx.stroke();
+      }});
+      ctx.restore();
+
+      ctx.strokeStyle = '#aeb8c0';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(plot.left + 0.5, plot.top + 0.5, plot.width - 1, plot.height - 1);
+      ctx.fillStyle = '#5c6972';
+      ctx.font = '11px Segoe UI, Arial, sans-serif';
+      ctx.textBaseline = 'middle';
+      ctx.textAlign = 'center';
+      forEachGridValue(minVisibleX, maxVisibleX, majorStep, (value) => {{
+        const x = project([value, 0])[0];
+        if (x > plot.left + 16 && x < plot.right - 58) {{
+          ctx.fillText(formatRulerValue(value, majorStep), x, plot.bottom + 18);
+        }}
+      }});
+      ctx.textAlign = 'right';
+      forEachGridValue(minVisibleY, maxVisibleY, majorStep, (value) => {{
+        const y = project([0, value])[1];
+        if (y > plot.top + 8 && y < plot.bottom - 8) {{
+          ctx.fillText(formatRulerValue(value, majorStep), plot.left - 8, y);
+        }}
+      }});
+      ctx.fillStyle = '#172026';
+      ctx.font = '600 11px Segoe UI, Arial, sans-serif';
+      ctx.textAlign = 'right';
+      ctx.fillText('X (mm)', plot.right, plot.bottom + 18);
+      ctx.save();
+      ctx.translate(12, (plot.top + plot.bottom) * 0.5);
+      ctx.rotate(-Math.PI * 0.5);
+      ctx.textAlign = 'center';
+      ctx.fillText('Y (mm)', 0, 0);
+      ctx.restore();
+    }}
+
+    function pathColor(role) {{
+      if (role === 'outer_contour') return '#146c43';
+      if (role === 'inner_contour') return '#7b2cbf';
+      if (role === 'fiber') return '#e66f00';
+      return '#0b6bcb';
     }}
 
     function drawPreview() {{
       const canvas = previewCanvas;
       const rect = canvas.getBoundingClientRect();
-      const scale = window.devicePixelRatio || 1;
-      canvas.width = Math.max(1, Math.floor(rect.width * scale));
-      canvas.height = Math.max(1, Math.floor(rect.height * scale));
+      const deviceScale = window.devicePixelRatio || 1;
+      canvas.width = Math.max(1, Math.floor(rect.width * deviceScale));
+      canvas.height = Math.max(1, Math.floor(rect.height * deviceScale));
       const ctx = canvas.getContext('2d');
-      ctx.setTransform(scale, 0, 0, scale, 0, 0);
+      ctx.setTransform(deviceScale, 0, 0, deviceScale, 0, 0);
       ctx.clearRect(0, 0, rect.width, rect.height);
 
       const layer = currentLayer();
-      if (!previewData || !layer) {{
+      const bounds = previewData?.bounds;
+      if (!layer || !bounds || [bounds.min_x, bounds.max_x, bounds.min_y, bounds.max_y]
+        .some((value) => value === null || value === undefined)) {{
         drawEmptyPreview(ctx, rect.width, rect.height);
         updateViewerLabels();
         return;
       }}
 
-      const bounds = previewData.bounds;
-      const minX = bounds.min_x;
-      const maxX = bounds.max_x;
-      const minY = bounds.min_y;
-      const maxY = bounds.max_y;
-      if ([minX, maxX, minY, maxY].some((value) => value === null || value === undefined)) {{
-        drawEmptyPreview(ctx, rect.width, rect.height);
-        updateViewerLabels();
-        return;
-      }}
-      const spanX = Math.max(0.001, maxX - minX);
-      const spanY = Math.max(0.001, maxY - minY);
+      const viewport = buildViewport(rect, bounds);
+      drawMeasurementGrid(ctx, viewport, rect);
+      const entries = selectedPrintEntries(layer);
+      const visibleCount = Math.min(Number(pathProgressSlider.value), entries.length);
+      const currentEntry = visibleCount > 0 ? entries[visibleCount - 1] : null;
       const lineWidths = previewData.line_widths || {{ resin: 2.0, fiber: 1.0 }};
       const usePhysicalWidth = showLineWidthInput.checked;
-      const previewLineWidth = Math.max(Number(lineWidths.resin || 2.0), Number(lineWidths.fiber || 1.0));
-      const initialFit = Math.min((rect.width - 48) / spanX, (rect.height - 48) / spanY);
-      const margin = usePhysicalWidth
-        ? Math.max(24, previewLineWidth * initialFit * 0.5 + 10)
-        : 24;
-      const x = margin;
-      const y = margin;
-      const w = Math.max(1, rect.width - margin * 2);
-      const h = Math.max(1, rect.height - margin * 2);
-      const fit = Math.min(w / spanX, h / spanY);
-      const offsetX = x + (w - spanX * fit) / 2;
-      const offsetY = y + (h - spanY * fit) / 2;
-      const resinStrokeWidth = usePhysicalWidth ? Math.max(1.2, Number(lineWidths.resin || 2.0) * fit) : 1.7;
-      const fiberStrokeWidth = usePhysicalWidth ? Math.max(1.0, Number(lineWidths.fiber || 1.0) * fit) : 2.0;
 
-      ctx.save();
-      ctx.lineCap = 'round';
-      ctx.lineJoin = 'round';
-
-      function project(point) {{
-        return [
-          offsetX + (point[0] - minX) * fit,
-          offsetY + (maxY - point[1]) * fit
-        ];
-      }}
-
-      const resinEntries = layer.resin_paths || (layer.paths || []).map((points) => ({{ role: 'infill', points }}));
-      const visiblePaths = Math.min(Number(resinPathSlider.value), resinEntries.length);
-      let currentResinPath = null;
-      let currentResinColor = '#0b6bcb';
-      for (let pathIndex = 0; pathIndex < resinEntries.length; pathIndex++) {{
-        const entry = resinEntries[pathIndex];
-        const path = entry.points || entry;
-        if (!path || path.length < 2) continue;
-        const isContour = entry.role === 'outer_contour' || entry.role === 'inner_contour';
-        if (!isContour && pathIndex >= visiblePaths) continue;
-        if (entry.role === 'outer_contour') {{
-          ctx.strokeStyle = '#146c43';
-          if (pathIndex === visiblePaths - 1) currentResinColor = '#146c43';
-          ctx.lineWidth = resinStrokeWidth;
-        }} else if (entry.role === 'inner_contour') {{
-          ctx.strokeStyle = '#7b2cbf';
-          if (pathIndex === visiblePaths - 1) currentResinColor = '#7b2cbf';
-          ctx.lineWidth = resinStrokeWidth;
-        }} else {{
-          ctx.strokeStyle = '#0b6bcb';
-          if (pathIndex === visiblePaths - 1) currentResinColor = '#0b6bcb';
-          ctx.lineWidth = resinStrokeWidth;
-        }}
-        if (pathIndex === visiblePaths - 1) currentResinPath = path;
-        const first = project(path[0]);
+      function drawPath(path) {{
+        const first = viewport.project(path[0]);
         ctx.beginPath();
         ctx.moveTo(first[0], first[1]);
         for (let pointIndex = 1; pointIndex < path.length; pointIndex++) {{
-          const point = project(path[pointIndex]);
+          const point = viewport.project(path[pointIndex]);
           ctx.lineTo(point[0], point[1]);
         }}
         const last = path[path.length - 1];
-        if (path.length > 2 && Math.abs(last[0] - path[0][0]) < 0.001 && Math.abs(last[1] - path[0][1]) < 0.001) {{
+        if (path.length > 2
+          && Math.abs(last[0] - path[0][0]) < 0.001
+          && Math.abs(last[1] - path[0][1]) < 0.001) {{
           ctx.closePath();
         }}
         ctx.stroke();
       }}
 
-      const fiberPaths = layer.fiber_paths || [];
-      const visibleFiberPaths = Math.min(Number(fiberPathSlider.value), fiberPaths.length);
-      let currentFiberPath = null;
-      for (let fiberIndex = 0; fiberIndex < visibleFiberPaths; fiberIndex++) {{
-        const path = fiberPaths[fiberIndex];
-        if (!path || path.length < 2) continue;
-        if (fiberIndex === visibleFiberPaths - 1) currentFiberPath = path;
-        ctx.strokeStyle = '#e66f00';
-        ctx.lineWidth = fiberStrokeWidth;
-        const first = project(path[0]);
-        ctx.beginPath();
-        ctx.moveTo(first[0], first[1]);
-        for (let pointIndex = 1; pointIndex < path.length; pointIndex++) {{
-          const point = project(path[pointIndex]);
-          ctx.lineTo(point[0], point[1]);
-        }}
-        ctx.stroke();
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(
+        viewport.plot.left,
+        viewport.plot.top,
+        viewport.plot.width,
+        viewport.plot.height
+      );
+      ctx.clip();
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      for (let index = 0; index < visibleCount; index++) {{
+        const entry = entries[index];
+        ctx.strokeStyle = pathColor(entry.role);
+        const physicalWidth = entry.role === 'fiber'
+          ? Number(lineWidths.fiber || 1.0)
+          : Number(lineWidths.resin || 2.0);
+        ctx.lineWidth = usePhysicalWidth
+          ? Math.max(1.0, physicalWidth * viewport.pixelsPerMm)
+          : entry.role === 'fiber' ? 2.0 : 1.7;
+        drawPath(entry.points);
       }}
-      if (showPathPointsInput.checked) {{
-        drawPathPoints(ctx, currentResinPath, currentResinColor, project);
-        drawPathPoints(ctx, currentFiberPath, '#e66f00', project);
+      if (currentEntry && showPathPointsInput.checked) {{
+        drawPathPoints(ctx, currentEntry.points, pathColor(currentEntry.role), viewport.project);
       }}
-      if (showDirectionInput.checked) {{
-        drawDirection(ctx, currentResinPath, currentResinColor, project);
-        drawDirection(ctx, currentFiberPath, '#e66f00', project);
+      if (currentEntry && showDirectionInput.checked) {{
+        drawDirection(ctx, currentEntry.points, pathColor(currentEntry.role), viewport.project);
       }}
       ctx.restore();
       updateViewerLabels();
@@ -1424,7 +1932,7 @@ def _index_html() -> str:
     function drawPathPoints(ctx, path, color, project) {{
       if (!path || path.length < 1) return;
       ctx.save();
-      ctx.fillStyle = '#ffffff';
+      ctx.fillStyle = color;
       ctx.strokeStyle = color;
       ctx.lineWidth = 1.5;
       const sampleSpacing = 12;
@@ -1489,19 +1997,6 @@ def _index_html() -> str:
       ctx.save();
       ctx.lineCap = 'round';
       ctx.lineJoin = 'round';
-      ctx.strokeStyle = '#ffffff';
-      ctx.lineWidth = 9;
-      ctx.beginPath();
-      ctx.moveTo(start[0], start[1]);
-      ctx.lineTo(tip[0], tip[1]);
-      ctx.stroke();
-      ctx.fillStyle = '#ffffff';
-      ctx.beginPath();
-      ctx.moveTo(tip[0], tip[1]);
-      ctx.lineTo(tip[0] - Math.cos(angle - 0.58) * 17, tip[1] - Math.sin(angle - 0.58) * 17);
-      ctx.lineTo(tip[0] - Math.cos(angle + 0.58) * 17, tip[1] - Math.sin(angle + 0.58) * 17);
-      ctx.closePath();
-      ctx.fill();
       ctx.strokeStyle = color;
       ctx.fillStyle = color;
       ctx.lineWidth = 4;
@@ -1519,14 +2014,100 @@ def _index_html() -> str:
     }}
 
     function drawEmptyPreview(ctx, width, height) {{
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, width, height);
     }}
 
-    layerSlider.addEventListener('input', () => {{
-      updatePathSlider();
+    function currentViewportForInteraction() {{
+      const bounds = previewData?.bounds;
+      if (!currentLayer() || !bounds
+        || [bounds.min_x, bounds.max_x, bounds.min_y, bounds.max_y]
+          .some((value) => value === null || value === undefined)) {{
+        return null;
+      }}
+      const rect = previewCanvas.getBoundingClientRect();
+      return {{ rect, viewport: buildViewport(rect, bounds) }};
+    }}
+
+    previewCanvas.addEventListener('wheel', (event) => {{
+      const current = currentViewportForInteraction();
+      if (!current) return;
+      event.preventDefault();
+      const x = event.clientX - current.rect.left;
+      const y = event.clientY - current.rect.top;
+      const {{ plot }} = current.viewport;
+      if (x < plot.left || x > plot.right || y < plot.top || y > plot.bottom) return;
+      const worldPoint = current.viewport.unproject(x, y);
+      const zoomFactor = Math.exp(-event.deltaY * 0.0015);
+      const nextZoom = Math.min(40.0, Math.max(0.2, viewerState.zoom * zoomFactor));
+      if (Math.abs(nextZoom - viewerState.zoom) < 1e-9) return;
+      viewerState.zoom = nextZoom;
+      const nextScale = current.viewport.baseScale * nextZoom;
+      viewerState.centerX = worldPoint[0]
+        - (x - current.viewport.plotCenterX) / nextScale;
+      viewerState.centerY = worldPoint[1]
+        + (y - current.viewport.plotCenterY) / nextScale;
+      drawPreview();
+    }}, {{ passive: false }});
+
+    previewCanvas.addEventListener('pointerdown', (event) => {{
+      if (![0, 1, 2].includes(event.button) || !currentViewportForInteraction()) return;
+      event.preventDefault();
+      viewerState.dragging = true;
+      viewerState.pointerId = event.pointerId;
+      viewerState.lastX = event.clientX;
+      viewerState.lastY = event.clientY;
+      previewCanvas.setPointerCapture(event.pointerId);
+      previewSurface.classList.add('dragging');
+    }});
+
+    previewCanvas.addEventListener('pointermove', (event) => {{
+      if (!viewerState.dragging || viewerState.pointerId !== event.pointerId) return;
+      const current = currentViewportForInteraction();
+      if (!current) return;
+      const deltaX = event.clientX - viewerState.lastX;
+      const deltaY = event.clientY - viewerState.lastY;
+      viewerState.lastX = event.clientX;
+      viewerState.lastY = event.clientY;
+      viewerState.centerX -= deltaX / current.viewport.pixelsPerMm;
+      viewerState.centerY += deltaY / current.viewport.pixelsPerMm;
       drawPreview();
     }});
-    resinPathSlider.addEventListener('input', drawPreview);
-    fiberPathSlider.addEventListener('input', drawPreview);
+
+    function finishPreviewDrag(event) {{
+      if (!viewerState.dragging || viewerState.pointerId !== event.pointerId) return;
+      viewerState.dragging = false;
+      viewerState.pointerId = null;
+      previewSurface.classList.remove('dragging');
+      if (previewCanvas.hasPointerCapture(event.pointerId)) {{
+        previewCanvas.releasePointerCapture(event.pointerId);
+      }}
+    }}
+
+    previewCanvas.addEventListener('pointerup', finishPreviewDrag);
+    previewCanvas.addEventListener('pointercancel', finishPreviewDrag);
+    previewCanvas.addEventListener('contextmenu', (event) => event.preventDefault());
+    previewCanvas.addEventListener('dblclick', () => {{
+      resetPreviewView();
+      drawPreview();
+    }});
+
+    layerSlider.addEventListener('input', () => {{
+      updatePathSlider(true);
+      drawPreview();
+    }});
+    pathProgressSlider.addEventListener('input', drawPreview);
+    for (const input of [
+      showOuterContourInput,
+      showInnerContourInput,
+      showResinInfillInput,
+      showFiberPathsInput
+    ]) {{
+      input.addEventListener('change', () => {{
+        updatePathSlider();
+        drawPreview();
+      }});
+    }}
     showLineWidthInput.addEventListener('change', drawPreview);
     showPathPointsInput.addEventListener('change', drawPreview);
     showDirectionInput.addEventListener('change', drawPreview);

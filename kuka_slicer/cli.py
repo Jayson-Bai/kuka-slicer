@@ -13,8 +13,10 @@ from .slicer import (
     DEFAULT_RESIN_INFILL_OVERLAP_PERCENT,
     DEFAULT_RESIN_LAYER_HEIGHT_MM,
     DEFAULT_RESIN_LINE_WIDTH_MM,
+    PySLMConfig,
     SliceConfig,
     normalize_job_xy_origin,
+    recommended_pyslm_strategy_defaults,
     slice_mesh_to_job,
 )
 from .stl_io import load_stl
@@ -53,6 +55,58 @@ def main(argv: list[str] | None = None) -> int:
         default="z",
         help="source STL axis used as the layer-height/build direction",
     )
+    slice_parser.add_argument(
+        "--slicing-kernel",
+        choices=["legacy", "pyslm"],
+        default="legacy",
+        help="toolpath kernel; pyslm is independent and requires optional dependencies",
+    )
+    slice_parser.add_argument(
+        "--pyslm-hatcher",
+        choices=["basic", "stripe", "island", "basic_island"],
+        default="basic",
+        help="PySLM native hatcher strategy",
+    )
+    slice_parser.add_argument("--pyslm-hatch-angle", type=float)
+    slice_parser.add_argument("--pyslm-layer-angle-increment", type=float, default=0.0)
+    slice_parser.add_argument("--pyslm-hatch-distance", type=float)
+    slice_parser.add_argument("--pyslm-contour-offset", type=float)
+    slice_parser.add_argument("--pyslm-spot-compensation", type=float)
+    slice_parser.add_argument("--pyslm-volume-offset-hatch", type=float)
+    slice_parser.add_argument("--pyslm-num-outer-contours", type=int)
+    slice_parser.add_argument("--pyslm-num-inner-contours", type=int)
+    slice_parser.add_argument(
+        "--pyslm-scan-contour-first",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    slice_parser.add_argument(
+        "--pyslm-hatch-sort",
+        choices=["none", "alternate", "unidirectional", "linear", "directional"],
+        default="none",
+    )
+    slice_parser.add_argument("--pyslm-stripe-width", type=float)
+    slice_parser.add_argument("--pyslm-stripe-overlap", type=float)
+    slice_parser.add_argument("--pyslm-stripe-offset", type=float)
+    slice_parser.add_argument("--pyslm-island-width", type=float)
+    slice_parser.add_argument("--pyslm-island-overlap", type=float)
+    slice_parser.add_argument("--pyslm-island-offset", type=float)
+    slice_parser.add_argument(
+        "--pyslm-fix-polygons",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    slice_parser.add_argument("--pyslm-simplification-factor", type=float)
+    slice_parser.add_argument(
+        "--pyslm-simplification-preserve-topology",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    slice_parser.add_argument(
+        "--pyslm-simplification-mode",
+        choices=["absolute", "bound"],
+        default="absolute",
+    )
     slice_parser.add_argument("--curve", choices=["flat", "sinusoidal"], default="flat")
     slice_parser.add_argument("--curve-amplitude", type=float, default=0.0)
     slice_parser.add_argument("--curve-period", type=float, default=50.0)
@@ -68,6 +122,7 @@ def main(argv: list[str] | None = None) -> int:
             "gyroid",
             "concentric",
             "zigzag",
+            "isotropic",
         ],
         default="rectilinear",
         help="resin fill pattern",
@@ -83,6 +138,18 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=DEFAULT_RESIN_INFILL_OVERLAP_PERCENT,
         help="resin path overlap percent used for infill spacing and wall overlap",
+    )
+    slice_parser.add_argument(
+        "--triangle-path-optimization",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="reorder and reverse legacy triangle paths to reduce travel",
+    )
+    slice_parser.add_argument(
+        "--zigzag-path-optimization",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="reorder, reverse, and merge legacy zigzag paths",
     )
     slice_parser.add_argument("--perimeter-count", type=int, default=2)
     slice_parser.add_argument(
@@ -122,10 +189,73 @@ def main(argv: list[str] | None = None) -> int:
 
 def _slice_command(args: argparse.Namespace) -> int:
     mesh = load_stl(args.input_stl)
+    material_defaults = {
+        "R": (DEFAULT_RESIN_LAYER_HEIGHT_MM, DEFAULT_RESIN_LINE_WIDTH_MM),
+        "F": (DEFAULT_FIBER_LAYER_HEIGHT_MM, DEFAULT_FIBER_LINE_WIDTH_MM),
+    }
+    layer_height = (
+        material_defaults[args.material][0]
+        if args.layer_height is None
+        else args.layer_height
+    )
+    line_width = (
+        material_defaults[args.material][1]
+        if args.line_width is None
+        else args.line_width
+    )
+    pyslm_strategy_defaults = recommended_pyslm_strategy_defaults(layer_height, line_width)
     config = SliceConfig(
-        layer_height=args.layer_height,
-        line_width=args.line_width,
+        layer_height=layer_height,
+        line_width=line_width,
         material=args.material,
+        slicing_kernel=args.slicing_kernel,
+        pyslm=PySLMConfig(
+            hatcher=args.pyslm_hatcher,
+            hatch_angle=args.pyslm_hatch_angle,
+            layer_angle_increment=args.pyslm_layer_angle_increment,
+            hatch_distance=args.pyslm_hatch_distance,
+            contour_offset=args.pyslm_contour_offset,
+            spot_compensation=args.pyslm_spot_compensation,
+            volume_offset_hatch=args.pyslm_volume_offset_hatch,
+            num_outer_contours=args.pyslm_num_outer_contours,
+            num_inner_contours=args.pyslm_num_inner_contours,
+            scan_contour_first=args.pyslm_scan_contour_first,
+            hatch_sort=args.pyslm_hatch_sort,
+            stripe_width=(
+                pyslm_strategy_defaults.width
+                if args.pyslm_stripe_width is None
+                else args.pyslm_stripe_width
+            ),
+            stripe_overlap=(
+                pyslm_strategy_defaults.overlap
+                if args.pyslm_stripe_overlap is None
+                else args.pyslm_stripe_overlap
+            ),
+            stripe_offset=(
+                pyslm_strategy_defaults.offset
+                if args.pyslm_stripe_offset is None
+                else args.pyslm_stripe_offset
+            ),
+            island_width=(
+                pyslm_strategy_defaults.width
+                if args.pyslm_island_width is None
+                else args.pyslm_island_width
+            ),
+            island_overlap=(
+                pyslm_strategy_defaults.overlap
+                if args.pyslm_island_overlap is None
+                else args.pyslm_island_overlap
+            ),
+            island_offset=(
+                pyslm_strategy_defaults.offset
+                if args.pyslm_island_offset is None
+                else args.pyslm_island_offset
+            ),
+            fix_polygons=args.pyslm_fix_polygons,
+            simplification_factor=args.pyslm_simplification_factor,
+            simplification_preserve_topology=args.pyslm_simplification_preserve_topology,
+            simplification_mode=args.pyslm_simplification_mode,
+        ),
         build_axis=args.build_axis,
         z_min=args.z_min,
         z_max=args.z_max,
@@ -135,6 +265,8 @@ def _slice_command(args: argparse.Namespace) -> int:
         infill_pattern=args.infill_pattern,
         infill_density=args.infill_density,
         infill_overlap=args.infill_overlap,
+        triangle_path_optimization=args.triangle_path_optimization,
+        zigzag_path_optimization=args.zigzag_path_optimization,
         perimeter_count=args.perimeter_count,
         smoothing_angle=args.smoothing_angle,
         smoothing_radius_factor=args.smoothing_radius_factor,

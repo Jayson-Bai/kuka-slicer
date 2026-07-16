@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import math
 from typing import Callable, Literal
 
@@ -31,8 +31,14 @@ InfillPattern = Literal[
     "gyroid",
     "concentric",
     "zigzag",
+    "isotropic",
 ]
 BuildAxis = Literal["x", "y", "z"]
+SlicingKernel = Literal["legacy", "pyslm"]
+PySLMHatcher = Literal["basic", "stripe", "island", "basic_island"]
+PySLMHatchSort = Literal["none", "alternate", "unidirectional", "linear", "directional"]
+PySLMSimplificationMode = Literal["absolute", "bound"]
+RaftInfillPattern = Literal["concentric", "zigzag"]
 
 DEFAULT_RESIN_LAYER_HEIGHT_MM = 0.5
 DEFAULT_RESIN_LINE_WIDTH_MM = 2.0
@@ -44,6 +50,17 @@ DEFAULT_RESIN_PERIMETER_COUNT = 2
 DEFAULT_RESIN_SMOOTHING_ANGLE_DEGREES = 150.0
 DEFAULT_RESIN_SMOOTHING_RADIUS_FACTOR = 0.35
 GYROID_WAVELENGTH_FACTOR = 2.35
+DEFAULT_RAFT_LAYER_COUNT = 2
+DEFAULT_RAFT_OUTWARD_OFFSETS_MM = (15.0, 10.0)
+DEFAULT_RAFT_TOP_GAP_MM = 0.0
+RAFT_BOTTOM_ZIGZAG_ANGLE_DEGREES = 90.0
+RAFT_TOP_ZIGZAG_ANGLE_DEGREES = -45.0
+PART_BOTTOM_ZIGZAG_ANGLE_DEGREES = 0.0
+PART_TOP_ZIGZAG_ANGLE_DEGREES = 45.0
+ISOTROPIC_LAYER_HEIGHT_MM = 0.5
+ISOTROPIC_REPEAT_HEIGHT_MM = 2.0
+ISOTROPIC_CAP_HEIGHT_MM = 1.0
+ISOTROPIC_REPEAT_ANGLES_DEGREES = (45.0, 0.0, -45.0, 90.0)
 MIN_GEOMETRY_TOLERANCE_MM = 1e-5
 MAX_GEOMETRY_TOLERANCE_MM = 1e-2
 
@@ -57,6 +74,119 @@ DEFAULT_MATERIAL_PROCESS = {
         "line_width_mm": DEFAULT_FIBER_LINE_WIDTH_MM,
     },
 }
+
+
+@dataclass(frozen=True)
+class PySLMStrategyDefaults:
+    """Recommended stripe/island dimensions for the current resin scale."""
+
+    width: float
+    overlap: float
+    offset: float = 0.5
+
+
+def recommended_pyslm_strategy_defaults(
+    layer_height: float,
+    line_width: float,
+) -> PySLMStrategyDefaults:
+    """Return scale-aware defaults for PySLM stripe and island strategies.
+
+    Stripe/island dimensions are XY scan settings, so line width is the primary
+    scale. Layer height provides a lower bound for very small line widths. The
+    offset is PySLM's dimensionless half-hatch-spacing default, not a distance.
+    """
+
+    if (
+        not math.isfinite(layer_height)
+        or not math.isfinite(line_width)
+        or layer_height <= 0
+        or line_width <= 0
+    ):
+        raise ValueError("layer_height and line_width must be positive")
+    return PySLMStrategyDefaults(
+        width=max(line_width * 5.0, layer_height * 10.0),
+        overlap=min(0.1, line_width * 0.05, layer_height * 0.2),
+    )
+
+
+@dataclass(frozen=True)
+class PySLMConfig:
+    """Native PySLM controls kept separate from the legacy slicer options."""
+
+    hatcher: PySLMHatcher = "basic"
+    hatch_angle: float | None = None
+    layer_angle_increment: float = 0.0
+    hatch_distance: float | None = None
+    contour_offset: float | None = None
+    spot_compensation: float | None = None
+    volume_offset_hatch: float | None = None
+    num_outer_contours: int | None = None
+    num_inner_contours: int | None = None
+    scan_contour_first: bool = True
+    hatch_sort: PySLMHatchSort = "none"
+    stripe_width: float = 5.0
+    stripe_overlap: float = 0.1
+    stripe_offset: float = 0.5
+    island_width: float = 5.0
+    island_overlap: float = 0.1
+    island_offset: float = 0.5
+    fix_polygons: bool = True
+    simplification_factor: float | None = None
+    simplification_preserve_topology: bool = True
+    simplification_mode: PySLMSimplificationMode = "absolute"
+
+    def __post_init__(self) -> None:
+        if self.hatcher not in ("basic", "stripe", "island", "basic_island"):
+            raise ValueError("pyslm hatcher must be basic, stripe, island, or basic_island")
+        if self.hatch_sort not in (
+            "none",
+            "alternate",
+            "unidirectional",
+            "linear",
+            "directional",
+        ):
+            raise ValueError("unsupported pyslm hatch_sort")
+        if self.simplification_mode not in ("absolute", "bound"):
+            raise ValueError("pyslm simplification_mode must be absolute or bound")
+        if self.hatch_angle is not None and (
+            not math.isfinite(self.hatch_angle) or self.hatch_angle < -180 or self.hatch_angle > 180
+        ):
+            raise ValueError("pyslm hatch_angle must be in the range [-180, 180]")
+        if not math.isfinite(self.layer_angle_increment):
+            raise ValueError("pyslm layer_angle_increment must be finite")
+        if self.hatch_distance is not None and (
+            not math.isfinite(self.hatch_distance) or self.hatch_distance <= 0
+        ):
+            raise ValueError("pyslm hatch_distance must be positive")
+        for name, value in (
+            ("contour_offset", self.contour_offset),
+            ("spot_compensation", self.spot_compensation),
+            ("simplification_factor", self.simplification_factor),
+        ):
+            if value is not None and (not math.isfinite(value) or value < 0):
+                raise ValueError(f"pyslm {name} must be non-negative")
+        if self.volume_offset_hatch is not None and not math.isfinite(self.volume_offset_hatch):
+            raise ValueError("pyslm volume_offset_hatch must be finite")
+        for name, value in (
+            ("num_outer_contours", self.num_outer_contours),
+            ("num_inner_contours", self.num_inner_contours),
+        ):
+            if value is not None and value < 0:
+                raise ValueError(f"pyslm {name} must be non-negative")
+        for name, value in (
+            ("stripe_width", self.stripe_width),
+            ("island_width", self.island_width),
+        ):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"pyslm {name} must be positive")
+        for name, value in (
+            ("stripe_overlap", self.stripe_overlap),
+            ("stripe_offset", self.stripe_offset),
+            ("island_overlap", self.island_overlap),
+            ("island_offset", self.island_offset),
+        ):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"pyslm {name} must be non-negative")
 
 
 def recommended_geometry_tolerance(layer_height: float, line_width: float) -> float:
@@ -80,9 +210,13 @@ class SliceConfig:
     infill_density: float = DEFAULT_RESIN_INFILL_DENSITY_PERCENT
     infill_overlap: float = DEFAULT_RESIN_INFILL_OVERLAP_PERCENT
     build_axis: BuildAxis = "z"
+    slicing_kernel: SlicingKernel = "legacy"
+    pyslm: PySLMConfig = field(default_factory=PySLMConfig)
     perimeter_count: int = DEFAULT_RESIN_PERIMETER_COUNT
     smoothing_angle: float = DEFAULT_RESIN_SMOOTHING_ANGLE_DEGREES
     smoothing_radius_factor: float = DEFAULT_RESIN_SMOOTHING_RADIUS_FACTOR
+    triangle_path_optimization: bool = True
+    zigzag_path_optimization: bool = True
 
     def __post_init__(self) -> None:
         if self.material not in ("R", "F"):
@@ -115,6 +249,7 @@ class SliceConfig:
             "gyroid",
             "concentric",
             "zigzag",
+            "isotropic",
         ):
             raise ValueError("unsupported infill_pattern")
         if self.infill_density < 0 or self.infill_density > 100:
@@ -123,6 +258,8 @@ class SliceConfig:
             raise ValueError("infill_overlap must be in the range [0, 100)")
         if self.build_axis not in ("x", "y", "z"):
             raise ValueError("build_axis must be x, y, or z")
+        if self.slicing_kernel not in ("legacy", "pyslm"):
+            raise ValueError("slicing_kernel must be legacy or pyslm")
         if self.perimeter_count < 1:
             raise ValueError("perimeter_count must be at least 1")
         if self.smoothing_angle <= 0 or self.smoothing_angle >= 180:
@@ -136,6 +273,7 @@ class RaftLayerConfig:
     outward_offset: float = 5.0
     layer_height: float = DEFAULT_RESIN_LAYER_HEIGHT_MM
     infill_density: float = DEFAULT_RESIN_INFILL_DENSITY_PERCENT
+    infill_pattern: RaftInfillPattern | None = None
 
     def __post_init__(self) -> None:
         if self.outward_offset < 0:
@@ -144,9 +282,21 @@ class RaftLayerConfig:
             raise ValueError("raft layer height must be positive")
         if self.infill_density <= 0 or self.infill_density > 100:
             raise ValueError("raft infill density must be in the range (0, 100]")
+        if self.infill_pattern not in (None, "concentric", "zigzag"):
+            raise ValueError("raft infill pattern must be concentric or zigzag")
 
 
 def slice_mesh_to_job(mesh: Mesh, config: SliceConfig) -> ExternalSourceJob:
+    if config.infill_pattern == "isotropic":
+        _validate_isotropic_infill_schedule(mesh, config)
+    if config.slicing_kernel == "pyslm":
+        from .pyslm_backend import slice_mesh_to_job_with_pyslm
+
+        return slice_mesh_to_job_with_pyslm(mesh, config)
+    return _slice_mesh_to_job_legacy(mesh, config)
+
+
+def _slice_mesh_to_job_legacy(mesh: Mesh, config: SliceConfig) -> ExternalSourceJob:
     mesh = orient_mesh_for_build_axis(mesh, config.build_axis)
     z_values = _layer_z_values(mesh, config)
     material_paths: list[MaterialPaths] = []
@@ -165,11 +315,18 @@ def slice_mesh_to_job(mesh: Mesh, config: SliceConfig) -> ExternalSourceJob:
             0,
             len(z_values) - 1,
         }
-        layer_config = (
-            replace(config, infill_pattern="zigzag", infill_density=100.0)
-            if is_part_cap_layer
-            else config
-        )
+        forced_cap_angle = None
+        if config.material == "R" and layer_index == 0:
+            forced_cap_angle = PART_BOTTOM_ZIGZAG_ANGLE_DEGREES
+        elif config.material == "R" and layer_index == len(z_values) - 1:
+            forced_cap_angle = PART_TOP_ZIGZAG_ANGLE_DEGREES
+        if is_part_cap_layer:
+            layer_config = replace(config, infill_pattern="zigzag", infill_density=100.0)
+        elif config.infill_pattern == "isotropic":
+            forced_cap_angle = _isotropic_part_layer_angle(layer_index, len(z_values))
+            layer_config = replace(config, infill_pattern="zigzag")
+        else:
+            layer_config = config
         if constant_section_paths is None:
             segments = _intersect_mesh_at_z(mesh.triangles, float(base_z), config.tolerance)
             paths_2d = _stitch_segments(segments, config.tolerance)
@@ -186,7 +343,12 @@ def slice_mesh_to_job(mesh: Mesh, config: SliceConfig) -> ExternalSourceJob:
                 paths_2d = [path.copy() for path in cached_constant_resin_paths_2d]
                 roles = list(cached_constant_roles)
             else:
-                paths_2d, roles = _build_resin_paths(paths_2d, layer_config, layer_index)
+                paths_2d, roles = _build_resin_paths(
+                    paths_2d,
+                    layer_config,
+                    layer_index,
+                    forced_zigzag_angle=forced_cap_angle,
+                )
                 if (
                     constant_section_paths is not None
                     and config.infill_pattern == "triangles"
@@ -212,7 +374,20 @@ def slice_mesh_to_job(mesh: Mesh, config: SliceConfig) -> ExternalSourceJob:
             "infill_pattern": config.infill_pattern,
             "infill_density": config.infill_density,
             "infill_overlap": config.infill_overlap,
+            "triangle_path_optimization": config.triangle_path_optimization,
+            "triangle_path_merge_tolerance": (
+                _legacy_path_merge_tolerance(config.line_width, config.tolerance)
+                if config.triangle_path_optimization and config.infill_pattern == "triangles"
+                else None
+            ),
+            "zigzag_path_optimization": config.zigzag_path_optimization,
+            "zigzag_path_merge_tolerance": (
+                _legacy_path_merge_tolerance(config.line_width, config.tolerance)
+                if config.zigzag_path_optimization
+                else None
+            ),
             "build_axis": config.build_axis,
+            "slicing_kernel": config.slicing_kernel,
             "perimeter_count": config.perimeter_count,
             "smoothing_angle": config.smoothing_angle,
             "smoothing_radius_factor": config.smoothing_radius_factor,
@@ -222,8 +397,15 @@ def slice_mesh_to_job(mesh: Mesh, config: SliceConfig) -> ExternalSourceJob:
                     "top": len(z_values) - 1 if len(z_values) else None,
                     "infill_pattern": "zigzag",
                     "infill_density": 100.0,
+                    "bottom_angle_degrees": PART_BOTTOM_ZIGZAG_ANGLE_DEGREES,
+                    "top_angle_degrees": PART_TOP_ZIGZAG_ANGLE_DEGREES,
                 }
                 if config.material == "R"
+                else None
+            ),
+            "isotropic_schedule": (
+                _isotropic_schedule_metadata(len(z_values), config.layer_height)
+                if config.material == "R" and config.infill_pattern == "isotropic"
                 else None
             ),
         },
@@ -240,6 +422,83 @@ def slice_mesh_to_job(mesh: Mesh, config: SliceConfig) -> ExternalSourceJob:
         },
     }
     return ExternalSourceJob(material_paths=material_paths, meta=meta)
+
+
+def _validate_isotropic_infill_schedule(mesh: Mesh, config: SliceConfig) -> int:
+    if config.material != "R":
+        raise ValueError("各向同性填充仅支持树脂材料 R")
+    tolerance = max(config.tolerance * 10.0, 1e-4)
+    if not math.isclose(
+        config.layer_height,
+        ISOTROPIC_LAYER_HEIGHT_MM,
+        rel_tol=0.0,
+        abs_tol=tolerance,
+    ):
+        raise ValueError(
+            "各向同性填充要求层高固定为 0.5 mm；"
+            f"当前层高为 {config.layer_height:g} mm，已拒绝切片"
+        )
+
+    oriented_mesh = orient_mesh_for_build_axis(mesh, config.build_axis)
+    z_min = oriented_mesh.z_min if config.z_min is None else config.z_min
+    z_max = oriented_mesh.z_max if config.z_max is None else config.z_max
+    if z_min > z_max:
+        raise ValueError("z_min must be <= z_max")
+    part_height = float(z_max - z_min)
+    repeat_value = (
+        part_height - ISOTROPIC_CAP_HEIGHT_MM
+    ) / ISOTROPIC_REPEAT_HEIGHT_MM
+    repeat_count = int(round(repeat_value))
+    expected_height = (
+        repeat_count * ISOTROPIC_REPEAT_HEIGHT_MM + ISOTROPIC_CAP_HEIGHT_MM
+    )
+    if repeat_count < 1 or not math.isclose(
+        part_height,
+        expected_height,
+        rel_tol=0.0,
+        abs_tol=tolerance,
+    ):
+        raise ValueError(
+            "各向同性填充要求零件有效高度为 2N+1 mm（N>=1），"
+            "用于底层 0.5 mm、N 组四方向 2 mm 和顶层 0.5 mm；"
+            f"当前高度为 {part_height:g} mm，无法完整完成四方向循环，已拒绝切片"
+        )
+
+    layer_count = len(_layer_z_values(oriented_mesh, config))
+    expected_layer_count = repeat_count * len(ISOTROPIC_REPEAT_ANGLES_DEGREES) + 2
+    if layer_count != expected_layer_count:
+        raise ValueError(
+            "各向同性填充的有效切层数必须为 4N+2；"
+            f"当前得到 {layer_count} 层，期望 {expected_layer_count} 层，已拒绝切片"
+        )
+    return repeat_count
+
+
+def _isotropic_part_layer_angle(layer_index: int, layer_count: int) -> float:
+    if layer_index == 0:
+        return PART_BOTTOM_ZIGZAG_ANGLE_DEGREES
+    if layer_index == layer_count - 1:
+        return PART_TOP_ZIGZAG_ANGLE_DEGREES
+    return ISOTROPIC_REPEAT_ANGLES_DEGREES[
+        (layer_index - 1) % len(ISOTROPIC_REPEAT_ANGLES_DEGREES)
+    ]
+
+
+def _isotropic_schedule_metadata(
+    layer_count: int,
+    layer_height: float,
+) -> dict[str, object]:
+    return {
+        "layer_height_mm": layer_height,
+        "repeat_count": (layer_count - 2) // len(ISOTROPIC_REPEAT_ANGLES_DEGREES),
+        "bottom_angle_degrees": PART_BOTTOM_ZIGZAG_ANGLE_DEGREES,
+        "repeat_angles_degrees": list(ISOTROPIC_REPEAT_ANGLES_DEGREES),
+        "top_angle_degrees": PART_TOP_ZIGZAG_ANGLE_DEGREES,
+        "layer_angles_degrees": [
+            _isotropic_part_layer_angle(index, layer_count)
+            for index in range(layer_count)
+        ],
+    }
 
 
 def _constant_section_paths_for_two_plane_extrusion(
@@ -265,19 +524,28 @@ def add_raft_to_job(
     mesh: Mesh,
     config: SliceConfig,
     raft_layers: list[RaftLayerConfig],
-    top_gap: float,
+    top_gap: float = DEFAULT_RAFT_TOP_GAP_MM,
 ) -> float:
     """Insert resin raft layers before the part and shift existing paths upward."""
 
     if not raft_layers:
         return 0.0
-    if top_gap < 0:
-        raise ValueError("raft top gap must be non-negative")
+    if len(raft_layers) != DEFAULT_RAFT_LAYER_COUNT:
+        raise ValueError(f"raft layer count is fixed at {DEFAULT_RAFT_LAYER_COUNT}")
+    top_gap = DEFAULT_RAFT_TOP_GAP_MM
+    raft_layers = [
+        RaftLayerConfig(
+            outward_offset=layer.outward_offset,
+            infill_density=config.infill_density if config.infill_density > 0 else DEFAULT_RESIN_INFILL_DENSITY_PERCENT,
+        )
+        for layer in raft_layers
+    ]
 
     oriented_mesh = orient_mesh_for_build_axis(mesh, config.build_axis)
-    footprint = _raft_footprint_geometry(oriented_mesh, config)
-    if footprint.is_empty:
+    part_projection = _part_projection_geometry(oriented_mesh, config)
+    if part_projection.is_empty:
         return 0.0
+    reserved_voids = _raft_reserved_void_geometry(part_projection, config.tolerance)
 
     raft_height = sum(layer.layer_height for layer in raft_layers)
     z_shift = raft_height + top_gap
@@ -312,11 +580,11 @@ def add_raft_to_job(
     for layer_index, raft_layer in enumerate(raft_layers):
         current_z += raft_layer.layer_height
         paths_2d, roles = _raft_paths_for_layer(
-            footprint,
+            part_projection,
+            reserved_voids,
             config,
             raft_layer,
             layer_index,
-            contact_layer=layer_index == raft_count - 1,
         )
         paths_3d = [_path_2d_to_constant_z(path, current_z) for path in paths_2d]
         if paths_3d:
@@ -328,13 +596,31 @@ def add_raft_to_job(
     job.meta["raft"] = {
         "layer_count": raft_count,
         "top_gap": top_gap,
+        "fixed_patterns": [
+            {
+                "layer_index": 0,
+                "infill_pattern": "zigzag",
+                "angle_degrees": RAFT_BOTTOM_ZIGZAG_ANGLE_DEGREES,
+            },
+            {
+                "layer_index": 1,
+                "infill_pattern": "zigzag",
+                "angle_degrees": RAFT_TOP_ZIGZAG_ANGLE_DEGREES,
+            },
+        ],
         "layers": [
             {
                 "outward_offset": layer.outward_offset,
                 "layer_height": layer.layer_height,
                 "infill_density": layer.infill_density,
+                "infill_pattern": "zigzag",
+                "angle_degrees": (
+                    RAFT_BOTTOM_ZIGZAG_ANGLE_DEGREES
+                    if index == 0
+                    else RAFT_TOP_ZIGZAG_ANGLE_DEGREES
+                ),
             }
-            for layer in raft_layers
+            for index, layer in enumerate(raft_layers)
         ],
     }
     return z_shift
@@ -402,38 +688,226 @@ def orient_mesh_for_build_axis(mesh: Mesh, build_axis: BuildAxis) -> Mesh:
 
 
 def _raft_footprint_geometry(mesh: Mesh, config: SliceConfig):
+    return _part_projection_geometry(mesh, config)
+
+
+def _part_projection_geometry(mesh: Mesh, config: SliceConfig):
     z_values = _layer_z_values(mesh, config)
     if len(z_values) == 0:
         return Polygon()
-    segments = _intersect_mesh_at_z(mesh.triangles, float(z_values[0]), config.tolerance)
-    contours = [path for path in _stitch_segments(segments, config.tolerance) if path.shape[0] >= 3]
-    return _solid_geometry_from_contours(contours)
+    sections = []
+    for base_z in z_values:
+        segments = _intersect_mesh_at_z(mesh.triangles, float(base_z), config.tolerance)
+        contours = [
+            path
+            for path in _stitch_segments(segments, config.tolerance)
+            if path.shape[0] >= 3
+        ]
+        section = _solid_geometry_from_contours(contours)
+        if not section.is_empty:
+            sections.append(section)
+    if not sections:
+        return Polygon()
+    projection = unary_union(sections)
+    if not projection.is_valid:
+        projection = projection.buffer(0)
+    return projection
 
 
 def _raft_paths_for_layer(
     footprint,
+    reserved_voids,
     config: SliceConfig,
     raft_layer: RaftLayerConfig,
     layer_index: int,
-    contact_layer: bool = False,
 ) -> tuple[list[np.ndarray], list[str]]:
-    geometry = footprint.buffer(raft_layer.outward_offset, join_style="round")
+    geometry = _raft_geometry_for_layer(
+        footprint,
+        reserved_voids,
+        raft_layer.outward_offset,
+        config.tolerance,
+    )
     if geometry.is_empty:
         return [], []
 
+    path_spacing = _resin_path_spacing(config.line_width, config.infill_overlap)
     perimeters, roles = _perimeter_paths_from_geometry(
         geometry,
         config.line_width,
-        _resin_path_spacing(config.line_width, config.infill_overlap),
+        path_spacing,
         config.perimeter_count,
         config.tolerance,
     )
     infill_geometry = _resin_infill_surface_geometry(geometry, config)
-    if contact_layer:
-        filled = _raft_lattice_infill_paths(infill_geometry, config, raft_layer.infill_density)
-    else:
-        filled = _raft_zigzag_infill_paths(infill_geometry, config, raft_layer.infill_density)
+    if infill_geometry.is_empty:
+        return perimeters, roles
+    angle = (
+        RAFT_BOTTOM_ZIGZAG_ANGLE_DEGREES
+        if layer_index == 0
+        else RAFT_TOP_ZIGZAG_ANGLE_DEGREES
+    )
+    filled = _raft_zigzag_infill_paths(
+        infill_geometry,
+        config,
+        raft_layer.infill_density,
+        angle_degrees=angle,
+    )
     return perimeters + filled, roles + ["infill"] * len(filled)
+
+
+def _boundary_paths_from_geometry(
+    geometry,
+    path_spacing: float,
+    perimeter_count: int,
+    tolerance: float,
+) -> tuple[list[np.ndarray], list[str]]:
+    paths: list[np.ndarray] = []
+    roles: list[str] = []
+    for perimeter_index in range(perimeter_count):
+        offset_geometry = (
+            geometry
+            if perimeter_index == 0
+            else _libslic3r_offset_geometry(
+                geometry,
+                -perimeter_index * path_spacing,
+                tolerance,
+            )
+        )
+        if offset_geometry.is_empty:
+            continue
+        for polygon in _iter_polygons(offset_geometry):
+            exterior = _coords_to_path(polygon.exterior.coords, tolerance)
+            if exterior.shape[0] >= 3:
+                paths.append(exterior)
+                roles.append("outer_contour" if perimeter_index == 0 else "inner_contour")
+            for interior in polygon.interiors:
+                inner = _coords_to_path(interior.coords, tolerance)
+                if inner.shape[0] >= 3:
+                    paths.append(inner)
+                    roles.append("outer_contour" if perimeter_index == 0 else "inner_contour")
+    return paths, roles
+
+
+def _raft_geometry_for_layer(
+    footprint,
+    reserved_voids,
+    outward_offset: float,
+    tolerance: float,
+):
+    geometry = footprint.buffer(outward_offset, join_style="round")
+    if reserved_voids.is_empty:
+        return geometry
+    exterior_extensions = _raft_exterior_void_extensions(
+        footprint,
+        outward_offset,
+        tolerance,
+    )
+    void_geometry = unary_union([reserved_voids, exterior_extensions])
+    geometry = geometry.difference(void_geometry)
+    if not geometry.is_valid:
+        geometry = geometry.buffer(0)
+    return geometry
+
+
+def _raft_exterior_void_extensions(
+    footprint,
+    outward_offset: float,
+    tolerance: float,
+):
+    """Carry projection openings through the outward raft band without widening them."""
+
+    if footprint.is_empty or outward_offset <= tolerance:
+        return Polygon()
+
+    outer_silhouette = footprint.convex_hull
+    silhouette_center = np.asarray(
+        [outer_silhouette.centroid.x, outer_silhouette.centroid.y],
+        dtype=np.float64,
+    )
+    extension_distance = outward_offset + max(tolerance * 10.0, 1e-5)
+    extension_pieces: list[Polygon] = []
+    exterior_voids = _nondegenerate_polygons(
+        outer_silhouette.difference(footprint),
+        tolerance,
+    )
+
+    for exterior_void in exterior_voids:
+        mouth_geometry = exterior_void.boundary.intersection(outer_silhouette.boundary)
+        for mouth_line in _extract_line_segments(mouth_geometry, tolerance):
+            coordinates = np.asarray(mouth_line.coords, dtype=np.float64)
+            extended_segments: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+            for start, end in zip(coordinates[:-1], coordinates[1:]):
+                direction = end - start
+                length = float(np.linalg.norm(direction))
+                if length <= tolerance:
+                    continue
+
+                normal = np.asarray([-direction[1], direction[0]], dtype=np.float64) / length
+                midpoint = (start + end) * 0.5
+                if float(np.dot(normal, midpoint - silhouette_center)) < 0.0:
+                    normal = -normal
+                extended_start = start + normal * extension_distance
+                extended_end = end + normal * extension_distance
+                extension_pieces.append(
+                    Polygon([start, end, extended_end, extended_start])
+                )
+                extended_segments.append((start, extended_start, extended_end, end))
+
+            for previous, current in zip(extended_segments[:-1], extended_segments[1:]):
+                if np.linalg.norm(previous[2] - current[1]) <= tolerance:
+                    continue
+                extension_pieces.append(
+                    Polygon([previous[3], previous[2], current[1]])
+                )
+
+    if not extension_pieces:
+        return Polygon()
+    extensions = unary_union(extension_pieces)
+    if not extensions.is_valid:
+        extensions = extensions.buffer(0)
+    return extensions
+
+
+def _raft_reserved_void_geometry(part_projection, tolerance: float):
+    if part_projection.is_empty:
+        return Polygon()
+
+    outer_silhouette = part_projection.convex_hull
+    voids = _nondegenerate_polygons(
+        outer_silhouette.difference(part_projection),
+        tolerance,
+    )
+    holes = _interior_holes_geometry(part_projection, tolerance)
+    if not holes.is_empty:
+        voids.extend(_nondegenerate_polygons(holes, tolerance))
+
+    combined = unary_union([void for void in voids if not void.is_empty])
+    if combined.is_empty:
+        return Polygon()
+    if not combined.is_valid:
+        combined = combined.buffer(0)
+    return combined
+
+
+def _nondegenerate_polygons(geometry, tolerance: float) -> list[Polygon]:
+    minimum_area = max(tolerance * tolerance, 0.01)
+    return [
+        polygon
+        for polygon in _iter_polygons(geometry)
+        if polygon.area > minimum_area
+    ]
+
+
+def _interior_holes_geometry(geometry, tolerance: float):
+    holes: list[Polygon] = []
+    for polygon in _iter_polygons(geometry):
+        for interior in polygon.interiors:
+            hole = Polygon(interior.coords)
+            if hole.area > max(tolerance * tolerance, 0.01):
+                holes.append(hole)
+    if not holes:
+        return Polygon()
+    return unary_union(holes)
 
 
 def _raft_lattice_infill_paths(
@@ -462,6 +936,7 @@ def _raft_zigzag_infill_paths(
     geometry,
     config: SliceConfig,
     infill_density: float,
+    angle_degrees: float = 0.0,
 ) -> list[np.ndarray]:
     if geometry.is_empty:
         return []
@@ -474,7 +949,7 @@ def _raft_zigzag_infill_paths(
     filled = _zigzag_infill_geometry(
         geometry,
         spacing,
-        0.0,
+        angle_degrees,
         config.tolerance,
     )
     filled = _connect_zigzag_infill_paths(
@@ -484,14 +959,49 @@ def _raft_zigzag_infill_paths(
         _resin_path_spacing(config.line_width, config.infill_overlap),
         config.tolerance,
     )
-    filled = _smooth_resin_infill_paths(
-        filled,
-        geometry,
-        config.line_width * DEFAULT_RESIN_SMOOTHING_RADIUS_FACTOR,
-        DEFAULT_RESIN_SMOOTHING_ANGLE_DEGREES,
-        config.tolerance,
-    )
-    return filled
+    return _filter_paths_covered_by_geometry(filled, geometry, config.tolerance)
+
+
+def _filter_paths_covered_by_geometry(
+    paths: list[np.ndarray],
+    geometry,
+    tolerance: float,
+) -> list[np.ndarray]:
+    filtered: list[np.ndarray] = []
+    safe_geometry = geometry.buffer(max(tolerance * 10.0, 1e-7), join_style="round")
+    for path in paths:
+        line = LineString([(float(point[0]), float(point[1])) for point in path[:, :2]])
+        if safe_geometry.covers(line):
+            filtered.append(path)
+    return filtered
+
+
+def _open_path_length(path: np.ndarray) -> float:
+    if path.shape[0] < 2:
+        return 0.0
+    differences = np.diff(np.asarray(path[:, :2], dtype=np.float64), axis=0)
+    return float(np.linalg.norm(differences, axis=1).sum())
+
+
+def _vectors_parallel(first: np.ndarray, second: np.ndarray, max_angle_degrees: float) -> bool:
+    first_norm = float(np.linalg.norm(first))
+    second_norm = float(np.linalg.norm(second))
+    if first_norm <= 0 or second_norm <= 0:
+        return False
+    cosine = float(np.dot(first, second) / (first_norm * second_norm))
+    cosine = max(-1.0, min(1.0, cosine))
+    angle = math.degrees(math.acos(abs(cosine)))
+    return angle <= max_angle_degrees
+
+
+def _vector_angle_degrees(first: np.ndarray, second: np.ndarray) -> float:
+    first_norm = float(np.linalg.norm(first))
+    second_norm = float(np.linalg.norm(second))
+    if first_norm <= 0 or second_norm <= 0:
+        return 0.0
+    cosine = float(np.dot(first, second) / (first_norm * second_norm))
+    cosine = max(-1.0, min(1.0, cosine))
+    return math.degrees(math.acos(abs(cosine)))
 
 
 def _shift_path_z(path: np.ndarray, z_shift: float) -> np.ndarray:
@@ -516,7 +1026,11 @@ def _layer_z_values(mesh: Mesh, config: SliceConfig) -> np.ndarray:
     # Start one layer above the bottom and include the top cap when it falls on
     # the layer grid. Horizontal faces are ignored by the intersection code, but
     # vertical side faces still provide the top boundary.
-    start = z_min if config.z_min is not None else z_min + config.layer_height
+    start = (
+        z_min
+        if config.z_min is not None and config.infill_pattern != "isotropic"
+        else z_min + config.layer_height
+    )
     end = z_max
     if start > end:
         start = (z_min + z_max) / 2.0
@@ -653,7 +1167,10 @@ def _apply_resin_infill(
 
 
 def _build_resin_paths(
-    paths: list[np.ndarray], config: SliceConfig, layer_index: int = 0
+    paths: list[np.ndarray],
+    config: SliceConfig,
+    layer_index: int = 0,
+    forced_zigzag_angle: float | None = None,
 ) -> tuple[list[np.ndarray], list[str]]:
     contours = [path for path in paths if path.shape[0] >= 3]
     solid_geometry = _solid_geometry_from_contours(contours)
@@ -676,7 +1193,23 @@ def _build_resin_paths(
         config,
         layer_index,
         config.infill_density,
+        forced_zigzag_angle=forced_zigzag_angle,
     )
+    if config.infill_pattern == "triangles" and config.triangle_path_optimization:
+        triangle_merge_tolerance = _legacy_path_merge_tolerance(
+            config.line_width,
+            config.tolerance,
+        )
+        filled = optimize_triangle_infill_travel(filled, config.tolerance)
+        filled = merge_adjacent_connected_paths(filled, triangle_merge_tolerance)
+        filled = _smooth_resin_infill_paths(
+            filled,
+            infill_geometry,
+            config.line_width * config.smoothing_radius_factor,
+            config.smoothing_angle,
+            config.tolerance,
+            merge_tolerance=triangle_merge_tolerance,
+        )
     return perimeters + filled, roles + ["infill"] * len(filled)
 
 
@@ -685,6 +1218,7 @@ def _infill_paths_for_geometry(
     config: SliceConfig,
     layer_index: int,
     infill_density: float,
+    forced_zigzag_angle: float | None = None,
 ) -> list[np.ndarray]:
     if geometry.is_empty:
         return []
@@ -727,7 +1261,9 @@ def _infill_paths_for_geometry(
             )
         )
     elif config.infill_pattern == "zigzag":
-        angle = 45.0 if layer_index % 2 == 0 else -45.0
+        angle = forced_zigzag_angle
+        if angle is None:
+            angle = 45.0 if layer_index % 2 == 0 else -45.0
         filled.extend(
             _zigzag_infill_geometry(
                 geometry,
@@ -795,6 +1331,14 @@ def _infill_paths_for_geometry(
             path_spacing,
             config.tolerance,
         )
+    zigzag_merge_tolerance = (
+        _legacy_path_merge_tolerance(config.line_width, config.tolerance)
+        if config.infill_pattern == "zigzag" and config.zigzag_path_optimization
+        else None
+    )
+    if config.infill_pattern == "zigzag" and config.zigzag_path_optimization:
+        filled = optimize_open_path_travel(filled, config.tolerance)
+        filled = merge_adjacent_connected_paths(filled, zigzag_merge_tolerance)
 
     if config.infill_pattern not in ("triangles", "gyroid"):
         smoothing_radius = config.line_width * config.smoothing_radius_factor
@@ -802,7 +1346,7 @@ def _infill_paths_for_geometry(
         if config.infill_pattern in ("rectilinear", "zigzag"):
             # Keep the bend as a small line-width-sized fillet. Larger radii
             # turn boundary turns into semicircles and force excessive splits.
-            smoothing_radius = config.line_width * 0.2
+            smoothing_radius = min(smoothing_radius, config.line_width * 0.2)
             smoothing_cut_fraction = 0.3
         filled = _smooth_resin_infill_paths(
             filled,
@@ -811,6 +1355,7 @@ def _infill_paths_for_geometry(
             config.smoothing_angle,
             config.tolerance,
             cut_fraction=smoothing_cut_fraction,
+            merge_tolerance=zigzag_merge_tolerance,
         )
     return filled
 
@@ -975,6 +1520,84 @@ def optimize_open_path_travel(paths: list[np.ndarray], tolerance: float = 1e-5) 
     return ordered
 
 
+def optimize_triangle_infill_travel(
+    paths: list[np.ndarray],
+    tolerance: float = 1e-5,
+) -> list[np.ndarray]:
+    """Choose the best greedy open-path order for legacy triangle infill.
+
+    Triangle lattice paths are intentionally kept as separate open paths so
+    different 0/60/120 degree families are never joined with an extrusion
+    connector. Trying representative starting points improves endpoint
+    ordering without changing path geometry or adding travel segments.
+    """
+
+    if len(paths) <= 2:
+        return optimize_open_path_travel(paths, tolerance)
+
+    step = max(1, len(paths) // 8)
+    starts = set(range(0, len(paths), step))
+    starts.update((0, len(paths) // 2, len(paths) - 1))
+    candidates = [
+        optimize_open_path_travel(paths[start:] + paths[:start], tolerance)
+        for start in sorted(starts)
+    ]
+    return min(candidates, key=_open_path_travel_length)
+
+
+def _open_path_travel_length(paths: list[np.ndarray]) -> float:
+    return sum(
+        float(np.linalg.norm(paths[index][0, :2] - paths[index - 1][-1, :2]))
+        for index in range(1, len(paths))
+    )
+
+
+def _legacy_path_merge_tolerance(line_width: float, tolerance: float) -> float:
+    """Limit post-planning joins to numerical endpoint coincidence.
+
+    ``line_width`` remains in the signature for metadata/API compatibility,
+    but a fraction of the bead width is not a safe merge tolerance: those
+    links would bypass the bead-aware connector clearance checks.
+    """
+
+    del line_width
+    return tolerance
+
+
+def merge_adjacent_connected_paths(
+    paths: list[np.ndarray],
+    tolerance: float = 1e-5,
+) -> list[np.ndarray]:
+    """Merge consecutive open paths whose endpoints coincide numerically.
+
+    This deliberately does not search for nearby paths. If a caller supplies
+    a looser tolerance, both near-endpoints are retained so the original first
+    segment is never silently replaced by an unvalidated diagonal.
+    """
+
+    merged: list[np.ndarray] = []
+    for path in paths:
+        current = np.asarray(path, dtype=np.float32)
+        if current.shape[0] == 0:
+            continue
+        if (
+            merged
+            and current.shape[0] >= 2
+            and merged[-1].shape[0] >= 2
+            and not _is_closed_path(merged[-1], tolerance)
+            and not _is_closed_path(current, tolerance)
+            and _close(merged[-1][-1, :2], current[0, :2], tolerance)
+        ):
+            endpoint_distance = float(
+                np.linalg.norm(merged[-1][-1, :2] - current[0, :2])
+            )
+            continuation = current[1:] if endpoint_distance <= 1e-12 else current
+            merged[-1] = np.vstack((merged[-1], continuation))
+        else:
+            merged.append(current)
+    return merged
+
+
 def _smooth_resin_infill_paths(
     paths: list[np.ndarray],
     geometry,
@@ -982,9 +1605,14 @@ def _smooth_resin_infill_paths(
     angle_threshold_degrees: float,
     tolerance: float,
     cut_fraction: float = 0.35,
+    merge_tolerance: float | None = None,
 ) -> list[np.ndarray]:
     if max_radius <= tolerance or not paths:
-        return paths
+        return (
+            merge_adjacent_connected_paths(paths, merge_tolerance)
+            if merge_tolerance is not None
+            else paths
+        )
 
     # ``geometry`` is already the bead-aware centerline corridor.  Only add a
     # numerical epsilon here; expanding by the corner radius would move a
@@ -1002,6 +1630,8 @@ def _smooth_resin_infill_paths(
                 cut_fraction,
             )
         )
+    if merge_tolerance is not None:
+        return merge_adjacent_connected_paths(smoothed, merge_tolerance)
     return smoothed
 
 
@@ -1110,7 +1740,6 @@ def _connect_boundary_infill_paths(
                             connector_points,
                         )
                     )
-
     candidates_by_endpoint: dict[int, list[tuple[float, int, np.ndarray]]] = defaultdict(list)
     for length, first_endpoint, second_endpoint, connector_points in candidates:
         candidates_by_endpoint[first_endpoint].append(
@@ -1383,13 +2012,6 @@ def _forward_infill_ring_arc(
     )
 
 
-def _open_path_length(path: np.ndarray) -> float:
-    points = np.asarray(path[:, :2], dtype=np.float64)
-    if points.shape[0] < 2:
-        return 0.0
-    return float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
-
-
 def _connect_concentric_infill_paths(
     paths: list[np.ndarray],
     geometry,
@@ -1528,8 +2150,6 @@ def _reroot_closed_path(
         )
     )
     return _dedupe_consecutive(rerooted, tolerance)
-
-
 def _connect_resin_infill_paths(
     paths: list[np.ndarray],
     geometry,
