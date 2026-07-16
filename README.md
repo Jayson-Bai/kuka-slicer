@@ -152,6 +152,26 @@ pitch at 100% density gives `3.6 mm` per grid direction and `5.4 mm` per
 triangle direction. This prevents two- and three-axis patterns from depositing
 roughly two or three times the requested material.
 
+At 100% density, single-axis legacy patterns (including the four directions
+used by `isotropic` and the zigzag raft) use bead-aware solid-fill phasing.
+Each disconnected printable island is centered at the configured pitch. Long
+boundaries parallel to the hatch may anchor the phase only when every band fits
+inside a small, symmetric tolerance around that pitch. For a 2 mm line with
+10% overlap, the target is 1.8 mm and the permitted local range is 1.7..1.9 mm;
+this bounds both visible gaps and local overlap instead of silently expanding
+spacing to a full 2 mm or squeezing lines together without limit. Corridors
+narrower than one pitch receive one centered stroke instead of duplicated
+boundary strokes.
+
+Coverage is evaluated with the physical round 2 mm bead, not centerlines alone.
+Short wall-seam doglegs and free-end tails are folded into an existing zigzag,
+and residual narrow-neck pockets may replace a short original interval with a
+triangle visit. These corrections keep the path count unchanged, reject
+retrace/self-intersection, remain inside the physical part, and keep at least
+the bounded clearance from the last perimeter. They are also limited by a
+small added-length budget. Solid-fill corner smoothing is limited to half the
+configured overlap allowance so a fillet does not reopen the seam.
+
 `grid` and `triangles` are noded at crossings and use a graph trail cover that
 prints every real lattice edge once. Virtual edges used to construct the Euler
 walk are never printed, which minimizes starts without retracing and piling

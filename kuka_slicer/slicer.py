@@ -6,7 +6,7 @@ import math
 from typing import Callable, Literal
 
 import numpy as np
-from shapely import affinity
+from shapely import affinity, maximum_inscribed_circle
 from shapely.geometry import (
     GeometryCollection,
     LineString,
@@ -15,7 +15,7 @@ from shapely.geometry import (
     Point,
     Polygon,
 )
-from shapely.ops import linemerge, unary_union
+from shapely.ops import linemerge, nearest_points, unary_union
 
 from .external_npz import ExternalSourceJob, Material, MaterialPaths
 from .stl_io import Mesh
@@ -61,6 +61,7 @@ ISOTROPIC_LAYER_HEIGHT_MM = 0.5
 ISOTROPIC_REPEAT_HEIGHT_MM = 2.0
 ISOTROPIC_CAP_HEIGHT_MM = 1.0
 ISOTROPIC_REPEAT_ANGLES_DEGREES = (45.0, 0.0, -45.0, 90.0)
+MINIMUM_RESIDUAL_CORRECTION_NOVEL_AREA_FRACTION = 0.4
 MIN_GEOMETRY_TOLERANCE_MM = 1e-5
 MAX_GEOMETRY_TOLERANCE_MM = 1e-2
 
@@ -752,6 +753,23 @@ def _raft_paths_for_layer(
         raft_layer.infill_density,
         angle_degrees=angle,
     )
+    if raft_layer.infill_density >= 100.0 - 1e-9:
+        filled = _reroute_residual_solid_bead_gaps(
+            geometry,
+            infill_geometry,
+            perimeters,
+            filled,
+            _last_perimeter_linework(
+                geometry,
+                config.line_width,
+                path_spacing,
+                config.perimeter_count,
+                config.tolerance,
+            ),
+            config.line_width,
+            path_spacing,
+            config.tolerance,
+        )
     return perimeters + filled, roles + ["infill"] * len(filled)
 
 
@@ -946,19 +964,29 @@ def _raft_zigzag_infill_paths(
         infill_density,
         config.infill_overlap,
     )
-    filled = _zigzag_infill_geometry(
-        geometry,
-        spacing,
-        angle_degrees,
-        config.tolerance,
-    )
-    filled = _connect_zigzag_infill_paths(
-        filled,
-        geometry,
-        spacing,
-        _resin_path_spacing(config.line_width, config.infill_overlap),
-        config.tolerance,
-    )
+    if infill_density >= 100.0 - 1e-9:
+        filled = _solid_zigzag_infill_paths(
+            geometry,
+            spacing,
+            config.line_width,
+            angle_degrees,
+            _resin_path_spacing(config.line_width, config.infill_overlap),
+            config.tolerance,
+        )
+    else:
+        filled = _zigzag_infill_geometry(
+            geometry,
+            spacing,
+            angle_degrees,
+            config.tolerance,
+        )
+        filled = _connect_zigzag_infill_paths(
+            filled,
+            geometry,
+            spacing,
+            _resin_path_spacing(config.line_width, config.infill_overlap),
+            config.tolerance,
+        )
     return _filter_paths_covered_by_geometry(filled, geometry, config.tolerance)
 
 
@@ -1195,6 +1223,27 @@ def _build_resin_paths(
         config.infill_density,
         forced_zigzag_angle=forced_zigzag_angle,
     )
+    if (
+        config.infill_density >= 100.0 - 1e-9
+        and config.infill_pattern
+        in ("rectilinear", "aligned_rectilinear", "line", "zigzag")
+    ):
+        filled = _reroute_residual_solid_bead_gaps(
+            solid_geometry,
+            infill_geometry,
+            perimeters,
+            filled,
+            _last_perimeter_linework(
+                solid_geometry,
+                config.line_width,
+                _resin_path_spacing(config.line_width, config.infill_overlap),
+                config.perimeter_count,
+                config.tolerance,
+            ),
+            config.line_width,
+            _resin_path_spacing(config.line_width, config.infill_overlap),
+            config.tolerance,
+        )
     if config.infill_pattern == "triangles" and config.triangle_path_optimization:
         triangle_merge_tolerance = _legacy_path_merge_tolerance(
             config.line_width,
@@ -1243,14 +1292,30 @@ def _infill_paths_for_geometry(
         3,
         config.infill_overlap,
     )
+    single_axis_patterns = ("rectilinear", "aligned_rectilinear", "line", "zigzag")
+    solid_single_axis = (
+        infill_density >= 100.0 - 1e-9 and config.infill_pattern in single_axis_patterns
+    )
+
+    def single_axis_paths(angle: float) -> list[np.ndarray]:
+        if solid_single_axis:
+            return _solid_zigzag_infill_paths(
+                geometry,
+                line_spacing,
+                config.line_width,
+                angle,
+                path_spacing,
+                config.tolerance,
+            )
+        return _zigzag_infill_geometry(geometry, line_spacing, angle, config.tolerance)
 
     if config.infill_pattern == "rectilinear":
         angle = 45.0 if layer_index % 2 == 0 else -45.0
-        filled.extend(_zigzag_infill_geometry(geometry, line_spacing, angle, config.tolerance))
+        filled.extend(single_axis_paths(angle))
     elif config.infill_pattern == "aligned_rectilinear":
-        filled.extend(_zigzag_infill_geometry(geometry, line_spacing, 0.0, config.tolerance))
+        filled.extend(single_axis_paths(0.0))
     elif config.infill_pattern == "line":
-        filled.extend(_zigzag_infill_geometry(geometry, line_spacing, 90.0, config.tolerance))
+        filled.extend(single_axis_paths(90.0))
     elif config.infill_pattern == "concentric":
         filled.extend(
             _concentric_infill_geometry(
@@ -1264,14 +1329,7 @@ def _infill_paths_for_geometry(
         angle = forced_zigzag_angle
         if angle is None:
             angle = 45.0 if layer_index % 2 == 0 else -45.0
-        filled.extend(
-            _zigzag_infill_geometry(
-                geometry,
-                line_spacing,
-                angle,
-                config.tolerance,
-            )
-        )
+        filled.extend(single_axis_paths(angle))
     elif config.infill_pattern == "grid":
         filled.extend(
             _multi_axis_lattice_infill_geometry(
@@ -1296,12 +1354,7 @@ def _infill_paths_for_geometry(
     elif config.infill_pattern == "gyroid":
         filled.extend(_gyroid_infill_geometry(geometry, line_spacing, config.tolerance))
 
-    if config.infill_pattern in (
-        "rectilinear",
-        "aligned_rectilinear",
-        "line",
-        "zigzag",
-    ):
+    if config.infill_pattern in single_axis_patterns and not solid_single_axis:
         filled = _connect_zigzag_infill_paths(
             filled,
             geometry,
@@ -1348,6 +1401,15 @@ def _infill_paths_for_geometry(
             # turn boundary turns into semicircles and force excessive splits.
             smoothing_radius = min(smoothing_radius, config.line_width * 0.2)
             smoothing_cut_fraction = 0.3
+        if solid_single_axis:
+            # At 100% density a fillet removes deposited area from the wall
+            # seam.  Limit that cut to half of the configured physical overlap
+            # allowance instead of silently turning a 2 mm bead into a visible
+            # corner gap.  Zero-overlap solid fill consequently stays sharp.
+            smoothing_radius = min(
+                smoothing_radius,
+                _resin_overlap_width(config.line_width, config.infill_overlap) * 0.5,
+            )
         filled = _smooth_resin_infill_paths(
             filled,
             geometry,
@@ -1358,6 +1420,558 @@ def _infill_paths_for_geometry(
             merge_tolerance=zigzag_merge_tolerance,
         )
     return filled
+
+
+def _reroute_residual_solid_bead_gaps(
+    solid_geometry,
+    infill_geometry,
+    perimeter_paths: list[np.ndarray],
+    infill_paths: list[np.ndarray],
+    last_perimeter_linework,
+    line_width: float,
+    path_spacing: float,
+    tolerance: float,
+) -> list[np.ndarray]:
+    """Fill visible fixed-width residuals by detouring existing solid paths.
+
+    Narrow necks between a hole and a concave wall can disappear from the
+    normally inset infill surface even though the two 2 mm perimeter beads do
+    not quite meet.  Adding another standalone stroke would create a stop and a
+    start blob.  Instead, this routine replaces at most a short interval of an
+    existing infill trail with a triangular visit through the uncovered pocket.
+    Path count and centerline continuity are preserved.
+    """
+
+    if (
+        solid_geometry.is_empty
+        or infill_geometry.is_empty
+        or not infill_paths
+        or line_width <= 0
+        or path_spacing <= 0
+    ):
+        return infill_paths
+
+    spacing_adjustment = _solid_spacing_adjustment_limit(path_spacing, line_width)
+    if spacing_adjustment <= tolerance:
+        return infill_paths
+
+    bead_radius = line_width * 0.5
+    safe_surface_allowed = infill_geometry.buffer(
+        spacing_adjustment,
+        join_style="round",
+    )
+    physical_centerlines = solid_geometry.buffer(
+        -(bead_radius - max(tolerance * 2.0, 1e-7)),
+        join_style="round",
+    )
+    minimum_wall_clearance = max(tolerance, path_spacing - spacing_adjustment)
+    actual_perimeter_lines = [
+        LineString(path[:, :2])
+        for path in perimeter_paths
+        if path.shape[0] >= 2
+    ]
+    wall_lines = list(actual_perimeter_lines)
+    if not last_perimeter_linework.is_empty:
+        wall_lines.append(last_perimeter_linework)
+    wall_linework = unary_union(wall_lines) if wall_lines else GeometryCollection()
+    if wall_linework.is_empty:
+        direct_allowed = physical_centerlines
+    else:
+        direct_allowed = physical_centerlines.difference(
+            wall_linework.buffer(
+                max(tolerance, minimum_wall_clearance - tolerance * 2.0),
+                join_style="round",
+            )
+        )
+    safe_surface_allowed = safe_surface_allowed.intersection(direct_allowed)
+    evaluation_region = solid_geometry.buffer(
+        -line_width * 0.15,
+        join_style="mitre",
+    )
+    if direct_allowed.is_empty or evaluation_region.is_empty:
+        return infill_paths
+
+    paths = [np.asarray(path[:, :2], dtype=np.float32).copy() for path in infill_paths]
+    original_path_corridors = [
+        LineString(path).buffer(
+            max(tolerance * 2.0, 1e-7),
+            cap_style="round",
+            join_style="round",
+        )
+        for path in paths
+    ]
+    original_path_endpoints = [
+        (
+            np.asarray(path[0, :2], dtype=np.float64),
+            np.asarray(path[-1, :2], dtype=np.float64),
+        )
+        for path in paths
+    ]
+    fixed_paths = [
+        np.asarray(path[:, :2], dtype=np.float32)
+        for path in perimeter_paths
+        if path.shape[0] >= 2
+    ]
+    original_total_length = sum(_open_path_length(path) for path in paths)
+    added_length_budget = max(line_width * 2.0, original_total_length * 0.015)
+    maximum_corrections = 20
+    target_void_diameter = line_width * 0.5
+    minimum_component_area = line_width * line_width * 0.0075
+    mic_tolerance = max(tolerance * 20.0, line_width * 0.005)
+    blocked_centers: set[tuple[int, int]] = set()
+    added_length = 0.0
+
+    for _ in range(maximum_corrections):
+        coverage = _round_bead_coverage(fixed_paths + paths, bead_radius)
+        uncovered = evaluation_region.difference(coverage)
+        candidates: list[tuple[float, object, np.ndarray, tuple[int, int]]] = []
+        for component in _iter_polygons(uncovered):
+            if component.area < minimum_component_area:
+                continue
+            circle = maximum_inscribed_circle(component, tolerance=mic_tolerance)
+            if circle.is_empty:
+                continue
+            diameter = float(circle.length * 2.0)
+            if diameter <= target_void_diameter:
+                continue
+            center = np.asarray(circle.coords[0], dtype=np.float64)
+            center_key = (
+                round(float(center[0]) / mic_tolerance),
+                round(float(center[1]) / mic_tolerance),
+            )
+            if center_key not in blocked_centers:
+                candidates.append((diameter, component, center, center_key))
+        if not candidates:
+            break
+        candidates.sort(key=lambda item: item[0], reverse=True)
+
+        changed = False
+        for _, component, center, center_key in candidates:
+            center_point = Point(float(center[0]), float(center[1]))
+            apex_candidates: list[np.ndarray] = []
+            for candidate_region in (safe_surface_allowed, direct_allowed):
+                if candidate_region.is_empty:
+                    continue
+                candidate_point = (
+                    center_point
+                    if candidate_region.covers(center_point)
+                    else nearest_points(center_point, candidate_region)[1]
+                )
+                candidate = np.asarray(candidate_point.coords[0], dtype=np.float64)
+                if float(np.linalg.norm(candidate - center)) >= bead_radius - tolerance:
+                    continue
+                if not any(
+                    float(np.linalg.norm(candidate - existing)) <= tolerance * 10.0
+                    for existing in apex_candidates
+                ):
+                    apex_candidates.append(candidate)
+            if not apex_candidates:
+                blocked_centers.add(center_key)
+                continue
+
+            best_proposal: tuple[
+                tuple[float, float, float, int, float],
+                int,
+                np.ndarray,
+                float,
+            ] | None = None
+            for apex in apex_candidates:
+                options: list[tuple[float, int, float, float, float]] = []
+                apex_geometry = Point(float(apex[0]), float(apex[1]))
+                for path_index, path in enumerate(paths):
+                    path_line = LineString(path)
+                    cumulative_start = 0.0
+                    for segment_start, segment_end in zip(path[:-1], path[1:]):
+                        segment = LineString([segment_start[:2], segment_end[:2]])
+                        segment_length = float(segment.length)
+                        segment_offset = cumulative_start
+                        cumulative_start += segment_length
+                        if segment_length <= tolerance:
+                            continue
+                        # A correction must always branch from the immutable
+                        # hatch.  Otherwise a later pass can branch from a
+                        # detour leg and create a tiny stacked zigzag with a
+                        # high local material dose.
+                        if not original_path_corridors[path_index].covers(segment):
+                            continue
+                        distance = float(segment.distance(apex_geometry))
+                        local_projection = float(segment.project(apex_geometry))
+                        left = min(bead_radius, local_projection)
+                        right = min(bead_radius, segment_length - local_projection)
+                        if (
+                            tolerance * 10.0 < distance < line_width * 1.5
+                            and left + right >= bead_radius * 0.55
+                            and min(left, right) > tolerance * 10.0
+                        ):
+                            options.append(
+                                (
+                                    distance,
+                                    path_index,
+                                    segment_offset,
+                                    local_projection,
+                                    segment_length,
+                                )
+                            )
+                    # A nearest point can be an interior smoothing vertex.  In
+                    # that case each incident micro-segment has zero usable
+                    # distance on one side even though the continuous path has
+                    # ample room for a safe detour.  Add a path-distance option
+                    # that may straddle original vertices; the immutable
+                    # corridor and retained-bead checks below keep it from
+                    # spanning a previously inserted correction.
+                    path_projection = float(path_line.project(apex_geometry))
+                    path_length = float(path_line.length)
+                    path_left = min(bead_radius, path_projection)
+                    path_right = min(bead_radius, path_length - path_projection)
+                    projection_point = path_line.interpolate(path_projection)
+                    if (
+                        tolerance * 10.0
+                        < path_line.distance(apex_geometry)
+                        < line_width * 1.5
+                        and path_left + path_right >= bead_radius * 0.55
+                        and min(path_left, path_right) > tolerance * 10.0
+                        and original_path_corridors[path_index].covers(projection_point)
+                    ):
+                        options.append(
+                            (
+                                float(path_line.distance(apex_geometry)),
+                                path_index,
+                                0.0,
+                                path_projection,
+                                path_length,
+                            )
+                        )
+
+                    # If the nearest printable point lies beyond a genuine
+                    # free end, a two-sided triangular replacement is
+                    # impossible.  Extend that same continuous trail once,
+                    # provided the short tail neither doubles back nor touches
+                    # another trail.  This covers narrow-neck pockets without
+                    # introducing a separate start/stop or a retraced stroke.
+                    for endpoint_side, endpoint_index in ((0, 0), (1, -1)):
+                        endpoint_projection_distance = (
+                            path_projection
+                            if endpoint_side == 0
+                            else path_length - path_projection
+                        )
+                        if endpoint_projection_distance > tolerance * 10.0:
+                            continue
+                        endpoint = np.asarray(path[endpoint_index, :2], dtype=np.float64)
+                        if (
+                            float(
+                                np.linalg.norm(
+                                    endpoint
+                                    - original_path_endpoints[path_index][endpoint_side]
+                                )
+                            )
+                            > tolerance * 10.0
+                        ):
+                            continue
+                        tail_line = LineString([endpoint, apex])
+                        tail_length = float(tail_line.length)
+                        if not (tolerance * 10.0 < tail_length <= line_width):
+                            continue
+                        if not direct_allowed.covers(tail_line):
+                            continue
+                        if (
+                            not wall_linework.is_empty
+                            and tail_line.distance(wall_linework)
+                            < minimum_wall_clearance - tolerance * 5.0
+                        ):
+                            continue
+                        if center_point.distance(tail_line) >= bead_radius - tolerance:
+                            continue
+                        old_line = path_line
+                        if _has_unexpected_linework_intersection(
+                            tail_line,
+                            old_line,
+                            (endpoint,),
+                            tolerance,
+                        ):
+                            continue
+                        if any(
+                            tail_line.distance(LineString(other_path))
+                            <= tolerance * 2.0
+                            for other_index, other_path in enumerate(paths)
+                            if other_index != path_index
+                        ):
+                            continue
+                        existing_ray = np.asarray(
+                            (
+                                path[1, :2] - path[0, :2]
+                                if endpoint_side == 0
+                                else path[-2, :2] - path[-1, :2]
+                            ),
+                            dtype=np.float64,
+                        )
+                        tail_ray = np.asarray(apex - endpoint, dtype=np.float64)
+                        if (
+                            _acute_angle_degrees(
+                                existing_ray,
+                                tail_ray,
+                                tolerance,
+                            )
+                            < 15.0
+                        ):
+                            continue
+                        new_path = _dedupe_consecutive(
+                            (
+                                np.vstack((apex, path))
+                                if endpoint_side == 0
+                                else np.vstack((path, apex))
+                            ).astype(np.float32),
+                            tolerance * 2.0,
+                        )
+                        new_line = LineString(new_path)
+                        if not new_line.is_simple:
+                            continue
+                        tail_bead = tail_line.buffer(
+                            bead_radius,
+                            cap_style="round",
+                            join_style="round",
+                        )
+                        component_gain = component.intersection(tail_bead).area
+                        if component_gain < component.area * 0.25:
+                            continue
+                        if not _residual_correction_has_sufficient_novel_area(
+                            component_gain,
+                            tail_length,
+                            line_width,
+                        ):
+                            continue
+                        if added_length + tail_length > added_length_budget:
+                            continue
+                        remaining_diameter = _maximum_inscribed_diameter(
+                            component.difference(tail_bead),
+                            mic_tolerance,
+                        )
+                        score = (
+                            remaining_diameter,
+                            -float(component_gain),
+                            tail_length,
+                            path_index,
+                            -1.0 if endpoint_side == 0 else path_length,
+                        )
+                        if best_proposal is None or score < best_proposal[0]:
+                            best_proposal = (
+                                score,
+                                path_index,
+                                new_path,
+                                tail_length,
+                            )
+                options.sort(key=lambda item: item[0])
+
+                for (
+                    _,
+                    path_index,
+                    cumulative_start,
+                    local_projection,
+                    segment_length,
+                ) in options:
+                    old_path = paths[path_index]
+                    old_line = LineString(old_path)
+                    for interval_factor in (1.0, 0.75, 0.5):
+                        left = min(
+                            bead_radius * interval_factor,
+                            local_projection,
+                        )
+                        right = min(
+                            bead_radius * interval_factor,
+                            segment_length - local_projection,
+                        )
+                        if (
+                            left + right < bead_radius * 0.55
+                            or min(left, right) <= tolerance * 10.0
+                        ):
+                            continue
+                        proposal = _replace_path_interval_with_detour(
+                            old_path,
+                            cumulative_start + local_projection - left,
+                            cumulative_start + local_projection + right,
+                            apex,
+                            tolerance,
+                        )
+                        if proposal is None:
+                            continue
+                        new_path, original_interval, detour = proposal
+                        if not original_path_corridors[path_index].covers(original_interval):
+                            continue
+                        detour_line = LineString(detour)
+                        if not direct_allowed.covers(detour_line):
+                            continue
+                        if (
+                            not wall_linework.is_empty
+                            and detour_line.distance(wall_linework)
+                            < minimum_wall_clearance - tolerance * 5.0
+                        ):
+                            continue
+                        if center_point.distance(detour_line) >= bead_radius - tolerance:
+                            continue
+                        retained_bead = detour_line.buffer(
+                            bead_radius * 0.95,
+                            cap_style="round",
+                            join_style="round",
+                        )
+                        if (
+                            original_interval.difference(retained_bead).length
+                            > tolerance * 10.0
+                        ):
+                            continue
+                        detour_bead = detour_line.buffer(
+                            bead_radius,
+                            cap_style="round",
+                            join_style="round",
+                        )
+                        component_gain = component.intersection(detour_bead).area
+                        if component_gain < component.area * 0.25:
+                            continue
+
+                        base_vector = np.asarray(
+                            detour[-1] - detour[0], dtype=np.float64
+                        )
+                        first_leg = np.asarray(
+                            detour[1] - detour[0], dtype=np.float64
+                        )
+                        second_leg = np.asarray(
+                            detour[-1] - detour[1], dtype=np.float64
+                        )
+                        if (
+                            _acute_angle_degrees(base_vector, first_leg, tolerance) < 15.0
+                            or _acute_angle_degrees(base_vector, second_leg, tolerance) < 15.0
+                            or _acute_angle_degrees(first_leg, second_leg, tolerance) < 15.0
+                        ):
+                            continue
+
+                        new_line = LineString(new_path)
+                        if old_line.is_simple and not new_line.is_simple:
+                            continue
+                        if any(
+                            detour_line.distance(LineString(other_path))
+                            <= tolerance * 2.0
+                            for other_index, other_path in enumerate(paths)
+                            if other_index != path_index
+                        ):
+                            continue
+                        length_increase = float(new_line.length - old_line.length)
+                        if (
+                            length_increase <= tolerance
+                            or length_increase > line_width * 2.0
+                            or added_length + length_increase > added_length_budget
+                        ):
+                            continue
+                        if not _residual_correction_has_sufficient_novel_area(
+                            component_gain,
+                            length_increase,
+                            line_width,
+                        ):
+                            continue
+
+                        remaining_diameter = _maximum_inscribed_diameter(
+                            component.difference(detour_bead),
+                            mic_tolerance,
+                        )
+                        score = (
+                            remaining_diameter,
+                            -float(component_gain),
+                            length_increase,
+                            path_index,
+                            cumulative_start + local_projection,
+                        )
+                        if best_proposal is None or score < best_proposal[0]:
+                            best_proposal = (
+                                score,
+                                path_index,
+                                new_path,
+                                length_increase,
+                            )
+            if best_proposal is not None:
+                _, path_index, new_path, length_increase = best_proposal
+                paths[path_index] = new_path
+                added_length += length_increase
+                changed = True
+                break
+            blocked_centers.add(center_key)
+        if not changed:
+            break
+    return paths
+
+
+def _round_bead_coverage(paths: list[np.ndarray], bead_radius: float):
+    beads = [
+        LineString(path[:, :2]).buffer(
+            bead_radius,
+            cap_style="round",
+            join_style="round",
+            quad_segs=8,
+        )
+        for path in paths
+        if path.shape[0] >= 2
+    ]
+    return unary_union(beads) if beads else GeometryCollection()
+
+
+def _residual_correction_has_sufficient_novel_area(
+    novel_area: float,
+    added_length: float,
+    line_width: float,
+) -> bool:
+    """Reject a correction that would deposit mostly onto existing 2 mm beads."""
+
+    if added_length <= 0 or line_width <= 0:
+        return False
+    minimum_novel_area = (
+        added_length
+        * line_width
+        * MINIMUM_RESIDUAL_CORRECTION_NOVEL_AREA_FRACTION
+    )
+    return novel_area >= minimum_novel_area
+
+
+def _maximum_inscribed_diameter(geometry, tolerance: float) -> float:
+    maximum = 0.0
+    for polygon in _iter_polygons(geometry):
+        if polygon.area <= tolerance * tolerance:
+            continue
+        circle = maximum_inscribed_circle(polygon, tolerance=tolerance)
+        if not circle.is_empty:
+            maximum = max(maximum, float(circle.length * 2.0))
+    return maximum
+
+
+def _replace_path_interval_with_detour(
+    path: np.ndarray,
+    start_distance: float,
+    end_distance: float,
+    apex: np.ndarray,
+    tolerance: float,
+) -> tuple[np.ndarray, LineString, np.ndarray] | None:
+    if path.shape[0] < 2 or not (tolerance < start_distance < end_distance):
+        return None
+    points = np.asarray(path[:, :2], dtype=np.float64)
+    segment_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    cumulative = np.concatenate(([0.0], np.cumsum(segment_lengths)))
+    total_length = float(cumulative[-1])
+    if end_distance >= total_length - tolerance:
+        return None
+
+    line = LineString(points)
+    start = np.asarray(line.interpolate(start_distance).coords[0], dtype=np.float64)
+    end = np.asarray(line.interpolate(end_distance).coords[0], dtype=np.float64)
+    middle = points[
+        (cumulative > start_distance + tolerance)
+        & (cumulative < end_distance - tolerance)
+    ]
+    original_interval = LineString(np.vstack((start, middle, end)))
+    detour = np.asarray([start, apex, end], dtype=np.float32)
+    prefix = points[cumulative < start_distance - tolerance]
+    suffix = points[cumulative > end_distance + tolerance]
+    new_path = _dedupe_consecutive(
+        np.vstack((prefix, detour, suffix)).astype(np.float32),
+        tolerance,
+    )
+    if new_path.shape[0] < 2:
+        return None
+    return new_path, original_interval, detour
 
 
 def _gyroid_infill_geometry(geometry, spacing: float, tolerance: float) -> list[np.ndarray]:
@@ -1641,6 +2255,10 @@ def _connect_zigzag_infill_paths(
     spacing: float,
     minimum_clearance: float,
     tolerance: float,
+    *,
+    maximum_spacing: float | None = None,
+    solid_bead_width: float | None = None,
+    wall_seam_clearance: float | None = None,
 ) -> list[np.ndarray]:
     """Join adjacent scanlines along the bead-aware centerline boundary."""
 
@@ -1651,6 +2269,9 @@ def _connect_zigzag_infill_paths(
         minimum_clearance,
         tolerance,
         adjacent_scanlines_only=True,
+        maximum_scan_spacing=maximum_spacing,
+        solid_bead_width=solid_bead_width,
+        wall_seam_clearance=wall_seam_clearance,
     )
 
 
@@ -1662,6 +2283,9 @@ def _connect_boundary_infill_paths(
     tolerance: float,
     *,
     adjacent_scanlines_only: bool,
+    maximum_scan_spacing: float | None = None,
+    solid_bead_width: float | None = None,
+    wall_seam_clearance: float | None = None,
 ) -> list[np.ndarray]:
     """Chain open infill trails with safe direct or boundary-following links."""
 
@@ -1697,49 +2321,77 @@ def _connect_boundary_infill_paths(
         if adjacent_scanlines_only
         else {}
     )
-    adjacent_level_tolerance = max(spacing * 0.1, tolerance * 20.0)
+    connector_spacing = (
+        max(spacing, maximum_scan_spacing)
+        if maximum_scan_spacing is not None
+        else spacing
+    )
+    adjacent_level_tolerance = max(spacing * 0.01, tolerance * 20.0)
+    if adjacent_scanlines_only:
+        ordered_indices = sorted(open_indices, key=lambda index: (scan_levels[index], index))
+        minimum_level_delta = (
+            spacing - adjacent_level_tolerance
+            if maximum_scan_spacing is not None
+            else spacing - max(spacing * 0.1, tolerance * 20.0)
+        )
+        maximum_level_delta = (
+            maximum_scan_spacing + adjacent_level_tolerance
+            if maximum_scan_spacing is not None
+            else spacing + max(spacing * 0.1, tolerance * 20.0)
+        )
+        candidate_index_pairs: list[tuple[int, int]] = []
+        for first_position, first_index in enumerate(ordered_indices):
+            first_level = scan_levels[first_index]
+            for second_index in ordered_indices[first_position + 1 :]:
+                level_delta = scan_levels[second_index] - first_level
+                if level_delta > maximum_level_delta:
+                    break
+                if level_delta >= minimum_level_delta:
+                    candidate_index_pairs.append((first_index, second_index))
+    else:
+        candidate_index_pairs = [
+            (first_index, second_index)
+            for first_position, first_index in enumerate(open_indices)
+            for second_index in open_indices[first_position + 1 :]
+        ]
+
     candidates: list[tuple[float, int, int, np.ndarray]] = []
-    for first_position, first_index in enumerate(open_indices):
-        for second_index in open_indices[first_position + 1 :]:
-            if adjacent_scanlines_only:
-                level_delta = abs(scan_levels[first_index] - scan_levels[second_index])
-                if abs(level_delta - spacing) > adjacent_level_tolerance:
+    for first_index, second_index in candidate_index_pairs:
+        for first_side in (0, 1):
+            first_endpoint = 2 * first_index + first_side
+            for second_side in (0, 1):
+                second_endpoint = 2 * second_index + second_side
+                direct_distance = float(
+                    np.linalg.norm(
+                        endpoint_points[first_endpoint]
+                        - endpoint_points[second_endpoint]
+                    )
+                )
+                # A continuity link is printed with material.  Routes whose
+                # endpoints are more than eight pitches apart add too much
+                # non-pattern material and are not useful candidates.  This
+                # inexpensive test also avoids quadratic Shapely projection
+                # work for dense gyroid layers.
+                if direct_distance > connector_spacing * 8.0:
                     continue
-            for first_side in (0, 1):
-                first_endpoint = 2 * first_index + first_side
-                for second_side in (0, 1):
-                    second_endpoint = 2 * second_index + second_side
-                    direct_distance = float(
-                        np.linalg.norm(
-                            endpoint_points[first_endpoint]
-                            - endpoint_points[second_endpoint]
-                        )
+                connector_points = _infill_endpoint_connector(
+                    endpoint_points[first_endpoint],
+                    endpoint_points[second_endpoint],
+                    boundary_rings,
+                    safe_geometry,
+                    connector_spacing,
+                    tolerance,
+                )
+                if connector_points is None:
+                    continue
+                candidates.append(
+                    (
+                        _open_path_length(connector_points),
+                        first_endpoint,
+                        second_endpoint,
+                        connector_points,
                     )
-                    # A continuity link is printed with material.  Routes whose
-                    # endpoints are more than eight pitches apart add too much
-                    # non-pattern material and are not useful candidates.  This
-                    # inexpensive test also avoids quadratic Shapely projection
-                    # work for dense gyroid layers.
-                    if direct_distance > spacing * 8.0:
-                        continue
-                    connector_points = _infill_endpoint_connector(
-                        endpoint_points[first_endpoint],
-                        endpoint_points[second_endpoint],
-                        boundary_rings,
-                        safe_geometry,
-                        spacing,
-                        tolerance,
-                    )
-                    if connector_points is None:
-                        continue
-                    candidates.append(
-                        (
-                            _open_path_length(connector_points),
-                            first_endpoint,
-                            second_endpoint,
-                            connector_points,
-                        )
-                    )
+                )
     candidates_by_endpoint: dict[int, list[tuple[float, int, np.ndarray]]] = defaultdict(list)
     for length, first_endpoint, second_endpoint, connector_points in candidates:
         candidates_by_endpoint[first_endpoint].append(
@@ -1815,6 +2467,27 @@ def _connect_boundary_infill_paths(
 
     connected_paths: list[np.ndarray] = []
     connected_indices: set[int] = set()
+    compensate_wall_seams = (
+        adjacent_scanlines_only
+        and solid_bead_width is not None
+        and wall_seam_clearance is not None
+        and solid_bead_width > tolerance
+        and wall_seam_clearance < solid_bead_width - tolerance
+    )
+    compensated_wall_gaps: set[tuple[int, int]] = set()
+    compensated_wall_lines: list[LineString] = []
+    accepted_connector_linework = (
+        unary_union(
+            [
+                LineString(
+                    [(float(point[0]), float(point[1])) for point in connector]
+                )
+                for _, _, connector in accepted
+            ]
+        )
+        if accepted
+        else GeometryCollection()
+    )
     for component in components:
         start_endpoint = next(
             endpoint
@@ -1824,6 +2497,7 @@ def _connect_boundary_infill_paths(
         )
         chain_points: list[np.ndarray] = []
         current_endpoint: int | None = start_endpoint
+        incoming_connector: np.ndarray | None = None
         while current_endpoint is not None:
             index = current_endpoint // 2
             side = current_endpoint % 2
@@ -1835,11 +2509,81 @@ def _connect_boundary_infill_paths(
                 if side == 0
                 else np.asarray(paths[index][::-1, :2], dtype=np.float32)
             )
-            chain_points.extend(oriented_path if not chain_points else oriented_path[1:])
+            if not chain_points:
+                if compensate_wall_seams:
+                    start_tail = _solid_wall_seam_tail(
+                        current_endpoint,
+                        endpoint_points,
+                        scan_levels,
+                        path_lines,
+                        boundary_rings,
+                        spacing,
+                        maximum_scan_spacing,
+                        solid_bead_width,
+                        wall_seam_clearance,
+                        safe_geometry,
+                        tolerance,
+                        compensated_wall_gaps,
+                        compensated_wall_lines,
+                        accepted_connector_linework,
+                        prepend=True,
+                    )
+                    if start_tail is not None:
+                        chain_points.extend(start_tail)
+                chain_points.extend(oriented_path if not chain_points else oriented_path[1:])
+            elif compensate_wall_seams and incoming_connector is not None:
+                dogleg = _solid_wall_seam_dogleg(
+                    incoming_connector,
+                    current_endpoint,
+                    oriented_path,
+                    chain_points,
+                    paths,
+                    path_lines,
+                    endpoint_points,
+                    scan_levels,
+                    boundary_rings,
+                    spacing,
+                    maximum_scan_spacing,
+                    solid_bead_width,
+                    wall_seam_clearance,
+                    safe_geometry,
+                    tolerance,
+                    compensated_wall_gaps,
+                    compensated_wall_lines,
+                    accepted_connector_linework,
+                )
+                if dogleg is None:
+                    chain_points.extend(oriented_path[1:])
+                else:
+                    bridge, trimmed_path = dogleg
+                    chain_points.extend(bridge[1:])
+                    chain_points.extend(trimmed_path[1:])
+            else:
+                chain_points.extend(oriented_path[1:])
 
             exit_endpoint = 2 * index + (1 - side)
             connection = connector_by_endpoint.get(exit_endpoint)
             if connection is None:
+                if compensate_wall_seams:
+                    end_tail = _solid_wall_seam_tail(
+                        exit_endpoint,
+                        endpoint_points,
+                        scan_levels,
+                        path_lines,
+                        boundary_rings,
+                        spacing,
+                        maximum_scan_spacing,
+                        solid_bead_width,
+                        wall_seam_clearance,
+                        safe_geometry,
+                        tolerance,
+                        compensated_wall_gaps,
+                        compensated_wall_lines,
+                        accepted_connector_linework,
+                        prepend=False,
+                    )
+                    if end_tail is not None:
+                        chain_points.extend(end_tail[1:])
                 current_endpoint = None
                 continue
             next_endpoint, connector_points = connection
@@ -1849,6 +2593,7 @@ def _connect_boundary_infill_paths(
                 else connector_points[::-1].copy()
             )
             chain_points.extend(oriented_connector[1:])
+            incoming_connector = oriented_connector
             current_endpoint = next_endpoint
 
         if len(chain_points) >= 2:
@@ -1891,6 +2636,482 @@ def _infill_boundary_ring(line: LineString) -> _InfillBoundaryRing:
         coordinates=coordinates,
         cumulative_lengths=np.concatenate(([0.0], np.cumsum(segment_lengths))),
     )
+
+
+def _solid_wall_seam_tail(
+    endpoint: int,
+    endpoint_points: dict[int, np.ndarray],
+    scan_levels: dict[int, float],
+    path_lines: dict[int, LineString],
+    boundary_rings: list[_InfillBoundaryRing],
+    minimum_scan_spacing: float,
+    maximum_scan_spacing: float | None,
+    bead_width: float,
+    wall_clearance: float,
+    safe_geometry,
+    tolerance: float,
+    compensated_gaps: set[tuple[int, int]],
+    compensated_lines: list[LineString],
+    accepted_connector_linework,
+    *,
+    prepend: bool,
+) -> np.ndarray | None:
+    """Extend a free solid-hatch end only across its uncovered wall gap."""
+
+    gap = _solid_wall_seam_gap_arc(
+        endpoint,
+        endpoint_points,
+        scan_levels,
+        boundary_rings,
+        minimum_scan_spacing,
+        maximum_scan_spacing,
+        bead_width,
+        wall_clearance,
+        tolerance,
+        compensated_gaps,
+    )
+    if gap is None:
+        return None
+    gap_arc, gap_key = gap
+    prefix = _solid_wall_seam_gap_prefix(
+        gap_arc,
+        bead_width,
+        wall_clearance,
+        tolerance,
+    )
+    if prefix is None:
+        return None
+    prefix_line = LineString(prefix)
+    incident_index = endpoint // 2
+    if (
+        not safe_geometry.covers(prefix_line)
+        or _has_unexpected_linework_intersection(
+            prefix_line,
+            accepted_connector_linework,
+            (),
+            tolerance,
+        )
+        or any(
+            _has_unexpected_linework_intersection(
+                prefix_line,
+                path_line,
+                (prefix[0, :2],) if path_index == incident_index else (),
+                tolerance,
+            )
+            for path_index, path_line in path_lines.items()
+        )
+        or any(
+            not prefix_line.disjoint(existing)
+            for existing in compensated_lines
+        )
+    ):
+        return None
+    compensated_gaps.add(gap_key)
+    compensated_lines.append(prefix_line)
+    return prefix[::-1].copy() if prepend else prefix
+
+
+def _solid_wall_seam_dogleg(
+    incoming_connector: np.ndarray,
+    endpoint: int,
+    oriented_path: np.ndarray,
+    assembled_prefix: list[np.ndarray],
+    paths: list[np.ndarray],
+    path_lines: dict[int, LineString],
+    endpoint_points: dict[int, np.ndarray],
+    scan_levels: dict[int, float],
+    boundary_rings: list[_InfillBoundaryRing],
+    minimum_scan_spacing: float,
+    maximum_scan_spacing: float | None,
+    bead_width: float,
+    wall_clearance: float,
+    safe_geometry,
+    tolerance: float,
+    compensated_gaps: set[tuple[int, int]],
+    compensated_lines: list[LineString],
+    accepted_connector_linework,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Fold a short wall-gap correction into an existing solid-fill turn."""
+
+    if oriented_path.shape[0] < 2:
+        return None
+    gap = _solid_wall_seam_gap_arc(
+        endpoint,
+        endpoint_points,
+        scan_levels,
+        boundary_rings,
+        minimum_scan_spacing,
+        maximum_scan_spacing,
+        bead_width,
+        wall_clearance,
+        tolerance,
+        compensated_gaps,
+        incoming_connector=incoming_connector,
+    )
+    if gap is None:
+        return None
+    gap_arc, gap_key = gap
+    prefix = _solid_wall_seam_gap_prefix(
+        gap_arc,
+        bead_width,
+        wall_clearance,
+        tolerance,
+    )
+    if prefix is None:
+        return None
+
+    bead_radius = bead_width * 0.5
+    path_length = _open_path_length(oriented_path)
+    trim_distance = min(bead_radius, path_length * 0.25)
+    if trim_distance <= tolerance:
+        return None
+    trimmed_path = _trim_open_path_start(oriented_path, trim_distance, tolerance)
+    if trimmed_path is None:
+        return None
+
+    return_point = trimmed_path[0, :2]
+    bridge = _dedupe_consecutive(
+        np.vstack((prefix, np.asarray(return_point, dtype=np.float32))),
+        tolerance,
+    )
+    if bridge.shape[0] < 3:
+        return None
+    bridge_line = LineString(bridge)
+    prefix_line = LineString(prefix)
+    if (
+        not bridge_line.is_simple
+        or not safe_geometry.covers(bridge_line)
+        or _has_unexpected_linework_intersection(
+            bridge_line,
+            accepted_connector_linework,
+            (bridge[0, :2],),
+            tolerance,
+        )
+        or _has_unexpected_linework_intersection(
+            bridge_line,
+            path_lines[endpoint // 2],
+            (bridge[0, :2], bridge[-1, :2]),
+            tolerance,
+        )
+        or any(
+            not bridge_line.disjoint(existing)
+            for existing in compensated_lines
+        )
+    ):
+        return None
+
+    boundary_vector = _last_nondegenerate_segment(prefix, tolerance)
+    return_vector = np.asarray(return_point - prefix[-1, :2], dtype=np.float64)
+    hatch_vector = _first_nondegenerate_segment(trimmed_path, tolerance)
+    if boundary_vector is None or hatch_vector is None:
+        return None
+    if (
+        _acute_angle_degrees(boundary_vector, return_vector, tolerance) < 10.0
+        or _acute_angle_degrees(return_vector, hatch_vector, tolerance) < 10.0
+    ):
+        return None
+
+    return_chord = LineString(
+        [
+            (float(prefix[-1, 0]), float(prefix[-1, 1])),
+            (float(return_point[0]), float(return_point[1])),
+        ]
+    )
+    incident_index = endpoint // 2
+    for other_index, other_line in path_lines.items():
+        if other_index == incident_index:
+            continue
+        if (
+            _has_unexpected_linework_intersection(
+                bridge_line,
+                other_line,
+                (),
+                tolerance,
+            )
+            or return_chord.distance(other_line) <= tolerance * 2.0
+        ):
+            return None
+
+    candidate_chain = _dedupe_consecutive(
+        np.vstack(
+            (
+                np.asarray(assembled_prefix, dtype=np.float32),
+                bridge[1:],
+                trimmed_path[1:],
+            )
+        ),
+        tolerance * 2.0,
+    )
+    if candidate_chain.shape[0] >= 2 and not LineString(candidate_chain).is_simple:
+        return None
+
+    original_trim = LineString(
+        [
+            (float(oriented_path[0, 0]), float(oriented_path[0, 1])),
+            (float(return_point[0]), float(return_point[1])),
+        ]
+    )
+    deposited = bridge_line.buffer(
+        max(bead_radius - tolerance * 2.0, bead_radius * 0.95),
+        cap_style="round",
+        join_style="round",
+    )
+    if original_trim.difference(deposited).length > tolerance * 10.0:
+        return None
+    compensated_gaps.add(gap_key)
+    compensated_lines.append(bridge_line)
+    return bridge, trimmed_path
+
+
+def _has_unexpected_linework_intersection(
+    candidate: LineString,
+    existing,
+    allowed_points: tuple[np.ndarray, ...],
+    tolerance: float,
+) -> bool:
+    if existing.is_empty or candidate.disjoint(existing):
+        return False
+    intersection = candidate.intersection(existing)
+    if not allowed_points:
+        return not intersection.is_empty
+    allowed = unary_union(
+        [
+            Point(float(point[0]), float(point[1])).buffer(tolerance * 10.0)
+            for point in allowed_points
+        ]
+    )
+    return not intersection.difference(allowed).is_empty
+
+
+def _solid_wall_seam_gap_arc(
+    endpoint: int,
+    endpoint_points: dict[int, np.ndarray],
+    scan_levels: dict[int, float],
+    boundary_rings: list[_InfillBoundaryRing],
+    minimum_scan_spacing: float,
+    maximum_scan_spacing: float | None,
+    bead_width: float,
+    wall_clearance: float,
+    tolerance: float,
+    compensated_gaps: set[tuple[int, int]],
+    *,
+    incoming_connector: np.ndarray | None = None,
+) -> tuple[np.ndarray, tuple[int, int]] | None:
+    point = endpoint_points[endpoint]
+    point_geometry = Point(float(point[0]), float(point[1]))
+    snap_tolerance = max(tolerance * 20.0, min(bead_width * 0.02, 0.05))
+    minimum_delta = minimum_scan_spacing - max(
+        minimum_scan_spacing * 0.02,
+        tolerance * 20.0,
+    )
+    maximum_delta = (
+        maximum_scan_spacing
+        if maximum_scan_spacing is not None
+        else minimum_scan_spacing * 1.1
+    ) + max(minimum_scan_spacing * 0.02, tolerance * 20.0)
+
+    best: tuple[float, np.ndarray, tuple[int, int]] | None = None
+    for ring in boundary_rings:
+        if ring.line.distance(point_geometry) > snap_tolerance:
+            continue
+        direction = _solid_wall_seam_ring_direction(
+            ring,
+            incoming_connector,
+            point,
+            snap_tolerance,
+        )
+        if incoming_connector is not None and direction is None:
+            continue
+        directions = (direction,) if direction is not None else (True, False)
+        point_distance = float(ring.line.project(point_geometry))
+        total_length = float(ring.cumulative_lengths[-1])
+        for forward in directions:
+            for candidate, candidate_point in endpoint_points.items():
+                if candidate == endpoint or candidate // 2 == endpoint // 2:
+                    continue
+                gap_key = tuple(sorted((endpoint, candidate)))
+                if gap_key in compensated_gaps:
+                    continue
+                level_delta = abs(
+                    scan_levels[candidate // 2] - scan_levels[endpoint // 2]
+                )
+                if not (minimum_delta <= level_delta <= maximum_delta):
+                    continue
+                candidate_geometry = Point(
+                    float(candidate_point[0]),
+                    float(candidate_point[1]),
+                )
+                if ring.line.distance(candidate_geometry) > snap_tolerance:
+                    continue
+                candidate_distance = float(ring.line.project(candidate_geometry))
+                travel = (
+                    (candidate_distance - point_distance) % total_length
+                    if forward
+                    else (point_distance - candidate_distance) % total_length
+                )
+                if not (
+                    tolerance < travel <= max(bead_width, maximum_delta) * 8.0
+                ):
+                    continue
+                arc = (
+                    _forward_infill_ring_arc(
+                        ring,
+                        point_distance,
+                        candidate_distance,
+                        tolerance,
+                    )
+                    if forward
+                    else _forward_infill_ring_arc(
+                        ring,
+                        candidate_distance,
+                        point_distance,
+                        tolerance,
+                    )[::-1].copy()
+                )
+                arc = _dedupe_consecutive(arc, tolerance)
+                arc_length = _open_path_length(arc)
+                if arc_length <= tolerance:
+                    continue
+                if best is None or arc_length < best[0]:
+                    best = (arc_length, arc, gap_key)
+    return None if best is None else (best[1], best[2])
+
+
+def _solid_wall_seam_ring_direction(
+    ring: _InfillBoundaryRing,
+    incoming_connector: np.ndarray | None,
+    endpoint: np.ndarray,
+    snap_tolerance: float,
+) -> bool | None:
+    if incoming_connector is None or incoming_connector.shape[0] < 2:
+        return None
+    previous = incoming_connector[-2, :2]
+    previous_geometry = Point(float(previous[0]), float(previous[1]))
+    if ring.line.distance(previous_geometry) > snap_tolerance:
+        return None
+    total_length = float(ring.cumulative_lengths[-1])
+    previous_distance = float(ring.line.project(previous_geometry))
+    endpoint_distance = float(
+        ring.line.project(Point(float(endpoint[0]), float(endpoint[1])))
+    )
+    forward_travel = (endpoint_distance - previous_distance) % total_length
+    backward_travel = (previous_distance - endpoint_distance) % total_length
+    return forward_travel <= backward_travel
+
+
+def _solid_wall_seam_gap_prefix(
+    gap_arc: np.ndarray,
+    bead_width: float,
+    wall_clearance: float,
+    tolerance: float,
+) -> np.ndarray | None:
+    bead_radius = bead_width * 0.5
+    seam_normal_offset = max(0.0, wall_clearance - bead_radius)
+    if seam_normal_offset >= bead_radius - tolerance:
+        return None
+    cap_half_width = math.sqrt(
+        max(0.0, bead_radius * bead_radius - seam_normal_offset * seam_normal_offset)
+    )
+    gap_length = _open_path_length(gap_arc)
+    correction_length = gap_length - 2.0 * cap_half_width
+    numerical_margin = max(tolerance * 20.0, bead_width * 1e-4)
+    if correction_length <= numerical_margin:
+        return None
+    correction_length = min(
+        gap_length - numerical_margin,
+        correction_length + numerical_margin,
+    )
+    return _open_path_prefix(gap_arc, correction_length, tolerance)
+
+
+def _open_path_prefix(
+    path: np.ndarray,
+    target_length: float,
+    tolerance: float,
+) -> np.ndarray | None:
+    if path.shape[0] < 2 or target_length <= tolerance:
+        return None
+    points = [np.asarray(path[0, :2], dtype=np.float32)]
+    remaining = target_length
+    for start, end in zip(path[:-1, :2], path[1:, :2]):
+        delta = np.asarray(end - start, dtype=np.float64)
+        segment_length = float(np.linalg.norm(delta))
+        if segment_length <= tolerance:
+            continue
+        if remaining >= segment_length - tolerance:
+            points.append(np.asarray(end, dtype=np.float32))
+            remaining -= segment_length
+            if remaining <= tolerance:
+                break
+            continue
+        points.append(
+            np.asarray(start, dtype=np.float64)
+            + delta * (remaining / segment_length)
+        )
+        remaining = 0.0
+        break
+    if remaining > tolerance or len(points) < 2:
+        return None
+    return _dedupe_consecutive(np.asarray(points, dtype=np.float32), tolerance)
+
+
+def _trim_open_path_start(
+    path: np.ndarray,
+    trim_length: float,
+    tolerance: float,
+) -> np.ndarray | None:
+    if path.shape[0] < 2 or trim_length <= tolerance:
+        return None
+    remaining = trim_length
+    for index, (start, end) in enumerate(zip(path[:-1, :2], path[1:, :2])):
+        delta = np.asarray(end - start, dtype=np.float64)
+        segment_length = float(np.linalg.norm(delta))
+        if segment_length <= tolerance:
+            continue
+        if remaining >= segment_length - tolerance:
+            remaining -= segment_length
+            continue
+        first = np.asarray(start, dtype=np.float64) + delta * (remaining / segment_length)
+        return _dedupe_consecutive(
+            np.vstack((np.asarray(first, dtype=np.float32), path[index + 1 :, :2])),
+            tolerance,
+        )
+    return None
+
+
+def _last_nondegenerate_segment(
+    path: np.ndarray,
+    tolerance: float,
+) -> np.ndarray | None:
+    for start, end in reversed(list(zip(path[:-1, :2], path[1:, :2]))):
+        delta = np.asarray(end - start, dtype=np.float64)
+        if float(np.linalg.norm(delta)) > tolerance:
+            return delta
+    return None
+
+
+def _first_nondegenerate_segment(
+    path: np.ndarray,
+    tolerance: float,
+) -> np.ndarray | None:
+    for start, end in zip(path[:-1, :2], path[1:, :2]):
+        delta = np.asarray(end - start, dtype=np.float64)
+        if float(np.linalg.norm(delta)) > tolerance:
+            return delta
+    return None
+
+
+def _acute_angle_degrees(
+    first: np.ndarray,
+    second: np.ndarray,
+    tolerance: float,
+) -> float:
+    first_length = float(np.linalg.norm(first))
+    second_length = float(np.linalg.norm(second))
+    if first_length <= tolerance or second_length <= tolerance:
+        return 0.0
+    cosine = abs(float(np.dot(first, second)) / (first_length * second_length))
+    return math.degrees(math.acos(min(1.0, max(-1.0, cosine))))
 
 
 def _infill_scan_levels(
@@ -2716,6 +3937,33 @@ def _perimeter_paths_from_geometry(
     return paths, roles
 
 
+def _last_perimeter_linework(
+    geometry,
+    line_width: float,
+    path_spacing: float,
+    perimeter_count: int,
+    tolerance: float,
+):
+    """Return only the innermost configured perimeter centerline rings."""
+
+    offset_distance = line_width * 0.5 + (perimeter_count - 1) * path_spacing
+    offset_geometry = _libslic3r_offset_geometry(
+        geometry,
+        -offset_distance,
+        tolerance,
+    )
+    rings: list[LineString] = []
+    for polygon in _iter_polygons(offset_geometry):
+        exterior = LineString(polygon.exterior.coords)
+        if exterior.length > tolerance:
+            rings.append(exterior)
+        for interior in polygon.interiors:
+            ring = LineString(interior.coords)
+            if ring.length > tolerance:
+                rings.append(ring)
+    return unary_union(rings) if rings else GeometryCollection()
+
+
 def _iter_polygons(geometry):
     if isinstance(geometry, Polygon):
         yield geometry
@@ -2982,6 +4230,325 @@ def _zigzag_infill_geometry(
             if path.shape[0] >= 2 and np.linalg.norm(path[-1] - path[0]) > tolerance:
                 paths.append(path)
     return paths
+
+
+def _solid_zigzag_infill_paths(
+    geometry,
+    spacing: float,
+    line_width: float,
+    angle_degrees: float,
+    minimum_clearance: float,
+    tolerance: float,
+) -> list[np.ndarray]:
+    """Plan full-density hatch lines with bounded bead-spacing correction.
+
+    Sparse infill intentionally shares a global phase so successive layers are
+    stable.  At full density that phase can leave almost an entire pitch beside
+    a wall.  Each printable island therefore uses an unchanged, centered pitch
+    by default.  When long boundaries are parallel to the hatch, their levels
+    are safe phase anchors only if every intervening band can be divided close
+    to the requested overlap pitch.  The small symmetric adjustment is capped
+    by both bead width and configured overlap, so it cannot silently turn a
+    10% overlap into either zero overlap or a dense pile.  A corridor narrower
+    than one pitch still receives exactly one centered stroke.
+    """
+
+    if spacing <= 0:
+        raise ValueError("infill spacing must be positive")
+    if line_width <= 0:
+        raise ValueError("line_width must be positive")
+    if geometry.is_empty:
+        return []
+
+    paths: list[np.ndarray] = []
+    spacing_adjustment = _solid_spacing_adjustment_limit(spacing, line_width)
+    minimum_scan_spacing = max(tolerance, spacing - spacing_adjustment)
+    maximum_scan_spacing = min(line_width, spacing + spacing_adjustment)
+    for polygon in _iter_polygons(geometry):
+        rotated = affinity.rotate(
+            polygon,
+            -angle_degrees,
+            origin=(0, 0),
+            use_radians=False,
+        )
+        min_x, min_y, max_x, max_y = rotated.bounds
+        scan_levels = _solid_zigzag_scan_levels(
+            rotated,
+            spacing,
+            line_width,
+            tolerance,
+        )
+        padding = spacing * 2.0
+
+        for scan_y in scan_levels:
+            line = LineString(
+                [(min_x - padding, scan_y), (max_x + padding, scan_y)]
+            )
+            intersection = rotated.intersection(line)
+            segments = list(_extract_line_segments(intersection, tolerance))
+            if len(segments) > 1:
+                # GEOS may split a scanline into touching collinear pieces when
+                # it lands exactly on a hole vertex.  Joining only pieces that
+                # already touch removes artificial stops without bridging a
+                # real void.
+                intersection = linemerge(unary_union(segments))
+                segments = list(_extract_line_segments(intersection, tolerance))
+            for segment in segments:
+                restored = affinity.rotate(
+                    segment,
+                    angle_degrees,
+                    origin=(0, 0),
+                    use_radians=False,
+                )
+                path = _dedupe_consecutive(
+                    np.asarray(
+                        [[float(x), float(y)] for x, y in restored.coords],
+                        dtype=np.float32,
+                    ),
+                    tolerance,
+                )
+                if (
+                    path.shape[0] >= 2
+                    and np.linalg.norm(path[-1] - path[0]) > tolerance
+                ):
+                    paths.append(path)
+
+    return _connect_zigzag_infill_paths(
+        paths,
+        geometry,
+        minimum_scan_spacing,
+        min(minimum_clearance, minimum_scan_spacing),
+        tolerance,
+        maximum_spacing=maximum_scan_spacing,
+        solid_bead_width=line_width,
+        wall_seam_clearance=minimum_clearance,
+    )
+
+
+def _solid_spacing_adjustment_limit(spacing: float, line_width: float) -> float:
+    """Return the maximum symmetric solid-pitch correction.
+
+    At 2 mm width and 10% overlap the requested pitch is 1.8 mm and the
+    correction is limited to 0.1 mm, so local pitches stay within 1.7..1.9 mm.
+    Zero-overlap fill remains exact, while extremely high overlap cannot create
+    a wide connector search window.
+    """
+
+    available_overlap = max(0.0, line_width - spacing)
+    return max(
+        0.0,
+        min(
+            available_overlap * 0.5,
+            line_width * 0.05,
+            spacing * 0.25,
+        ),
+    )
+
+
+def _solid_zigzag_scan_levels(
+    rotated_polygon: Polygon,
+    spacing: float,
+    line_width: float,
+    tolerance: float,
+) -> list[float]:
+    min_y = float(rotated_polygon.bounds[1])
+    max_y = float(rotated_polygon.bounds[3])
+    centered = _centered_scan_levels(min_y, max_y, spacing, tolerance)
+    if max_y - min_y < spacing - tolerance:
+        return centered
+
+    anchors = _parallel_boundary_scan_anchors(
+        rotated_polygon,
+        line_width,
+        tolerance,
+    )
+    anchor_tolerance = max(tolerance * 20.0, line_width * 1e-4)
+    if not anchors:
+        return centered
+
+    anchors_minimum = abs(anchors[0] - min_y) <= anchor_tolerance
+    anchors_maximum = abs(anchors[-1] - max_y) <= anchor_tolerance
+    spacing_adjustment = _solid_spacing_adjustment_limit(spacing, line_width)
+    minimum_scan_spacing = max(tolerance, spacing - spacing_adjustment)
+    maximum_scan_spacing = min(line_width, spacing + spacing_adjustment)
+    if anchors_minimum and anchors_maximum:
+        anchored = _scan_levels_between_anchors(
+            anchors,
+            spacing,
+            minimum_scan_spacing,
+            maximum_scan_spacing,
+            tolerance,
+        )
+        if anchored is not None:
+            return anchored
+        return centered
+    if anchors_minimum:
+        return _one_sided_anchored_scan_levels(
+            anchors,
+            min_y,
+            max_y,
+            spacing,
+            minimum_scan_spacing,
+            maximum_scan_spacing,
+            tolerance,
+            anchor_from_minimum=True,
+        )
+    if anchors_maximum:
+        return _one_sided_anchored_scan_levels(
+            anchors,
+            min_y,
+            max_y,
+            spacing,
+            minimum_scan_spacing,
+            maximum_scan_spacing,
+            tolerance,
+            anchor_from_minimum=False,
+        )
+    return centered
+
+
+def _scan_levels_between_anchors(
+    anchors: list[float],
+    spacing: float,
+    minimum_scan_spacing: float,
+    maximum_scan_spacing: float,
+    tolerance: float,
+) -> list[float] | None:
+    levels: list[float] = [anchors[0]]
+    for lower, upper in zip(anchors[:-1], anchors[1:]):
+        interval = _scan_levels_for_anchored_interval(
+            lower,
+            upper,
+            spacing,
+            minimum_scan_spacing,
+            maximum_scan_spacing,
+            tolerance,
+        )
+        if interval is None:
+            return None
+        levels.extend(interval)
+    return levels
+
+
+def _scan_levels_for_anchored_interval(
+    lower: float,
+    upper: float,
+    spacing: float,
+    minimum_scan_spacing: float,
+    maximum_scan_spacing: float,
+    tolerance: float,
+) -> list[float] | None:
+    span = upper - lower
+    interval_count = max(1, math.floor(span / spacing + 0.5))
+    local_spacing = span / interval_count
+    if (
+        local_spacing < minimum_scan_spacing - tolerance
+        or local_spacing > maximum_scan_spacing + tolerance
+    ):
+        return None
+    levels = [
+        lower + local_spacing * index
+        for index in range(1, interval_count + 1)
+    ]
+    # Repeated floating-point addition can put the mathematically identical
+    # final level a few ulps outside the polygon.  GEOS then returns an empty
+    # boundary intersection and silently drops a complete solid-fill row.
+    levels[-1] = upper
+    return levels
+
+
+def _one_sided_anchored_scan_levels(
+    anchors: list[float],
+    min_y: float,
+    max_y: float,
+    spacing: float,
+    minimum_scan_spacing: float,
+    maximum_scan_spacing: float,
+    tolerance: float,
+    *,
+    anchor_from_minimum: bool,
+) -> list[float]:
+    ordered = anchors if anchor_from_minimum else [-value for value in reversed(anchors)]
+    transformed_max = max_y if anchor_from_minimum else -min_y
+    levels: list[float] = [ordered[0]]
+    current = ordered[0]
+
+    for anchor in ordered[1:]:
+        interval = _scan_levels_for_anchored_interval(
+            current,
+            anchor,
+            spacing,
+            minimum_scan_spacing,
+            maximum_scan_spacing,
+            tolerance,
+        )
+        if interval is None:
+            continue
+        levels.extend(interval)
+        current = anchor
+
+    next_level = current + spacing
+    while next_level < transformed_max - tolerance:
+        levels.append(next_level)
+        next_level += spacing
+    if abs(next_level - transformed_max) <= max(tolerance * 20.0, spacing * 1e-6):
+        levels.append(transformed_max)
+
+    if anchor_from_minimum:
+        return levels
+    return sorted(-value for value in levels)
+
+
+def _centered_scan_levels(
+    min_y: float,
+    max_y: float,
+    spacing: float,
+    tolerance: float,
+) -> list[float]:
+    span = max_y - min_y
+    interval_count = max(0, math.floor((span + tolerance) / spacing))
+    residual = max(0.0, span - interval_count * spacing)
+    first_scan_y = min_y + residual * 0.5
+    levels = [first_scan_y + index * spacing for index in range(interval_count + 1)]
+    snap_tolerance = max(tolerance * 20.0, spacing * 1e-6)
+    if levels and abs(levels[0] - min_y) <= snap_tolerance:
+        levels[0] = min_y
+    if levels and abs(levels[-1] - max_y) <= snap_tolerance:
+        levels[-1] = max_y
+    return levels
+
+
+def _parallel_boundary_scan_anchors(
+    polygon: Polygon,
+    line_width: float,
+    tolerance: float,
+) -> list[float]:
+    anchors: list[float] = []
+    maximum_vertical_delta = max(tolerance * 20.0, line_width * 1e-5)
+    for ring in (polygon.exterior, *polygon.interiors):
+        coordinates = list(ring.coords)
+        for start, end in zip(coordinates[:-1], coordinates[1:]):
+            dx = float(end[0] - start[0])
+            dy = float(end[1] - start[1])
+            if math.hypot(dx, dy) < line_width - tolerance:
+                continue
+            if abs(dy) <= maximum_vertical_delta:
+                anchors.append((float(start[1]) + float(end[1])) * 0.5)
+
+    if not anchors:
+        return []
+    anchors.sort()
+    cluster_tolerance = max(tolerance * 20.0, line_width * 1e-4)
+    clustered: list[float] = []
+    cluster: list[float] = []
+    for anchor in anchors:
+        if cluster and anchor - cluster[-1] > cluster_tolerance:
+            clustered.append(sum(cluster) / len(cluster))
+            cluster = []
+        cluster.append(anchor)
+    if cluster:
+        clustered.append(sum(cluster) / len(cluster))
+    return clustered
 
 
 def _triangular_lattice_infill_geometry(

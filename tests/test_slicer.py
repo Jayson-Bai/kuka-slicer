@@ -2,6 +2,7 @@
 
 import numpy as np
 import pytest
+from shapely import maximum_inscribed_circle
 from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import unary_union
 
@@ -26,8 +27,10 @@ from kuka_slicer.slicer import (
     _raft_reserved_void_geometry,
     _raft_zigzag_infill_paths,
     _resin_infill_surface_geometry,
+    _residual_correction_has_sufficient_novel_area,
     _smooth_path_corners_into_paths,
     _smooth_path_corners,
+    _solid_spacing_adjustment_limit,
     _uniform_concentric_offsets,
     add_raft_to_job,
     merge_adjacent_connected_paths,
@@ -121,10 +124,9 @@ def test_resin_line_infill_uses_default_overlap_spacing():
     assert len(contour_paths) == 2
     assert len(infill_paths) == 1
     assert infill_paths[0].shape[0] > 8
-    assert np.allclose(
-        _horizontal_scan_ys(infill_paths[0]),
-        [5.4, 7.2, 9.0, 10.8, 12.6, 14.4],
-    )
+    scan_ys = _horizontal_scan_ys_for_paths(infill_paths)
+    assert np.allclose(scan_ys, [4.6, 6.4, 8.2, 10.0, 11.8, 13.6, 15.4])
+    assert np.allclose(np.diff(scan_ys), 1.8)
 
 
 def test_resin_line_infill_can_disable_overlap_for_legacy_spacing():
@@ -138,10 +140,9 @@ def test_resin_line_infill_can_disable_overlap_for_legacy_spacing():
     roles = job.meta["path_roles"]["R"]["1"]
     infill_paths = _paths_with_role(job.material_paths[1].paths, roles, "infill")
     assert len(infill_paths) == 1
-    assert np.allclose(
-        _horizontal_scan_ys(infill_paths[0]),
-        [6.0, 8.0, 10.0, 12.0, 14.0],
-    )
+    scan_ys = _horizontal_scan_ys_for_paths(infill_paths)
+    assert np.allclose(scan_ys, [5.0, 7.0, 9.0, 11.0, 13.0, 15.0])
+    assert np.allclose(np.diff(scan_ys), 2.0)
 
 
 def test_resin_perimeters_use_overlap_spacing():
@@ -220,10 +221,12 @@ def test_resin_infill_density_changes_path_spacing():
     sparse_roles = sparse.meta["path_roles"]["R"]["1"]
     dense_infill = _paths_with_role(dense.material_paths[1].paths, dense_roles, "infill")
     sparse_infill = _paths_with_role(sparse.material_paths[1].paths, sparse_roles, "infill")
-    assert len(dense_infill) == 1
-    assert len(sparse_infill) == 1
-    assert len(_horizontal_scan_ys(dense_infill[0])) == 6
-    assert len(_horizontal_scan_ys(sparse_infill[0])) == 3
+    roi = Polygon([(6, 6), (14, 6), (14, 14), (6, 14)])
+    dense_length = unary_union([LineString(path[:, :2]) for path in dense_infill]).intersection(roi).length
+    sparse_length = unary_union([LineString(path[:, :2]) for path in sparse_infill]).intersection(roi).length
+    assert dense_infill
+    assert sparse_infill
+    assert dense_length > sparse_length * 1.7
     assert dense.meta["slicing"]["infill_density"] == 100
     assert dense.meta["slicing"]["infill_overlap"] == DEFAULT_RESIN_INFILL_OVERLAP_PERCENT
 
@@ -749,12 +752,10 @@ def test_rectilinear_infill_flips_angle_by_layer():
 
     first_roles = job.meta["path_roles"]["R"]["1"]
     second_roles = job.meta["path_roles"]["R"]["2"]
-    first_layer_path = _paths_with_role(job.material_paths[1].paths, first_roles, "infill")[0]
-    second_layer_path = _paths_with_role(job.material_paths[2].paths, second_roles, "infill")[0]
-    first_delta = first_layer_path[1, :2] - first_layer_path[0, :2]
-    second_delta = second_layer_path[1, :2] - second_layer_path[0, :2]
-    assert first_delta[0] * first_delta[1] < 0
-    assert second_delta[0] * second_delta[1] > 0
+    first_layer_paths = _paths_with_role(job.material_paths[1].paths, first_roles, "infill")
+    second_layer_paths = _paths_with_role(job.material_paths[2].paths, second_roles, "infill")
+    assert _diagonal_segment_sign(first_layer_paths) < 0
+    assert _diagonal_segment_sign(second_layer_paths) > 0
 
 
 def test_triangular_infill_generates_single_layer_lattice_without_edge_overlaps():
@@ -957,18 +958,20 @@ def test_zero_smoothing_radius_keeps_zigzag_turns_sharp():
             layer_height=1.0,
             line_width=2.0,
             infill_pattern="aligned_rectilinear",
+            infill_density=50.0,
             smoothing_radius_factor=0.0,
         ),
         layer_index=1,
     )
     infill = _paths_with_role(paths, roles, "infill")
 
-    assert len(infill) == 1
-    deltas = np.diff(infill[0][:, :2], axis=0)
+    assert infill
+    deltas = np.vstack([np.diff(path[:, :2], axis=0) for path in infill])
     assert all(abs(float(delta[0])) <= 1e-6 or abs(float(delta[1])) <= 1e-6 for delta in deltas)
     assert any(
         abs(float(np.dot(first, second))) <= 1e-6
-        for first, second in zip(deltas, deltas[1:])
+        for path in infill
+        for first, second in zip(np.diff(path[:, :2], axis=0), np.diff(path[:, :2], axis=0)[1:])
     )
 
 
@@ -1121,7 +1124,10 @@ def test_gyroid_infill_supports_zero_and_full_density():
         ("zigzag", 1),
     ],
 )
-def test_prusa_infill_patterns_minimize_interruptions(pattern: str, max_path_count: int):
+def test_prusa_infill_patterns_bound_interruptions_without_retracing(
+    pattern: str,
+    max_path_count: int,
+):
     contour = _square_contour(40.0)
 
     paths, roles = _build_resin_paths(
@@ -1139,6 +1145,191 @@ def test_prusa_infill_patterns_minimize_interruptions(pattern: str, max_path_cou
     assert infill
     assert len(infill) <= max_path_count
     assert all(path.shape[0] >= 2 for path in infill)
+
+
+@pytest.mark.parametrize(
+    ("angle", "minimum_coverage", "maximum_void_diameter"),
+    [
+        (0.0, 0.997, 0.50),
+        (45.0, 0.997, 0.50),
+        (-45.0, 0.997, 0.50),
+        (90.0, 0.997, 0.50),
+    ],
+)
+def test_prusa_full_density_round_beads_cover_wall_transition_without_piling(
+    angle: float,
+    minimum_coverage: float,
+    maximum_void_diameter: float,
+):
+    outer = np.asarray(
+        [[0, 0], [60, 0], [60, 40], [0, 40], [0, 0]],
+        dtype=np.float32,
+    )
+    hole = np.asarray(
+        [[25, 15], [35, 15], [35, 25], [25, 25], [25, 15]],
+        dtype=np.float32,
+    )
+    solid = Polygon(outer[:-1], holes=[hole[:-1]])
+    config = SliceConfig(
+        layer_height=1.0,
+        line_width=2.0,
+        infill_pattern="zigzag",
+        infill_density=100.0,
+        infill_overlap=10.0,
+    )
+
+    paths, roles = _build_resin_paths(
+        [outer, hole],
+        config,
+        layer_index=1,
+        forced_zigzag_angle=angle,
+    )
+    infill = _paths_with_role(paths, roles, "infill")
+    last_walls = _paths_with_role(paths, roles, "inner_contour")
+    full_width_stroke = _round_bead_union(paths, config.line_width)
+    infill_linework = unary_union([LineString(path[:, :2]) for path in infill])
+    repeated_length = sum(LineString(path[:, :2]).length for path in infill) - infill_linework.length
+    expected_pitch = config.line_width * (1.0 - config.infill_overlap / 100.0)
+    pitch_adjustment = _solid_spacing_adjustment_limit(
+        expected_pitch,
+        config.line_width,
+    )
+    wall_clearance = infill_linework.distance(
+        unary_union([LineString(path[:, :2]) for path in last_walls])
+    )
+    physical_centerline_region = solid.buffer(
+        -(config.line_width * 0.5 - config.tolerance * 2.0),
+        join_style="round",
+    )
+    coverage = solid.intersection(full_width_stroke).area / solid.area
+    scan_gaps = _hatch_scan_level_gaps(infill, angle, config.line_width)
+
+    assert coverage >= minimum_coverage
+    assert _maximum_uncovered_void_diameter(
+        solid,
+        full_width_stroke,
+        edge_inset=0.3,
+    ) <= maximum_void_diameter
+    assert _infill_extra_dose_ratio(infill, solid, config.line_width) <= 0.01
+    assert _segment_bead_overlap_ratio(infill, config.line_width) <= 0.23
+    assert scan_gaps
+    assert min(scan_gaps) >= expected_pitch - pitch_adjustment - 0.02
+    assert max(scan_gaps) <= expected_pitch + pitch_adjustment + 0.02
+    assert abs(repeated_length) <= 1e-4
+    assert wall_clearance == pytest.approx(expected_pitch, abs=0.02)
+    assert len(infill) <= 4
+    assert all(LineString(path[:, :2]).is_simple for path in infill)
+    assert all(
+        physical_centerline_region.covers(LineString(path[:, :2]))
+        for path in infill
+    )
+
+
+def test_residual_correction_rejects_stroke_stacked_inside_two_mm_bead():
+    existing = LineString([(0.0, 0.0), (10.0, 0.0)]).buffer(
+        1.0,
+        cap_style="round",
+        join_style="round",
+    )
+    stacked = LineString([(0.0, 0.1), (10.0, 0.1)]).buffer(
+        1.0,
+        cap_style="round",
+        join_style="round",
+    )
+    uncovered = LineString([(0.0, 3.0), (10.0, 3.0)]).buffer(
+        1.0,
+        cap_style="round",
+        join_style="round",
+    )
+
+    assert not _residual_correction_has_sufficient_novel_area(
+        stacked.difference(existing).area,
+        added_length=10.0,
+        line_width=2.0,
+    )
+    assert _residual_correction_has_sufficient_novel_area(
+        uncovered.difference(existing).area,
+        added_length=10.0,
+        line_width=2.0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("height", "expected_scan_ys"),
+    [
+        (9.3, [4.65]),
+        (10.0, [5.0]),
+        (11.2, [4.7, 6.5]),
+        (14.5, [4.6, 6.36667, 8.13333, 9.9]),
+        (14.59, [4.6, 6.39667, 8.19333, 9.99]),
+    ],
+)
+def test_prusa_full_density_narrow_corridors_do_not_add_boundary_pileup(
+    height: float,
+    expected_scan_ys: list[float],
+):
+    contour = np.asarray(
+        [[0, 0], [40, 0], [40, height], [0, height], [0, 0]],
+        dtype=np.float32,
+    )
+    solid = Polygon(contour[:-1])
+    config = SliceConfig(
+        layer_height=1.0,
+        line_width=2.0,
+        infill_pattern="zigzag",
+        infill_density=100.0,
+        infill_overlap=10.0,
+    )
+
+    paths, roles = _build_resin_paths(
+        [contour],
+        config,
+        layer_index=1,
+        forced_zigzag_angle=0.0,
+    )
+    infill = _paths_with_role(paths, roles, "infill")
+    scan_ys = _horizontal_scan_ys_for_paths(infill)
+
+    assert len(infill) == 1
+    assert np.allclose(scan_ys, expected_scan_ys, atol=0.02)
+    assert _infill_extra_dose_ratio(infill, solid, config.line_width) <= 1e-6
+    if len(scan_ys) > 1:
+        expected_pitch = config.line_width * (1.0 - config.infill_overlap / 100.0)
+        adjustment = _solid_spacing_adjustment_limit(
+            expected_pitch,
+            config.line_width,
+        )
+        assert min(np.diff(scan_ys)) >= expected_pitch - adjustment - 0.02
+
+
+@pytest.mark.parametrize("angle", [0.0, 90.0])
+def test_prusa_full_density_anchor_levels_snap_to_large_square_boundary(angle: float):
+    contour = _square_contour(100.0)
+    solid = Polygon(contour[:-1])
+    config = SliceConfig(
+        layer_height=1.0,
+        line_width=2.0,
+        infill_pattern="zigzag",
+        infill_density=100.0,
+        infill_overlap=10.0,
+    )
+
+    paths, roles = _build_resin_paths(
+        [contour],
+        config,
+        layer_index=1,
+        forced_zigzag_angle=angle,
+    )
+    infill = _paths_with_role(paths, roles, "infill")
+    deposited = _round_bead_union(paths, config.line_width)
+
+    assert len(infill) == 1
+    assert solid.intersection(deposited).area / solid.area >= 0.998
+    expected_pitch = config.line_width * (1.0 - config.infill_overlap / 100.0)
+    adjustment = _solid_spacing_adjustment_limit(expected_pitch, config.line_width)
+    assert max(_hatch_scan_level_gaps(infill, angle, config.line_width)) <= (
+        expected_pitch + adjustment + 0.02
+    )
 
 
 @pytest.mark.parametrize("overlap_percent", [0.0, 10.0, 25.0])
@@ -1688,6 +1879,7 @@ def test_raft_infill_paths_are_clipped_to_geometry():
 
     assert len(paths) == 1
     assert paths[0].shape[0] > 2
+    assert abs(_repeated_centerline_length(paths)) <= 1e-4
     assert all(geometry.buffer(0.2).covers(LineString(path[:, :2])) for path in paths)
 
 
@@ -1915,7 +2107,7 @@ def test_raft_infill_does_not_cross_true_void_boundaries():
         assert not line.intersects(hole_polygon.buffer(config.line_width * 0.5))
 
 
-def test_raft_zigzag_infill_connects_adjacent_scanlines():
+def test_raft_zigzag_full_density_covers_boundary_without_retrace():
     geometry = Polygon([(0, 0), (30, 0), (30, 20), (0, 20)])
     config = SliceConfig(layer_height=1.0, line_width=2.0, infill_overlap=10.0)
 
@@ -1926,9 +2118,17 @@ def test_raft_zigzag_infill_connects_adjacent_scanlines():
         angle_degrees=45.0,
     )
 
-    assert len(paths) == 1
-    assert paths[0].shape[0] > 2
-    assert LineString(paths[0]).is_simple
+    full_width_stroke = _round_bead_union(paths, config.line_width)
+
+    assert 1 <= len(paths) <= 3
+    assert all(LineString(path).is_simple for path in paths)
+    assert full_width_stroke.intersection(geometry).area / geometry.area > 0.97
+    assert _maximum_uncovered_void_diameter(
+        geometry,
+        full_width_stroke,
+        edge_inset=0.3,
+    ) <= 0.6
+    assert abs(_repeated_centerline_length(paths)) <= 1e-4
 
 
 def test_raft_zigzag_follows_hole_boundary_with_few_full_width_strokes():
@@ -1962,13 +2162,13 @@ def test_raft_zigzag_follows_hole_boundary_with_few_full_width_strokes():
         ]
     )
 
-    # Reducing this to two paths requires a hole-boundary bridge whose center
-    # comes within about 1.588 mm of an incident line, below the 1.8 mm pitch.
     assert 1 <= len(paths) <= 3
     assert all(LineString(path).is_simple for path in paths)
+    assert abs(_repeated_centerline_length(paths)) <= 1e-4
     assert all(safe_geometry.buffer(1e-5).covers(LineString(path)) for path in paths)
     assert geometry.buffer(1e-5).covers(full_width_stroke)
     assert not full_width_stroke.intersects(hole_polygon)
+    assert full_width_stroke.intersection(safe_geometry).area / safe_geometry.area > 0.995
 
 
 def test_raft_zigzag_full_density_covers_printable_surface():
@@ -1995,7 +2195,7 @@ def test_raft_zigzag_full_density_covers_printable_surface():
     )
 
     assert paths
-    assert stroke_area.intersection(safe_geometry).area / safe_geometry.area > 0.98
+    assert stroke_area.intersection(safe_geometry).area / safe_geometry.area > 0.995
 
 
 def test_raft_voids_include_openings_from_later_part_sections():
@@ -2182,6 +2382,137 @@ def _cube_triangles(size: float) -> np.ndarray:
 
 def _paths_with_role(paths: list[np.ndarray], roles: list[str], role: str) -> list[np.ndarray]:
     return [path for path, path_role in zip(paths, roles) if path_role == role]
+
+
+def _round_bead_union(paths: list[np.ndarray], line_width: float):
+    return unary_union(
+        [
+            LineString(path[:, :2]).buffer(
+                line_width * 0.5,
+                cap_style="round",
+                join_style="round",
+                quad_segs=32,
+            )
+            for path in paths
+            if path.shape[0] >= 2
+        ]
+    )
+
+
+def _maximum_uncovered_void_diameter(
+    solid: Polygon,
+    deposited,
+    *,
+    edge_inset: float,
+) -> float:
+    region = solid.buffer(-edge_inset, join_style="mitre")
+    uncovered = region.difference(deposited)
+    if uncovered.is_empty:
+        return 0.0
+    return float(maximum_inscribed_circle(uncovered, tolerance=0.01).length * 2.0)
+
+
+def _infill_extra_dose_ratio(
+    paths: list[np.ndarray],
+    solid: Polygon,
+    line_width: float,
+) -> float:
+    region = solid.buffer(-0.3, join_style="mitre")
+    beads = [
+        LineString(path[:, :2])
+        .buffer(
+            line_width * 0.5,
+            cap_style="round",
+            join_style="round",
+            quad_segs=32,
+        )
+        .intersection(region)
+        for path in paths
+        if path.shape[0] >= 2
+    ]
+    if not beads:
+        return 0.0
+    return (sum(bead.area for bead in beads) - unary_union(beads).area) / solid.area
+
+
+def _segment_bead_overlap_ratio(
+    paths: list[np.ndarray],
+    line_width: float,
+) -> float:
+    """Measure overlap per printed segment, including within one continuous path."""
+
+    segment_beads = [
+        LineString([start[:2], end[:2]]).buffer(
+            line_width * 0.5,
+            cap_style="flat",
+            join_style="mitre",
+            quad_segs=8,
+        )
+        for path in paths
+        for start, end in zip(path[:-1], path[1:])
+        if float(np.linalg.norm(end[:2] - start[:2])) > 1e-6
+    ]
+    total_area = sum(bead.area for bead in segment_beads)
+    if total_area <= 0:
+        return 0.0
+    return (total_area - unary_union(segment_beads).area) / total_area
+
+
+def _hatch_scan_level_gaps(
+    paths: list[np.ndarray],
+    angle_degrees: float,
+    line_width: float,
+) -> list[float]:
+    radians = math.radians(angle_degrees)
+    direction = np.asarray([math.cos(radians), math.sin(radians)], dtype=np.float64)
+    normal = np.asarray([-direction[1], direction[0]], dtype=np.float64)
+    minimum_segment_length = line_width * 1.5
+    minimum_parallel_cosine = math.cos(math.radians(1.0))
+    levels: list[float] = []
+    for path in paths:
+        for start, end in zip(path[:-1, :2], path[1:, :2]):
+            delta = np.asarray(end - start, dtype=np.float64)
+            length = float(np.linalg.norm(delta))
+            if length < minimum_segment_length:
+                continue
+            if abs(float(np.dot(delta / length, direction))) < minimum_parallel_cosine:
+                continue
+            midpoint = (np.asarray(start, dtype=np.float64) + end) * 0.5
+            levels.append(float(np.dot(midpoint, normal)))
+
+    clustered: list[float] = []
+    for level in sorted(levels):
+        if not clustered or level - clustered[-1] > 0.02:
+            clustered.append(level)
+    return [
+        upper - lower
+        for lower, upper in zip(clustered[:-1], clustered[1:])
+    ]
+
+
+def _repeated_centerline_length(paths: list[np.ndarray]) -> float:
+    lines = [LineString(path[:, :2]) for path in paths if path.shape[0] >= 2]
+    return sum(line.length for line in lines) - unary_union(lines).length
+
+
+def _horizontal_scan_ys_for_paths(paths: list[np.ndarray]) -> list[float]:
+    values = {
+        round(y, 5)
+        for path in paths
+        for y in _horizontal_scan_ys(path)
+    }
+    return sorted(values)
+
+
+def _diagonal_segment_sign(paths: list[np.ndarray]) -> float:
+    products = [
+        float(delta[0] * delta[1])
+        for path in paths
+        for delta in np.diff(path[:, :2], axis=0)
+        if abs(float(delta[0])) > 1e-4 and abs(float(delta[1])) > 1e-4
+    ]
+    assert products
+    return float(np.median(products))
 
 
 def _horizontal_scan_ys(path: np.ndarray) -> list[float]:
