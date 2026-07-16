@@ -8,6 +8,7 @@ __pycache__/
 .agents/
 .coverage
 htmlcov/
+.artifacts/
 
 .venv/
 venv/

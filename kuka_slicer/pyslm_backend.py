@@ -9,12 +9,20 @@ from .external_npz import ExternalSourceJob, MaterialPaths
 from .stl_io import Mesh
 from .slicer import (
     DEFAULT_MATERIAL_PROCESS,
+    PART_BOTTOM_ZIGZAG_ANGLE_DEGREES,
+    PART_TOP_ZIGZAG_ANGLE_DEGREES,
     SliceConfig,
     _build_z_projector,
+    _connect_zigzag_infill_paths,
+    _isotropic_part_layer_angle,
+    _isotropic_schedule_metadata,
     _layer_z_values,
     _libslic3r_fill_surface_overlap_offset,
     _path_2d_to_3d,
+    _resin_infill_surface_geometry,
     _resin_path_spacing,
+    _solid_geometry_from_contours,
+    _zigzag_infill_geometry,
     orient_mesh_for_build_axis,
 )
 
@@ -25,7 +33,8 @@ PYSLM_NATIVE_PATTERNS = {
     "rectilinear",
     "zigzag",
 }
-SUPPORTED_PYSLM_PATTERNS = PYSLM_NATIVE_PATTERNS
+PROJECT_ZIGZAG_PATTERNS = {"zigzag", "isotropic"}
+SUPPORTED_PYSLM_PATTERNS = PYSLM_NATIVE_PATTERNS | {"isotropic"}
 
 
 def slice_mesh_to_job_with_pyslm(mesh: Mesh, config: SliceConfig) -> ExternalSourceJob:
@@ -44,8 +53,15 @@ def slice_mesh_to_job_with_pyslm(mesh: Mesh, config: SliceConfig) -> ExternalSou
 
     for layer_index, base_z in enumerate(z_values):
         layer_config = _effective_layer_config(config, layer_index, len(z_values))
+        slice_z = float(base_z)
+        if abs(slice_z - oriented_mesh.z_max) <= max(config.tolerance * 10.0, 1e-7):
+            top_sample_offset = max(
+                config.tolerance * 2.0,
+                config.layer_height * 1e-4,
+            )
+            slice_z = max(oriented_mesh.z_min, slice_z - top_sample_offset)
         boundary_paths = part.getVectorSlice(
-            float(base_z),
+            slice_z,
             returnCoordPaths=True,
             fixPolygons=config.pyslm.fix_polygons,
             simplificationFactor=config.pyslm.simplification_factor,
@@ -61,6 +77,7 @@ def slice_mesh_to_job_with_pyslm(mesh: Mesh, config: SliceConfig) -> ExternalSou
             boundary_paths,
             layer_config,
             layer_index,
+            len(z_values),
             pyslm_hatching,
             pyslm_geometry,
         )
@@ -101,8 +118,15 @@ def slice_mesh_to_job_with_pyslm(mesh: Mesh, config: SliceConfig) -> ExternalSou
                         "top": len(z_values) - 1 if len(z_values) else None,
                         "infill_pattern": "zigzag",
                         "infill_density": 100.0,
+                        "bottom_angle_degrees": PART_BOTTOM_ZIGZAG_ANGLE_DEGREES,
+                        "top_angle_degrees": PART_TOP_ZIGZAG_ANGLE_DEGREES,
                     }
                     if config.material == "R"
+                    else None
+                ),
+                "isotropic_schedule": (
+                    _isotropic_schedule_metadata(len(z_values), config.layer_height)
+                    if config.material == "R" and config.infill_pattern == "isotropic"
                     else None
                 ),
                 "pyslm": {
@@ -150,7 +174,7 @@ def _validate_pyslm_config(config: SliceConfig) -> None:
         raise ValueError("PySLM slicing kernel currently supports resin material R only")
     if config.infill_pattern not in SUPPORTED_PYSLM_PATTERNS:
         raise ValueError(
-            "PySLM native kernel currently supports "
+            "PySLM kernel currently supports "
             f"{', '.join(sorted(SUPPORTED_PYSLM_PATTERNS))}; "
             f"got {config.infill_pattern!r}"
         )
@@ -184,8 +208,33 @@ def _effective_layer_config(
     layer_index: int,
     layer_count: int,
 ) -> SliceConfig:
-    if config.material == "R" and layer_index in {0, layer_count - 1}:
-        return replace(config, infill_pattern="zigzag", infill_density=100.0)
+    if config.material == "R" and config.infill_pattern == "isotropic":
+        return replace(
+            config,
+            infill_density=(
+                100.0
+                if layer_index in {0, layer_count - 1}
+                else config.infill_density
+            ),
+            pyslm=replace(
+                config.pyslm,
+                hatch_angle=_isotropic_part_layer_angle(layer_index, layer_count),
+            ),
+        )
+    if config.material == "R" and layer_index == 0:
+        return replace(
+            config,
+            infill_pattern="zigzag",
+            infill_density=100.0,
+            pyslm=replace(config.pyslm, hatch_angle=PART_BOTTOM_ZIGZAG_ANGLE_DEGREES),
+        )
+    if config.material == "R" and layer_index == layer_count - 1:
+        return replace(
+            config,
+            infill_pattern="zigzag",
+            infill_density=100.0,
+            pyslm=replace(config.pyslm, hatch_angle=PART_TOP_ZIGZAG_ANGLE_DEGREES),
+        )
     return config
 
 
@@ -193,10 +242,11 @@ def _pyslm_layer_paths(
     boundary_paths: list[np.ndarray],
     config: SliceConfig,
     layer_index: int,
+    layer_count: int,
     pyslm_hatching: Any,
     pyslm_geometry: Any,
 ) -> tuple[list[np.ndarray], list[str]]:
-    hatcher = _make_hatcher(pyslm_hatching, config, layer_index)
+    hatcher = _make_hatcher(pyslm_hatching, config, layer_index, layer_count)
     hatcher.hatchingEnabled = config.infill_pattern != "none" and config.infill_density > 0
 
     layer = hatcher.hatch([_open_path_for_pyslm(path) for path in boundary_paths])
@@ -211,17 +261,39 @@ def _pyslm_layer_paths(
             if path.shape[0] >= 3:
                 paths.append(path)
                 roles.append("outer_contour" if geometry.subType == "outer" else "inner_contour")
-        elif isinstance(geometry, pyslm_geometry.HatchGeometry):
+        elif (
+            isinstance(geometry, pyslm_geometry.HatchGeometry)
+            and config.infill_pattern not in PROJECT_ZIGZAG_PATTERNS
+        ):
             hatch_coords = np.asarray(geometry.coords, dtype=np.float32).reshape(-1, 2, 2)
             for hatch in hatch_coords:
                 path = np.asarray(hatch, dtype=np.float32)
                 if np.linalg.norm(path[1] - path[0]) > config.tolerance:
                     paths.append(path)
                     roles.append("infill")
+
+    if config.infill_pattern in PROJECT_ZIGZAG_PATTERNS and config.infill_density > 0:
+        solid_geometry = _solid_geometry_from_contours(boundary_paths)
+        infill_geometry = _resin_infill_surface_geometry(solid_geometry, config)
+        spacing = _pyslm_hatch_spacing(config)
+        infill_paths = _zigzag_infill_geometry(
+            infill_geometry,
+            spacing,
+            _pyslm_hatch_angle(config, layer_index, layer_count),
+            config.tolerance,
+        )
+        infill_paths = _connect_zigzag_infill_paths(
+            infill_paths,
+            infill_geometry,
+            spacing,
+            config.tolerance,
+        )
+        paths.extend(infill_paths)
+        roles.extend(["infill"] * len(infill_paths))
     return paths, roles
 
 
-def _make_hatcher(pyslm_hatching: Any, config: SliceConfig, layer_index: int) -> Any:
+def _make_hatcher(pyslm_hatching: Any, config: SliceConfig, layer_index: int, layer_count: int) -> Any:
     settings = config.pyslm
     hatcher_class = {
         "basic": pyslm_hatching.Hatcher,
@@ -255,7 +327,7 @@ def _make_hatcher(pyslm_hatching: Any, config: SliceConfig, layer_index: int) ->
         else settings.volume_offset_hatch
     )
     hatcher.hatchDistance = _pyslm_hatch_spacing(config)
-    hatcher.hatchAngle = _pyslm_hatch_angle(config, layer_index)
+    hatcher.hatchAngle = _pyslm_hatch_angle(config, layer_index, layer_count)
     hatcher.layerAngleIncrement = layer_index * settings.layer_angle_increment
 
     if settings.hatcher == "stripe":
@@ -306,7 +378,14 @@ def _pyslm_hatch_spacing(config: SliceConfig) -> float:
     return path_spacing / (config.infill_density / 100.0)
 
 
-def _pyslm_hatch_angle(config: SliceConfig, layer_index: int) -> float:
+def _pyslm_hatch_angle(config: SliceConfig, layer_index: int, layer_count: int) -> float:
+    if config.material == "R" and config.infill_pattern == "isotropic":
+        return _isotropic_part_layer_angle(layer_index, layer_count)
+    if config.material == "R" and config.infill_pattern == "zigzag":
+        if layer_index == 0:
+            return PART_BOTTOM_ZIGZAG_ANGLE_DEGREES
+        if layer_index == layer_count - 1:
+            return PART_TOP_ZIGZAG_ANGLE_DEGREES
     if config.pyslm.hatch_angle is None:
         angle = 45.0 if config.infill_pattern in {"rectilinear", "zigzag"} else 0.0
     else:

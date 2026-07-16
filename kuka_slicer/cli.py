@@ -122,6 +122,7 @@ def main(argv: list[str] | None = None) -> int:
             "gyroid",
             "concentric",
             "zigzag",
+            "isotropic",
         ],
         default="rectilinear",
         help="resin fill pattern",

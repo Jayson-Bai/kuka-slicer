@@ -31,6 +31,7 @@ InfillPattern = Literal[
     "gyroid",
     "concentric",
     "zigzag",
+    "isotropic",
 ]
 BuildAxis = Literal["x", "y", "z"]
 SlicingKernel = Literal["legacy", "pyslm"]
@@ -49,6 +50,17 @@ DEFAULT_RESIN_PERIMETER_COUNT = 2
 DEFAULT_RESIN_SMOOTHING_ANGLE_DEGREES = 150.0
 DEFAULT_RESIN_SMOOTHING_RADIUS_FACTOR = 0.35
 DEFAULT_LEGACY_PATH_MERGE_TOLERANCE_MM = 0.7
+DEFAULT_RAFT_LAYER_COUNT = 2
+DEFAULT_RAFT_OUTWARD_OFFSETS_MM = (15.0, 10.0)
+DEFAULT_RAFT_TOP_GAP_MM = 0.0
+RAFT_BOTTOM_ZIGZAG_ANGLE_DEGREES = 90.0
+RAFT_TOP_ZIGZAG_ANGLE_DEGREES = -45.0
+PART_BOTTOM_ZIGZAG_ANGLE_DEGREES = 0.0
+PART_TOP_ZIGZAG_ANGLE_DEGREES = 45.0
+ISOTROPIC_LAYER_HEIGHT_MM = 0.5
+ISOTROPIC_REPEAT_HEIGHT_MM = 2.0
+ISOTROPIC_CAP_HEIGHT_MM = 1.0
+ISOTROPIC_REPEAT_ANGLES_DEGREES = (45.0, 0.0, -45.0, 90.0)
 MIN_GEOMETRY_TOLERANCE_MM = 1e-5
 MAX_GEOMETRY_TOLERANCE_MM = 1e-2
 
@@ -237,6 +249,7 @@ class SliceConfig:
             "gyroid",
             "concentric",
             "zigzag",
+            "isotropic",
         ):
             raise ValueError("unsupported infill_pattern")
         if self.infill_density < 0 or self.infill_density > 100:
@@ -274,6 +287,8 @@ class RaftLayerConfig:
 
 
 def slice_mesh_to_job(mesh: Mesh, config: SliceConfig) -> ExternalSourceJob:
+    if config.infill_pattern == "isotropic":
+        _validate_isotropic_infill_schedule(mesh, config)
     if config.slicing_kernel == "pyslm":
         from .pyslm_backend import slice_mesh_to_job_with_pyslm
 
@@ -300,11 +315,18 @@ def _slice_mesh_to_job_legacy(mesh: Mesh, config: SliceConfig) -> ExternalSource
             0,
             len(z_values) - 1,
         }
-        layer_config = (
-            replace(config, infill_pattern="zigzag", infill_density=100.0)
-            if is_part_cap_layer
-            else config
-        )
+        forced_cap_angle = None
+        if config.material == "R" and layer_index == 0:
+            forced_cap_angle = PART_BOTTOM_ZIGZAG_ANGLE_DEGREES
+        elif config.material == "R" and layer_index == len(z_values) - 1:
+            forced_cap_angle = PART_TOP_ZIGZAG_ANGLE_DEGREES
+        if is_part_cap_layer:
+            layer_config = replace(config, infill_pattern="zigzag", infill_density=100.0)
+        elif config.infill_pattern == "isotropic":
+            forced_cap_angle = _isotropic_part_layer_angle(layer_index, len(z_values))
+            layer_config = replace(config, infill_pattern="zigzag")
+        else:
+            layer_config = config
         if constant_section_paths is None:
             segments = _intersect_mesh_at_z(mesh.triangles, float(base_z), config.tolerance)
             paths_2d = _stitch_segments(segments, config.tolerance)
@@ -321,7 +343,12 @@ def _slice_mesh_to_job_legacy(mesh: Mesh, config: SliceConfig) -> ExternalSource
                 paths_2d = [path.copy() for path in cached_constant_resin_paths_2d]
                 roles = list(cached_constant_roles)
             else:
-                paths_2d, roles = _build_resin_paths(paths_2d, layer_config, layer_index)
+                paths_2d, roles = _build_resin_paths(
+                    paths_2d,
+                    layer_config,
+                    layer_index,
+                    forced_zigzag_angle=forced_cap_angle,
+                )
                 if (
                     constant_section_paths is not None
                     and config.infill_pattern == "triangles"
@@ -370,8 +397,15 @@ def _slice_mesh_to_job_legacy(mesh: Mesh, config: SliceConfig) -> ExternalSource
                     "top": len(z_values) - 1 if len(z_values) else None,
                     "infill_pattern": "zigzag",
                     "infill_density": 100.0,
+                    "bottom_angle_degrees": PART_BOTTOM_ZIGZAG_ANGLE_DEGREES,
+                    "top_angle_degrees": PART_TOP_ZIGZAG_ANGLE_DEGREES,
                 }
                 if config.material == "R"
+                else None
+            ),
+            "isotropic_schedule": (
+                _isotropic_schedule_metadata(len(z_values), config.layer_height)
+                if config.material == "R" and config.infill_pattern == "isotropic"
                 else None
             ),
         },
@@ -388,6 +422,83 @@ def _slice_mesh_to_job_legacy(mesh: Mesh, config: SliceConfig) -> ExternalSource
         },
     }
     return ExternalSourceJob(material_paths=material_paths, meta=meta)
+
+
+def _validate_isotropic_infill_schedule(mesh: Mesh, config: SliceConfig) -> int:
+    if config.material != "R":
+        raise ValueError("各向同性填充仅支持树脂材料 R")
+    tolerance = max(config.tolerance * 10.0, 1e-4)
+    if not math.isclose(
+        config.layer_height,
+        ISOTROPIC_LAYER_HEIGHT_MM,
+        rel_tol=0.0,
+        abs_tol=tolerance,
+    ):
+        raise ValueError(
+            "各向同性填充要求层高固定为 0.5 mm；"
+            f"当前层高为 {config.layer_height:g} mm，已拒绝切片"
+        )
+
+    oriented_mesh = orient_mesh_for_build_axis(mesh, config.build_axis)
+    z_min = oriented_mesh.z_min if config.z_min is None else config.z_min
+    z_max = oriented_mesh.z_max if config.z_max is None else config.z_max
+    if z_min > z_max:
+        raise ValueError("z_min must be <= z_max")
+    part_height = float(z_max - z_min)
+    repeat_value = (
+        part_height - ISOTROPIC_CAP_HEIGHT_MM
+    ) / ISOTROPIC_REPEAT_HEIGHT_MM
+    repeat_count = int(round(repeat_value))
+    expected_height = (
+        repeat_count * ISOTROPIC_REPEAT_HEIGHT_MM + ISOTROPIC_CAP_HEIGHT_MM
+    )
+    if repeat_count < 1 or not math.isclose(
+        part_height,
+        expected_height,
+        rel_tol=0.0,
+        abs_tol=tolerance,
+    ):
+        raise ValueError(
+            "各向同性填充要求零件有效高度为 2N+1 mm（N>=1），"
+            "用于底层 0.5 mm、N 组四方向 2 mm 和顶层 0.5 mm；"
+            f"当前高度为 {part_height:g} mm，无法完整完成四方向循环，已拒绝切片"
+        )
+
+    layer_count = len(_layer_z_values(oriented_mesh, config))
+    expected_layer_count = repeat_count * len(ISOTROPIC_REPEAT_ANGLES_DEGREES) + 2
+    if layer_count != expected_layer_count:
+        raise ValueError(
+            "各向同性填充的有效切层数必须为 4N+2；"
+            f"当前得到 {layer_count} 层，期望 {expected_layer_count} 层，已拒绝切片"
+        )
+    return repeat_count
+
+
+def _isotropic_part_layer_angle(layer_index: int, layer_count: int) -> float:
+    if layer_index == 0:
+        return PART_BOTTOM_ZIGZAG_ANGLE_DEGREES
+    if layer_index == layer_count - 1:
+        return PART_TOP_ZIGZAG_ANGLE_DEGREES
+    return ISOTROPIC_REPEAT_ANGLES_DEGREES[
+        (layer_index - 1) % len(ISOTROPIC_REPEAT_ANGLES_DEGREES)
+    ]
+
+
+def _isotropic_schedule_metadata(
+    layer_count: int,
+    layer_height: float,
+) -> dict[str, object]:
+    return {
+        "layer_height_mm": layer_height,
+        "repeat_count": (layer_count - 2) // len(ISOTROPIC_REPEAT_ANGLES_DEGREES),
+        "bottom_angle_degrees": PART_BOTTOM_ZIGZAG_ANGLE_DEGREES,
+        "repeat_angles_degrees": list(ISOTROPIC_REPEAT_ANGLES_DEGREES),
+        "top_angle_degrees": PART_TOP_ZIGZAG_ANGLE_DEGREES,
+        "layer_angles_degrees": [
+            _isotropic_part_layer_angle(index, layer_count)
+            for index in range(layer_count)
+        ],
+    }
 
 
 def _constant_section_paths_for_two_plane_extrusion(
@@ -413,19 +524,28 @@ def add_raft_to_job(
     mesh: Mesh,
     config: SliceConfig,
     raft_layers: list[RaftLayerConfig],
-    top_gap: float,
+    top_gap: float = DEFAULT_RAFT_TOP_GAP_MM,
 ) -> float:
     """Insert resin raft layers before the part and shift existing paths upward."""
 
     if not raft_layers:
         return 0.0
-    if top_gap < 0:
-        raise ValueError("raft top gap must be non-negative")
+    if len(raft_layers) != DEFAULT_RAFT_LAYER_COUNT:
+        raise ValueError(f"raft layer count is fixed at {DEFAULT_RAFT_LAYER_COUNT}")
+    top_gap = DEFAULT_RAFT_TOP_GAP_MM
+    raft_layers = [
+        RaftLayerConfig(
+            outward_offset=layer.outward_offset,
+            infill_density=config.infill_density if config.infill_density > 0 else DEFAULT_RESIN_INFILL_DENSITY_PERCENT,
+        )
+        for layer in raft_layers
+    ]
 
     oriented_mesh = orient_mesh_for_build_axis(mesh, config.build_axis)
-    footprint = _raft_footprint_geometry(oriented_mesh, config)
-    if footprint.is_empty:
+    part_projection = _part_projection_geometry(oriented_mesh, config)
+    if part_projection.is_empty:
         return 0.0
+    reserved_voids = _raft_reserved_void_geometry(part_projection, config.tolerance)
 
     raft_height = sum(layer.layer_height for layer in raft_layers)
     z_shift = raft_height + top_gap
@@ -460,11 +580,11 @@ def add_raft_to_job(
     for layer_index, raft_layer in enumerate(raft_layers):
         current_z += raft_layer.layer_height
         paths_2d, roles = _raft_paths_for_layer(
-            footprint,
+            part_projection,
+            reserved_voids,
             config,
             raft_layer,
             layer_index,
-            contact_layer=layer_index == raft_count - 1,
         )
         paths_3d = [_path_2d_to_constant_z(path, current_z) for path in paths_2d]
         if paths_3d:
@@ -476,15 +596,28 @@ def add_raft_to_job(
     job.meta["raft"] = {
         "layer_count": raft_count,
         "top_gap": top_gap,
+        "fixed_patterns": [
+            {
+                "layer_index": 0,
+                "infill_pattern": "zigzag",
+                "angle_degrees": RAFT_BOTTOM_ZIGZAG_ANGLE_DEGREES,
+            },
+            {
+                "layer_index": 1,
+                "infill_pattern": "zigzag",
+                "angle_degrees": RAFT_TOP_ZIGZAG_ANGLE_DEGREES,
+            },
+        ],
         "layers": [
             {
                 "outward_offset": layer.outward_offset,
                 "layer_height": layer.layer_height,
                 "infill_density": layer.infill_density,
-                "infill_pattern": (
-                    layer.infill_pattern
-                    if layer.infill_pattern is not None
-                    else ("lattice" if index == raft_count - 1 else "zigzag")
+                "infill_pattern": "zigzag",
+                "angle_degrees": (
+                    RAFT_BOTTOM_ZIGZAG_ANGLE_DEGREES
+                    if index == 0
+                    else RAFT_TOP_ZIGZAG_ANGLE_DEGREES
                 ),
             }
             for index, layer in enumerate(raft_layers)
@@ -555,66 +688,226 @@ def orient_mesh_for_build_axis(mesh: Mesh, build_axis: BuildAxis) -> Mesh:
 
 
 def _raft_footprint_geometry(mesh: Mesh, config: SliceConfig):
+    return _part_projection_geometry(mesh, config)
+
+
+def _part_projection_geometry(mesh: Mesh, config: SliceConfig):
     z_values = _layer_z_values(mesh, config)
     if len(z_values) == 0:
         return Polygon()
-    segments = _intersect_mesh_at_z(mesh.triangles, float(z_values[0]), config.tolerance)
-    contours = [path for path in _stitch_segments(segments, config.tolerance) if path.shape[0] >= 3]
-    return _solid_geometry_from_contours(contours)
+    sections = []
+    for base_z in z_values:
+        segments = _intersect_mesh_at_z(mesh.triangles, float(base_z), config.tolerance)
+        contours = [
+            path
+            for path in _stitch_segments(segments, config.tolerance)
+            if path.shape[0] >= 3
+        ]
+        section = _solid_geometry_from_contours(contours)
+        if not section.is_empty:
+            sections.append(section)
+    if not sections:
+        return Polygon()
+    projection = unary_union(sections)
+    if not projection.is_valid:
+        projection = projection.buffer(0)
+    return projection
 
 
 def _raft_paths_for_layer(
     footprint,
+    reserved_voids,
     config: SliceConfig,
     raft_layer: RaftLayerConfig,
     layer_index: int,
-    contact_layer: bool = False,
 ) -> tuple[list[np.ndarray], list[str]]:
-    geometry = footprint.buffer(raft_layer.outward_offset, join_style="round")
+    geometry = _raft_geometry_for_layer(
+        footprint,
+        reserved_voids,
+        raft_layer.outward_offset,
+        config.tolerance,
+    )
     if geometry.is_empty:
         return [], []
 
+    path_spacing = _resin_path_spacing(config.line_width, config.infill_overlap)
     perimeters, roles = _perimeter_paths_from_geometry(
         geometry,
         config.line_width,
-        _resin_path_spacing(config.line_width, config.infill_overlap),
+        path_spacing,
         config.perimeter_count,
         config.tolerance,
     )
-    infill_geometry = geometry.buffer(
-        -_infill_geometry_inset(config),
-        join_style="round",
+    infill_geometry = _resin_infill_surface_geometry(geometry, config)
+    if infill_geometry.is_empty:
+        return perimeters, roles
+    angle = (
+        RAFT_BOTTOM_ZIGZAG_ANGLE_DEGREES
+        if layer_index == 0
+        else RAFT_TOP_ZIGZAG_ANGLE_DEGREES
     )
-    if raft_layer.infill_pattern is not None:
-        filled = _raft_legacy_infill_paths(
-            infill_geometry,
-            config,
-            layer_index,
-            raft_layer.infill_pattern,
-            raft_layer.infill_density,
-        )
-    elif contact_layer:
-        filled = _raft_lattice_infill_paths(infill_geometry, config, raft_layer.infill_density)
-    else:
-        filled = _raft_zigzag_infill_paths(infill_geometry, config, raft_layer.infill_density)
+    filled = _raft_zigzag_infill_paths(
+        infill_geometry,
+        config,
+        raft_layer.infill_density,
+        angle_degrees=angle,
+    )
     return perimeters + filled, roles + ["infill"] * len(filled)
 
 
-def _raft_legacy_infill_paths(
+def _boundary_paths_from_geometry(
     geometry,
-    config: SliceConfig,
-    layer_index: int,
-    infill_pattern: RaftInfillPattern,
-    infill_density: float,
-) -> list[np.ndarray]:
-    """Use the legacy resin infill implementation for an explicit raft pattern."""
+    path_spacing: float,
+    perimeter_count: int,
+    tolerance: float,
+) -> tuple[list[np.ndarray], list[str]]:
+    paths: list[np.ndarray] = []
+    roles: list[str] = []
+    for perimeter_index in range(perimeter_count):
+        offset_geometry = (
+            geometry
+            if perimeter_index == 0
+            else _libslic3r_offset_geometry(
+                geometry,
+                -perimeter_index * path_spacing,
+                tolerance,
+            )
+        )
+        if offset_geometry.is_empty:
+            continue
+        for polygon in _iter_polygons(offset_geometry):
+            exterior = _coords_to_path(polygon.exterior.coords, tolerance)
+            if exterior.shape[0] >= 3:
+                paths.append(exterior)
+                roles.append("outer_contour" if perimeter_index == 0 else "inner_contour")
+            for interior in polygon.interiors:
+                inner = _coords_to_path(interior.coords, tolerance)
+                if inner.shape[0] >= 3:
+                    paths.append(inner)
+                    roles.append("outer_contour" if perimeter_index == 0 else "inner_contour")
+    return paths, roles
 
-    raft_config = replace(
-        config,
-        infill_pattern=infill_pattern,
-        infill_density=infill_density,
+
+def _raft_geometry_for_layer(
+    footprint,
+    reserved_voids,
+    outward_offset: float,
+    tolerance: float,
+):
+    geometry = footprint.buffer(outward_offset, join_style="round")
+    if reserved_voids.is_empty:
+        return geometry
+    exterior_extensions = _raft_exterior_void_extensions(
+        footprint,
+        outward_offset,
+        tolerance,
     )
-    return _infill_paths_for_geometry(geometry, raft_config, layer_index, infill_density)
+    void_geometry = unary_union([reserved_voids, exterior_extensions])
+    geometry = geometry.difference(void_geometry)
+    if not geometry.is_valid:
+        geometry = geometry.buffer(0)
+    return geometry
+
+
+def _raft_exterior_void_extensions(
+    footprint,
+    outward_offset: float,
+    tolerance: float,
+):
+    """Carry projection openings through the outward raft band without widening them."""
+
+    if footprint.is_empty or outward_offset <= tolerance:
+        return Polygon()
+
+    outer_silhouette = footprint.convex_hull
+    silhouette_center = np.asarray(
+        [outer_silhouette.centroid.x, outer_silhouette.centroid.y],
+        dtype=np.float64,
+    )
+    extension_distance = outward_offset + max(tolerance * 10.0, 1e-5)
+    extension_pieces: list[Polygon] = []
+    exterior_voids = _nondegenerate_polygons(
+        outer_silhouette.difference(footprint),
+        tolerance,
+    )
+
+    for exterior_void in exterior_voids:
+        mouth_geometry = exterior_void.boundary.intersection(outer_silhouette.boundary)
+        for mouth_line in _extract_line_segments(mouth_geometry, tolerance):
+            coordinates = np.asarray(mouth_line.coords, dtype=np.float64)
+            extended_segments: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+            for start, end in zip(coordinates[:-1], coordinates[1:]):
+                direction = end - start
+                length = float(np.linalg.norm(direction))
+                if length <= tolerance:
+                    continue
+
+                normal = np.asarray([-direction[1], direction[0]], dtype=np.float64) / length
+                midpoint = (start + end) * 0.5
+                if float(np.dot(normal, midpoint - silhouette_center)) < 0.0:
+                    normal = -normal
+                extended_start = start + normal * extension_distance
+                extended_end = end + normal * extension_distance
+                extension_pieces.append(
+                    Polygon([start, end, extended_end, extended_start])
+                )
+                extended_segments.append((start, extended_start, extended_end, end))
+
+            for previous, current in zip(extended_segments[:-1], extended_segments[1:]):
+                if np.linalg.norm(previous[2] - current[1]) <= tolerance:
+                    continue
+                extension_pieces.append(
+                    Polygon([previous[3], previous[2], current[1]])
+                )
+
+    if not extension_pieces:
+        return Polygon()
+    extensions = unary_union(extension_pieces)
+    if not extensions.is_valid:
+        extensions = extensions.buffer(0)
+    return extensions
+
+
+def _raft_reserved_void_geometry(part_projection, tolerance: float):
+    if part_projection.is_empty:
+        return Polygon()
+
+    outer_silhouette = part_projection.convex_hull
+    voids = _nondegenerate_polygons(
+        outer_silhouette.difference(part_projection),
+        tolerance,
+    )
+    holes = _interior_holes_geometry(part_projection, tolerance)
+    if not holes.is_empty:
+        voids.extend(_nondegenerate_polygons(holes, tolerance))
+
+    combined = unary_union([void for void in voids if not void.is_empty])
+    if combined.is_empty:
+        return Polygon()
+    if not combined.is_valid:
+        combined = combined.buffer(0)
+    return combined
+
+
+def _nondegenerate_polygons(geometry, tolerance: float) -> list[Polygon]:
+    minimum_area = max(tolerance * tolerance, 0.01)
+    return [
+        polygon
+        for polygon in _iter_polygons(geometry)
+        if polygon.area > minimum_area
+    ]
+
+
+def _interior_holes_geometry(geometry, tolerance: float):
+    holes: list[Polygon] = []
+    for polygon in _iter_polygons(geometry):
+        for interior in polygon.interiors:
+            hole = Polygon(interior.coords)
+            if hole.area > max(tolerance * tolerance, 0.01):
+                holes.append(hole)
+    if not holes:
+        return Polygon()
+    return unary_union(holes)
 
 
 def _raft_lattice_infill_paths(
@@ -632,10 +925,13 @@ def _raft_lattice_infill_paths(
     )
     filled = _gyroid_infill_geometry(geometry, spacing, config.tolerance)
     return filled
+
+
 def _raft_zigzag_infill_paths(
     geometry,
     config: SliceConfig,
     infill_density: float,
+    angle_degrees: float = 0.0,
 ) -> list[np.ndarray]:
     if geometry.is_empty:
         return []
@@ -648,13 +944,8 @@ def _raft_zigzag_infill_paths(
     filled = _zigzag_infill_geometry(
         geometry,
         spacing,
-        0.0,
+        angle_degrees,
         config.tolerance,
-    )
-    zigzag_merge_tolerance = (
-        _legacy_path_merge_tolerance(config.line_width, config.tolerance)
-        if config.zigzag_path_optimization
-        else None
     )
     filled = _connect_zigzag_infill_paths(
         filled,
@@ -662,18 +953,49 @@ def _raft_zigzag_infill_paths(
         spacing,
         config.tolerance,
     )
-    if config.zigzag_path_optimization:
-        filled = optimize_open_path_travel(filled, config.tolerance)
-        filled = merge_adjacent_connected_paths(filled, zigzag_merge_tolerance)
-    filled = _smooth_resin_infill_paths(
-        filled,
-        geometry,
-        config.line_width * DEFAULT_RESIN_SMOOTHING_RADIUS_FACTOR,
-        DEFAULT_RESIN_SMOOTHING_ANGLE_DEGREES,
-        config.tolerance,
-        merge_tolerance=zigzag_merge_tolerance,
-    )
-    return filled
+    return _filter_paths_covered_by_geometry(filled, geometry, config.tolerance)
+
+
+def _filter_paths_covered_by_geometry(
+    paths: list[np.ndarray],
+    geometry,
+    tolerance: float,
+) -> list[np.ndarray]:
+    filtered: list[np.ndarray] = []
+    safe_geometry = geometry.buffer(max(tolerance * 10.0, 1e-7), join_style="round")
+    for path in paths:
+        line = LineString([(float(point[0]), float(point[1])) for point in path[:, :2]])
+        if safe_geometry.covers(line):
+            filtered.append(path)
+    return filtered
+
+
+def _open_path_length(path: np.ndarray) -> float:
+    if path.shape[0] < 2:
+        return 0.0
+    differences = np.diff(np.asarray(path[:, :2], dtype=np.float64), axis=0)
+    return float(np.linalg.norm(differences, axis=1).sum())
+
+
+def _vectors_parallel(first: np.ndarray, second: np.ndarray, max_angle_degrees: float) -> bool:
+    first_norm = float(np.linalg.norm(first))
+    second_norm = float(np.linalg.norm(second))
+    if first_norm <= 0 or second_norm <= 0:
+        return False
+    cosine = float(np.dot(first, second) / (first_norm * second_norm))
+    cosine = max(-1.0, min(1.0, cosine))
+    angle = math.degrees(math.acos(abs(cosine)))
+    return angle <= max_angle_degrees
+
+
+def _vector_angle_degrees(first: np.ndarray, second: np.ndarray) -> float:
+    first_norm = float(np.linalg.norm(first))
+    second_norm = float(np.linalg.norm(second))
+    if first_norm <= 0 or second_norm <= 0:
+        return 0.0
+    cosine = float(np.dot(first, second) / (first_norm * second_norm))
+    cosine = max(-1.0, min(1.0, cosine))
+    return math.degrees(math.acos(abs(cosine)))
 
 
 def _shift_path_z(path: np.ndarray, z_shift: float) -> np.ndarray:
@@ -835,7 +1157,10 @@ def _apply_resin_infill(
 
 
 def _build_resin_paths(
-    paths: list[np.ndarray], config: SliceConfig, layer_index: int = 0
+    paths: list[np.ndarray],
+    config: SliceConfig,
+    layer_index: int = 0,
+    forced_zigzag_angle: float | None = None,
 ) -> tuple[list[np.ndarray], list[str]]:
     contours = [path for path in paths if path.shape[0] >= 3]
     solid_geometry = _solid_geometry_from_contours(contours)
@@ -858,6 +1183,7 @@ def _build_resin_paths(
         config,
         layer_index,
         config.infill_density,
+        forced_zigzag_angle=forced_zigzag_angle,
     )
     if config.infill_pattern == "triangles" and config.triangle_path_optimization:
         triangle_merge_tolerance = _legacy_path_merge_tolerance(
@@ -882,6 +1208,7 @@ def _infill_paths_for_geometry(
     config: SliceConfig,
     layer_index: int,
     infill_density: float,
+    forced_zigzag_angle: float | None = None,
 ) -> list[np.ndarray]:
     if geometry.is_empty:
         return []
@@ -923,7 +1250,9 @@ def _infill_paths_for_geometry(
             )
         )
     elif config.infill_pattern == "zigzag":
-        angle = 45.0 if layer_index % 2 == 0 else -45.0
+        angle = forced_zigzag_angle
+        if angle is None:
+            angle = 45.0 if layer_index % 2 == 0 else -45.0
         filled.extend(
             _zigzag_infill_geometry(
                 geometry,
@@ -1270,13 +1599,7 @@ def _connect_zigzag_infill_paths(
     spacing: float,
     tolerance: float,
 ) -> list[np.ndarray]:
-    """Grow safe zigzag chains from both free ends.
-
-    The generic connector greedily consumes the shortest endpoint pair. That
-    can strand a connected scanline component as many short chains. Zigzag
-    paths instead extend both ends of each chain while keeping the same
-    boundary, intersection, and connector-length checks.
-    """
+    """Join adjacent scanlines by following printable outer and hole boundaries."""
 
     if len(paths) < 2 or spacing <= 0 or geometry.is_empty:
         return paths
@@ -1290,13 +1613,13 @@ def _connect_zigzag_infill_paths(
         return paths
 
     safe_geometry = geometry.buffer(max(tolerance * 10.0, 1e-7), join_style="round")
+    boundary_rings = _zigzag_boundary_rings(geometry, tolerance)
     path_lines = {
         index: LineString(
             [(float(point[0]), float(point[1])) for point in paths[index][:, :2]]
         )
         for index in open_indices
     }
-    max_connector_length = max(spacing * 1.5, tolerance * 10.0)
     endpoint_points = {
         2 * index + side: np.asarray(
             paths[index][0 if side == 0 else -1, :2], dtype=np.float32
@@ -1304,96 +1627,318 @@ def _connect_zigzag_infill_paths(
         for index in open_indices
         for side in (0, 1)
     }
+    scan_levels = _zigzag_scan_levels(paths, open_indices, tolerance)
+    adjacent_level_tolerance = max(spacing * 0.1, tolerance * 20.0)
+    candidates: list[tuple[float, int, int, np.ndarray]] = []
+    for first_position, first_index in enumerate(open_indices):
+        for second_index in open_indices[first_position + 1 :]:
+            level_delta = abs(scan_levels[first_index] - scan_levels[second_index])
+            if abs(level_delta - spacing) > adjacent_level_tolerance:
+                continue
+            for first_side in (0, 1):
+                first_endpoint = 2 * first_index + first_side
+                for second_side in (0, 1):
+                    second_endpoint = 2 * second_index + second_side
+                    connector_points = _zigzag_endpoint_connector(
+                        endpoint_points[first_endpoint],
+                        endpoint_points[second_endpoint],
+                        boundary_rings,
+                        safe_geometry,
+                        spacing,
+                        tolerance,
+                    )
+                    if connector_points is None:
+                        continue
+                    candidates.append(
+                        (
+                            _open_path_length(connector_points),
+                            first_endpoint,
+                            second_endpoint,
+                            connector_points,
+                        )
+                    )
+    candidates_by_endpoint: dict[int, list[tuple[float, int, np.ndarray]]] = defaultdict(list)
+    for length, first_endpoint, second_endpoint, connector_points in candidates:
+        candidates_by_endpoint[first_endpoint].append(
+            (length, second_endpoint, connector_points)
+        )
+        candidates_by_endpoint[second_endpoint].append(
+            (length, first_endpoint, connector_points)
+        )
+    for endpoint_candidates in candidates_by_endpoint.values():
+        endpoint_candidates.sort(key=lambda item: (item[0], item[1]))
 
     unused = set(open_indices)
     accepted: list[tuple[int, int, np.ndarray]] = []
-    connected_paths: list[np.ndarray] = []
-
+    connector_by_endpoint: dict[int, tuple[int, np.ndarray]] = {}
+    components: list[list[int]] = []
     while unused:
         start_index = min(unused)
         unused.remove(start_index)
-        chain: list[tuple[int, bool]] = [(start_index, False)]
+        component = [start_index]
         left_endpoint = 2 * start_index
         right_endpoint = 2 * start_index + 1
 
         while True:
-            candidates: list[tuple[float, str, int, int]] = []
-            for side, current_endpoint in (("left", left_endpoint), ("right", right_endpoint)):
-                current_point = endpoint_points[current_endpoint]
-                for next_index in unused:
-                    for next_side in (0, 1):
-                        next_endpoint = 2 * next_index + next_side
-                        distance = float(
-                            np.linalg.norm(current_point - endpoint_points[next_endpoint])
-                        )
-                        if not (tolerance < distance <= max_connector_length):
-                            continue
-                        connector = LineString(
-                            [
-                                (float(current_point[0]), float(current_point[1])),
-                                (
-                                    float(endpoint_points[next_endpoint][0]),
-                                    float(endpoint_points[next_endpoint][1]),
-                                ),
-                            ]
-                        )
-                        if not safe_geometry.covers(connector):
-                            continue
-                        if not _resin_connector_is_clear(
-                            connector,
-                            paths,
-                            path_lines,
-                            current_endpoint,
-                            next_endpoint,
-                            accepted,
-                            tolerance,
-                        ):
-                            continue
-                        candidates.append((distance, side, next_index, next_endpoint))
-
-            if not candidates:
+            extensions: list[tuple[float, str, int, int, np.ndarray]] = []
+            for side, current_endpoint in (
+                ("left", left_endpoint),
+                ("right", right_endpoint),
+            ):
+                for length, next_endpoint, connector_points in candidates_by_endpoint.get(
+                    current_endpoint,
+                    [],
+                ):
+                    next_index = next_endpoint // 2
+                    if next_index not in unused:
+                        continue
+                    connector = LineString(
+                        [(float(point[0]), float(point[1])) for point in connector_points]
+                    )
+                    if not _resin_connector_is_clear(
+                        connector,
+                        paths,
+                        path_lines,
+                        current_endpoint,
+                        next_endpoint,
+                        accepted,
+                        tolerance,
+                    ):
+                        continue
+                    extensions.append(
+                        (length, side, current_endpoint, next_endpoint, connector_points)
+                    )
+                    break
+            if not extensions:
                 break
 
-            distance, side, next_index, next_endpoint = min(
-                candidates,
-                key=lambda item: (item[0], item[2], item[3]),
+            _, side, current_endpoint, next_endpoint, connector_points = min(
+                extensions,
+                key=lambda item: (item[0], item[3]),
             )
-            current_endpoint = left_endpoint if side == "left" else right_endpoint
-            accepted.append(
-                (
-                    current_endpoint,
-                    next_endpoint,
-                    np.asarray(
-                        [endpoint_points[current_endpoint], endpoint_points[next_endpoint]],
-                        dtype=np.float32,
-                    ),
-                )
-            )
+            next_index = next_endpoint // 2
             unused.remove(next_index)
-
-            opposite_endpoint = 2 * next_index + (1 if next_endpoint % 2 == 0 else 0)
+            component.append(next_index)
+            accepted.append((current_endpoint, next_endpoint, connector_points))
+            connector_by_endpoint[current_endpoint] = (next_endpoint, connector_points)
+            connector_by_endpoint[next_endpoint] = (current_endpoint, connector_points)
+            opposite_endpoint = 2 * next_index + (1 - next_endpoint % 2)
             if side == "left":
-                reverse = next_endpoint % 2 == 0
-                chain.insert(0, (next_index, reverse))
                 left_endpoint = opposite_endpoint
             else:
-                reverse = next_endpoint % 2 == 1
-                chain.append((next_index, reverse))
                 right_endpoint = opposite_endpoint
+        components.append(component)
 
-        connected_path: np.ndarray | None = None
-        for path_index, reverse in chain:
-            path = paths[path_index][::-1].copy() if reverse else paths[path_index]
-            connected_path = (
-                np.asarray(path, dtype=np.float32).copy()
-                if connected_path is None
-                else np.vstack((connected_path, path))
+    connected_paths: list[np.ndarray] = []
+    connected_indices: set[int] = set()
+    for component in components:
+        start_endpoint = next(
+            endpoint
+            for index in component
+            for endpoint in (2 * index, 2 * index + 1)
+            if endpoint not in connector_by_endpoint
+        )
+        chain_points: list[np.ndarray] = []
+        current_endpoint: int | None = start_endpoint
+        while current_endpoint is not None:
+            index = current_endpoint // 2
+            side = current_endpoint % 2
+            if index in connected_indices:
+                break
+            connected_indices.add(index)
+            oriented_path = (
+                np.asarray(paths[index][:, :2], dtype=np.float32)
+                if side == 0
+                else np.asarray(paths[index][::-1, :2], dtype=np.float32)
             )
-        if connected_path is not None:
-            connected_paths.append(connected_path)
+            chain_points.extend(oriented_path if not chain_points else oriented_path[1:])
 
-    closed_paths = [paths[index] for index in range(len(paths)) if index not in open_indices]
-    return connected_paths + closed_paths
+            exit_endpoint = 2 * index + (1 - side)
+            connection = connector_by_endpoint.get(exit_endpoint)
+            if connection is None:
+                current_endpoint = None
+                continue
+            next_endpoint, connector_points = connection
+            oriented_connector = (
+                connector_points
+                if _close(connector_points[0, :2], endpoint_points[exit_endpoint], tolerance)
+                else connector_points[::-1].copy()
+            )
+            chain_points.extend(oriented_connector[1:])
+            current_endpoint = next_endpoint
+
+        if len(chain_points) >= 2:
+            connected_paths.append(
+                _dedupe_consecutive(np.asarray(chain_points, dtype=np.float32), tolerance)
+            )
+
+    for index, path in enumerate(paths):
+        if index not in connected_indices:
+            connected_paths.append(path)
+    return connected_paths
+
+
+@dataclass(frozen=True)
+class _ZigzagBoundaryRing:
+    line: LineString
+    coordinates: np.ndarray
+    cumulative_lengths: np.ndarray
+
+
+def _zigzag_boundary_rings(geometry, tolerance: float) -> list[_ZigzagBoundaryRing]:
+    rings: list[_ZigzagBoundaryRing] = []
+    for polygon in _iter_polygons(geometry):
+        exterior = LineString(polygon.exterior.coords)
+        if exterior.length > tolerance:
+            rings.append(_zigzag_boundary_ring(exterior))
+        for interior in polygon.interiors:
+            ring = LineString(interior.coords)
+            if ring.length > tolerance:
+                rings.append(_zigzag_boundary_ring(ring))
+    return rings
+
+
+def _zigzag_boundary_ring(line: LineString) -> _ZigzagBoundaryRing:
+    coordinates = np.asarray(line.coords, dtype=np.float64)
+    differences = np.diff(coordinates, axis=0)
+    segment_lengths = np.linalg.norm(differences, axis=1)
+    return _ZigzagBoundaryRing(
+        line=line,
+        coordinates=coordinates,
+        cumulative_lengths=np.concatenate(([0.0], np.cumsum(segment_lengths))),
+    )
+
+
+def _zigzag_scan_levels(
+    paths: list[np.ndarray],
+    open_indices: list[int],
+    tolerance: float,
+) -> dict[int, float]:
+    direction: np.ndarray | None = None
+    longest = 0.0
+    for index in open_indices:
+        candidate = np.asarray(paths[index][-1, :2] - paths[index][0, :2], dtype=np.float64)
+        length = float(np.linalg.norm(candidate))
+        if length > longest:
+            direction = candidate / length
+            longest = length
+    if direction is None or longest <= tolerance:
+        return {index: float(index) for index in open_indices}
+    normal = np.asarray([-direction[1], direction[0]], dtype=np.float64)
+    return {
+        index: float(
+            np.dot(
+                (paths[index][0, :2] + paths[index][-1, :2]) * 0.5,
+                normal,
+            )
+        )
+        for index in open_indices
+    }
+
+
+def _zigzag_endpoint_connector(
+    first_point: np.ndarray,
+    second_point: np.ndarray,
+    boundary_rings: list[_ZigzagBoundaryRing],
+    safe_geometry,
+    spacing: float,
+    tolerance: float,
+) -> np.ndarray | None:
+    snap_tolerance = max(tolerance * 20.0, min(spacing * 0.02, 0.05))
+    first = Point(float(first_point[0]), float(first_point[1]))
+    second = Point(float(second_point[0]), float(second_point[1]))
+    boundary_candidates: list[np.ndarray] = []
+    for ring in boundary_rings:
+        if (
+            ring.line.distance(first) > snap_tolerance
+            or ring.line.distance(second) > snap_tolerance
+        ):
+            continue
+        connector = _shortest_ring_arc(
+            ring,
+            first_point,
+            second_point,
+            tolerance,
+        )
+        connector_line = LineString(
+            [(float(point[0]), float(point[1])) for point in connector]
+        )
+        direct_distance = float(np.linalg.norm(second_point - first_point))
+        maximum_length = max(spacing * 8.0, direct_distance * 1.5)
+        if connector_line.length <= maximum_length and safe_geometry.covers(connector_line):
+            boundary_candidates.append(connector)
+    if boundary_candidates:
+        return min(boundary_candidates, key=_open_path_length)
+
+    direct_distance = float(np.linalg.norm(second_point - first_point))
+    if not (tolerance < direct_distance <= max(spacing * 1.5, tolerance * 10.0)):
+        return None
+    direct = np.asarray([first_point, second_point], dtype=np.float32)
+    direct_line = LineString(
+        [(float(point[0]), float(point[1])) for point in direct]
+    )
+    return direct if safe_geometry.covers(direct_line) else None
+
+
+def _shortest_ring_arc(
+    ring: _ZigzagBoundaryRing,
+    first_point: np.ndarray,
+    second_point: np.ndarray,
+    tolerance: float,
+) -> np.ndarray:
+    first_distance = float(
+        ring.line.project(Point(float(first_point[0]), float(first_point[1])))
+    )
+    second_distance = float(
+        ring.line.project(Point(float(second_point[0]), float(second_point[1])))
+    )
+    forward = _forward_ring_arc(ring, first_distance, second_distance, tolerance)
+    backward = _forward_ring_arc(ring, second_distance, first_distance, tolerance)[::-1].copy()
+    arc = forward if _open_path_length(forward) <= _open_path_length(backward) else backward
+    return _dedupe_consecutive(
+        np.vstack(
+            [
+                np.asarray(first_point[:2], dtype=np.float32),
+                arc,
+                np.asarray(second_point[:2], dtype=np.float32),
+            ]
+        ),
+        tolerance,
+    )
+
+
+def _forward_ring_arc(
+    ring: _ZigzagBoundaryRing,
+    start_distance: float,
+    end_distance: float,
+    tolerance: float,
+) -> np.ndarray:
+    total_length = float(ring.cumulative_lengths[-1])
+    travel = (end_distance - start_distance) % total_length
+    target_end = start_distance + travel
+    vertex_distances = ring.cumulative_lengths[1:]
+    vertices = ring.coordinates[1:]
+    if target_end > total_length:
+        vertex_distances = np.concatenate(
+            (vertex_distances, vertex_distances + total_length)
+        )
+        vertices = np.vstack((vertices, vertices))
+    mask = (
+        (vertex_distances > start_distance + tolerance)
+        & (vertex_distances < target_end - tolerance)
+    )
+    start_point = np.asarray(
+        ring.line.interpolate(start_distance).coords[0],
+        dtype=np.float32,
+    )
+    end_point = np.asarray(
+        ring.line.interpolate(end_distance).coords[0],
+        dtype=np.float32,
+    )
+    return _dedupe_consecutive(
+        np.vstack((start_point, vertices[mask], end_point)).astype(np.float32),
+        tolerance,
+    )
 
 
 def _connect_resin_infill_paths(
@@ -1575,6 +2120,7 @@ def _resin_connector_is_clear(
     second_endpoint: int,
     accepted: list[tuple[int, int, np.ndarray]],
     tolerance: float,
+    allow_crossing_points: bool = False,
 ) -> bool:
     first_index = first_endpoint // 2
     second_index = second_endpoint // 2
@@ -1593,29 +2139,67 @@ def _resin_connector_is_clear(
         ),
     }
     endpoint_buffer = max(tolerance * 10.0, 1e-7)
+    connector_bounds = connector.bounds
 
     for index, path_line in path_lines.items():
+        if not _bounds_overlap(connector_bounds, path_line.bounds, endpoint_buffer):
+            continue
         intersection = connector.intersection(path_line)
         if intersection.is_empty:
             continue
         if index not in allowed_intersections:
+            if allow_crossing_points and _geometry_is_point_like(intersection):
+                continue
             return False
         residual = intersection.difference(
             allowed_intersections[index].buffer(endpoint_buffer, join_style="round")
         )
-        if not residual.is_empty:
+        if residual.is_empty:
+            continue
+        if allow_crossing_points and _geometry_is_point_like(residual):
+            continue
+        else:
             return False
 
     for _, _, existing_connector in accepted:
         existing_line = LineString(
-            [
-                (float(existing_connector[0, 0]), float(existing_connector[0, 1])),
-                (float(existing_connector[1, 0]), float(existing_connector[1, 1])),
-            ]
+            [(float(point[0]), float(point[1])) for point in existing_connector[:, :2]]
         )
-        if not connector.disjoint(existing_line):
+        if not _bounds_overlap(connector_bounds, existing_line.bounds, endpoint_buffer):
+            continue
+        intersection = connector.intersection(existing_line)
+        if intersection.is_empty:
+            continue
+        if allow_crossing_points and _geometry_is_point_like(intersection):
+            continue
+        else:
             return False
     return True
+
+
+def _bounds_overlap(
+    first: tuple[float, float, float, float],
+    second: tuple[float, float, float, float],
+    padding: float,
+) -> bool:
+    return not (
+        first[2] < second[0] - padding
+        or second[2] < first[0] - padding
+        or first[3] < second[1] - padding
+        or second[3] < first[1] - padding
+    )
+
+
+def _geometry_is_point_like(geometry) -> bool:
+    if geometry.is_empty:
+        return True
+    if isinstance(geometry, Point):
+        return True
+    if geometry.geom_type == "MultiPoint":
+        return True
+    if isinstance(geometry, GeometryCollection):
+        return all(_geometry_is_point_like(item) for item in geometry.geoms)
+    return False
 
 
 def _smooth_path_corners_into_paths(
