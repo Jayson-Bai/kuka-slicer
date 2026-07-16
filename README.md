@@ -31,10 +31,17 @@ Default process parameters are:
 | Resin `R` | `0.5 mm` | `2.0 mm` |
 | Fiber `F` | `0.1 mm` | `1.0 mm` |
 
-Resin infill uses a default overlap of `10%`. With a `2.0 mm` resin line width,
-the default 100% line infill center spacing is therefore `1.8 mm`. The infill
-surface is offset with the PrusaSlicer-style `overlap - 0.5 * spacing` rule.
-Set `--infill-overlap 0` to remove intentional wall overlap.
+Resin infill uses a default overlap of `10%`. The planner accounts for the
+physical bead width before applying that overlap. With a `2.0 mm` resin line
+width, the overlap is `0.2 mm` and the default centerline pitch is therefore
+`2.0 - 0.2 = 1.8 mm`. The first infill centerline, including a
+boundary-following continuity link, stays one pitch inward from the innermost
+(last) perimeter centerline. From the physical inner edge of the last `2.0 mm`
+perimeter bead, the safe infill centerline moves inward by half a bead and then
+back toward the wall by only the requested overlap. This avoids ignoring half
+of the printed bead or counting overlap twice, either of which can create
+wall-parallel overfill and material pile-up. Set `--infill-overlap 0` to remove
+intentional wall overlap.
 
 Useful options:
 
@@ -62,24 +69,45 @@ centerline generation:
 
 | Pattern | Meaning |
 | --- | --- |
-| `rectilinear` | Alternating rectilinear lines by layer |
-| `aligned_rectilinear` | Fixed-direction rectilinear lines |
-| `line` | One-direction line fill |
-| `grid` | Two-direction grid |
-| `triangles` | Three-direction triangular grid |
-| `gyroid` | Continuous gyroid-like curve fill |
-| `concentric` | Concentric offset loops inside the perimeters |
-| `zigzag` | Zig-zag rectilinear line segments without cross-path connectors |
+| `rectilinear` | Alternating single-axis scanlines, joined along the safe infill boundary where possible |
+| `aligned_rectilinear` | Fixed-direction scanlines with the same boundary-following joins |
+| `line` | One-direction scanlines with the same boundary-following joins |
+| `grid` | Two-axis noded lattice covered by a minimum number of edge-disjoint trails |
+| `triangles` | Three-axis noded lattice covered by a minimum number of edge-disjoint trails |
+| `gyroid` | Gyroid-like curves with boundary-safe trail connections and a calibrated `2.35` wavelength factor |
+| `concentric` | Density-spaced offset loops with safe connections between adjacent rings |
+| `zigzag` | Alternating scanlines with adjacent, boundary-following continuity links |
 | `none` | Internal option for perimeter-only output |
 
 `--infill-density` is a resin fill percentage from `0` to `100`. It controls
 the generated path spacing together with resin line width and
-`--infill-overlap`.
-For `triangles`, density is converted across the three lattice directions, so
-lower densities produce larger triangles rather than three over-dense line sets.
-`gyroid` uses continuous clipped contour curves, which usually reduces resin
-path start/stop count at high densities while keeping a more balanced direction
-distribution than one-direction line fill.
+`--infill-overlap`. For one-axis patterns and `concentric`, the density-adjusted
+spacing is `centerline_pitch / density_fraction`; consequently, concentric ring
+spacing increases as density decreases. For multi-axis patterns, density is a
+total material-length budget shared across all directions, not a separate full
+budget for each direction. Their spacing is
+`centerline_pitch * axis_count / density_fraction`, so the default `1.8 mm`
+pitch at 100% density gives `3.6 mm` per grid direction and `5.4 mm` per
+triangle direction. This prevents two- and three-axis patterns from depositing
+roughly two or three times the requested material.
+
+`grid` and `triangles` are noded at crossings and use a graph trail cover that
+prints every real lattice edge once. Virtual edges used to construct the Euler
+walk are never printed, which minimizes starts without retracing and piling
+material at an existing edge. `gyroid` derives its wavelength as `2.35` times
+the density-adjusted line spacing and connects clipped curves only through
+boundary-safe links. `concentric` uses the requested density for ring spacing
+and tries to continue directly from one adjacent ring to the next without
+reprinting either ring.
+
+Continuity links are printed centerlines, not zero-material travel moves. A link
+is accepted only when it stays inside the bead-aware safe infill corridor,
+avoids non-incident paths and existing links, and preserves at least the base
+centerline pitch where clearance is required. If no safe link exists, the
+planner keeps separate paths instead of forcing a one-stroke result. Boundary
+safety and avoidance of material pile-up take priority over eliminating every
+start/stop.
+
 Only path centerlines are exported. PrusaSlicer behaviors that depend on
 extrusion amount, variable bead width, volumetric flow, or support/tree-specific
 material accounting are not serialized into this NPZ format.
