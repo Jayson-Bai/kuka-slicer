@@ -587,7 +587,6 @@ def _preview_payload(
     } | set(fiber_paths_by_layer)
 
     for layer_index in sorted(layer_indices):
-        infill_paths: list[list[list[float]]] = []
         resin_paths: list[dict[str, object]] = []
         group_resin_index = 0
         for group in groups_by_layer.get(layer_index, {}).get("R", []):
@@ -605,23 +604,12 @@ def _preview_payload(
                 group_resin_index += 1
                 if role in ("outer_contour", "inner_contour", "infill"):
                     resin_paths.append({"role": role, "points": points})
-                    if role == "infill":
-                        infill_paths.append(points)
                 elif path.shape[0] > 2:
                     resin_paths.append({"role": "outer_contour", "points": points})
                 else:
                     resin_paths.append({"role": "infill", "points": points})
-                    infill_paths.append(points)
                 for x, y, z in points:
                     _expand_bounds(bounds, x, y, z)
-
-        outer_contours: list[list[list[float]]] = []
-        inner_contours: list[list[list[float]]] = []
-        for entry in resin_paths:
-            if entry["role"] == "inner_contour":
-                inner_contours.append(entry["points"])
-            elif entry["role"] == "outer_contour":
-                outer_contours.append(entry["points"])
 
         serialized_fiber_paths = [
             _simplify_preview_path(path, max_points=2000)
@@ -642,11 +630,7 @@ def _preview_payload(
 
         layers_by_index[layer_index] = {
             "index": layer_index,
-            "outer_contours": outer_contours,
-            "inner_contours": inner_contours,
-            "infill_paths": infill_paths,
             "resin_paths": resin_paths,
-            "paths": [entry["points"] for entry in resin_paths],
             "fiber_paths": serialized_fiber_paths,
         }
 

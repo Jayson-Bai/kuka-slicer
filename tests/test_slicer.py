@@ -6,6 +6,8 @@ from shapely import maximum_inscribed_circle
 from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import unary_union
 
+import kuka_slicer.slicer as slicer_module
+from kuka_slicer.external_npz import ExternalSourceJob, MaterialPaths
 from kuka_slicer.slicer import (
     DEFAULT_FIBER_LAYER_HEIGHT_MM,
     DEFAULT_FIBER_LINE_WIDTH_MM,
@@ -20,6 +22,7 @@ from kuka_slicer.slicer import (
     _connect_concentric_infill_paths,
     _connect_resin_infill_paths,
     _filter_concentric_paths_by_spacing,
+    _finish_solid_fill_paths,
     _libslic3r_fill_surface_overlap_offset,
     _perimeter_paths_from_geometry,
     _raft_geometry_for_layer,
@@ -43,6 +46,7 @@ from kuka_slicer.slicer import (
 from kuka_slicer.stl_io import Mesh
 from kuka_slicer.ui_server import (
     _index_html,
+    _preview_payload,
     _raft_layers_from_params,
     _simplify_preview_path,
     expand_fiber_template_for_resin_layers,
@@ -303,6 +307,111 @@ def test_isotropic_infill_repeats_four_direction_zigzag_schedule():
         90.0,
         45.0,
     ]
+
+
+def test_constant_section_isotropic_plans_each_effective_angle_once_and_copies_layers(
+    monkeypatch,
+):
+    triangles = _cube_triangles(size=20.0)
+    triangles[:, :, 2] *= 0.25
+    mesh = Mesh(triangles)
+    planned_angles: list[float | None] = []
+    original_build_resin_paths = slicer_module._build_resin_paths
+
+    def counting_build_resin_paths(*args, **kwargs):
+        planned_angles.append(kwargs.get("forced_zigzag_angle"))
+        return original_build_resin_paths(*args, **kwargs)
+
+    monkeypatch.setattr(
+        slicer_module,
+        "_build_resin_paths",
+        counting_build_resin_paths,
+    )
+
+    job = slice_mesh_to_job(
+        mesh,
+        SliceConfig(
+            layer_height=0.5,
+            line_width=2.0,
+            infill_pattern="isotropic",
+            infill_density=100.0,
+        ),
+    )
+
+    assert len(planned_angles) == 4
+    assert set(planned_angles) == {0.0, 45.0, -45.0, 90.0}
+    assert len(job.material_paths) == 10
+
+    first_zero_degree_layer = job.material_paths[0]
+    repeated_zero_degree_layer = job.material_paths[2]
+    assert len(first_zero_degree_layer.paths) == len(repeated_zero_degree_layer.paths)
+    for first_path, repeated_path in zip(
+        first_zero_degree_layer.paths,
+        repeated_zero_degree_layer.paths,
+    ):
+        assert np.allclose(first_path[:, :2], repeated_path[:, :2])
+        assert not np.shares_memory(first_path, repeated_path)
+
+    repeated_snapshot = repeated_zero_degree_layer.paths[0].copy()
+    first_zero_degree_layer.paths[0][0, 0] += 123.0
+    assert np.array_equal(repeated_zero_degree_layer.paths[0], repeated_snapshot)
+
+
+def test_preview_payload_uses_slim_role_aware_layer_schema_and_complete_bounds():
+    resin_outer = np.asarray(
+        [[0, 0, 0.5], [10, 0, 0.5], [10, 10, 0.5], [0, 10, 0.5], [0, 0, 0.5]],
+        dtype=np.float32,
+    )
+    resin_inner = np.asarray(
+        [[3, 3, 0.5], [7, 3, 0.5], [7, 7, 0.5], [3, 7, 0.5], [3, 3, 0.5]],
+        dtype=np.float32,
+    )
+    resin_infill = np.asarray(
+        [[1, 5, 0.5], [9, 5, 0.5]],
+        dtype=np.float32,
+    )
+    fiber = np.asarray(
+        [[-2, 2, 0.6], [12, 2, 0.6]],
+        dtype=np.float32,
+    )
+    job = ExternalSourceJob(
+        material_paths=[
+            MaterialPaths(0, "R", [resin_outer, resin_inner, resin_infill]),
+            MaterialPaths(0, "F", [fiber]),
+        ],
+        meta={
+            "path_roles": {
+                "R": {"0": ["outer_contour", "inner_contour", "infill"]}
+            }
+        },
+    )
+
+    preview = _preview_payload(
+        Mesh(_cube_triangles(size=10.0)),
+        SliceConfig(line_width=2.0),
+        job,
+    )
+
+    assert set(preview) == {"bounds", "line_widths", "layers"}
+    assert len(preview["layers"]) == 1
+    layer = preview["layers"][0]
+    assert set(layer) == {"index", "resin_paths", "fiber_paths"}
+    assert layer["index"] == 0
+    assert [entry["role"] for entry in layer["resin_paths"]] == [
+        "outer_contour",
+        "inner_contour",
+        "infill",
+    ]
+    assert layer["resin_paths"][2]["points"] == resin_infill.tolist()
+    assert layer["fiber_paths"] == [fiber.tolist()]
+    assert preview["bounds"] == {
+        "min_x": -2.0,
+        "max_x": 12.0,
+        "min_y": 0.0,
+        "max_y": 10.0,
+        "min_z": 0.5,
+        "max_z": pytest.approx(0.6),
+    }
 
 
 def test_isotropic_infill_explicit_z_bounds_keep_four_direction_schedule():
@@ -1148,18 +1257,24 @@ def test_prusa_infill_patterns_bound_interruptions_without_retracing(
 
 
 @pytest.mark.parametrize(
-    ("angle", "minimum_coverage", "maximum_void_diameter"),
+    (
+        "angle",
+        "minimum_coverage",
+        "maximum_void_diameter",
+        "maximum_path_count",
+    ),
     [
-        (0.0, 0.997, 0.50),
-        (45.0, 0.997, 0.50),
-        (-45.0, 0.997, 0.50),
-        (90.0, 0.997, 0.50),
+        (0.0, 0.997, 0.50, 2),
+        (45.0, 0.997, 0.50, 3),
+        (-45.0, 0.997, 0.50, 2),
+        (90.0, 0.997, 0.50, 2),
     ],
 )
 def test_prusa_full_density_round_beads_cover_wall_transition_without_piling(
     angle: float,
     minimum_coverage: float,
     maximum_void_diameter: float,
+    maximum_path_count: int,
 ):
     outer = np.asarray(
         [[0, 0], [60, 0], [60, 40], [0, 40], [0, 0]],
@@ -1217,11 +1332,449 @@ def test_prusa_full_density_round_beads_cover_wall_transition_without_piling(
     assert max(scan_gaps) <= expected_pitch + pitch_adjustment + 0.02
     assert abs(repeated_length) <= 1e-4
     assert wall_clearance == pytest.approx(expected_pitch, abs=0.02)
-    assert len(infill) <= 4
+    assert len(infill) <= maximum_path_count
     assert all(LineString(path[:, :2]).is_simple for path in infill)
+    minimum_vertex_angles = [
+        _minimum_nondegenerate_vertex_angle(
+            path,
+            minimum_segment_length=config.line_width * 0.005,
+        )
+        for path in infill
+    ]
+    assert min(minimum_vertex_angles, default=180.0) >= config.smoothing_angle - 1e-3
     assert all(
         physical_centerline_region.covers(LineString(path[:, :2]))
         for path in infill
+    )
+
+
+def _scalar_effective_path_corner_candidates(
+    path: np.ndarray,
+    minimum_span: float,
+    angle_threshold_degrees: float,
+    tolerance: float,
+) -> list[tuple[float, int, int, int]]:
+    """Reference implementation retained to guard vectorized equivalence."""
+
+    points = np.asarray(path[:, :2], dtype=np.float64)
+    candidates: list[tuple[float, int, int, int]] = []
+    for index in range(1, points.shape[0] - 1):
+        previous_index = index - 1
+        while (
+            previous_index >= 0
+            and float(np.linalg.norm(points[index] - points[previous_index]))
+            < minimum_span
+        ):
+            previous_index -= 1
+        next_index = index + 1
+        while (
+            next_index < points.shape[0]
+            and float(np.linalg.norm(points[next_index] - points[index]))
+            < minimum_span
+        ):
+            next_index += 1
+        if previous_index < 0 or next_index >= points.shape[0]:
+            continue
+        incoming = points[previous_index] - points[index]
+        outgoing = points[next_index] - points[index]
+        incoming_length = float(np.linalg.norm(incoming))
+        outgoing_length = float(np.linalg.norm(outgoing))
+        if min(incoming_length, outgoing_length) <= tolerance:
+            continue
+        cosine = float(
+            np.clip(
+                np.dot(incoming, outgoing)
+                / (incoming_length * outgoing_length),
+                -1.0,
+                1.0,
+            )
+        )
+        angle = math.degrees(math.acos(cosine))
+        if angle < angle_threshold_degrees - 1e-6:
+            candidates.append((angle, index, previous_index, next_index))
+    candidates.sort(key=lambda item: item[0])
+    return candidates
+
+
+@pytest.mark.parametrize(
+    ("path", "minimum_span", "angle_threshold_degrees", "tolerance"),
+    [
+        pytest.param(
+            np.asarray(
+                [
+                    [0.0, 0.0],
+                    [10.0, 0.0],
+                    [10.002, 0.0],
+                    [10.004, 0.0],
+                    [10.006, 0.0],
+                    [10.006, 10.0],
+                    [20.0, 10.0],
+                ],
+                dtype=np.float32,
+            ),
+            0.01,
+            150.0,
+            5e-4,
+            id="micro-segment-chain",
+        ),
+        pytest.param(
+            np.asarray(
+                [
+                    [0.0, 0.0],
+                    [0.0, 0.0],
+                    [0.0, 0.0],
+                    [1.0, 0.0],
+                    [1.0, 0.0],
+                    [1.0, 1.0],
+                    [1.0, 1.0],
+                ],
+                dtype=np.float64,
+            ),
+            0.01,
+            120.0,
+            1e-6,
+            id="duplicate-degenerate-points",
+        ),
+        pytest.param(
+            np.empty((0, 2), dtype=np.float32),
+            0.01,
+            150.0,
+            5e-4,
+            id="empty-path",
+        ),
+        pytest.param(
+            np.asarray([[0.0, 0.0], [1.0, 0.0]], dtype=np.float32),
+            0.01,
+            150.0,
+            5e-4,
+            id="two-point-path",
+        ),
+    ],
+)
+def test_effective_corner_candidates_vectorized_matches_scalar_edge_cases(
+    path: np.ndarray,
+    minimum_span: float,
+    angle_threshold_degrees: float,
+    tolerance: float,
+):
+    assert slicer_module._effective_path_corner_candidates(
+        path,
+        minimum_span,
+        angle_threshold_degrees,
+        tolerance,
+    ) == _scalar_effective_path_corner_candidates(
+        path,
+        minimum_span,
+        angle_threshold_degrees,
+        tolerance,
+    )
+
+
+def test_effective_corner_candidates_preserve_exact_minimum_span_boundary():
+    delta = np.asarray([0.90535587, 0.44637457], dtype=np.float64)
+    path = np.asarray(
+        [
+            [0.0, 0.0],
+            delta,
+            delta + np.asarray([0.25, 1.0]),
+            delta + np.asarray([1.25, 1.2]),
+        ],
+        dtype=np.float64,
+    )
+    exact_span = float(np.linalg.norm(delta))
+
+    for minimum_span in (
+        np.nextafter(exact_span, -math.inf),
+        exact_span,
+        np.nextafter(exact_span, math.inf),
+    ):
+        assert slicer_module._effective_path_corner_candidates(
+            path,
+            minimum_span,
+            150.0,
+            1e-9,
+        ) == _scalar_effective_path_corner_candidates(
+            path,
+            minimum_span,
+            150.0,
+            1e-9,
+        )
+
+
+def test_effective_corner_candidates_vectorized_matches_scalar_randomized():
+    rng = np.random.default_rng(492910)
+    for case_index in range(250):
+        point_count = int(rng.integers(0, 96))
+        steps = rng.normal(size=(point_count, 2))
+        steps[rng.random(point_count) < 0.18] *= 1e-4
+        steps[rng.random(point_count) < 0.08] = 0.0
+        path = np.cumsum(steps, axis=0)
+        path = path.astype(np.float32 if case_index % 2 else np.float64)
+        minimum_span = float(10 ** rng.uniform(-4.0, 0.3))
+        if point_count > 1 and case_index % 5 == 0:
+            boundary_index = int(rng.integers(1, point_count))
+            minimum_span = float(
+                np.linalg.norm(path[boundary_index] - path[boundary_index - 1])
+            )
+        angle_threshold_degrees = float(rng.uniform(1.0, 179.0))
+        tolerance = float(10 ** rng.uniform(-8.0, -3.0))
+
+        expected = _scalar_effective_path_corner_candidates(
+            path,
+            minimum_span,
+            angle_threshold_degrees,
+            tolerance,
+        )
+        actual = slicer_module._effective_path_corner_candidates(
+            path,
+            minimum_span,
+            angle_threshold_degrees,
+            tolerance,
+        )
+        assert actual == expected, f"vectorized mismatch in random case {case_index}"
+
+
+def test_solid_fill_finisher_removes_micro_segment_without_leaving_hard_corner():
+    config = SliceConfig(
+        layer_height=1.0,
+        line_width=2.0,
+        infill_pattern="zigzag",
+        infill_density=100.0,
+        infill_overlap=10.0,
+        smoothing_angle=150.0,
+        smoothing_radius_factor=0.35,
+    )
+    allowed = Polygon([(-5, -5), (20, -5), (20, 20), (-5, 20)])
+    micro_segment_then_hard_turn = np.asarray(
+        [[0, 0], [10, 0], [10.005, 0], [10.005, 10]],
+        dtype=np.float32,
+    )
+    assert float(
+        np.linalg.norm(
+            micro_segment_then_hard_turn[2] - micro_segment_then_hard_turn[1]
+        )
+    ) < 0.01
+    assert _minimum_nondegenerate_vertex_angle(
+        micro_segment_then_hard_turn,
+        minimum_segment_length=0.01,
+    ) < config.smoothing_angle
+
+    finished = _finish_solid_fill_paths(
+        allowed,
+        allowed,
+        [],
+        [micro_segment_then_hard_turn],
+        LineString(),
+        config,
+        centerline_regions=(0.1, allowed, allowed, 1.7, LineString()),
+    )
+
+    assert len(finished) == 1
+    assert LineString(finished[0]).is_simple
+    assert _minimum_nondegenerate_vertex_angle(
+        finished[0],
+        minimum_segment_length=0.01,
+    ) >= config.smoothing_angle - 1e-3
+
+
+def test_solid_fill_finisher_never_turns_simple_path_into_self_intersection():
+    config = SliceConfig(
+        layer_height=1.0,
+        line_width=2.0,
+        infill_pattern="zigzag",
+        infill_density=100.0,
+        infill_overlap=10.0,
+        smoothing_angle=150.0,
+        smoothing_radius_factor=0.35,
+    )
+    allowed = Polygon([(-100, -100), (100, -100), (100, 100), (-100, 100)])
+    simple_close_turns = np.asarray(
+        [
+            [1.0110112, -1.6085931],
+            [0.9906273, 0.0302924],
+            [1.0160627, -1.0956739],
+            [1.7129788, -1.0671705],
+            [2.0806093, -0.4887412],
+            [1.6354822, -1.0645614],
+        ],
+        dtype=np.float32,
+    )
+    assert LineString(simple_close_turns).is_simple
+
+    finished = _finish_solid_fill_paths(
+        allowed,
+        allowed,
+        [],
+        [simple_close_turns],
+        LineString(),
+        config,
+        centerline_regions=(0.1, allowed, allowed, 1.7, LineString()),
+    )
+
+    assert finished
+    assert len(finished) == 4
+    assert all(LineString(path).is_simple for path in finished)
+    assert all(
+        np.allclose(previous[-1], following[0])
+        for previous, following in zip(finished, finished[1:])
+    )
+    assert all(
+        not slicer_module._effective_path_corner_candidates(
+            path,
+            config.line_width * 0.005,
+            config.smoothing_angle,
+            config.tolerance,
+        )
+        for path in finished
+    )
+
+
+def test_solid_fill_finisher_rolls_back_non_simple_rounding_candidate(monkeypatch):
+    config = SliceConfig(
+        layer_height=1.0,
+        line_width=2.0,
+        infill_pattern="zigzag",
+        infill_density=100.0,
+        infill_overlap=10.0,
+        smoothing_angle=150.0,
+        smoothing_radius_factor=0.35,
+    )
+    allowed = Polygon([(-10, -10), (10, -10), (10, 10), (-10, 10)])
+    baseline = np.asarray([[0, 0], [6, 0]], dtype=np.float32)
+    crossing_candidate = np.asarray(
+        [[0, 0], [4, 4], [0, 4], [4, 0], [6, 0]],
+        dtype=np.float32,
+    )
+    assert LineString(baseline).is_simple
+    assert not LineString(crossing_candidate).is_simple
+
+    with pytest.raises(ValueError, match="simple baseline"):
+        slicer_module._split_path_at_unresolved_effective_corners(
+            crossing_candidate,
+            config.line_width * 0.005,
+            config.smoothing_angle,
+            config.tolerance,
+        )
+
+    monkeypatch.setattr(
+        slicer_module,
+        "_smooth_resin_infill_paths",
+        lambda *args, **kwargs: [crossing_candidate],
+    )
+    finished = _finish_solid_fill_paths(
+        allowed,
+        allowed,
+        [],
+        [baseline],
+        LineString(),
+        config,
+        centerline_regions=(0.1, allowed, allowed, 1.7, LineString()),
+    )
+
+    assert len(finished) == 1
+    assert LineString(finished[0]).is_simple
+    assert np.array_equal(finished[0], baseline)
+
+
+def test_corner_smoothing_radius_is_a_physical_radius_not_a_tangent_cut():
+    previous = np.asarray([0.0, 0.0], dtype=np.float32)
+    corner = np.asarray([1.0, 0.0], dtype=np.float32)
+    following = np.asarray(
+        [1.0 - math.sqrt(0.5), math.sqrt(0.5)],
+        dtype=np.float32,
+    )
+
+    rounded = slicer_module._rounded_corner_points(
+        previous,
+        corner,
+        following,
+        max_radius=0.2,
+        angle_threshold_degrees=150.0,
+        tolerance=1e-5,
+        cut_fraction=0.8,
+    )
+
+    assert rounded is not None
+    first, middle, last = (
+        np.asarray(rounded[index], dtype=np.float64)
+        for index in (0, len(rounded) // 2, -1)
+    )
+    first_leg = middle - first
+    second_leg = last - middle
+    twice_area = abs(
+        first_leg[0] * second_leg[1] - first_leg[1] * second_leg[0]
+    )
+    circumradius = (
+        np.linalg.norm(first_leg)
+        * np.linalg.norm(second_leg)
+        * np.linalg.norm(last - first)
+        / (2.0 * twice_area)
+    )
+
+    assert circumradius == pytest.approx(0.2, abs=1e-4)
+
+
+def test_wall_seam_dogleg_trial_rejects_hook_but_keeps_tangent_turn():
+    tolerance = 5e-4
+    safe_geometry = Polygon([(80, 60), (100, 60), (100, 75), (80, 75)])
+    assembled = np.asarray(
+        [
+            [90.5353, 66.0996],
+            [90.6594, 64.5229],
+            [86.7823, 68.4],
+            [89.3279, 68.4],
+        ],
+        dtype=np.float32,
+    )
+    hooked_bridge = np.asarray(
+        [
+            [89.3279, 68.4],
+            [90.3834, 68.0302],
+            [90.5660, 65.7093],
+            [89.6064, 68.1215],
+        ],
+        dtype=np.float32,
+    )
+    trimmed = np.asarray(
+        [[89.6064, 68.1215], [90.4420, 67.2860]],
+        dtype=np.float32,
+    )
+    hooked_candidate = np.vstack(
+        (assembled, hooked_bridge[1:], trimmed[1:])
+    ).astype(np.float32)
+
+    assert not slicer_module._solid_wall_seam_dogleg_is_finishable(
+        hooked_candidate,
+        hooked_bridge,
+        assembled,
+        trimmed,
+        safe_geometry,
+        2.0,
+        150.0,
+        0.3,
+        tolerance,
+    )
+
+    angles = np.linspace(-np.pi * 0.5, np.pi * 0.5, 19)
+    tangent_bridge = np.column_stack(
+        (np.cos(angles), 1.0 + np.sin(angles))
+    ).astype(np.float32)
+    tangent_assembled = np.asarray([[-2, 0], [0, 0]], dtype=np.float32)
+    tangent_trimmed = np.asarray([[0, 2], [-2, 2]], dtype=np.float32)
+    tangent_candidate = np.vstack(
+        (tangent_assembled, tangent_bridge[1:], tangent_trimmed[1:])
+    ).astype(np.float32)
+
+    assert slicer_module._solid_wall_seam_dogleg_is_finishable(
+        tangent_candidate,
+        tangent_bridge,
+        tangent_assembled,
+        tangent_trimmed,
+        Polygon([(-3, -1), (2, -1), (2, 3), (-3, 3)]),
+        2.0,
+        150.0,
+        0.3,
+        tolerance,
     )
 
 
@@ -2493,6 +3046,53 @@ def _hatch_scan_level_gaps(
 def _repeated_centerline_length(paths: list[np.ndarray]) -> float:
     lines = [LineString(path[:, :2]) for path in paths if path.shape[0] >= 2]
     return sum(line.length for line in lines) - unary_union(lines).length
+
+
+def _minimum_nondegenerate_vertex_angle(
+    path: np.ndarray,
+    minimum_segment_length: float,
+) -> float:
+    """Return the sharpest continuous turn, looking across numerical micro-segments."""
+
+    points = np.asarray(path[:, :2], dtype=np.float64)
+    angles: list[float] = []
+    for index in range(1, points.shape[0] - 1):
+        previous_index = index - 1
+        while (
+            previous_index >= 0
+            and float(np.linalg.norm(points[index] - points[previous_index]))
+            < minimum_segment_length
+        ):
+            previous_index -= 1
+
+        next_index = index + 1
+        while (
+            next_index < points.shape[0]
+            and float(np.linalg.norm(points[next_index] - points[index]))
+            < minimum_segment_length
+        ):
+            next_index += 1
+
+        if previous_index < 0 or next_index >= points.shape[0]:
+            continue
+        incoming = points[previous_index] - points[index]
+        outgoing = points[next_index] - points[index]
+        incoming_length = float(np.linalg.norm(incoming))
+        outgoing_length = float(np.linalg.norm(outgoing))
+        if (
+            incoming_length < minimum_segment_length
+            or outgoing_length < minimum_segment_length
+        ):
+            continue
+        cosine = float(
+            np.clip(
+                np.dot(incoming, outgoing) / (incoming_length * outgoing_length),
+                -1.0,
+                1.0,
+            )
+        )
+        angles.append(math.degrees(math.acos(cosine)))
+    return min(angles, default=180.0)
 
 
 def _horizontal_scan_ys_for_paths(paths: list[np.ndarray]) -> list[float]:

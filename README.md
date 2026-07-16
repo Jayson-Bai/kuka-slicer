@@ -169,8 +169,24 @@ and residual narrow-neck pockets may replace a short original interval with a
 triangle visit. These corrections keep the path count unchanged, reject
 retrace/self-intersection, remain inside the physical part, and keep at least
 the bounded clearance from the last perimeter. They are also limited by a
-small added-length budget. Solid-fill corner smoothing is limited to half the
-configured overlap allowance so a fillet does not reopen the seam.
+small added-length budget. Solid-fill turns are rounded before correction and
+again after wall-seam/residual detours are inserted. The second pass removes
+sub-0.01 mm numerical fragments, fits the largest fillet covered by the same
+physical centerline-safe region, and samples it at no more than 10 degrees of
+heading change per segment. The smoothing factor is interpreted as a physical
+centerline radius rather than a tangent-cut length. Acute wall-seam hairpins
+use analytical constant-radius/C1 returns; a return that cannot be rounded
+inside the safe region is omitted instead of exporting a hidden sharp hook.
+The ordinary initial radius remains coverage-limited, residual correction aims
+below 40% of the physical bead width, and every added route remains subject to
+novel-area/dose guards so a 2 mm bead is neither treated as a zero-width line
+nor stacked onto an already printed stroke.
+
+For constant-section models, resin planning results are cached by the effective
+fill direction and copied into repeated layers. The browser preview serializes
+the role-aware path list once instead of repeating the same coordinates in
+legacy contour/infill aliases; neither optimization changes the NPZ path
+contract.
 
 `grid` and `triangles` are noded at crossings and use a graph trail cover that
 prints every real lattice edge once. Virtual edges used to construct the Euler
