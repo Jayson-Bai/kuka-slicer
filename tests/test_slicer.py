@@ -1506,6 +1506,46 @@ def test_finished_solid_fill_reconnects_parallel_trails_with_trimmed_tangent_ret
     )
 
 
+def test_measured_width_reconnect_runs_on_all_dense_prusa_layers(monkeypatch):
+    calls: list[int] = []
+
+    def record_reconnect(*args, **kwargs):
+        calls.append(len(args[1]))
+        return args[1]
+
+    monkeypatch.setattr(
+        slicer_module,
+        "_reconnect_finished_solid_fill_paths",
+        record_reconnect,
+    )
+    footprint = Polygon([(0, 0), (40, 0), (40, 30), (0, 30)])
+    config = SliceConfig(
+        line_width=2.0,
+        planning_line_width=2.2,
+        infill_pattern="zigzag",
+        infill_density=100.0,
+        infill_overlap=10.0,
+        tolerance=0.0005,
+    )
+
+    for layer_index in (0, 1):
+        slicer_module._raft_paths_for_layer(
+            footprint,
+            Polygon(),
+            config,
+            slicer_module.RaftLayerConfig(0.0),
+            layer_index=layer_index,
+        )
+    contour = np.asarray(
+        [[0, 0], [40, 0], [40, 30], [0, 30], [0, 0]],
+        dtype=np.float32,
+    )
+    _build_resin_paths([contour], config, layer_index=0)
+
+    assert len(calls) == 3
+    assert all(path_count >= 1 for path_count in calls)
+
+
 @pytest.mark.parametrize("density", [20.0, 50.0, 99.0])
 def test_measured_width_validates_sparse_raft_endcaps(density: float):
     footprint = Polygon([(0, 0), (60, 0), (60, 40), (0, 40)])

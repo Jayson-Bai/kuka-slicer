@@ -1012,10 +1012,7 @@ def _raft_paths_for_layer(
             config,
             centerline_regions=centerline_regions,
         )
-        if (
-            config.planning_line_width is not None
-            and layer_index == DEFAULT_RAFT_LAYER_COUNT - 1
-        ):
+        if config.planning_line_width is not None:
             filled = _reconnect_finished_solid_fill_paths(
                 perimeters,
                 filled,
@@ -1601,6 +1598,16 @@ def _build_resin_paths(
             config,
             centerline_regions=centerline_regions,
         )
+        if config.planning_line_width is not None:
+            filled = _reconnect_finished_solid_fill_paths(
+                perimeters,
+                filled,
+                last_perimeter_linework,
+                config,
+                direct_allowed=(
+                    None if centerline_regions is None else centerline_regions[2]
+                ),
+            )
         measured_width_validated = config.planning_line_width is not None
     if config.infill_pattern == "triangles" and config.triangle_path_optimization:
         triangle_merge_tolerance = _legacy_path_merge_tolerance(
@@ -3977,7 +3984,6 @@ def _reconnect_finished_solid_fill_paths(
     for first_index, first_source in enumerate(source_paths):
         for second_index in range(first_index + 1, len(source_paths)):
             second_source = source_paths[second_index]
-            best_candidate: tuple[float, float, np.ndarray] | None = None
             for first_side in (0, 1):
                 first_oriented = (
                     first_source if first_side == 1 else first_source[::-1].copy()
@@ -4066,40 +4072,18 @@ def _reconnect_finished_solid_fill_paths(
                             allow_boundary_bridges=True,
                         ):
                             continue
-                        proposed = [
-                            path
-                            for path_index, path in enumerate(source_paths)
-                            if path_index not in (first_index, second_index)
-                        ]
-                        proposed.append(chain)
-                        if not layer_is_valid(proposed):
-                            continue
-                        if not coverage_is_preserved(proposed):
-                            continue
                         trim_total = path_spacing * (
                             first_factor + second_factor
                         )
-                        proposal = (trim_total, endpoint_gap, chain)
-                        if (
-                            best_candidate is None
-                            or proposal[:2] < best_candidate[:2]
-                        ):
-                            best_candidate = proposal
-                        break
-                    if best_candidate is not None:
-                        break
-                if best_candidate is not None:
-                    break
-            if best_candidate is not None:
-                candidates.append(
-                    (
-                        first_index,
-                        second_index,
-                        best_candidate[0],
-                        best_candidate[1],
-                        best_candidate[2],
-                    )
-                )
+                        candidates.append(
+                            (
+                                first_index,
+                                second_index,
+                                trim_total,
+                                endpoint_gap,
+                                chain,
+                            )
+                        )
 
     if not candidates:
         return source_paths
