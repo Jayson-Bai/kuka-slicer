@@ -1467,6 +1467,33 @@ def test_measured_width_caps_raft_parallel_overlap(angle: float):
     assert min(scan_gaps) >= 2.2 * 0.9 - 0.002
 
 
+def test_strict_solid_boundary_chaining_starts_from_far_scan_side():
+    paths = [
+        np.asarray([[1.0, 1.0], [9.0, 1.0]], dtype=np.float32),
+        np.asarray([[1.0, 3.0], [9.0, 3.0]], dtype=np.float32),
+    ]
+    geometry = Polygon([(0.0, 0.0), (10.0, 0.0), (10.0, 4.0), (0.0, 4.0)])
+
+    connected = slicer_module._connect_boundary_infill_paths(
+        paths,
+        geometry,
+        spacing=2.0,
+        minimum_clearance=0.0,
+        tolerance=0.0005,
+        adjacent_scanlines_only=True,
+        maximum_scan_spacing=2.0,
+        solid_bead_width=2.2,
+        wall_seam_clearance=1.98,
+        solid_smoothing_angle_degrees=120.0,
+        solid_smoothing_corner_cut=0.4,
+        maximum_connector_overlap_spacing=1.98,
+    )
+
+    assert len(connected) == 1
+    assert connected[0][0, 1] == pytest.approx(3.0)
+    assert connected[0][-1, 1] == pytest.approx(1.0)
+
+
 def test_finished_solid_fill_reconnects_parallel_trails_with_trimmed_tangent_return():
     planning_width = 2.2
     requested_pitch = planning_width * 0.9

@@ -5255,8 +5255,19 @@ def _connect_boundary_infill_paths(
     accepted: list[tuple[int, int, np.ndarray]] = []
     connector_by_endpoint: dict[int, tuple[int, np.ndarray, bool]] = {}
     components: list[list[int]] = []
+    reverse_solid_scan_order = (
+        adjacent_scanlines_only
+        and maximum_scan_spacing is not None
+        and maximum_connector_overlap_spacing is not None
+    )
     while unused:
-        start_index = min(unused)
+        # Work back from the far scan side so hole-split branches keep their
+        # adjacent continuation available instead of burying it mid-chain.
+        start_index = (
+            max(unused, key=lambda index: (scan_levels[index], index))
+            if reverse_solid_scan_order
+            else min(unused)
+        )
         unused.remove(start_index)
         component = [start_index]
         left_endpoint = 2 * start_index
