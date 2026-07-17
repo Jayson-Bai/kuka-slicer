@@ -42,8 +42,20 @@ def main(argv: list[str] | None = None) -> int:
         "--line-width",
         type=float,
         help=(
-            f"path line width in mm; defaults by material "
+            f"nominal process line width in mm; defaults by material "
             f"(R={DEFAULT_RESIN_LINE_WIDTH_MM}, F={DEFAULT_FIBER_LINE_WIDTH_MM})"
+        ),
+    )
+    slice_parser.add_argument(
+        "--planning-line-width",
+        type=float,
+        default=None,
+        help=(
+            "measured flattened resin width used only for Prusa toolpath spacing, "
+            "overlap, and deposited-width checks; defaults to --line-width and "
+            "does not change the NPZ nominal line width or extrusion multiplier; "
+            "strict measured-width mode safely executes grid, triangles, and "
+            "gyroid as documented single-axis layer schedules"
         ),
     )
     slice_parser.add_argument("--z-min", type=float)
@@ -207,6 +219,7 @@ def _slice_command(args: argparse.Namespace) -> int:
     config = SliceConfig(
         layer_height=layer_height,
         line_width=line_width,
+        planning_line_width=args.planning_line_width,
         material=args.material,
         slicing_kernel=args.slicing_kernel,
         pyslm=PySLMConfig(

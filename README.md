@@ -31,17 +31,34 @@ Default process parameters are:
 | Resin `R` | `0.5 mm` | `2.0 mm` |
 | Fiber `F` | `0.1 mm` | `1.0 mm` |
 
-Resin infill uses a default overlap of `10%`. The planner accounts for the
-physical bead width before applying that overlap. With a `2.0 mm` resin line
-width, the overlap is `0.2 mm` and the default centerline pitch is therefore
-`2.0 - 0.2 = 1.8 mm`. The first infill centerline, including a
-boundary-following continuity link, stays one pitch inward from the innermost
-(last) perimeter centerline. From the physical inner edge of the last `2.0 mm`
-perimeter bead, the safe infill centerline moves inward by half a bead and then
-back toward the wall by only the requested overlap. This avoids ignoring half
-of the printed bead or counting overlap twice, either of which can create
-wall-parallel overfill and material pile-up. Set `--infill-overlap 0` to remove
-intentional wall overlap.
+Resin infill uses a default overlap of `10%`. `--line-width` remains the nominal
+process width written to NPZ metadata; it does not have to equal the bead width
+measured after the nozzle presses the resin flat. The separate
+`--planning-line-width` value is used only by the Prusa resin planner for path
+spacing, overlap, and deposited-width safety checks. For example, a measured
+flattened width of `2.2 mm` and `10%` overlap gives a requested centerline pitch
+of `2.2 * (1 - 0.10) = 1.98 mm`, so the intended physical contact width is
+`0.22 mm`. The same pitch governs adjacent infill paths and the first infill
+path beside the innermost perimeter. Set `--infill-overlap 0` to remove
+intentional overlap. Explicit measured-width planning adds only a conservative
+numerical safety margin (`16 * geometry_tolerance`; `0.008 mm` with the normal
+UI tolerance), so this example is generated at `1.988 mm`. A final guard keeps
+the innermost perimeter, non-local infill runs, independent endcaps, and
+opposing sides of closed rings on the conservative side of the semantic
+`1.98 mm` limit after smoothing. Local continuous turns and point-only
+continuation splits are topology, not a second parallel hatch, and are excluded
+from the percentage-overlap contract.
+
+The web UI defaults the measured flattened/planning width to the conservative
+field estimate `2.2 mm`. The CLI keeps backward compatibility: when
+`--planning-line-width` is omitted, it falls back to the nominal
+`--line-width`. Changing the planning width changes only centerline geometry
+and its physical-width validation. This path-only NPZ format has no extrusion
+multiplier, volumetric-flow, or per-segment flow field, and the nominal
+`slicing.line_width` metadata remains unchanged. Existing perimeter centerlines
+also continue to use the nominal line width because their printed result was
+already validated; the strict maximum-overlap scope recorded in metadata is
+non-local material-length infill runs and infill-to-innermost-perimeter.
 
 Useful options:
 
@@ -49,6 +66,7 @@ Useful options:
 python -m kuka_slicer slice input.stl output.npz `
   --layer-height 0.5 `
   --line-width 2.0 `
+  --planning-line-width 2.2 `
   --build-axis y `
   --infill-pattern rectilinear `
   --infill-density 100 `
@@ -133,54 +151,83 @@ centerline generation:
 | `rectilinear` | Alternating single-axis scanlines, joined along the safe infill boundary where possible |
 | `aligned_rectilinear` | Fixed-direction scanlines with the same boundary-following joins |
 | `line` | One-direction scanlines with the same boundary-following joins |
-| `grid` | Two-axis noded lattice covered by a minimum number of edge-disjoint trails |
-| `triangles` | Three-axis noded lattice covered by a minimum number of edge-disjoint trails |
-| `gyroid` | Gyroid-like curves with boundary-safe trail connections and a calibrated `2.35` wavelength factor |
+| `grid` | Two-axis noded lattice; strict measured-width mode executes one safe direction per layer on a `0°/90°` cycle |
+| `triangles` | Three-axis noded lattice; strict measured-width mode executes one safe direction per layer on a `0°/60°/120°` cycle |
+| `gyroid` | Gyroid-like curves with a calibrated `2.35` wavelength factor; strict measured-width mode executes `45°/-45°` single-axis layers |
 | `concentric` | Density-spaced offset loops with safe connections between adjacent rings |
 | `zigzag` | Alternating scanlines with adjacent, boundary-following continuity links |
 | `none` | Internal option for perimeter-only output |
 
+`grid`, `triangles`, and `gyroid` retain their native same-layer geometry in
+backward-compatible legacy planning when `--planning-line-width` is omitted.
+With an explicit measured planning width, the requested names remain available
+but are executed as the safe single-axis layer schedules shown above. This
+removes same-layer crossings and locally unbounded spacing while preserving the
+requested multi-direction intent across layers. The requested pattern, actual
+`zigzag` execution, angle schedule, and downgrade reason are recorded in NPZ
+metadata and shown in the web result summary.
+
 `--infill-density` is a resin fill percentage from `0` to `100`. It controls
-the generated path spacing together with resin line width and
+the generated path spacing together with the resin planning width and
 `--infill-overlap`. For one-axis patterns and `concentric`, the density-adjusted
 spacing is `centerline_pitch / density_fraction`; consequently, concentric ring
 spacing increases as density decreases. For multi-axis patterns, density is a
 total material-length budget shared across all directions, not a separate full
 budget for each direction. Their spacing is
-`centerline_pitch * axis_count / density_fraction`, so the default `1.8 mm`
-pitch at 100% density gives `3.6 mm` per grid direction and `5.4 mm` per
-triangle direction. This prevents two- and three-axis patterns from depositing
-roughly two or three times the requested material.
+`centerline_pitch * axis_count / density_fraction`. With the UI's `2.2 mm`
+planning width and `10%` overlap, the semantic `1.98 mm` pitch at 100% density
+would give
+`3.96 mm` per grid direction and `5.94 mm` per triangle direction. This
+prevents two- and three-axis patterns from depositing roughly two or three
+times the requested material in non-strict legacy mode, but their crossings
+still prevent a strict local-overlap guarantee.
 
 At 100% density, single-axis legacy patterns (including the four directions
 used by `isotropic` and the zigzag raft) use bead-aware solid-fill phasing.
 Each disconnected printable island is centered at the configured pitch. Long
-boundaries parallel to the hatch may anchor the phase only when every band fits
-inside a small, symmetric tolerance around that pitch. For a 2 mm line with
-10% overlap, the target is 1.8 mm and the permitted local range is 1.7..1.9 mm;
-this bounds both visible gaps and local overlap instead of silently expanding
-spacing to a full 2 mm or squeezing lines together without limit. Corridors
-narrower than one pitch receive one centered stroke instead of duplicated
-boundary strokes.
+boundaries parallel to the hatch may anchor the phase only when doing so does
+not reduce a neighboring centerline distance below that requested pitch. For a
+`2.2 mm` measured width with `10%` overlap, the minimum requested pitch is
+`1.98 mm`; geometry fitting may conservatively leave a slightly wider interval
+instead of squeezing lines closer and increasing the physical overlap.
+Corridors narrower than one pitch receive one centered stroke instead of
+duplicated boundary strokes.
 
-Coverage is evaluated with the physical round 2 mm bead, not centerlines alone.
+When a measured planning width is supplied (the web UI always supplies it),
+the Prusa solid-fill planner also disables wall-seam and residual gap detours
+that cannot prove the same maximum-overlap bound. This may leave a small local
+underfill beside difficult concave geometry; it is the conservative fallback
+chosen to avoid a raised ridge or material pile-up.
+
+Strict measured-width concentric fill keeps individually verified closed rings
+instead of joining them through a seam. The legacy seam connector can bring a
+later ring back within one measured bead of an earlier run; retaining separate
+rings sacrifices some continuity but preserves the maximum-overlap guarantee.
+
+Coverage is evaluated with the configured planning bead width, not centerlines
+or the nominal NPZ line width alone.
 Short wall-seam doglegs and free-end tails are folded into an existing zigzag,
 and residual narrow-neck pockets may replace a short original interval with a
 triangle visit. These corrections keep the path count unchanged, reject
 retrace/self-intersection, remain inside the physical part, and keep at least
 the bounded clearance from the last perimeter. They are also limited by a
 small added-length budget. Solid-fill turns are rounded before correction and
-again after wall-seam/residual detours are inserted. The second pass removes
-sub-0.01 mm numerical fragments, fits the largest fillet covered by the same
-physical centerline-safe region, and samples it at no more than 10 degrees of
-heading change per segment. The smoothing factor is interpreted as a physical
-centerline radius rather than a tangent-cut length. Acute wall-seam hairpins
+again after wall-seam/residual detours are inserted. In measured-width strict
+mode, the second pass deliberately preserves micro arc samples: removing them
+before another fillet fit can turn a straight hatch into an under-spaced long
+diagonal chord. It fits the largest fillet covered by the same physical
+centerline-safe region and samples it at no more than 10 degrees of heading
+change per segment. A final indexed postcondition verifies fill-to-wall distance
+and materially overlapping parallel returns; an unsafe smoothing result falls
+back to the proven baseline with only the minimum required path splits. The
+smoothing factor is interpreted as a physical centerline radius rather than a
+tangent-cut length. Acute wall-seam hairpins
 use analytical constant-radius/C1 returns; a return that cannot be rounded
 inside the safe region is omitted instead of exporting a hidden sharp hook.
 The ordinary initial radius remains coverage-limited, residual correction aims
 below 40% of the physical bead width, and every added route remains subject to
-novel-area/dose guards so a 2 mm bead is neither treated as a zero-width line
-nor stacked onto an already printed stroke.
+novel-area/dose guards so the measured bead is neither treated as a zero-width
+line nor stacked onto an already printed stroke.
 
 For constant-section models, resin planning results are cached by the effective
 fill direction and copied into repeated layers. The browser preview serializes
@@ -188,7 +235,7 @@ the role-aware path list once instead of repeating the same coordinates in
 legacy contour/infill aliases; neither optimization changes the NPZ path
 contract.
 
-`grid` and `triangles` are noded at crossings and use a graph trail cover that
+In non-strict legacy mode, `grid` and `triangles` are noded at crossings and use a graph trail cover that
 prints every real lattice edge once. Virtual edges used to construct the Euler
 walk are never printed, which minimizes starts without retracing and piling
 material at an existing edge. `gyroid` derives its wavelength as `2.35` times
@@ -217,11 +264,13 @@ Legacy zigzag infill, including forced part cap layers and explicit raft
 zigzag layers, uses the same ordering, reversal, endpoint merge, and final
 smoothing cleanup by default. It can be disabled with
 `--no-zigzag-path-optimization` or its UI checkbox.
-`gyroid` uses continuous clipped contour curves, which usually reduces resin
+In non-strict legacy mode, `gyroid` uses continuous clipped contour curves, which usually reduces resin
 path start/stop count at high densities while keeping a more balanced direction
 distribution than one-direction line fill.
-Only path centerlines are exported. PrusaSlicer behaviors that depend on
-extrusion amount, variable bead width, volumetric flow, or support/tree-specific
+Only path centerlines are exported. The measured planning width is recorded as
+separate slicing metadata for traceability, but it does not add or alter any
+flow column. PrusaSlicer behaviors that depend on extrusion amount, extrusion
+multiplier, variable bead width, volumetric flow, or support/tree-specific
 material accounting are not serialized into this NPZ format.
 
 `--build-axis` selects the STL source axis used as the layer-height direction.
@@ -250,7 +299,7 @@ The UI groups adjustable inputs into:
 | --- | --- |
 | Input files | STL upload, optional single-layer fiber JSON |
 | Model and layers | layer height, build axis, optional `z_min`/`z_max`, geometric tolerance |
-| Resin path kernel | slicing kernel (`Prusa` or `PySLM`), line width, perimeter count, infill pattern, density, overlap, triangle/zigzag path optimization, smoothing, PySLM native settings |
+| Resin path kernel | slicing kernel (`Prusa` or `PySLM`), nominal line width, Prusa measured flattened/planning width, perimeter count, infill pattern, density, overlap, triangle/zigzag path optimization, smoothing, PySLM native settings |
 | Raft | fixed two-layer raft with editable outward offsets; layer height, density, gap, and zigzag angles follow the fixed print schedule |
 | Curved Z | flat/sinusoidal mode, amplitude, period |
 

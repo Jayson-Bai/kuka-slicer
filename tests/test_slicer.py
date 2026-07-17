@@ -14,6 +14,7 @@ from kuka_slicer.slicer import (
     DEFAULT_RESIN_INFILL_OVERLAP_PERCENT,
     DEFAULT_RESIN_LAYER_HEIGHT_MM,
     DEFAULT_RESIN_LINE_WIDTH_MM,
+    DEFAULT_RESIN_PLANNING_LINE_WIDTH_MM,
     RaftLayerConfig,
     SliceConfig,
     _build_resin_paths,
@@ -188,6 +189,37 @@ def test_resin_infill_surface_uses_last_perimeter_and_overlap_offset():
     assert np.isclose(max_y, 15.4, atol=0.05)
 
 
+def test_measured_planning_width_changes_only_infill_to_perimeter_pitch():
+    geometry = Polygon([(0, 0), (30, 0), (30, 30), (0, 30)])
+    config = SliceConfig(
+        layer_height=1.0,
+        line_width=2.0,
+        planning_line_width=2.2,
+        infill_overlap=10.0,
+        infill_pattern="none",
+    )
+
+    perimeters, roles = _build_resin_paths(
+        [
+            np.asarray(
+                [[0, 0], [30, 0], [30, 30], [0, 30], [0, 0]],
+                dtype=np.float32,
+            )
+        ],
+        config,
+    )
+    outer = _paths_with_role(perimeters, roles, "outer_contour")[0]
+    inner = _paths_with_role(perimeters, roles, "inner_contour")[0]
+    infill_surface = _resin_infill_surface_geometry(geometry, config)
+
+    assert float(outer[:, 0].min()) == pytest.approx(1.0, abs=0.05)
+    assert float(inner[:, 0].min()) == pytest.approx(2.8, abs=0.05)
+    requested_pitch = 2.2 * 0.9
+    actual_pitch = infill_surface.bounds[0] - float(inner[:, 0].min())
+    assert actual_pitch >= requested_pitch
+    assert actual_pitch - requested_pitch < 0.01
+
+
 def test_resin_infill_surface_respects_configured_perimeter_count():
     geometry = Polygon([(0, 0), (30, 0), (30, 30), (0, 30)])
     one_wall = SliceConfig(
@@ -357,6 +389,33 @@ def test_constant_section_isotropic_plans_each_effective_angle_once_and_copies_l
     assert np.array_equal(repeated_zero_degree_layer.paths[0], repeated_snapshot)
 
 
+def test_two_plane_frustum_does_not_reuse_first_layer_geometry():
+    triangles = _cube_triangles(size=10.0)
+    vertices = triangles.reshape(-1, 3)
+    top_vertices = np.isclose(vertices[:, 2], 10.0)
+    vertices[top_vertices, :2] = (
+        vertices[top_vertices, :2] - np.asarray([5.0, 5.0], dtype=np.float32)
+    ) * 0.5 + np.asarray([5.0, 5.0], dtype=np.float32)
+    mesh = Mesh(triangles)
+
+    job = slice_mesh_to_job(
+        mesh,
+        SliceConfig(
+            layer_height=1.0,
+            line_width=2.0,
+            infill_pattern="none",
+        ),
+    )
+
+    layer_widths = []
+    for group in job.material_paths:
+        coordinates = np.vstack(group.paths)
+        layer_widths.append(
+            float(coordinates[:, 0].max() - coordinates[:, 0].min())
+        )
+    assert layer_widths[0] > layer_widths[len(layer_widths) // 2] > layer_widths[-1]
+
+
 def test_preview_payload_uses_slim_role_aware_layer_schema_and_complete_bounds():
     resin_outer = np.asarray(
         [[0, 0, 0.5], [10, 0, 0.5], [10, 10, 0.5], [0, 10, 0.5], [0, 0, 0.5]],
@@ -388,11 +447,16 @@ def test_preview_payload_uses_slim_role_aware_layer_schema_and_complete_bounds()
 
     preview = _preview_payload(
         Mesh(_cube_triangles(size=10.0)),
-        SliceConfig(line_width=2.0),
+        SliceConfig(line_width=2.0, planning_line_width=2.2),
         job,
     )
 
     assert set(preview) == {"bounds", "line_widths", "layers"}
+    assert preview["line_widths"] == {
+        "resin": 2.2,
+        "resin_nominal": 2.0,
+        "fiber": DEFAULT_FIBER_LINE_WIDTH_MM,
+    }
     assert len(preview["layers"]) == 1
     layer = preview["layers"][0]
     assert set(layer) == {"index", "resin_paths", "fiber_paths"}
@@ -688,6 +752,78 @@ def test_concentric_filters_paths_closer_than_line_width():
     assert len(filtered) == 2
     assert filtered[0] is outer
     assert filtered[1] is far_enough
+
+
+def test_strict_concentric_filter_drops_under_spaced_residual_ring():
+    geometry = Polygon(
+        [(-5.91, -5.91), (5.91, -5.91), (5.91, 5.91), (-5.91, 5.91)]
+    )
+    requested_pitch = 2.2 * 0.9
+    planned_pitch = requested_pitch + 0.008
+
+    rings = _concentric_infill_geometry(
+        geometry,
+        line_width=2.2,
+        path_spacing=planned_pitch,
+        tolerance=0.0005,
+        minimum_spacing=requested_pitch,
+    )
+    linework = [LineString(ring) for ring in rings]
+
+    assert len(linework) >= 2
+    assert min(
+        first.distance(second)
+        for index, first in enumerate(linework)
+        for second in linework[index + 1 :]
+    ) >= requested_pitch - 1e-6
+
+
+def test_strict_concentric_filter_drops_a_ring_folded_through_narrow_neck():
+    folded_ring = np.asarray(
+        [[0.0, 0.0], [20.0, 0.0], [20.0, 1.5], [0.0, 1.5], [0.0, 0.0]],
+        dtype=np.float32,
+    )
+
+    filtered = _filter_concentric_paths_by_spacing(
+        [folded_ring],
+        path_spacing=1.988,
+        tolerance=0.0005,
+        minimum_spacing=1.98,
+    )
+
+    assert filtered == []
+
+
+@pytest.mark.parametrize("density", [20.0, 50.0, 100.0])
+def test_strict_concentric_densities_omit_collapsed_center_residual(density: float):
+    contour = np.asarray(
+        [[0.0, 0.0], [60.0, 0.0], [60.0, 40.0], [0.0, 40.0], [0.0, 0.0]],
+        dtype=np.float32,
+    )
+
+    paths, roles = _build_resin_paths(
+        [contour],
+        SliceConfig(
+            layer_height=1.0,
+            line_width=2.0,
+            planning_line_width=2.2,
+            infill_pattern="concentric",
+            infill_density=density,
+            infill_overlap=10.0,
+            tolerance=0.0005,
+        ),
+    )
+    infill = _paths_with_role(paths, roles, "infill")
+
+    assert infill
+    assert all(np.allclose(path[0], path[-1]) for path in infill)
+    assert slicer_module._solid_fill_spacing_postcondition(
+        infill,
+        Polygon(),
+        minimum_spacing=1.98,
+        tolerance=0.0005,
+        bead_width=2.2,
+    )
 
 
 def test_concentric_concave_offsets_keep_pitch_and_connect_continuously():
@@ -1254,6 +1390,613 @@ def test_prusa_infill_patterns_bound_interruptions_without_retracing(
     assert infill
     assert len(infill) <= max_path_count
     assert all(path.shape[0] >= 2 for path in infill)
+
+
+@pytest.mark.parametrize("angle", [0.0, 45.0, -45.0, 90.0])
+def test_measured_width_caps_solid_infill_overlap_in_every_direction(angle: float):
+    outer = np.asarray(
+        [[0, 0], [60, 0], [60, 40], [0, 40], [0, 0]],
+        dtype=np.float32,
+    )
+    hole = np.asarray(
+        [[25, 15], [35, 15], [35, 25], [25, 25], [25, 15]],
+        dtype=np.float32,
+    )
+    planning_width = 2.2
+    overlap_percent = 10.0
+    requested_pitch = planning_width * (1.0 - overlap_percent / 100.0)
+    config = SliceConfig(
+        layer_height=1.0,
+        line_width=2.0,
+        planning_line_width=planning_width,
+        infill_pattern="zigzag",
+        infill_density=100.0,
+        infill_overlap=overlap_percent,
+    )
+
+    paths, roles = _build_resin_paths(
+        [outer, hole],
+        config,
+        layer_index=1,
+        forced_zigzag_angle=angle,
+    )
+    infill = _paths_with_role(paths, roles, "infill")
+    inner_walls = _paths_with_role(paths, roles, "inner_contour")
+    scan_gaps = _hatch_scan_level_gaps(infill, angle, planning_width)
+    infill_linework = unary_union([LineString(path[:, :2]) for path in infill])
+    wall_linework = unary_union([LineString(path[:, :2]) for path in inner_walls])
+
+    assert scan_gaps
+    assert min(scan_gaps) >= requested_pitch - 0.002
+    assert max(
+        0.0,
+        (planning_width - min(scan_gaps)) / planning_width,
+    ) <= overlap_percent / 100.0 + 0.001
+    assert infill_linework.distance(wall_linework) >= requested_pitch - 0.002
+    # Strict measured-width planning may drop an unsafe boundary connector,
+    # but it must keep the remaining safe hatches in long continuous trails.
+    assert len(infill) <= 4
+    assert slicer_module._solid_fill_spacing_postcondition(
+        infill,
+        wall_linework,
+        minimum_spacing=requested_pitch,
+        tolerance=config.tolerance,
+        bead_width=planning_width,
+    )
+
+
+@pytest.mark.parametrize("angle", [0.0, -45.0, 90.0])
+def test_measured_width_caps_raft_parallel_overlap(angle: float):
+    geometry = Polygon([(0, 0), (60, 0), (60, 40), (0, 40)])
+    config = SliceConfig(
+        layer_height=1.0,
+        line_width=2.0,
+        planning_line_width=2.2,
+        infill_overlap=10.0,
+    )
+
+    paths = _raft_zigzag_infill_paths(
+        geometry,
+        config,
+        infill_density=100.0,
+        angle_degrees=angle,
+    )
+    scan_gaps = _hatch_scan_level_gaps(paths, angle, 2.2)
+
+    assert scan_gaps
+    assert min(scan_gaps) >= 2.2 * 0.9 - 0.002
+
+
+@pytest.mark.parametrize("density", [20.0, 50.0, 99.0])
+def test_measured_width_validates_sparse_raft_endcaps(density: float):
+    footprint = Polygon([(0, 0), (60, 0), (60, 40), (0, 40)])
+    config = SliceConfig(
+        layer_height=1.0,
+        line_width=2.0,
+        planning_line_width=2.2,
+        infill_density=density,
+        infill_overlap=10.0,
+        tolerance=0.0005,
+    )
+
+    paths, roles = slicer_module._raft_paths_for_layer(
+        footprint,
+        Polygon(),
+        config,
+        slicer_module.RaftLayerConfig(0.0, infill_density=density),
+        layer_index=1,
+    )
+
+    assert paths
+    assert "infill" in roles
+
+
+def test_final_spacing_postcondition_rejects_long_parallel_return_below_pitch():
+    def return_path(gap: float) -> np.ndarray:
+        radius = gap * 0.5
+        center = np.asarray([20.0, radius], dtype=np.float64)
+        angles = np.linspace(-math.pi * 0.5, math.pi * 0.5, 19)
+        turn = np.column_stack(
+            (center[0] + np.cos(angles) * radius, center[1] + np.sin(angles) * radius)
+        )
+        return np.vstack(([[0.0, 0.0]], turn, [[0.0, gap]])).astype(np.float32)
+
+    assert not slicer_module._solid_fill_spacing_postcondition(
+        [return_path(1.90)],
+        Polygon(),
+        minimum_spacing=1.98,
+        tolerance=0.0005,
+    )
+    assert slicer_module._solid_fill_spacing_postcondition(
+        [return_path(1.99)],
+        Polygon(),
+        minimum_spacing=1.98,
+        tolerance=0.0005,
+    )
+
+
+def test_final_spacing_postcondition_rejects_slightly_skewed_long_return():
+    radius = 0.95
+    center = np.asarray([5.0, radius], dtype=np.float64)
+    angles = np.linspace(-math.pi * 0.5, math.pi * 0.5, 37)
+    turn = np.column_stack(
+        (center[0] + radius * np.cos(angles), center[1] + radius * np.sin(angles))
+    )
+    path = np.vstack(
+        (
+            [[0.0, 0.0]],
+            turn,
+            [[0.0, 2.0746038]],
+        )
+    ).astype(np.float32)
+
+    assert not slicer_module._solid_fill_spacing_postcondition(
+        [path],
+        Polygon(),
+        minimum_spacing=1.98,
+        tolerance=0.0005,
+        bead_width=2.2,
+    )
+
+
+def test_final_spacing_postcondition_rejects_shallow_long_return_corridor():
+    radius = 0.5
+    turn_angle = math.radians(160.0)
+    center = np.asarray([5.0, radius], dtype=np.float64)
+    arc_angles = np.linspace(-math.pi * 0.5, -math.pi * 0.5 + turn_angle, 65)
+    arc = np.column_stack(
+        (
+            center[0] + radius * np.cos(arc_angles),
+            center[1] + radius * np.sin(arc_angles),
+        )
+    )
+    return_direction = np.asarray(
+        [math.cos(turn_angle), math.sin(turn_angle)], dtype=np.float64
+    )
+    path = np.vstack(
+        (
+            [[0.0, 0.0]],
+            arc,
+            arc[-1] + return_direction * 5.0,
+        )
+    ).astype(np.float32)
+
+    assert not slicer_module._solid_fill_spacing_postcondition(
+        [path],
+        Polygon(),
+        minimum_spacing=1.98,
+        tolerance=0.0005,
+        bead_width=2.2,
+    )
+
+
+@pytest.mark.parametrize("gap", [0.1, 0.2, 0.5, 1.5])
+@pytest.mark.parametrize("split_at_turn", [False, True])
+def test_final_spacing_postcondition_rejects_short_deep_return_arms(
+    gap: float,
+    split_at_turn: bool,
+):
+    radius = gap * 0.5
+    turn_angle = math.radians(169.9)
+    center = np.asarray([5.0, radius], dtype=np.float64)
+    arc_angles = np.linspace(
+        -math.pi * 0.5,
+        -math.pi * 0.5 + turn_angle,
+        101,
+    )
+    arc = np.column_stack(
+        (
+            center[0] + radius * np.cos(arc_angles),
+            center[1] + radius * np.sin(arc_angles),
+        )
+    )
+    return_direction = np.asarray(
+        [math.cos(turn_angle), math.sin(turn_angle)],
+        dtype=np.float64,
+    )
+    path = np.vstack(
+        (
+            [[0.0, 0.0]],
+            arc,
+            arc[-1] + return_direction * 1.9,
+        )
+    ).astype(np.float32)
+    paths = [path]
+    if split_at_turn:
+        split_index = 1 + arc.shape[0] // 2
+        paths = [path[: split_index + 1], path[split_index:]]
+
+    assert not slicer_module._solid_fill_spacing_postcondition(
+        paths,
+        Polygon(),
+        minimum_spacing=1.98,
+        tolerance=0.0005,
+        bead_width=2.2,
+    )
+
+
+@pytest.mark.parametrize(
+    ("radius", "turn_degrees", "return_length", "expected"),
+    [
+        (0.7, 90.0, 5.0, True),
+        (0.7, 135.0, 5.0, True),
+        (0.994, 180.0, 5.0, True),
+        (0.5, 160.0, 5.0, False),
+        (0.95, 180.0, 1.87, False),
+        (0.25, 169.9, 1.9, False),
+        (0.05, 135.0, 1.9, False),
+        (0.05, 145.0, 1.9, False),
+        (0.05, 149.0, 1.9, False),
+        (0.05, 149.9, 1.9, False),
+        (0.05, 150.0, 1.9, False),
+    ],
+)
+def test_final_spacing_postcondition_is_sampling_and_partition_invariant(
+    radius: float,
+    turn_degrees: float,
+    return_length: float,
+    expected: bool,
+):
+    turn_angle = math.radians(turn_degrees)
+    center = np.asarray([5.0, radius], dtype=np.float64)
+    return_direction = np.asarray(
+        [math.cos(turn_angle), math.sin(turn_angle)],
+        dtype=np.float64,
+    )
+
+    for sample_count in (3, 5, 9, 19, 101):
+        arc_angles = np.linspace(
+            -math.pi * 0.5,
+            -math.pi * 0.5 + turn_angle,
+            sample_count,
+        )
+        arc = np.column_stack(
+            (
+                center[0] + radius * np.cos(arc_angles),
+                center[1] + radius * np.sin(arc_angles),
+            )
+        )
+        path = np.vstack(
+            (
+                [[0.0, 0.0]],
+                arc,
+                arc[-1] + return_direction * return_length,
+            )
+        ).astype(np.float32)
+        midpoint = path.shape[0] // 2
+        partition_variants = (
+            [path],
+            [path[: midpoint + 1], path[midpoint:]],
+            [path[index : index + 2] for index in range(path.shape[0] - 1)],
+        )
+
+        for partitioned_paths in partition_variants:
+            assert (
+                slicer_module._solid_fill_spacing_postcondition(
+                    partitioned_paths,
+                    Polygon(),
+                    minimum_spacing=1.98,
+                    tolerance=0.0005,
+                    bead_width=2.2,
+                )
+                is expected
+            ), (
+                f"radius={radius}, turn={turn_degrees}, samples={sample_count}, "
+                f"parts={len(partitioned_paths)}"
+            )
+
+
+def test_measured_width_retracts_independent_facing_endcaps_to_safe_pitch():
+    paths = [
+        np.asarray([[-8.0, 0.0], [0.0, 0.0]], dtype=np.float32),
+        np.asarray([[1.618, 0.0], [9.0, 0.0]], dtype=np.float32),
+    ]
+
+    repaired = slicer_module._trim_close_collinear_solid_fill_endcaps(
+        paths,
+        target_spacing=1.988,
+        tolerance=0.0005,
+    )
+
+    endcap_gap = float(np.linalg.norm(repaired[1][0] - repaired[0][-1]))
+    assert endcap_gap >= 1.988
+    assert repaired[0][0].tolist() == paths[0][0].tolist()
+    assert repaired[1][-1].tolist() == paths[1][-1].tolist()
+    assert slicer_module._solid_fill_spacing_postcondition(
+        repaired,
+        Polygon(),
+        minimum_spacing=1.98,
+        tolerance=0.0005,
+    )
+
+
+def test_measured_width_does_not_retract_exact_corner_split_components():
+    paths = [
+        np.asarray([[-8.0, 0.0], [0.0, 0.0]], dtype=np.float32),
+        np.asarray([[0.0, 0.0], [0.0, 8.0]], dtype=np.float32),
+    ]
+
+    repaired = slicer_module._trim_close_collinear_solid_fill_endcaps(
+        paths,
+        target_spacing=1.988,
+        tolerance=0.0005,
+    )
+
+    assert all(np.array_equal(before, after) for before, after in zip(paths, repaired))
+
+
+def test_measured_width_postcondition_still_runs_when_smoothing_is_disabled():
+    paths = [
+        np.asarray([[-8.0, 0.0], [0.0, 0.0]], dtype=np.float32),
+        np.asarray([[1.618, 0.0], [9.0, 0.0]], dtype=np.float32),
+    ]
+    config = SliceConfig(
+        line_width=2.0,
+        planning_line_width=2.2,
+        infill_overlap=10.0,
+        smoothing_radius_factor=0.0,
+        tolerance=0.0005,
+    )
+
+    finished = _finish_solid_fill_paths(
+        Polygon(),
+        Polygon(),
+        [],
+        paths,
+        Polygon(),
+        config,
+    )
+
+    assert float(np.linalg.norm(finished[1][0] - finished[0][-1])) >= 1.988
+
+
+def test_final_spacing_postcondition_rejects_infill_too_close_to_wall():
+    wall = LineString([(0.0, 0.0), (20.0, 0.0)])
+    too_close = np.asarray([[0.0, 1.97], [20.0, 1.97]], dtype=np.float32)
+    safe = np.asarray([[0.0, 1.99], [20.0, 1.99]], dtype=np.float32)
+
+    assert not slicer_module._solid_fill_spacing_postcondition(
+        [too_close], wall, minimum_spacing=1.98, tolerance=0.0005
+    )
+    assert slicer_module._solid_fill_spacing_postcondition(
+        [safe], wall, minimum_spacing=1.98, tolerance=0.0005
+    )
+
+
+def test_final_spacing_postcondition_rejects_nonlocal_geometry_regressions():
+    empty_wall = Polygon()
+    segmented_lower = np.column_stack(
+        (np.arange(0.0, 10.5, 0.5), np.zeros(21))
+    ).astype(np.float32)
+    segmented_upper = segmented_lower + np.asarray([0.0, 1.9], dtype=np.float32)
+    cases = [
+        [
+            np.asarray(
+                [[0.0, 0.0], [2.0, 2.0], [0.0, 2.0], [2.0, 0.0]],
+                dtype=np.float32,
+            )
+        ],
+        [segmented_lower, segmented_upper],
+        [
+            np.asarray([[0.0, 0.0], [10.0, 0.0]], dtype=np.float32),
+            np.asarray([[5.0, 0.5], [5.0, 10.0]], dtype=np.float32),
+        ],
+        [
+            np.asarray(
+                [
+                    [0.0, 0.0],
+                    [10.0, 0.0],
+                    [10.0, 10.0],
+                    [5.0, 10.0],
+                    [5.0, 0.5],
+                ],
+                dtype=np.float32,
+            )
+        ],
+        [
+            np.asarray([[0.0, 0.0], [5.0, 0.0]], dtype=np.float32),
+            np.asarray([[0.0, 0.0], [5.0, 0.0]], dtype=np.float32),
+        ],
+        [
+            np.asarray([[0.0, 0.0], [5.0, 0.0]], dtype=np.float32),
+            np.asarray([[0.0, 0.0], [2.0, 0.0]], dtype=np.float32),
+        ],
+        [
+            np.asarray(
+                [
+                    [0.9, 0.0],
+                    [1.8, 0.0],
+                    [1.8, 0.9],
+                    [0.0, 0.9],
+                    [0.0, 0.0],
+                    [0.9, 0.0],
+                ],
+                dtype=np.float32,
+            )
+        ],
+        [
+            np.asarray([[0.0, 0.0], [10.0, 0.0]], dtype=np.float32),
+            np.asarray([[0.0, 0.4], [0.0, 10.0]], dtype=np.float32),
+            np.asarray([[10.0, 0.0], [0.0, 10.0]], dtype=np.float32),
+        ],
+        [
+            np.asarray(
+                [
+                    [0.0, 0.0],
+                    [3.2, 0.0],
+                    [3.2, 2.4],
+                    [1.0, 2.4],
+                    [1.0, 0.5],
+                ],
+                dtype=np.float32,
+            )
+        ],
+    ]
+
+    for paths in cases:
+        assert not slicer_module._solid_fill_spacing_postcondition(
+            paths,
+            empty_wall,
+            minimum_spacing=1.98,
+            tolerance=0.0005,
+        )
+
+
+def test_final_spacing_postcondition_rejects_short_segment_curve_gaps():
+    angles = np.linspace(0.0, math.pi, 91)
+    outer_arc = np.column_stack((10.0 * np.cos(angles), 10.0 * np.sin(angles)))
+    inner_arc = np.column_stack((8.1 * np.cos(angles), 8.1 * np.sin(angles)))
+
+    spiral_angles = np.linspace(0.0, math.pi * 4.0, 721)
+    spiral_radii = 10.0 - 0.15 * spiral_angles
+    spiral = np.column_stack(
+        (
+            spiral_radii * np.cos(spiral_angles),
+            spiral_radii * np.sin(spiral_angles),
+        )
+    )
+    almost_loops = []
+    for turn_degrees in (200.0, 300.0):
+        almost_loop_angles = np.linspace(
+            0.0, math.radians(turn_degrees), 151
+        )
+        almost_loops.append(
+            np.column_stack(
+                (
+                    0.75 * np.cos(almost_loop_angles),
+                    0.75 * np.sin(almost_loop_angles),
+                )
+            ).astype(np.float32)
+        )
+
+    for paths in (
+        [outer_arc.astype(np.float32), inner_arc.astype(np.float32)],
+        [spiral.astype(np.float32)],
+        *([almost_loop] for almost_loop in almost_loops),
+    ):
+        assert not slicer_module._solid_fill_spacing_postcondition(
+            paths,
+            Polygon(),
+            minimum_spacing=1.98,
+            tolerance=0.0005,
+            bead_width=2.2,
+        )
+
+
+@pytest.mark.parametrize(
+    ("radius", "turn_degrees"),
+    [(0.5, 200.0), (0.3, 300.0), (0.4, 270.0), (0.3, 350.0)],
+)
+def test_final_spacing_postcondition_rejects_short_tight_almost_loops(
+    radius: float,
+    turn_degrees: float,
+):
+    angles = np.linspace(0.0, math.radians(turn_degrees), 181)
+    path = np.column_stack(
+        (radius * np.cos(angles), radius * np.sin(angles))
+    ).astype(np.float32)
+
+    assert not slicer_module._solid_fill_spacing_postcondition(
+        [path],
+        Polygon(),
+        minimum_spacing=1.98,
+        tolerance=0.0005,
+        bead_width=2.2,
+    )
+
+
+def test_final_spacing_postcondition_allows_point_only_split_continuation():
+    horizontal = np.asarray([[0.0, 0.0], [5.0, 0.0]], dtype=np.float32)
+    vertical = np.asarray([[5.0, 0.0], [5.0, 5.0]], dtype=np.float32)
+
+    assert slicer_module._solid_fill_spacing_postcondition(
+        [horizontal, vertical],
+        Polygon(),
+        minimum_spacing=1.98,
+        tolerance=0.0005,
+    )
+
+
+def test_final_spacing_postcondition_allows_compact_turn_across_exact_split():
+    incoming = np.asarray(
+        [[0.0, 10.0], [0.0, 0.01], [0.01, 0.0]],
+        dtype=np.float32,
+    )
+    outgoing = np.asarray(
+        [
+            [0.01, 0.0],
+            [0.2, 0.02],
+            [0.35, 0.08],
+            [0.5, 0.17],
+            [0.65, 0.28],
+            [0.8, 0.4],
+            [1.0, 0.5],
+            [5.0, 0.5],
+        ],
+        dtype=np.float32,
+    )
+
+    assert slicer_module._solid_fill_spacing_postcondition(
+        [incoming, outgoing],
+        Polygon(),
+        minimum_spacing=1.98,
+        tolerance=0.0005,
+        bead_width=2.2,
+    )
+
+
+def test_final_spacing_postcondition_rejects_sub_pitch_closed_ring():
+    tiny_ring = np.asarray(
+        Point(0.0, 0.0).buffer(0.5, quad_segs=64).exterior.coords,
+        dtype=np.float32,
+    )
+    safe_ring = np.asarray(
+        Point(0.0, 0.0).buffer(2.0, quad_segs=64).exterior.coords,
+        dtype=np.float32,
+    )
+
+    assert not slicer_module._solid_fill_spacing_postcondition(
+        [tiny_ring],
+        Polygon(),
+        minimum_spacing=1.98,
+        tolerance=0.0005,
+        bead_width=2.2,
+    )
+    assert slicer_module._solid_fill_spacing_postcondition(
+        [safe_ring],
+        Polygon(),
+        minimum_spacing=1.98,
+        tolerance=0.0005,
+        bead_width=2.2,
+    )
+
+
+def test_measured_width_concentric_drops_collapsed_residual_ring():
+    contour = np.asarray(
+        Point(0.0, 0.0).buffer(5.0, quad_segs=64).exterior.coords,
+        dtype=np.float32,
+    )
+    config = SliceConfig(
+        layer_height=1.0,
+        line_width=2.0,
+        planning_line_width=2.2,
+        infill_pattern="concentric",
+        infill_density=100.0,
+        infill_overlap=10.0,
+        tolerance=0.0005,
+    )
+
+    paths, roles = _build_resin_paths([contour], config)
+    infill = _paths_with_role(paths, roles, "infill")
+
+    assert infill == []
+
+    safe_contour = np.asarray(
+        Point(0.0, 0.0).buffer(6.0, quad_segs=64).exterior.coords,
+        dtype=np.float32,
+    )
+    safe_paths, safe_roles = _build_resin_paths([safe_contour], config)
+    assert _paths_with_role(safe_paths, safe_roles, "infill")
 
 
 @pytest.mark.parametrize(
@@ -2069,9 +2812,20 @@ def test_material_defaults_are_hard_coded():
 
     assert resin.layer_height == DEFAULT_RESIN_LAYER_HEIGHT_MM
     assert resin.line_width == DEFAULT_RESIN_LINE_WIDTH_MM
+    assert resin.planning_line_width is None
+    assert DEFAULT_RESIN_PLANNING_LINE_WIDTH_MM == 2.2
     assert resin.infill_overlap == DEFAULT_RESIN_INFILL_OVERLAP_PERCENT
     assert fiber.layer_height == DEFAULT_FIBER_LAYER_HEIGHT_MM
     assert fiber.line_width == DEFAULT_FIBER_LINE_WIDTH_MM
+
+
+def test_slice_config_keeps_existing_positional_argument_order():
+    config = SliceConfig(0.5, 2.0, "R")
+
+    assert config.layer_height == 0.5
+    assert config.line_width == 2.0
+    assert config.material == "R"
+    assert config.planning_line_width is None
 
 
 def test_slice_config_exposes_ui_tunable_path_parameters_in_meta():
@@ -2082,6 +2836,7 @@ def test_slice_config_exposes_ui_tunable_path_parameters_in_meta():
         SliceConfig(
             layer_height=5.0,
             line_width=1.0,
+            planning_line_width=1.1,
             infill_pattern="aligned_rectilinear",
             perimeter_count=3,
             smoothing_angle=120.0,
@@ -2090,11 +2845,240 @@ def test_slice_config_exposes_ui_tunable_path_parameters_in_meta():
     )
 
     slicing = job.meta["slicing"]
+    assert slicing["line_width"] == 1.0
+    assert slicing["planning_line_width"] == 1.1
+    assert slicing["planning_line_width_applied"] is True
+    assert slicing["planning_line_width_changes_extrusion"] is False
+    assert slicing["maximum_overlap_spacing"] == pytest.approx(0.99)
+    assert slicing["planning_spacing_safety_margin"] == pytest.approx(0.00016)
+    assert slicing["planning_path_spacing"] == pytest.approx(0.99016)
+    assert slicing["maximum_overlap_enforced"] is True
+    assert (
+        slicing["maximum_overlap_scope"]
+        == "infill_to_innermost_perimeter_nonlocal_runs_endcaps_and_closed_ring_footprints"
+    )
+    assert slicing["perimeter_spacing_uses_nominal_line_width"] is True
     assert slicing["perimeter_count"] == 3
     assert slicing["smoothing_angle"] == 120.0
     assert slicing["smoothing_radius_factor"] == 0.25
     assert slicing["slicing_kernel"] == "legacy"
     assert "forced_part_cap_layers" not in slicing
+
+
+@pytest.mark.parametrize("planning_width", [0.0, -1.0, math.nan, math.inf])
+def test_planning_line_width_must_be_finite_and_positive(planning_width: float):
+    with pytest.raises(ValueError, match="planning_line_width"):
+        SliceConfig(planning_line_width=planning_width)
+
+
+@pytest.mark.parametrize("pattern", ["grid", "triangles", "gyroid"])
+@pytest.mark.parametrize("density", [50.0, 100.0])
+def test_strict_measured_width_safely_layers_crossing_patterns(
+    pattern: str,
+    density: float,
+):
+    config = SliceConfig(
+        layer_height=1.0,
+        line_width=2.0,
+        planning_line_width=2.2,
+        infill_pattern=pattern,
+        infill_density=density,
+        infill_overlap=10.0,
+        smoothing_radius_factor=0.0,
+    )
+    expected_angles = {
+        "grid": 90.0,
+        "triangles": 60.0,
+        "gyroid": -45.0,
+    }
+
+    paths, roles = _build_resin_paths(
+        [_square_contour(30.0)],
+        config,
+        layer_index=1,
+    )
+    infill = _paths_with_role(paths, roles, "infill")
+    inner_walls = _paths_with_role(paths, roles, "inner_contour")
+    wall_linework = unary_union([LineString(path) for path in inner_walls])
+
+    assert slicer_module._strict_measured_pattern_angle(config, 1) == expected_angles[pattern]
+    assert infill
+    # Oblique 60-degree clipping can require two conservative endpoint splits
+    # at opposite boundaries; the long hatches still remain a small trail set.
+    assert len(infill) <= 7
+    if density < 100.0:
+        assert all(
+            slicer_module._open_path_length(path) >= 1.98 * 0.25
+            for path in infill
+        )
+    assert slicer_module._solid_fill_spacing_postcondition(
+        infill,
+        wall_linework,
+        minimum_spacing=1.98,
+        tolerance=config.tolerance,
+        bead_width=2.2,
+    )
+
+
+@pytest.mark.parametrize(
+    ("contour", "density", "angle"),
+    [
+        (
+            np.asarray(
+                [[0, 0], [40, 0], [40, 30], [0, 30], [0, 0]],
+                dtype=np.float32,
+            ),
+            100.0,
+            -45.0,
+        ),
+        (
+            np.asarray(
+                [[0, 0], [40, 0], [40, 30], [0, 30], [0, 0]],
+                dtype=np.float32,
+            ),
+            100.0,
+            135.0,
+        ),
+        (
+            np.asarray(
+                [[0, 0], [60, 0], [53, 40], [8, 40], [0, 0]],
+                dtype=np.float32,
+            ),
+            50.0,
+            -45.0,
+        ),
+        (
+            np.asarray(
+                [[0, 0], [60, 0], [53, 40], [8, 40], [0, 0]],
+                dtype=np.float32,
+            ),
+            100.0,
+            -45.0,
+        ),
+    ],
+    ids=("rectangle-minus-45", "rectangle-135", "sparse-trapezoid", "solid-trapezoid"),
+)
+def test_strict_measured_oblique_non_square_infill_drops_only_unsafe_connectors(
+    contour: np.ndarray,
+    density: float,
+    angle: float,
+):
+    config = SliceConfig(
+        line_width=2.0,
+        planning_line_width=2.2,
+        infill_pattern="zigzag",
+        infill_density=density,
+        infill_overlap=10.0,
+        smoothing_angle=150.0,
+        smoothing_radius_factor=0.35,
+        tolerance=0.0005,
+    )
+
+    paths, roles = _build_resin_paths(
+        [contour],
+        config,
+        layer_index=1,
+        forced_zigzag_angle=angle,
+    )
+    infill = _paths_with_role(paths, roles, "infill")
+    wall_linework = unary_union(
+        [LineString(path) for path in _paths_with_role(paths, roles, "inner_contour")]
+    )
+
+    assert infill
+    assert all(LineString(path).is_simple for path in infill)
+    assert min(
+        (
+            _minimum_nondegenerate_vertex_angle(path, minimum_segment_length=0.01)
+            for path in infill
+        ),
+        default=180.0,
+    ) >= config.smoothing_angle - 1e-3
+    assert slicer_module._solid_fill_spacing_postcondition(
+        infill,
+        wall_linework,
+        minimum_spacing=1.98,
+        tolerance=config.tolerance,
+        bead_width=2.2,
+    )
+
+
+@pytest.mark.parametrize(
+    ("pattern", "schedule"),
+    [
+        ("grid", [0.0, 90.0]),
+        ("triangles", [0.0, 60.0, 120.0]),
+        ("gyroid", [45.0, -45.0]),
+    ],
+)
+def test_strict_pattern_fallback_is_explicit_in_export_metadata(
+    pattern: str,
+    schedule: list[float],
+):
+    job = slice_mesh_to_job(
+        Mesh(_cube_triangles(size=10.0)),
+        SliceConfig(
+            layer_height=2.5,
+            line_width=2.0,
+            planning_line_width=2.2,
+            infill_pattern=pattern,
+            infill_density=100.0,
+        ),
+    )
+
+    slicing = job.meta["slicing"]
+    execution = slicing["infill_pattern_execution"]
+    assert slicing["infill_pattern"] == pattern
+    assert slicing["effective_infill_pattern"] == "zigzag"
+    assert execution == {
+        "applied": True,
+        "requested_pattern": pattern,
+        "effective_pattern": "zigzag",
+        "strategy": "single_axis_per_layer",
+        "angle_schedule_degrees": schedule,
+        "same_layer_crossings_disabled": True,
+        "reason": "measured_width_maximum_overlap_contract",
+    }
+
+
+@pytest.mark.parametrize("pattern", ["grid", "triangles", "gyroid"])
+def test_crossing_patterns_keep_legacy_compatibility_without_strict_width(pattern: str):
+    config = SliceConfig(
+        planning_line_width=None,
+        infill_pattern=pattern,
+        infill_density=100.0,
+    )
+
+    assert config.infill_pattern == pattern
+
+
+def test_pyslm_backend_never_receives_prusa_planning_width(monkeypatch):
+    import kuka_slicer.pyslm_backend as pyslm_backend
+
+    received: list[SliceConfig] = []
+
+    def fake_backend(mesh: Mesh, config: SliceConfig) -> ExternalSourceJob:
+        received.append(config)
+        return ExternalSourceJob(material_paths=[], meta={"slicing": {}})
+
+    monkeypatch.setattr(pyslm_backend, "slice_mesh_to_job_with_pyslm", fake_backend)
+    job = slice_mesh_to_job(
+        Mesh(_cube_triangles(size=10.0)),
+        SliceConfig(
+            slicing_kernel="pyslm",
+            planning_line_width=2.2,
+            infill_pattern="none",
+        ),
+    )
+
+    assert received[0].planning_line_width is None
+    slicing = job.meta["slicing"]
+    assert slicing["planning_line_width"] == 2.0
+    assert slicing["planning_line_width_applied"] is False
+    assert slicing["planning_spacing_safety_margin"] == 0.0
+    assert slicing["maximum_overlap_enforced"] is False
+    assert slicing["maximum_overlap_scope"] is None
+    assert slicing["perimeter_spacing_uses_nominal_line_width"] is False
 
 
 def test_slice_config_defaults_to_legacy_kernel():
@@ -2270,6 +3254,12 @@ def test_ui_exposes_slicing_kernel_input():
         "轮廓优先扫描",
         "修复切层多边形",
         "保持拓扑结构",
+        "名义树脂线宽 mm",
+        "实测压平线宽 mm",
+        "不会改变挤出倍率",
+        "严格模式按层 0°/90°",
+        "严格模式按层 0°/60°/120°",
+        "严格模式按层 45°/-45°",
         "树脂填充路径",
         "各向同性填充",
         "三角形填充路径优化",
@@ -2313,8 +3303,10 @@ def test_ui_exposes_slicing_kernel_input():
         "zMax",
         "tolerance",
         "lineWidth",
+        "planningLineWidth",
         "perimeterCount",
         "infillPattern",
+        "infillSafetyNote",
         "infillDensity",
         "infillOverlap",
         "trianglePathOptimization",
@@ -2361,12 +3353,23 @@ def test_ui_exposes_slicing_kernel_input():
         "printSizeLabel",
         "previewSurface",
         "previewCanvas",
+        "executedInfillPattern",
     ):
         assert f'id="{control_id}"' in html
+
+    assert "formData.append('planning_line_width'" in html
+    assert "if (slicingKernelInput.value === 'legacy')" in html
+    assert "planningLineWidthInput.disabled = isPyslm" in html
+    assert "const strictLayeredFallbackPatterns" in html
+    assert "option.disabled = isPyslm && !pyslmSupportedPatterns.has(option.value)" in html
+    assert f'value="{DEFAULT_RESIN_PLANNING_LINE_WIDTH_MM}"' in html
     assert 'value="legacy" selected' in html
     assert 'value="pyslm"' in html
     assert 'id="trianglePathOptimization" type="checkbox" checked' in html
     assert 'value="isotropic"' in html
+    for pattern in ("grid", "triangles", "gyroid"):
+        assert f'value="{pattern}"' in html
+        assert f'value="{pattern}" disabled' not in html
     for hatcher in ("basic", "stripe", "island", "basic_island"):
         assert f'value="{hatcher}"' in html
     for removed_raft_control in (
@@ -2381,6 +3384,22 @@ def test_ui_exposes_slicing_kernel_input():
     assert "topCapAngle" not in html
     assert 'id="resinPathSlider"' not in html
     assert 'id="fiberPathSlider"' not in html
+
+
+def test_ui_result_summary_reports_backend_kernel_and_planning_width():
+    html = _index_html()
+
+    assert '<span>实际执行内核</span><strong id="executedKernel">-</strong>' in html
+    assert (
+        '<span>实际规划线宽（仅轨迹规划）</span>'
+        '<strong id="executedPlanningLineWidth">-</strong>'
+    ) in html
+    assert "executedKernelEl.textContent = result.slicing_kernel" in html
+    assert "executedPlanningLineWidth = Number(result.planning_line_width)" in html
+    assert "不适用（PySLM 后端自行控制）" in html
+    assert '<span>实际填充策略</span><strong id="executedInfillPattern">-</strong>' in html
+    assert "const patternExecution = result.infill_pattern_execution" in html
+    assert "安全分层单向之字形" in html
 
 
 def test_ui_preview_supports_filtered_ordered_progress_pan_zoom_and_rulers():

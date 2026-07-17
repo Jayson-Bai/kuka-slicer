@@ -16,6 +16,7 @@ from shapely.geometry import (
     Polygon,
 )
 from shapely.ops import linemerge, nearest_points, unary_union
+from shapely.strtree import STRtree
 
 from .external_npz import ExternalSourceJob, Material, MaterialPaths
 from .stl_io import Mesh
@@ -42,6 +43,7 @@ RaftInfillPattern = Literal["concentric", "zigzag"]
 
 DEFAULT_RESIN_LAYER_HEIGHT_MM = 0.5
 DEFAULT_RESIN_LINE_WIDTH_MM = 2.0
+DEFAULT_RESIN_PLANNING_LINE_WIDTH_MM = 2.2
 DEFAULT_RESIN_INFILL_DENSITY_PERCENT = 100.0
 DEFAULT_RESIN_INFILL_OVERLAP_PERCENT = 10.0
 DEFAULT_FIBER_LAYER_HEIGHT_MM = 0.1
@@ -61,6 +63,11 @@ ISOTROPIC_LAYER_HEIGHT_MM = 0.5
 ISOTROPIC_REPEAT_HEIGHT_MM = 2.0
 ISOTROPIC_CAP_HEIGHT_MM = 1.0
 ISOTROPIC_REPEAT_ANGLES_DEGREES = (45.0, 0.0, -45.0, 90.0)
+STRICT_MEASURED_PATTERN_ANGLE_SCHEDULES = {
+    "grid": (0.0, 90.0),
+    "triangles": (0.0, 60.0, 120.0),
+    "gyroid": (45.0, -45.0),
+}
 MINIMUM_RESIDUAL_CORRECTION_NOVEL_AREA_FRACTION = 0.4
 MIN_GEOMETRY_TOLERANCE_MM = 1e-5
 MAX_GEOMETRY_TOLERANCE_MM = 1e-2
@@ -218,6 +225,7 @@ class SliceConfig:
     smoothing_radius_factor: float = DEFAULT_RESIN_SMOOTHING_RADIUS_FACTOR
     triangle_path_optimization: bool = True
     zigzag_path_optimization: bool = True
+    planning_line_width: float | None = None
 
     def __post_init__(self) -> None:
         if self.material not in ("R", "F"):
@@ -236,8 +244,13 @@ class SliceConfig:
             )
         if self.layer_height <= 0:
             raise ValueError("layer_height must be positive")
-        if self.line_width <= 0:
+        if not math.isfinite(self.line_width) or self.line_width <= 0:
             raise ValueError("line_width must be positive")
+        if self.planning_line_width is not None and (
+            not math.isfinite(self.planning_line_width)
+            or self.planning_line_width <= 0
+        ):
+            raise ValueError("planning_line_width must be positive")
         if self.curve_period <= 0:
             raise ValueError("curve_period must be positive")
         if self.infill_pattern not in (
@@ -269,6 +282,48 @@ class SliceConfig:
             raise ValueError("smoothing_radius_factor must be non-negative")
 
 
+def _strict_measured_pattern_angle(
+    config: SliceConfig,
+    layer_index: int,
+) -> float | None:
+    """Return the safe single-axis angle for a crossing pattern in strict mode.
+
+    Grid, triangle and gyroid centerlines can cross or approach each other below
+    the requested pitch within one layer.  When a measured planning footprint is
+    active, retain the requested layer-to-layer directional intent but execute a
+    single zigzag direction per layer so the existing spacing contract remains
+    physically meaningful.
+    """
+
+    schedule = STRICT_MEASURED_PATTERN_ANGLE_SCHEDULES.get(config.infill_pattern)
+    if (
+        schedule is None
+        or config.material != "R"
+        or config.slicing_kernel != "legacy"
+        or config.planning_line_width is None
+        or config.infill_density <= 0
+    ):
+        return None
+    return float(schedule[layer_index % len(schedule)])
+
+
+def _strict_measured_pattern_execution(config: SliceConfig) -> dict[str, object] | None:
+    """Describe the explicit safety fallback stored in exported metadata."""
+
+    schedule = STRICT_MEASURED_PATTERN_ANGLE_SCHEDULES.get(config.infill_pattern)
+    if _strict_measured_pattern_angle(config, 0) is None or schedule is None:
+        return None
+    return {
+        "applied": True,
+        "requested_pattern": config.infill_pattern,
+        "effective_pattern": "zigzag",
+        "strategy": "single_axis_per_layer",
+        "angle_schedule_degrees": list(schedule),
+        "same_layer_crossings_disabled": True,
+        "reason": "measured_width_maximum_overlap_contract",
+    }
+
+
 @dataclass(frozen=True)
 class RaftLayerConfig:
     outward_offset: float = 5.0
@@ -293,8 +348,93 @@ def slice_mesh_to_job(mesh: Mesh, config: SliceConfig) -> ExternalSourceJob:
     if config.slicing_kernel == "pyslm":
         from .pyslm_backend import slice_mesh_to_job_with_pyslm
 
-        return slice_mesh_to_job_with_pyslm(mesh, config)
-    return _slice_mesh_to_job_legacy(mesh, config)
+        # PySLM owns its hatch-distance semantics.  Never let the Prusa-only
+        # measured footprint partially alter PySLM's infill inset while its
+        # hatch spacing still uses the nominal width.
+        backend_config = replace(config, planning_line_width=None)
+        job = slice_mesh_to_job_with_pyslm(mesh, backend_config)
+        _record_line_width_contract(job, backend_config, planning_applied=False)
+        return job
+    job = _slice_mesh_to_job_legacy(mesh, config)
+    _record_line_width_contract(job, config, planning_applied=True)
+    return job
+
+
+def _resin_planning_line_width(config: SliceConfig) -> float:
+    """Return the measured bead footprint used only for resin XY planning."""
+
+    if config.material != "R" or config.planning_line_width is None:
+        return float(config.line_width)
+    return float(config.planning_line_width)
+
+
+def _resin_maximum_overlap_spacing(config: SliceConfig) -> float:
+    """Return the centreline pitch that exactly matches the configured overlap."""
+
+    return _resin_path_spacing(
+        _resin_planning_line_width(config),
+        config.infill_overlap,
+    )
+
+
+def _resin_planning_spacing_safety_margin(config: SliceConfig) -> float:
+    """Keep numerical geometry operations on the conservative side of the pitch.
+
+    Several GEOS containment checks intentionally expand a safe corridor by up to
+    ten geometry tolerances.  A strict measured-width plan starts slightly farther
+    away so those numerical allowances can never turn into extra physical overlap.
+    The margin affects XY centreline placement only; it is not an extrusion value.
+    """
+
+    if config.material != "R" or config.planning_line_width is None:
+        return 0.0
+    planning_width = _resin_planning_line_width(config)
+    return max(config.tolerance * 16.0, planning_width * 1e-5, 1e-7)
+
+
+def _resin_planning_path_spacing(config: SliceConfig) -> float:
+    """Return the conservative pitch used to generate measured-width infill."""
+
+    return _resin_maximum_overlap_spacing(
+        config
+    ) + _resin_planning_spacing_safety_margin(config)
+
+
+def _record_line_width_contract(
+    job: ExternalSourceJob,
+    config: SliceConfig,
+    *,
+    planning_applied: bool,
+) -> None:
+    """Keep nominal process width separate from the path-planning footprint."""
+
+    slicing = job.meta.get("slicing")
+    if not isinstance(slicing, dict):
+        return
+    slicing["line_width"] = float(config.line_width)
+    slicing["planning_line_width"] = _resin_planning_line_width(config)
+    slicing["planning_line_width_applied"] = bool(
+        planning_applied and config.material == "R"
+    )
+    slicing["planning_line_width_changes_extrusion"] = False
+    slicing["maximum_overlap_spacing"] = _resin_maximum_overlap_spacing(config)
+    slicing["planning_spacing_safety_margin"] = (
+        _resin_planning_spacing_safety_margin(config)
+    )
+    slicing["planning_path_spacing"] = _resin_planning_path_spacing(config)
+    slicing["maximum_overlap_enforced"] = bool(
+        planning_applied
+        and config.material == "R"
+        and config.planning_line_width is not None
+    )
+    slicing["maximum_overlap_scope"] = (
+        "infill_to_innermost_perimeter_nonlocal_runs_endcaps_and_closed_ring_footprints"
+        if slicing["maximum_overlap_enforced"]
+        else None
+    )
+    slicing["perimeter_spacing_uses_nominal_line_width"] = bool(
+        config.slicing_kernel == "legacy"
+    )
 
 
 def _slice_mesh_to_job_legacy(mesh: Mesh, config: SliceConfig) -> ExternalSourceJob:
@@ -327,6 +467,13 @@ def _slice_mesh_to_job_legacy(mesh: Mesh, config: SliceConfig) -> ExternalSource
             layer_config = replace(config, infill_pattern="zigzag", infill_density=100.0)
         elif config.infill_pattern == "isotropic":
             forced_cap_angle = _isotropic_part_layer_angle(layer_index, len(z_values))
+            layer_config = replace(config, infill_pattern="zigzag")
+        elif (
+            strict_pattern_angle := _strict_measured_pattern_angle(config, layer_index)
+        ) is not None:
+            # Preserve the selected pattern's layer-to-layer directions while
+            # removing unsafe same-layer crossings in measured-width mode.
+            forced_cap_angle = strict_pattern_angle
             layer_config = replace(config, infill_pattern="zigzag")
         else:
             layer_config = config
@@ -386,6 +533,12 @@ def _slice_mesh_to_job_legacy(mesh: Mesh, config: SliceConfig) -> ExternalSource
             "curve_amplitude": config.curve_amplitude,
             "curve_period": config.curve_period,
             "infill_pattern": config.infill_pattern,
+            "effective_infill_pattern": (
+                "zigzag"
+                if _strict_measured_pattern_execution(config) is not None
+                else config.infill_pattern
+            ),
+            "infill_pattern_execution": _strict_measured_pattern_execution(config),
             "infill_density": config.infill_density,
             "infill_overlap": config.infill_overlap,
             "triangle_path_optimization": config.triangle_path_optimization,
@@ -528,9 +681,56 @@ def _constant_section_paths_for_two_plane_extrusion(
     thickness = float(z_levels[-1] - z_levels[0])
     if thickness <= tolerance:
         return None
-    segments = _intersect_mesh_at_z(mesh.triangles, float(z_values[0]), tolerance)
-    paths = _stitch_segments(segments, tolerance)
-    return paths or None
+
+    def section_paths_and_geometry(z_value: float):
+        segments = _intersect_mesh_at_z(mesh.triangles, z_value, tolerance)
+        section_paths = _stitch_segments(segments, tolerance)
+        section_geometry = _solid_geometry_from_contours(
+            [path for path in section_paths if path.shape[0] >= 3]
+        )
+        return section_paths, section_geometry
+
+    reference_paths, reference_geometry = section_paths_and_geometry(
+        float(z_values[0])
+    )
+    if not reference_paths or reference_geometry.is_empty:
+        return None
+
+    # Two vertex planes do not by themselves prove a constant extrusion: a
+    # frustum and an arbitrary two-profile loft have the same Z-level count.
+    # Intersections are cheap compared with bead-aware path planning, so verify
+    # every actual layer before enabling the direction cache.  This retains the
+    # exact-model speed-up without ever copying a first-layer toolpath into a
+    # geometrically different layer.
+    reference_boundary = reference_geometry.boundary
+    reference_signature = sorted(
+        (len(polygon.interiors) for polygon in _iter_polygons(reference_geometry))
+    )
+    for raw_z_value in z_values[1:]:
+        _, section_geometry = section_paths_and_geometry(float(raw_z_value))
+        if section_geometry.is_empty:
+            return None
+        section_signature = sorted(
+            (len(polygon.interiors) for polygon in _iter_polygons(section_geometry))
+        )
+        if section_signature != reference_signature:
+            return None
+        boundary_distance = reference_boundary.hausdorff_distance(
+            section_geometry.boundary
+        )
+        if boundary_distance > tolerance:
+            return None
+        area_tolerance = max(
+            tolerance * max(
+                float(reference_boundary.length),
+                float(section_geometry.boundary.length),
+                1.0,
+            ),
+            tolerance * tolerance * 10.0,
+        )
+        if reference_geometry.symmetric_difference(section_geometry).area > area_tolerance:
+            return None
+    return reference_paths
 
 
 def add_raft_to_job(
@@ -744,11 +944,16 @@ def _raft_paths_for_layer(
     if geometry.is_empty:
         return [], []
 
-    path_spacing = _resin_path_spacing(config.line_width, config.infill_overlap)
+    perimeter_path_spacing = _resin_path_spacing(
+        config.line_width,
+        config.infill_overlap,
+    )
+    planning_width = _resin_planning_line_width(config)
+    infill_path_spacing = _resin_planning_path_spacing(config)
     perimeters, roles = _perimeter_paths_from_geometry(
         geometry,
         config.line_width,
-        path_spacing,
+        perimeter_path_spacing,
         config.perimeter_count,
         config.tolerance,
     )
@@ -766,11 +971,13 @@ def _raft_paths_for_layer(
         raft_layer.infill_density,
         angle_degrees=angle,
     )
+    last_perimeter_linework = None
+    measured_width_validated = False
     if raft_layer.infill_density >= 100.0 - 1e-9:
         last_perimeter_linework = _last_perimeter_linework(
             geometry,
             config.line_width,
-            path_spacing,
+            perimeter_path_spacing,
             config.perimeter_count,
             config.tolerance,
         )
@@ -779,21 +986,23 @@ def _raft_paths_for_layer(
             infill_geometry,
             perimeters,
             last_perimeter_linework,
-            config.line_width,
-            path_spacing,
+            planning_width,
+            infill_path_spacing,
             config.tolerance,
+            enforce_maximum_overlap=config.planning_line_width is not None,
         )
-        filled = _reroute_residual_solid_bead_gaps(
-            geometry,
-            infill_geometry,
-            perimeters,
-            filled,
-            last_perimeter_linework,
-            config.line_width,
-            path_spacing,
-            config.tolerance,
-            centerline_regions=centerline_regions,
-        )
+        if config.planning_line_width is None:
+            filled = _reroute_residual_solid_bead_gaps(
+                geometry,
+                infill_geometry,
+                perimeters,
+                filled,
+                last_perimeter_linework,
+                planning_width,
+                infill_path_spacing,
+                config.tolerance,
+                centerline_regions=centerline_regions,
+            )
         filled = _finish_solid_fill_paths(
             geometry,
             infill_geometry,
@@ -802,6 +1011,25 @@ def _raft_paths_for_layer(
             last_perimeter_linework,
             config,
             centerline_regions=centerline_regions,
+        )
+        measured_width_validated = config.planning_line_width is not None
+    if (
+        config.planning_line_width is not None
+        and filled
+        and not measured_width_validated
+    ):
+        if last_perimeter_linework is None:
+            last_perimeter_linework = _last_perimeter_linework(
+                geometry,
+                config.line_width,
+                perimeter_path_spacing,
+                config.perimeter_count,
+                config.tolerance,
+            )
+        filled = _require_measured_width_infill(
+            filled,
+            last_perimeter_linework,
+            config,
         )
     return perimeters + filled, roles + ["infill"] * len(filled)
 
@@ -969,20 +1197,20 @@ def _raft_lattice_infill_paths(
     if geometry.is_empty:
         return []
 
-    spacing = _line_infill_spacing(
-        config.line_width,
-        infill_density,
-        config.infill_overlap,
-    )
+    planning_width = _resin_planning_line_width(config)
+    path_spacing = _resin_planning_path_spacing(config)
+    spacing = path_spacing / (infill_density / 100.0)
     filled = _gyroid_infill_geometry(geometry, spacing, config.tolerance)
     return _connect_boundary_infill_paths(
         filled,
         geometry,
         spacing,
-        _resin_path_spacing(config.line_width, config.infill_overlap),
+        path_spacing,
         config.tolerance,
         adjacent_scanlines_only=False,
     )
+
+
 def _raft_zigzag_infill_paths(
     geometry,
     config: SliceConfig,
@@ -992,21 +1220,29 @@ def _raft_zigzag_infill_paths(
     if geometry.is_empty:
         return []
 
-    spacing = _line_infill_spacing(
-        config.line_width,
-        infill_density,
-        config.infill_overlap,
-    )
+    planning_width = _resin_planning_line_width(config)
+    path_spacing = _resin_planning_path_spacing(config)
+    spacing = path_spacing / (infill_density / 100.0)
     if infill_density >= 100.0 - 1e-9:
         filled = _solid_zigzag_infill_paths(
             geometry,
             spacing,
-            config.line_width,
+            planning_width,
             angle_degrees,
-            _resin_path_spacing(config.line_width, config.infill_overlap),
+            path_spacing,
             config.tolerance,
             smoothing_angle_degrees=config.smoothing_angle,
-            smoothing_corner_cut=_solid_fill_final_smoothing_cut_distance(config),
+            smoothing_corner_cut=(
+                _solid_fill_initial_smoothing_cut_distance(config)
+                if config.planning_line_width is not None
+                else _solid_fill_final_smoothing_cut_distance(config)
+            ),
+            enforce_maximum_overlap=config.planning_line_width is not None,
+            maximum_overlap_spacing=(
+                _resin_maximum_overlap_spacing(config)
+                if config.planning_line_width is not None
+                else None
+            ),
         )
         filled = _smooth_resin_infill_paths(
             filled,
@@ -1023,12 +1259,40 @@ def _raft_zigzag_infill_paths(
             angle_degrees,
             config.tolerance,
         )
+        if config.planning_line_width is not None:
+            # Clipping an oblique sparse hatch at a corner can leave a tiny
+            # centreline stub.  Printing that sub-quarter-pitch fragment is a
+            # resin blob, and connecting it creates a tight hairpin.  Omit it
+            # before continuity planning; the missing footprint is smaller
+            # than the configured bead-overlap resolution.
+            minimum_fragment_length = path_spacing * 0.25
+            filled = [
+                path
+                for path in filled
+                if _open_path_length(path) >= minimum_fragment_length
+            ]
         filled = _connect_zigzag_infill_paths(
             filled,
             geometry,
             spacing,
-            _resin_path_spacing(config.line_width, config.infill_overlap),
+            path_spacing,
             config.tolerance,
+            solid_bead_width=(
+                planning_width
+                if config.planning_line_width is not None
+                else None
+            ),
+            solid_smoothing_angle_degrees=config.smoothing_angle,
+            solid_smoothing_corner_cut=(
+                _solid_fill_final_smoothing_cut_distance(config)
+                if config.planning_line_width is not None
+                else None
+            ),
+            maximum_connector_overlap_spacing=(
+                _resin_maximum_overlap_spacing(config)
+                if config.planning_line_width is not None
+                else None
+            ),
         )
     return _filter_paths_covered_by_geometry(filled, geometry, config.tolerance)
 
@@ -1243,15 +1507,28 @@ def _build_resin_paths(
     layer_index: int = 0,
     forced_zigzag_angle: float | None = None,
 ) -> tuple[list[np.ndarray], list[str]]:
+    strict_pattern_angle = _strict_measured_pattern_angle(config, layer_index)
+    if strict_pattern_angle is not None:
+        # Direct callers do not pass through the layer scheduler above.  Apply
+        # the same explicit single-axis safety fallback here as a backstop.
+        config = replace(config, infill_pattern="zigzag")
+        if forced_zigzag_angle is None:
+            forced_zigzag_angle = strict_pattern_angle
     contours = [path for path in paths if path.shape[0] >= 3]
     solid_geometry = _solid_geometry_from_contours(contours)
     if solid_geometry.is_empty:
         return paths, ["outer_contour" if path.shape[0] > 2 else "infill" for path in paths]
 
+    perimeter_path_spacing = _resin_path_spacing(
+        config.line_width,
+        config.infill_overlap,
+    )
+    planning_width = _resin_planning_line_width(config)
+    infill_path_spacing = _resin_planning_path_spacing(config)
     perimeters, roles = _perimeter_paths_from_geometry(
         solid_geometry,
         config.line_width,
-        _resin_path_spacing(config.line_width, config.infill_overlap),
+        perimeter_path_spacing,
         config.perimeter_count,
         config.tolerance,
     )
@@ -1266,6 +1543,8 @@ def _build_resin_paths(
         config.infill_density,
         forced_zigzag_angle=forced_zigzag_angle,
     )
+    last_perimeter_linework = None
+    measured_width_validated = False
     if (
         config.infill_density >= 100.0 - 1e-9
         and config.infill_pattern
@@ -1274,7 +1553,7 @@ def _build_resin_paths(
         last_perimeter_linework = _last_perimeter_linework(
             solid_geometry,
             config.line_width,
-            _resin_path_spacing(config.line_width, config.infill_overlap),
+            perimeter_path_spacing,
             config.perimeter_count,
             config.tolerance,
         )
@@ -1283,21 +1562,23 @@ def _build_resin_paths(
             infill_geometry,
             perimeters,
             last_perimeter_linework,
-            config.line_width,
-            _resin_path_spacing(config.line_width, config.infill_overlap),
+            planning_width,
+            infill_path_spacing,
             config.tolerance,
+            enforce_maximum_overlap=config.planning_line_width is not None,
         )
-        filled = _reroute_residual_solid_bead_gaps(
-            solid_geometry,
-            infill_geometry,
-            perimeters,
-            filled,
-            last_perimeter_linework,
-            config.line_width,
-            _resin_path_spacing(config.line_width, config.infill_overlap),
-            config.tolerance,
-            centerline_regions=centerline_regions,
-        )
+        if config.planning_line_width is None:
+            filled = _reroute_residual_solid_bead_gaps(
+                solid_geometry,
+                infill_geometry,
+                perimeters,
+                filled,
+                last_perimeter_linework,
+                planning_width,
+                infill_path_spacing,
+                config.tolerance,
+                centerline_regions=centerline_regions,
+            )
         filled = _finish_solid_fill_paths(
             solid_geometry,
             infill_geometry,
@@ -1307,6 +1588,7 @@ def _build_resin_paths(
             config,
             centerline_regions=centerline_regions,
         )
+        measured_width_validated = config.planning_line_width is not None
     if config.infill_pattern == "triangles" and config.triangle_path_optimization:
         triangle_merge_tolerance = _legacy_path_merge_tolerance(
             config.line_width,
@@ -1321,6 +1603,24 @@ def _build_resin_paths(
             config.smoothing_angle,
             config.tolerance,
             merge_tolerance=triangle_merge_tolerance,
+        )
+    if (
+        config.planning_line_width is not None
+        and filled
+        and not measured_width_validated
+    ):
+        if last_perimeter_linework is None:
+            last_perimeter_linework = _last_perimeter_linework(
+                solid_geometry,
+                config.line_width,
+                perimeter_path_spacing,
+                config.perimeter_count,
+                config.tolerance,
+            )
+        filled = _require_measured_width_infill(
+            filled,
+            last_perimeter_linework,
+            config,
         )
     return perimeters + filled, roles + ["infill"] * len(filled)
 
@@ -1338,23 +1638,12 @@ def _infill_paths_for_geometry(
         return []
 
     filled: list[np.ndarray] = []
-    path_spacing = _resin_path_spacing(config.line_width, config.infill_overlap)
-    line_spacing = _line_infill_spacing(
-        config.line_width,
-        infill_density,
-        config.infill_overlap,
-    )
-    grid_spacing = _grid_infill_spacing(
-        config.line_width,
-        infill_density,
-        config.infill_overlap,
-    )
-    triangle_spacing = _multi_axis_infill_spacing(
-        config.line_width,
-        infill_density,
-        3,
-        config.infill_overlap,
-    )
+    planning_width = _resin_planning_line_width(config)
+    path_spacing = _resin_planning_path_spacing(config)
+    density_fraction = infill_density / 100.0
+    line_spacing = path_spacing / density_fraction
+    grid_spacing = path_spacing * 2.0 / density_fraction
+    triangle_spacing = path_spacing * 3.0 / density_fraction
     single_axis_patterns = ("rectilinear", "aligned_rectilinear", "line", "zigzag")
     solid_single_axis = (
         infill_density >= 100.0 - 1e-9 and config.infill_pattern in single_axis_patterns
@@ -1365,14 +1654,37 @@ def _infill_paths_for_geometry(
             return _solid_zigzag_infill_paths(
                 geometry,
                 line_spacing,
-                config.line_width,
+                planning_width,
                 angle,
                 path_spacing,
                 config.tolerance,
                 smoothing_angle_degrees=config.smoothing_angle,
-                smoothing_corner_cut=_solid_fill_final_smoothing_cut_distance(config),
+                smoothing_corner_cut=(
+                    _solid_fill_initial_smoothing_cut_distance(config)
+                    if config.planning_line_width is not None
+                    else _solid_fill_final_smoothing_cut_distance(config)
+                ),
+                enforce_maximum_overlap=config.planning_line_width is not None,
+                maximum_overlap_spacing=(
+                    _resin_maximum_overlap_spacing(config)
+                    if config.planning_line_width is not None
+                    else None
+                ),
             )
-        return _zigzag_infill_geometry(geometry, line_spacing, angle, config.tolerance)
+        single_axis = _zigzag_infill_geometry(
+            geometry,
+            line_spacing,
+            angle,
+            config.tolerance,
+        )
+        if config.planning_line_width is not None:
+            minimum_fragment_length = path_spacing * 0.25
+            single_axis = [
+                path
+                for path in single_axis
+                if _open_path_length(path) >= minimum_fragment_length
+            ]
+        return single_axis
 
     if config.infill_pattern == "rectilinear":
         angle = 45.0 if layer_index % 2 == 0 else -45.0
@@ -1385,9 +1697,14 @@ def _infill_paths_for_geometry(
         filled.extend(
             _concentric_infill_geometry(
                 geometry,
-                config.line_width,
+                planning_width,
                 line_spacing,
                 config.tolerance,
+                minimum_spacing=(
+                    _resin_maximum_overlap_spacing(config)
+                    if config.planning_line_width is not None
+                    else None
+                ),
             )
         )
     elif config.infill_pattern == "zigzag":
@@ -1410,8 +1727,8 @@ def _infill_paths_for_geometry(
                 geometry,
                 triangle_spacing,
                 max(
-                    config.line_width,
-                    min(config.line_width * 1.6, triangle_spacing * 0.38),
+                    planning_width,
+                    min(planning_width * 1.6, triangle_spacing * 0.38),
                 ),
                 config.tolerance,
             )
@@ -1426,6 +1743,22 @@ def _infill_paths_for_geometry(
             line_spacing,
             path_spacing,
             config.tolerance,
+            solid_bead_width=(
+                planning_width
+                if config.planning_line_width is not None
+                else None
+            ),
+            solid_smoothing_angle_degrees=config.smoothing_angle,
+            solid_smoothing_corner_cut=(
+                _solid_fill_final_smoothing_cut_distance(config)
+                if config.planning_line_width is not None
+                else None
+            ),
+            maximum_connector_overlap_spacing=(
+                _resin_maximum_overlap_spacing(config)
+                if config.planning_line_width is not None
+                else None
+            ),
         )
     elif config.infill_pattern in ("grid", "triangles", "gyroid"):
         pattern_spacing = {
@@ -1441,7 +1774,10 @@ def _infill_paths_for_geometry(
             config.tolerance,
             adjacent_scanlines_only=False,
         )
-    elif config.infill_pattern == "concentric":
+    elif (
+        config.infill_pattern == "concentric"
+        and config.planning_line_width is None
+    ):
         filled = _connect_concentric_infill_paths(
             filled,
             geometry,
@@ -1525,6 +1861,8 @@ def _solid_residual_centerline_regions(
     line_width: float,
     path_spacing: float,
     tolerance: float,
+    *,
+    enforce_maximum_overlap: bool = False,
 ):
     """Build the shared physical centerline limits for gap repair and smoothing."""
 
@@ -1537,7 +1875,17 @@ def _solid_residual_centerline_regions(
         -(bead_radius - max(tolerance * 2.0, 1e-7)),
         join_style="round",
     )
-    minimum_wall_clearance = max(tolerance, path_spacing - spacing_adjustment)
+    # Never buy residual coverage by moving an infill centreline closer to the
+    # last perimeter than the requested measured-footprint pitch.  A smaller
+    # clearance would turn (for example) a 10% UI overlap into 15% locally.
+    minimum_wall_clearance = max(
+        tolerance,
+        (
+            path_spacing
+            if enforce_maximum_overlap
+            else path_spacing - spacing_adjustment
+        ),
+    )
     actual_perimeter_lines = [
         LineString(path[:, :2])
         for path in perimeter_paths
@@ -2056,6 +2404,1271 @@ def _split_path_at_unresolved_effective_corners(
             return pieces
 
 
+def _solid_fill_spacing_postcondition(
+    paths: list[np.ndarray],
+    wall_linework,
+    minimum_spacing: float,
+    tolerance: float,
+    *,
+    bead_width: float | None = None,
+    allow_boundary_bridges: bool = False,
+) -> bool:
+    """Verify the physical pitch after all continuity and smoothing passes.
+
+    Consecutive polyline segments necessarily meet at a vertex, and a rounded
+    U-turn necessarily remains close to its incident hatch.  Those are one
+    continuous deposited bead, not two neighbouring passes.  The material-pile
+    failure mode is instead a pair of non-local, material-length runs (including
+    returns in the same one-stroke path).  Collinear micro-segments are first
+    coalesced so numerical sampling cannot hide an under-spaced long hatch.
+    """
+
+    if minimum_spacing <= 0:
+        raise ValueError("minimum_spacing must be positive")
+    if bead_width is not None and bead_width <= 0:
+        raise ValueError("bead_width must be positive")
+    comparison_epsilon = max(1e-6, minimum_spacing * 1e-7)
+
+    # The sharp-corner finisher is allowed to split one deposited trail into
+    # several arrays.  Validate the physical centreline, not that incidental
+    # array partition: otherwise a tight return can evade the same-path checks
+    # simply by putting every sampled segment in a separate path.  Merge only
+    # exact, non-branching endpoint chains.  Branched, overlapping, or
+    # self-intersecting components remain separate and therefore receive no
+    # continuity exemption below.
+    path_arrays = [np.asarray(path) for path in paths]
+    endpoint_merge_tolerance = max(tolerance * 2.0, comparison_epsilon)
+    merge_parents = list(range(len(path_arrays)))
+
+    def merge_root(index: int) -> int:
+        while merge_parents[index] != index:
+            merge_parents[index] = merge_parents[merge_parents[index]]
+            index = merge_parents[index]
+        return index
+
+    def union_merge_components(first: int, second: int) -> None:
+        first_root = merge_root(first)
+        second_root = merge_root(second)
+        if first_root != second_root:
+            merge_parents[second_root] = first_root
+
+    merge_endpoints = [
+        (
+            np.asarray(path[0, :2], dtype=np.float64),
+            np.asarray(path[-1, :2], dtype=np.float64),
+        )
+        if path.ndim == 2 and path.shape[0] >= 2
+        else None
+        for path in path_arrays
+    ]
+    for first_index, first_endpoints in enumerate(merge_endpoints):
+        if first_endpoints is None:
+            continue
+        for second_index in range(first_index + 1, len(merge_endpoints)):
+            second_endpoints = merge_endpoints[second_index]
+            if second_endpoints is None:
+                continue
+            if any(
+                float(np.linalg.norm(first_endpoint - second_endpoint))
+                <= endpoint_merge_tolerance
+                for first_endpoint in first_endpoints
+                for second_endpoint in second_endpoints
+            ):
+                union_merge_components(first_index, second_index)
+
+    merge_members: dict[int, list[int]] = defaultdict(list)
+    for path_index, endpoints in enumerate(merge_endpoints):
+        if endpoints is not None:
+            merge_members[merge_root(path_index)].append(path_index)
+    merged_replacements: dict[int, np.ndarray] = {}
+    merged_consumed: set[int] = set()
+    for members in merge_members.values():
+        if len(members) < 2:
+            continue
+        member_lines = [
+            LineString(np.asarray(path_arrays[index][:, :2], dtype=np.float64))
+            for index in members
+        ]
+        merged = linemerge(MultiLineString(member_lines))
+        total_length = sum(float(line.length) for line in member_lines)
+        if (
+            isinstance(merged, LineString)
+            and merged.is_simple
+            and abs(float(merged.length) - total_length)
+            <= endpoint_merge_tolerance * max(1, len(member_lines))
+        ):
+            representative = min(members)
+            merged_replacements[representative] = np.asarray(
+                merged.coords,
+                dtype=np.float64,
+            )
+            merged_consumed.update(index for index in members if index != representative)
+    paths = [
+        merged_replacements.get(index, path)
+        for index, path in enumerate(path_arrays)
+        if index not in merged_consumed
+    ]
+
+    path_lines = [
+        LineString(np.asarray(path[:, :2], dtype=np.float64))
+        for path in paths
+        if path.shape[0] >= 2
+    ]
+    if not path_lines:
+        return True
+    if any(not line.is_simple for line in path_lines):
+        return False
+
+    # A tiny closed ring can be made entirely of short arc samples and thus
+    # contain no material-length directional run below.  Its opposite sides
+    # still receive the same 2.2 mm bead and may completely stack.  Eroding the
+    # enclosed region by half the required pitch is the closed-curve analogue
+    # of the run-spacing check: an empty or split core proves that non-local
+    # sides of the ring approach more closely than the allowed centre distance.
+    closed_curve_radius = max(
+        0.0,
+        (minimum_spacing if bead_width is None else bead_width) * 0.5
+        - comparison_epsilon,
+    )
+    if closed_curve_radius > 0:
+        for path in paths:
+            points = np.asarray(path[:, :2], dtype=np.float64)
+            if points.shape[0] < 4 or not _close(
+                points[0], points[-1], tolerance
+            ):
+                continue
+            enclosed = Polygon(points)
+            if enclosed.is_empty or not enclosed.is_valid:
+                return False
+            closed_core = enclosed.buffer(
+                -closed_curve_radius,
+                join_style="round",
+            )
+            if closed_core.is_empty or not isinstance(closed_core, Polygon):
+                return False
+
+    # Corner fallback may split one logical trail into several paths, including
+    # a very short point-to-point bridge.  Reconstruct those exact endpoint
+    # components using only geometry-scale tolerance; nearby but independent
+    # paths must never gain the same exemption.
+    component_parents = list(range(len(paths)))
+
+    def component_root(index: int) -> int:
+        while component_parents[index] != index:
+            component_parents[index] = component_parents[component_parents[index]]
+            index = component_parents[index]
+        return index
+
+    def union_components(first: int, second: int) -> None:
+        first_root = component_root(first)
+        second_root = component_root(second)
+        if first_root != second_root:
+            component_parents[second_root] = first_root
+
+    endpoint_tolerance = max(tolerance * 2.0, comparison_epsilon)
+    direct_endpoint_links: dict[
+        tuple[int, int], list[tuple[int, int]]
+    ] = defaultdict(list)
+    path_endpoints = [
+        (
+            np.asarray(path[0, :2], dtype=np.float64),
+            np.asarray(path[-1, :2], dtype=np.float64),
+        )
+        if path.shape[0] >= 2
+        else None
+        for path in paths
+    ]
+    for first_index, first_endpoints in enumerate(path_endpoints):
+        if first_endpoints is None:
+            continue
+        for second_index in range(first_index + 1, len(path_endpoints)):
+            second_endpoints = path_endpoints[second_index]
+            if second_endpoints is None:
+                continue
+            matching_sides = [
+                (first_side, second_side)
+                for first_side, first_endpoint in enumerate(first_endpoints)
+                for second_side, second_endpoint in enumerate(second_endpoints)
+                if float(np.linalg.norm(first_endpoint - second_endpoint))
+                <= endpoint_tolerance
+            ]
+            if matching_sides:
+                union_components(first_index, second_index)
+                direct_endpoint_links[(first_index, second_index)].extend(
+                    matching_sides
+                )
+    if (
+        wall_linework is not None
+        and not wall_linework.is_empty
+        and unary_union(path_lines).distance(wall_linework)
+        < minimum_spacing - comparison_epsilon
+    ):
+        return False
+
+    # A directional run represents a material pass, not an individual sample
+    # chord from a fillet.  Keeping the threshold at a quarter pitch prevents
+    # medium-density arc samples from being mistaken for parallel return arms;
+    # the raw fallback below still audits curves made entirely of short chords.
+    minimum_run_length = max(minimum_spacing * 0.25, tolerance * 20.0)
+    collinear_cosine = math.cos(math.radians(1.0))
+    run_lines: list[LineString] = []
+    run_records: list[
+        tuple[int, np.ndarray, np.ndarray, np.ndarray, tuple[float, float]]
+    ] = []
+    run_topology: list[tuple[float, float, float, bool]] = []
+    path_topology_points: list[np.ndarray] = []
+    path_topology_cumulative: list[np.ndarray] = []
+    path_topology_turn_cumulative: list[np.ndarray] = []
+    path_topology_lines: list[LineString] = []
+    raw_segment_lines: list[LineString] = []
+    raw_segment_records: list[tuple[int, int]] = []
+    raw_segment_lengths: list[float] = []
+
+    def append_run(
+        path_index: int,
+        run_points: np.ndarray,
+        start_position: float,
+        end_position: float,
+        path_length: float,
+        is_closed: bool,
+    ) -> None:
+        if run_points.shape[0] < 2:
+            return
+        run = LineString(run_points)
+        if run.length < minimum_run_length:
+            return
+        start_point = np.asarray(run_points[0], dtype=np.float64)
+        end_point = np.asarray(run_points[-1], dtype=np.float64)
+        direction = end_point - start_point
+        direction_length = float(np.linalg.norm(direction))
+        if direction_length <= tolerance:
+            return
+        direction /= direction_length
+        projection = sorted(
+            (
+                float(np.dot(start_point, direction)),
+                float(np.dot(end_point, direction)),
+            )
+        )
+        run_lines.append(run)
+        run_records.append(
+            (
+                path_index,
+                start_point,
+                end_point,
+                direction,
+                (projection[0], projection[1]),
+            )
+        )
+        run_topology.append(
+            (start_position, end_position, path_length, is_closed)
+        )
+
+    for path_index, path in enumerate(paths):
+        points = np.asarray(path[:, :2], dtype=np.float64)
+        segment_vectors = np.diff(points, axis=0)
+        segment_lengths = np.linalg.norm(segment_vectors, axis=1)
+        cumulative_lengths = np.concatenate(
+            (np.asarray([0.0]), np.cumsum(segment_lengths))
+        )
+        path_topology_points.append(points)
+        path_topology_cumulative.append(cumulative_lengths)
+        path_topology_lines.append(LineString(points))
+        turn_cumulative = np.zeros(segment_lengths.shape[0], dtype=np.float64)
+        prior_direction: np.ndarray | None = None
+        total_turn = 0.0
+        for segment_index, (vector, length) in enumerate(
+            zip(segment_vectors, segment_lengths)
+        ):
+            if float(length) > tolerance:
+                direction = vector / float(length)
+                if prior_direction is not None:
+                    total_turn += abs(
+                        math.atan2(
+                            float(
+                                prior_direction[0] * direction[1]
+                                - prior_direction[1] * direction[0]
+                            ),
+                            float(np.dot(prior_direction, direction)),
+                        )
+                    )
+                prior_direction = direction
+            turn_cumulative[segment_index] = total_turn
+        path_topology_turn_cumulative.append(turn_cumulative)
+        path_length = float(cumulative_lengths[-1])
+        is_closed = _close(points[0], points[-1], tolerance)
+        for segment_index, length in enumerate(segment_lengths):
+            if float(length) <= tolerance:
+                continue
+            raw_segment_lines.append(
+                LineString(points[segment_index : segment_index + 2])
+            )
+            raw_segment_records.append((path_index, segment_index))
+            raw_segment_lengths.append(float(length))
+        raw_runs: list[tuple[np.ndarray, float, float]] = []
+        run_start: int | None = None
+        run_end: int | None = None
+        run_direction: np.ndarray | None = None
+        for segment_index, (vector, length) in enumerate(
+            zip(segment_vectors, segment_lengths)
+        ):
+            length = float(length)
+            if length <= tolerance:
+                continue
+            direction = vector / length
+            if run_start is None:
+                run_start = segment_index
+                run_end = segment_index + 1
+                run_direction = direction
+                continue
+            if float(np.dot(run_direction, direction)) >= collinear_cosine:
+                run_end = segment_index + 1
+                chord = points[run_end] - points[run_start]
+                chord_length = float(np.linalg.norm(chord))
+                if chord_length > tolerance:
+                    run_direction = chord / chord_length
+                continue
+            raw_runs.append(
+                (
+                    points[run_start : run_end + 1],
+                    float(cumulative_lengths[run_start]),
+                    float(cumulative_lengths[run_end]),
+                )
+            )
+            run_start = segment_index
+            run_end = segment_index + 1
+            run_direction = direction
+        if run_start is not None and run_end is not None:
+            raw_runs.append(
+                (
+                    points[run_start : run_end + 1],
+                    float(cumulative_lengths[run_start]),
+                    float(cumulative_lengths[run_end]),
+                )
+            )
+
+        # A closed ring may start halfway along a straight side.  Join its last
+        # and first directional runs before the material-length filter so two
+        # short halves cannot hide a long folded return.
+        if is_closed and len(raw_runs) >= 2:
+            first_vector = raw_runs[0][0][-1] - raw_runs[0][0][0]
+            last_vector = raw_runs[-1][0][-1] - raw_runs[-1][0][0]
+            first_length = float(np.linalg.norm(first_vector))
+            last_length = float(np.linalg.norm(last_vector))
+            if (
+                first_length > tolerance
+                and last_length > tolerance
+                and float(
+                    np.dot(
+                        first_vector / first_length,
+                        last_vector / last_length,
+                    )
+                )
+                >= collinear_cosine
+            ):
+                raw_runs[0] = (
+                    np.vstack((raw_runs[-1][0][:-1], raw_runs[0][0])),
+                    raw_runs[-1][1],
+                    raw_runs[0][2],
+                )
+                raw_runs.pop()
+        for run_points, start_position, end_position in raw_runs:
+            append_run(
+                path_index,
+                run_points,
+                start_position,
+                end_position,
+                path_length,
+                is_closed,
+            )
+
+    query_distance = max(0.0, minimum_spacing - comparison_epsilon)
+    local_bead_width = minimum_spacing if bead_width is None else bead_width
+    component_members: dict[int, list[int]] = defaultdict(list)
+    for path_index, endpoints in enumerate(path_endpoints):
+        if endpoints is not None:
+            component_members[component_root(path_index)].append(path_index)
+    merged_component_lines: dict[int, LineString] = {}
+    for root, members in component_members.items():
+        if len(members) < 2:
+            continue
+        merged = linemerge(
+            MultiLineString(
+                [
+                    LineString(path_topology_points[path_index])
+                    for path_index in members
+                ]
+            )
+        )
+        if isinstance(merged, LineString) and merged.is_simple and not merged.is_ring:
+            merged_component_lines[root] = merged
+
+    def path_interval_points(
+        path_index: int,
+        first_position: float,
+        second_position: float,
+        *,
+        wraps: bool = False,
+    ) -> np.ndarray:
+        lower = min(first_position, second_position)
+        upper = max(first_position, second_position)
+        points = path_topology_points[path_index]
+        cumulative = path_topology_cumulative[path_index]
+        source_line = path_topology_lines[path_index]
+        lower_point = np.asarray(
+            source_line.interpolate(lower).coords[0], dtype=np.float64
+        )
+        upper_point = np.asarray(
+            source_line.interpolate(upper).coords[0], dtype=np.float64
+        )
+        if wraps:
+            after_upper = points[cumulative > upper + comparison_epsilon]
+            before_lower = points[cumulative < lower - comparison_epsilon]
+            return np.vstack(
+                (
+                    upper_point,
+                    after_upper,
+                    before_lower,
+                    lower_point,
+                )
+            )
+        interior = points[
+            (cumulative > lower + comparison_epsilon)
+            & (cumulative < upper - comparison_epsilon)
+        ]
+        return np.vstack((lower_point, interior, upper_point))
+
+    def absolute_heading_change(local_points: np.ndarray) -> float:
+        vectors = np.diff(local_points, axis=0)
+        lengths = np.linalg.norm(vectors, axis=1)
+        vectors = vectors[lengths > tolerance]
+        if vectors.shape[0] < 2:
+            return 0.0
+        headings = np.arctan2(vectors[:, 1], vectors[:, 0])
+        heading_steps = np.arctan2(
+            np.sin(np.diff(headings)),
+            np.cos(np.diff(headings)),
+        )
+        return float(np.sum(np.abs(heading_steps)))
+
+    def points_form_compact_local_turn(local_points: np.ndarray) -> bool:
+        # A genuine continuous U-turn has both a short material route (checked
+        # by the callers) and a compact spatial footprint.  The small 1.6-bead
+        # diagonal allowance covers a discretised semicircular connector plus
+        # its incident tangent samples; a later loop-back cannot qualify merely
+        # because its two nearest points are spatially close.
+        span = np.ptp(local_points, axis=0)
+        if (
+            float(np.linalg.norm(span))
+            > local_bead_width * 1.6 + endpoint_tolerance
+        ):
+            return False
+        # One generated hatch-end connector reverses direction once.  Permit a
+        # small discretisation/smoothing allowance; a materially larger turn
+        # is an almost-loop, not a local U-turn exemption.
+        heading_change = absolute_heading_change(local_points)
+        if heading_change > math.pi + math.radians(10.0):
+            return False
+        return True
+
+    def same_path_interval_absolute_turn(
+        path_index: int,
+        first_position: float,
+        second_position: float,
+    ) -> float:
+        cumulative = path_topology_cumulative[path_index]
+        path_length = float(cumulative[-1])
+        points = path_topology_points[path_index]
+        direct_distance = abs(first_position - second_position)
+        wraps = (
+            _close(points[0], points[-1], tolerance)
+            and path_length - direct_distance < direct_distance
+        )
+        return absolute_heading_change(
+            path_interval_points(
+                path_index,
+                first_position,
+                second_position,
+                wraps=wraps,
+            )
+        )
+
+    def same_path_positions_form_compact_local_turn(
+        path_index: int,
+        first_position: float,
+        second_position: float,
+    ) -> bool:
+        """Distinguish a compact continuous bend from a later loop-back."""
+
+        cumulative = path_topology_cumulative[path_index]
+        path_length = float(cumulative[-1])
+        points = path_topology_points[path_index]
+        is_closed = _close(points[0], points[-1], tolerance)
+        direct_distance = abs(first_position - second_position)
+        wraps = is_closed and path_length - direct_distance < direct_distance
+        material_distance = (
+            path_length - direct_distance if wraps else direct_distance
+        )
+        if material_distance <= minimum_run_length + endpoint_tolerance:
+            return True
+        if material_distance > math.pi * local_bead_width + endpoint_tolerance:
+            return False
+        return points_form_compact_local_turn(
+            path_interval_points(
+                path_index,
+                first_position,
+                second_position,
+                wraps=wraps,
+            )
+        )
+
+    def different_path_positions_form_compact_local_turn(
+        first_path: int,
+        first_position: float,
+        second_path: int,
+        second_position: float,
+    ) -> bool:
+        links = direct_endpoint_links.get((first_path, second_path))
+        reverse_links = False
+        if links is None:
+            links = direct_endpoint_links.get((second_path, first_path))
+            reverse_links = links is not None
+        if links:
+            first_length = float(path_topology_cumulative[first_path][-1])
+            second_length = float(path_topology_cumulative[second_path][-1])
+            candidates: list[tuple[float, int, int]] = []
+            for raw_first_side, raw_second_side in links:
+                first_side, second_side = (
+                    (raw_second_side, raw_first_side)
+                    if reverse_links
+                    else (raw_first_side, raw_second_side)
+                )
+                first_endpoint_position = (
+                    0.0 if first_side == 0 else first_length
+                )
+                second_endpoint_position = (
+                    0.0 if second_side == 0 else second_length
+                )
+                candidates.append(
+                    (
+                        abs(first_position - first_endpoint_position)
+                        + abs(second_position - second_endpoint_position),
+                        first_side,
+                        second_side,
+                    )
+                )
+            material_distance, first_side, second_side = min(
+                candidates,
+                key=lambda item: item[0],
+            )
+            if material_distance <= minimum_spacing * 0.3 + endpoint_tolerance:
+                return True
+            if (
+                material_distance
+                <= math.pi * local_bead_width + endpoint_tolerance
+            ):
+                first_endpoint_position = (
+                    0.0 if first_side == 0 else first_length
+                )
+                second_endpoint_position = (
+                    0.0 if second_side == 0 else second_length
+                )
+                first_interval = path_interval_points(
+                    first_path,
+                    first_position,
+                    first_endpoint_position,
+                )
+                if first_position > first_endpoint_position:
+                    first_interval = first_interval[::-1]
+                second_interval = path_interval_points(
+                    second_path,
+                    second_endpoint_position,
+                    second_position,
+                )
+                if second_endpoint_position > second_position:
+                    second_interval = second_interval[::-1]
+                if points_form_compact_local_turn(
+                    np.vstack((first_interval, second_interval))
+                ):
+                    return True
+
+        # The hard-corner splitter may insert one or more exact, tiny bridge
+        # paths.  Rebuild only non-branching endpoint chains and apply the same
+        # short-route/compact-turn proof to the actual merged material route.
+        # A merely transitive component receives no blanket exemption: the
+        # route must itself remain local, so a long A-C-B detour is rejected.
+        root = component_root(first_path)
+        if root != component_root(second_path):
+            return False
+        merged = merged_component_lines.get(root)
+        if merged is None:
+            return False
+        first_point = path_topology_lines[first_path].interpolate(
+            first_position
+        )
+        second_point = path_topology_lines[second_path].interpolate(
+            second_position
+        )
+        merged_first = float(merged.project(first_point))
+        merged_second = float(merged.project(second_point))
+        material_distance = abs(merged_first - merged_second)
+        if material_distance <= minimum_spacing * 0.3 + endpoint_tolerance:
+            return True
+        if material_distance > math.pi * local_bead_width + endpoint_tolerance:
+            return False
+        lower = min(merged_first, merged_second)
+        upper = max(merged_first, merged_second)
+        merged_points = np.asarray(merged.coords, dtype=np.float64)
+        merged_lengths = np.linalg.norm(np.diff(merged_points, axis=0), axis=1)
+        merged_cumulative = np.concatenate(
+            (np.asarray([0.0]), np.cumsum(merged_lengths))
+        )
+        interval = np.vstack(
+            (
+                np.asarray(merged.interpolate(lower).coords[0]),
+                merged_points[
+                    (merged_cumulative > lower + comparison_epsilon)
+                    & (merged_cumulative < upper - comparison_epsilon)
+                ],
+                np.asarray(merged.interpolate(upper).coords[0]),
+            )
+        )
+        return points_form_compact_local_turn(interval)
+
+    def run_path_position(
+        run_index: int,
+        run_line: LineString,
+        point: Point,
+    ) -> float:
+        start_position, _, path_length, is_closed = run_topology[run_index]
+        position = start_position + float(run_line.project(point))
+        if is_closed and path_length > 0:
+            position %= path_length
+        return position
+
+    def incident_runs_have_safe_turn_radius(
+        first_index: int,
+        second_index: int,
+        run_distance: float,
+    ) -> bool:
+        """Apply a sampling-independent radius check to one local bend.
+
+        Arc samples may be arbitrarily dense or sparse, but the incident
+        material-length runs retain the physical turn angle and their minimum
+        separation.  For tangent rays, ``distance / (2 sin(theta / 2))`` is the
+        bend radius.  A short boundary-following bridge between two already
+        safe, pitch-separated hatch arms is handled as an explicit three-run
+        topology below; every true two-arm return is checked regardless of the
+        arc sampling density.
+        """
+
+        first_path, _, _, first_direction, _ = run_records[first_index]
+        second_path, _, _, second_direction, _ = run_records[second_index]
+        if first_path != second_path:
+            return False
+        cosine = float(
+            np.clip(np.dot(first_direction, second_direction), -1.0, 1.0)
+        )
+        turn_angle = math.acos(cosine)
+        if turn_angle <= math.radians(90.0) + 1e-9:
+            return True
+        sine_half_turn = math.sin(turn_angle * 0.5)
+        if sine_half_turn <= 1e-12:
+            return True
+        effective_radius = run_distance / (2.0 * sine_half_turn)
+        minimum_radius = (
+            minimum_spacing
+            * 0.5
+            * sine_half_turn**10
+        )
+        radius_tolerance = max(endpoint_tolerance, minimum_spacing * 1e-4)
+        if effective_radius >= minimum_radius - radius_tolerance:
+            return True
+
+        # A generated boundary join can contain three material-length runs:
+        # hatch arm -> short boundary bridge -> next hatch arm.  The bridge may
+        # locally approach its incident arm, but it is not a second return pass
+        # when the two outer hatch arms themselves are antiparallel and remain
+        # at or beyond the configured pitch.  Make that exception structural,
+        # rather than applying the former blanket <=150-degree exemption which
+        # also admitted arbitrarily tight 135-149 degree hairpins.
+        if turn_angle > math.radians(135.1):
+            return False
+        path_run_indices = sorted(
+            (
+                run_index
+                for run_index, record in enumerate(run_records)
+                if record[0] == first_path
+            ),
+            key=lambda run_index: run_topology[run_index][0],
+        )
+        if run_topology[first_index][3] or len(path_run_indices) < 3:
+            return False
+        positions = {
+            run_index: position
+            for position, run_index in enumerate(path_run_indices)
+        }
+        first_order = positions[first_index]
+        second_order = positions[second_index]
+        bridge_candidates: list[tuple[int, int, int]] = []
+        if second_order == first_order + 1 and first_order > 0:
+            bridge_candidates.append(
+                (
+                    first_index,
+                    path_run_indices[first_order - 1],
+                    second_index,
+                )
+            )
+        if first_order == second_order + 1 and second_order > 0:
+            bridge_candidates.append(
+                (
+                    second_index,
+                    path_run_indices[second_order - 1],
+                    first_index,
+                )
+            )
+        if second_order == first_order + 1 and second_order + 1 < len(path_run_indices):
+            bridge_candidates.append(
+                (
+                    second_index,
+                    first_index,
+                    path_run_indices[second_order + 1],
+                )
+            )
+        if first_order == second_order + 1 and first_order + 1 < len(path_run_indices):
+            bridge_candidates.append(
+                (
+                    first_index,
+                    second_index,
+                    path_run_indices[first_order + 1],
+                )
+        )
+
+        for bridge_index, outer_index, other_index in bridge_candidates:
+            # This exemption is only for a connector that actually follows the
+            # bead-aware infill boundary beside the innermost perimeter.  That
+            # geometric anchor distinguishes it from an arbitrary third segment
+            # appended to a tight hairpin, and also permits low-density hatches
+            # whose legitimate boundary bridge is longer than one bead width.
+            if not allow_boundary_bridges:
+                if wall_linework is None or wall_linework.is_empty:
+                    continue
+                bridge_wall_distance = run_lines[bridge_index].distance(
+                    wall_linework
+                )
+                if bridge_wall_distance > (
+                    minimum_spacing
+                    + max(local_bead_width * 0.1, endpoint_tolerance)
+                ):
+                    continue
+            bridge_start, bridge_end, _, _ = run_topology[bridge_index]
+            outer_start, outer_end, _, _ = run_topology[outer_index]
+            other_start, other_end, _, _ = run_topology[other_index]
+            ordered = sorted(
+                (
+                    (outer_start, outer_end, outer_index),
+                    (bridge_start, bridge_end, bridge_index),
+                    (other_start, other_end, other_index),
+                ),
+                key=lambda item: item[0],
+            )
+            if ordered[1][2] != bridge_index:
+                continue
+            if (
+                ordered[1][0] - ordered[0][1]
+                > minimum_spacing + endpoint_tolerance
+                or ordered[2][0] - ordered[1][1]
+                > minimum_spacing + endpoint_tolerance
+            ):
+                continue
+            outer_direction = run_records[outer_index][3]
+            other_direction = run_records[other_index][3]
+            if float(np.dot(outer_direction, other_direction)) > -math.cos(
+                math.radians(10.0)
+            ):
+                continue
+            if run_lines[outer_index].distance(run_lines[other_index]) < (
+                minimum_spacing - comparison_epsilon
+            ):
+                continue
+            return True
+        return False
+
+    # Directional-run aggregation is intentionally optimized for long hatch
+    # ridges.  Curves sampled into many sub-run segments need an exact fallback
+    # so a spiral or two independent arcs cannot evade the physical spacing
+    # contract merely because every individual segment is short.
+    if len(raw_segment_lines) >= 2:
+        raw_tree = STRtree(raw_segment_lines)
+        for first_index, first_line in enumerate(raw_segment_lines):
+            first_path, first_segment = raw_segment_records[first_index]
+            for raw_second_index in raw_tree.query(
+                first_line,
+                predicate="dwithin",
+                distance=query_distance,
+            ):
+                second_index = int(raw_second_index)
+                if second_index <= first_index:
+                    continue
+                second_line = raw_segment_lines[second_index]
+                if (
+                    first_line.distance(second_line)
+                    >= minimum_spacing - comparison_epsilon
+                ):
+                    continue
+                second_path, second_segment = raw_segment_records[second_index]
+                # Material-length directional runs are checked again below
+                # after collinear aggregation.  The raw fallback exists for
+                # finely sampled curves, so do not duplicate the expensive
+                # exact topology work when both segments already qualify.
+                if (
+                    raw_segment_lengths[first_index] >= minimum_run_length
+                    and raw_segment_lengths[second_index] >= minimum_run_length
+                ):
+                    continue
+                if first_path == second_path:
+                    lower_segment = min(first_segment, second_segment)
+                    upper_segment = max(first_segment, second_segment)
+                    cumulative = path_topology_cumulative[first_path]
+                    material_gap = max(
+                        0.0,
+                        float(
+                            cumulative[upper_segment]
+                            - cumulative[lower_segment + 1]
+                        ),
+                    )
+                    points = path_topology_points[first_path]
+                    is_closed = _close(points[0], points[-1], tolerance)
+                    if is_closed:
+                        path_length = float(cumulative[-1])
+                        material_gap = min(
+                            material_gap,
+                            max(0.0, path_length - material_gap),
+                        )
+                    # Nearby samples along one deposited centreline are the
+                    # unavoidable local material continuation.  Non-local
+                    # returns, spirals, and almost-loops remain beyond one
+                    # requested pitch and still take the exact path below.
+                    turn_cumulative = path_topology_turn_cumulative[first_path]
+                    material_turn = float(
+                        turn_cumulative[upper_segment]
+                        - turn_cumulative[lower_segment]
+                    )
+                    if (
+                        not is_closed
+                        and material_gap
+                        <= minimum_run_length + endpoint_tolerance
+                        and material_turn <= math.radians(135.0)
+                    ):
+                        continue
+                    if (
+                        not is_closed
+                        and material_gap
+                        <= minimum_spacing + endpoint_tolerance
+                        and material_turn <= math.radians(90.0)
+                    ):
+                        continue
+                first_nearest, second_nearest = nearest_points(
+                    first_line,
+                    second_line,
+                )
+                first_position = float(
+                    path_topology_cumulative[first_path][first_segment]
+                    + first_line.project(first_nearest)
+                )
+                second_position = float(
+                    path_topology_cumulative[second_path][second_segment]
+                    + second_line.project(second_nearest)
+                )
+                if first_path == second_path:
+                    if same_path_positions_form_compact_local_turn(
+                        first_path,
+                        first_position,
+                        second_position,
+                    ):
+                        continue
+                    return False
+                if different_path_positions_form_compact_local_turn(
+                    first_path,
+                    first_position,
+                    second_path,
+                    second_position,
+                ):
+                    continue
+                return False
+
+    if len(run_lines) < 2:
+        return True
+
+    tree = STRtree(run_lines)
+    for first_index, first_line in enumerate(run_lines):
+        first_path = run_records[first_index][0]
+        for raw_second_index in tree.query(
+            first_line,
+            predicate="dwithin",
+            distance=query_distance,
+        ):
+            second_index = int(raw_second_index)
+            if second_index <= first_index:
+                continue
+            second_path = run_records[second_index][0]
+            second_line = run_lines[second_index]
+            same_component = component_root(first_path) == component_root(second_path)
+            first_nearest, second_nearest = nearest_points(
+                first_line,
+                second_line,
+            )
+            first_position = run_path_position(
+                first_index,
+                first_line,
+                first_nearest,
+            )
+            second_position = run_path_position(
+                second_index,
+                second_line,
+                second_nearest,
+            )
+            locally_adjacent = (
+                (
+                    first_path == second_path
+                    and same_path_positions_form_compact_local_turn(
+                        first_path,
+                        first_position,
+                        second_position,
+                    )
+                )
+                or (
+                    first_path != second_path
+                    and same_component
+                    and different_path_positions_form_compact_local_turn(
+                        first_path,
+                        first_position,
+                        second_path,
+                        second_position,
+                    )
+                )
+            )
+            distance = first_line.distance(second_line)
+            if distance >= minimum_spacing - comparison_epsilon:
+                continue
+            if same_component and locally_adjacent:
+                # Exact non-branching endpoint chains were normalised above.
+                # Any remaining cross-path component is branched/ambiguous and
+                # must not gain a local-turn exemption.  For one logical path,
+                # validate the incident runs before the short-route fast path;
+                # this is what makes a tight U-turn independent of arc sampling.
+                if first_path != second_path:
+                    return False
+                if not incident_runs_have_safe_turn_radius(
+                    first_index,
+                    second_index,
+                    distance,
+                ):
+                    return False
+                if first_path == second_path:
+                    path_length = float(
+                        path_topology_cumulative[first_path][-1]
+                    )
+                    local_material_distance = abs(
+                        first_position - second_position
+                    )
+                    if _close(
+                        path_topology_points[first_path][0],
+                        path_topology_points[first_path][-1],
+                        tolerance,
+                    ):
+                        local_material_distance = min(
+                            local_material_distance,
+                            path_length - local_material_distance,
+                        )
+                    # Consecutive directional pieces inside one sampled fillet
+                    # are one local curve, not a second pass.  The raw-segment
+                    # guard still checks the whole curve for later loop-backs.
+                    if local_material_distance <= (
+                        minimum_spacing + endpoint_tolerance
+                    ):
+                        continue
+                    local_interval_turn = same_path_interval_absolute_turn(
+                        first_path,
+                        first_position,
+                        second_position,
+                    )
+                    if local_interval_turn <= math.radians(95.0):
+                        continue
+                # A compact local bend may be split across exact path boundaries
+                # when the sharp-corner finisher inserts a tiny bridge.  Apply the
+                # same physical corridor test to that reconstructed component as
+                # to an unsplit curve.  Only a fully close run lasting almost a
+                # complete pitch is a second material pass; a shorter curved
+                # sample is intrinsic to the one local turn.
+                first_close_length = float(
+                    first_line.intersection(
+                        second_line.buffer(
+                            query_distance,
+                            cap_style="round",
+                            join_style="round",
+                        )
+                    ).length
+                )
+                second_close_length = float(
+                    second_line.intersection(
+                        first_line.buffer(
+                            query_distance,
+                            cap_style="round",
+                            join_style="round",
+                        )
+                    ).length
+                )
+                directions_are_parallel = abs(
+                    float(
+                        np.dot(
+                            run_records[first_index][3],
+                            run_records[second_index][3],
+                        )
+                    )
+                ) >= math.cos(math.radians(25.0))
+                sustained_run_length = minimum_spacing * 0.95
+                if (
+                    directions_are_parallel
+                    and (
+                        (
+                            float(first_line.length)
+                            >= sustained_run_length - endpoint_tolerance
+                            and first_close_length
+                            >= float(first_line.length) - endpoint_tolerance
+                        )
+                        or (
+                            float(second_line.length)
+                            >= sustained_run_length - endpoint_tolerance
+                            and second_close_length
+                            >= float(second_line.length) - endpoint_tolerance
+                        )
+                    )
+                ):
+                    return False
+                if min(first_close_length, second_close_length) <= (
+                    minimum_spacing + endpoint_tolerance
+                ):
+                    continue
+            return False
+    return True
+
+
+def _trim_close_collinear_solid_fill_endcaps(
+    paths: list[np.ndarray],
+    target_spacing: float,
+    tolerance: float,
+) -> list[np.ndarray]:
+    """Separate facing hatch endcaps without moving the neighbouring runs.
+
+    A scanline can be split by the bead-aware wall exclusion into two
+    collinear pieces.  When that excluded interval is shorter than the
+    measured-width pitch, two independent starts/stops would still overlap at
+    their round endcaps even though all parallel hatch levels are correctly
+    spaced.  A direct bridge is not necessarily legal: on a curved wall it can
+    cut through the wall exclusion.  Conservatively retract both facing ends
+    along their existing straight terminal segments instead.  Exact endpoint
+    components created by the hard-corner splitter are one logical trail and
+    are deliberately left unchanged.
+    """
+
+    if target_spacing <= 0:
+        raise ValueError("target_spacing must be positive")
+    if len(paths) < 2:
+        return paths
+
+    repaired = [np.asarray(path, dtype=np.float32).copy() for path in paths]
+    endpoint_tolerance = max(tolerance * 2.0, target_spacing * 1e-7, 1e-6)
+    component_parents = list(range(len(repaired)))
+
+    def component_root(index: int) -> int:
+        while component_parents[index] != index:
+            component_parents[index] = component_parents[
+                component_parents[index]
+            ]
+            index = component_parents[index]
+        return index
+
+    def union_components(first: int, second: int) -> None:
+        first_root = component_root(first)
+        second_root = component_root(second)
+        if first_root != second_root:
+            component_parents[second_root] = first_root
+
+    path_endpoints = [
+        (
+            np.asarray(path[0, :2], dtype=np.float64),
+            np.asarray(path[-1, :2], dtype=np.float64),
+        )
+        if path.shape[0] >= 2 and not _is_closed_path(path, tolerance)
+        else None
+        for path in repaired
+    ]
+    for first_index, first_endpoints in enumerate(path_endpoints):
+        if first_endpoints is None:
+            continue
+        for second_index in range(first_index + 1, len(path_endpoints)):
+            second_endpoints = path_endpoints[second_index]
+            if second_endpoints is None:
+                continue
+            if any(
+                float(np.linalg.norm(first_endpoint - second_endpoint))
+                <= endpoint_tolerance
+                for first_endpoint in first_endpoints
+                for second_endpoint in second_endpoints
+            ):
+                union_components(first_index, second_index)
+
+    endpoints: list[tuple[int, int]] = [
+        (path_index, side)
+        for path_index, path in enumerate(repaired)
+        if path.shape[0] >= 2 and not _is_closed_path(path, tolerance)
+        for side in (0, -1)
+    ]
+    candidate_pairs: list[tuple[float, int, int]] = []
+    collinear_cosine = math.cos(math.radians(1.0))
+    for first_endpoint_index, (first_path, first_side) in enumerate(endpoints):
+        first_point = np.asarray(
+            repaired[first_path][first_side, :2], dtype=np.float64
+        )
+        first_neighbour = np.asarray(
+            repaired[first_path][1 if first_side == 0 else -2, :2],
+            dtype=np.float64,
+        )
+        first_inward = first_neighbour - first_point
+        first_length = float(np.linalg.norm(first_inward))
+        if first_length <= endpoint_tolerance:
+            continue
+        first_inward /= first_length
+        for second_endpoint_index in range(
+            first_endpoint_index + 1, len(endpoints)
+        ):
+            second_path, second_side = endpoints[second_endpoint_index]
+            if component_root(first_path) == component_root(second_path):
+                continue
+            second_point = np.asarray(
+                repaired[second_path][second_side, :2], dtype=np.float64
+            )
+            gap = second_point - first_point
+            gap_length = float(np.linalg.norm(gap))
+            if not (
+                endpoint_tolerance < gap_length
+                < target_spacing - endpoint_tolerance
+            ):
+                continue
+            second_neighbour = np.asarray(
+                repaired[second_path][1 if second_side == 0 else -2, :2],
+                dtype=np.float64,
+            )
+            second_inward = second_neighbour - second_point
+            second_length = float(np.linalg.norm(second_inward))
+            if second_length <= endpoint_tolerance:
+                continue
+            second_inward /= second_length
+            gap_direction = gap / gap_length
+            if (
+                abs(float(np.dot(first_inward, second_inward)))
+                < collinear_cosine
+                or float(np.dot(first_inward, gap_direction))
+                > -collinear_cosine
+                or float(np.dot(second_inward, -gap_direction))
+                > -collinear_cosine
+            ):
+                continue
+            candidate_pairs.append(
+                (gap_length, first_endpoint_index, second_endpoint_index)
+            )
+
+    # Resolve the closest independent cap pair first.  An endpoint is moved at
+    # most once; any ambiguous multi-neighbour case remains for the strict
+    # postcondition to reject rather than being repaired speculatively.
+    used_endpoints: set[int] = set()
+    safety = max(tolerance * 0.02, target_spacing * 1e-7, 1e-7)
+    minimum_remaining_segment = max(tolerance * 2.0, safety * 2.0)
+    for gap_length, first_endpoint_index, second_endpoint_index in sorted(
+        candidate_pairs
+    ):
+        if (
+            first_endpoint_index in used_endpoints
+            or second_endpoint_index in used_endpoints
+        ):
+            continue
+        first_path, first_side = endpoints[first_endpoint_index]
+        second_path, second_side = endpoints[second_endpoint_index]
+        first_point = np.asarray(
+            repaired[first_path][first_side, :2], dtype=np.float64
+        )
+        second_point = np.asarray(
+            repaired[second_path][second_side, :2], dtype=np.float64
+        )
+        first_neighbour = np.asarray(
+            repaired[first_path][1 if first_side == 0 else -2, :2],
+            dtype=np.float64,
+        )
+        second_neighbour = np.asarray(
+            repaired[second_path][1 if second_side == 0 else -2, :2],
+            dtype=np.float64,
+        )
+        first_vector = first_neighbour - first_point
+        second_vector = second_neighbour - second_point
+        first_length = float(np.linalg.norm(first_vector))
+        second_length = float(np.linalg.norm(second_vector))
+        retraction = (target_spacing - gap_length) * 0.5 + safety
+        if (
+            retraction >= first_length - minimum_remaining_segment
+            or retraction >= second_length - minimum_remaining_segment
+        ):
+            continue
+        repaired[first_path][first_side, :2] = (
+            first_point + first_vector / first_length * retraction
+        ).astype(np.float32)
+        repaired[second_path][second_side, :2] = (
+            second_point + second_vector / second_length * retraction
+        ).astype(np.float32)
+        used_endpoints.update((first_endpoint_index, second_endpoint_index))
+    return repaired
+
+
+def _measured_width_infill_result(
+    paths: list[np.ndarray],
+    last_perimeter_linework,
+    config: SliceConfig,
+) -> tuple[list[np.ndarray], bool]:
+    """Return conservatively repaired paths and their strict spacing result."""
+
+    if config.planning_line_width is None:
+        return paths, True
+    repaired = _trim_close_collinear_solid_fill_endcaps(
+        paths,
+        _resin_planning_path_spacing(config),
+        config.tolerance,
+    )
+    return repaired, _solid_fill_spacing_postcondition(
+        repaired,
+        last_perimeter_linework,
+        _resin_maximum_overlap_spacing(config),
+        config.tolerance,
+        bead_width=_resin_planning_line_width(config),
+    )
+
+
+def _require_measured_width_infill(
+    paths: list[np.ndarray],
+    last_perimeter_linework,
+    config: SliceConfig,
+) -> list[np.ndarray]:
+    repaired, valid = _measured_width_infill_result(
+        paths,
+        last_perimeter_linework,
+        config,
+    )
+    if not valid:
+        raise ValueError(
+            "measured-width infill cannot satisfy the configured maximum overlap"
+        )
+    return repaired
+
+
 def _finish_solid_fill_paths(
     solid_geometry,
     infill_geometry,
@@ -2068,25 +3681,41 @@ def _finish_solid_fill_paths(
 ) -> list[np.ndarray]:
     """Remove hard corners introduced by wall-seam and residual corrections."""
 
-    corner_cut = _solid_fill_final_smoothing_cut_distance(config)
-    if corner_cut <= config.tolerance or not infill_paths:
+    if not infill_paths:
         return infill_paths
+    corner_cut = _solid_fill_final_smoothing_cut_distance(config)
+    if corner_cut <= config.tolerance:
+        return _require_measured_width_infill(
+            infill_paths,
+            last_perimeter_linework,
+            config,
+        )
     regions = centerline_regions
     if regions is None:
+        planning_width = _resin_planning_line_width(config)
         regions = _solid_residual_centerline_regions(
             solid_geometry,
             infill_geometry,
             perimeter_paths,
             last_perimeter_linework,
-            config.line_width,
-            _resin_path_spacing(config.line_width, config.infill_overlap),
+            planning_width,
+            _resin_planning_path_spacing(config),
             config.tolerance,
+            enforce_maximum_overlap=config.planning_line_width is not None,
         )
     if regions is None:
-        return infill_paths
+        return _require_measured_width_infill(
+            infill_paths,
+            last_perimeter_linework,
+            config,
+        )
     direct_allowed = regions[2]
     if direct_allowed.is_empty:
-        return infill_paths
+        return _require_measured_width_infill(
+            infill_paths,
+            last_perimeter_linework,
+            config,
+        )
 
     safe_geometry = direct_allowed.buffer(
         max(config.tolerance * 10.0, 1e-7),
@@ -2103,13 +3732,23 @@ def _finish_solid_fill_paths(
     )
     finished: list[np.ndarray] = []
     for source_path in infill_paths:
-        cleaned = _remove_smoothing_micro_segments(
-            source_path,
-            safe_geometry,
-            minimum_segment_length,
-            config.tolerance,
-        )
         source = np.asarray(source_path[:, :2], dtype=np.float32)
+        # Removing tiny arc samples and then fitting another fillet can replace
+        # an otherwise straight hatch with one long diagonal chord.  On the
+        # measured-width plan that reduced a requested 1.98 mm pitch to about
+        # 1.90 mm on real geometry.  Keep the already-simple source in strict
+        # mode; the effective-corner pass below still rounds or minimally splits
+        # every remaining turn below the configured angle threshold.
+        cleaned = (
+            source
+            if config.planning_line_width is not None
+            else _remove_smoothing_micro_segments(
+                source_path,
+                safe_geometry,
+                minimum_segment_length,
+                config.tolerance,
+            )
+        )
         last_known_simple = cleaned if LineString(cleaned).is_simple else None
         if last_known_simple is None and LineString(source).is_simple:
             last_known_simple = source
@@ -2153,7 +3792,44 @@ def _finish_solid_fill_paths(
                 config.tolerance,
             )
         )
-    return finished
+    if config.planning_line_width is None:
+        return finished
+
+    finished, finished_is_valid = _measured_width_infill_result(
+        finished,
+        last_perimeter_linework,
+        config,
+    )
+    if finished_is_valid:
+        return finished
+
+    # Fail conservatively: retain the proven pre-finisher centreline geometry,
+    # then turn every unresolved hard corner into the minimum number of path
+    # boundaries.  This fallback may add a stop only when the smoother would
+    # otherwise violate the user's maximum-overlap contract.
+    fallback: list[np.ndarray] = []
+    for source_path in infill_paths:
+        source = np.asarray(source_path[:, :2], dtype=np.float32)
+        if source.shape[0] < 2 or not LineString(source).is_simple:
+            raise ValueError("measured-width infill baseline is not a simple path")
+        fallback.extend(
+            _split_path_at_unresolved_effective_corners(
+                source,
+                effective_span,
+                config.smoothing_angle,
+                config.tolerance,
+            )
+        )
+    fallback, fallback_is_valid = _measured_width_infill_result(
+        fallback,
+        last_perimeter_linework,
+        config,
+    )
+    if not fallback_is_valid:
+        raise ValueError(
+            "measured-width infill cannot satisfy the configured maximum overlap"
+        )
+    return fallback
 
 
 def _reroute_residual_solid_bead_gaps(
@@ -3015,6 +4691,7 @@ def _connect_zigzag_infill_paths(
     wall_seam_clearance: float | None = None,
     solid_smoothing_angle_degrees: float | None = None,
     solid_smoothing_corner_cut: float | None = None,
+    maximum_connector_overlap_spacing: float | None = None,
 ) -> list[np.ndarray]:
     """Join adjacent scanlines along the bead-aware centerline boundary."""
 
@@ -3030,6 +4707,7 @@ def _connect_zigzag_infill_paths(
         wall_seam_clearance=wall_seam_clearance,
         solid_smoothing_angle_degrees=solid_smoothing_angle_degrees,
         solid_smoothing_corner_cut=solid_smoothing_corner_cut,
+        maximum_connector_overlap_spacing=maximum_connector_overlap_spacing,
     )
 
 
@@ -3122,6 +4800,7 @@ def _connect_boundary_infill_paths(
     wall_seam_clearance: float | None = None,
     solid_smoothing_angle_degrees: float | None = None,
     solid_smoothing_corner_cut: float | None = None,
+    maximum_connector_overlap_spacing: float | None = None,
 ) -> list[np.ndarray]:
     """Chain open infill trails with safe direct or boundary-following links."""
 
@@ -3301,6 +4980,15 @@ def _connect_boundary_infill_paths(
                         accepted,
                         tolerance,
                         minimum_clearance=minimum_clearance,
+                        maximum_overlap_spacing=(
+                            maximum_connector_overlap_spacing
+                        ),
+                        bead_width=solid_bead_width,
+                        safe_geometry=safe_geometry,
+                        smoothing_angle_degrees=(
+                            solid_smoothing_angle_degrees
+                        ),
+                        smoothing_corner_cut=solid_smoothing_corner_cut,
                     ):
                         continue
                     extensions.append(
@@ -3372,6 +5060,92 @@ def _connect_boundary_infill_paths(
         if accepted
         else GeometryCollection()
     )
+
+    def validated_chain_chunks(
+        chain: np.ndarray,
+        connector_ranges: list[tuple[int, int]],
+        component_indices: list[int],
+    ) -> list[np.ndarray]:
+        """Drop only connectors that remain unsafe after the final fillet."""
+
+        should_validate = (
+            maximum_connector_overlap_spacing is not None
+            and solid_bead_width is not None
+        )
+        if not should_validate or not connector_ranges:
+            return [_dedupe_consecutive(chain, tolerance)]
+
+        def chain_is_valid(candidate: np.ndarray) -> bool:
+            candidate_paths = [candidate]
+            if (
+                solid_smoothing_corner_cut is not None
+                and solid_smoothing_corner_cut > tolerance
+            ):
+                candidate_paths = _smooth_resin_infill_paths(
+                    candidate_paths,
+                    safe_geometry,
+                    solid_smoothing_corner_cut,
+                    (
+                        DEFAULT_RESIN_SMOOTHING_ANGLE_DEGREES
+                        if solid_smoothing_angle_degrees is None
+                        else solid_smoothing_angle_degrees
+                    ),
+                    tolerance,
+                    cut_fraction=0.3,
+                )
+            return _solid_fill_spacing_postcondition(
+                candidate_paths,
+                Polygon(),
+                maximum_connector_overlap_spacing,
+                tolerance,
+                bead_width=solid_bead_width,
+                allow_boundary_bridges=True,
+            )
+
+        normalized_chain = _dedupe_consecutive(chain, tolerance)
+        if chain_is_valid(normalized_chain):
+            return [normalized_chain]
+
+        base_segments: list[np.ndarray] = []
+        connectors: list[np.ndarray] = []
+        base_start = 0
+        for entry_index, exit_index in connector_ranges:
+            base_segments.append(chain[base_start : entry_index + 1])
+            connectors.append(chain[entry_index : exit_index + 1])
+            base_start = exit_index
+        base_segments.append(chain[base_start:])
+
+        chunks: list[np.ndarray] = []
+        current = base_segments[0]
+        for connector, next_base in zip(connectors, base_segments[1:]):
+            candidate = _dedupe_consecutive(
+                np.vstack((current, connector[1:], next_base[1:])).astype(
+                    np.float32
+                ),
+                tolerance,
+            )
+            if candidate.shape[0] >= 2 and chain_is_valid(candidate):
+                current = candidate
+                continue
+            if current.shape[0] >= 2:
+                chunks.append(_dedupe_consecutive(current, tolerance))
+            current = next_base
+        if current.shape[0] >= 2:
+            chunks.append(_dedupe_consecutive(current, tolerance))
+        if chunks and all(chain_is_valid(chunk) for chunk in chunks):
+            return chunks
+
+        # Seam compensation can make a retained base chunk depend on the
+        # connector that was just removed.  If that happens, fall all the way
+        # back to the original independent hatches for this component.  Those
+        # are the proven bead-aware baseline and losing continuity is safer
+        # than exporting a tight hook or failing the whole slice.
+        return [
+            np.asarray(paths[index][:, :2], dtype=np.float32).copy()
+            for index in component_indices
+            if paths[index].shape[0] >= 2
+        ]
+
     for component in components:
         start_endpoint = next(
             endpoint
@@ -3380,6 +5154,7 @@ def _connect_boundary_infill_paths(
             if endpoint not in connector_by_endpoint
         )
         chain_points: list[np.ndarray] = []
+        chain_connector_ranges: list[tuple[int, int]] = []
         current_endpoint: int | None = start_endpoint
         incoming_connector: np.ndarray | None = None
         incoming_is_tangent_u_turn = False
@@ -3483,14 +5258,22 @@ def _connect_boundary_infill_paths(
                 if _close(connector_points[0, :2], endpoint_points[exit_endpoint], tolerance)
                 else connector_points[::-1].copy()
             )
+            connector_entry_index = len(chain_points) - 1
             chain_points.extend(oriented_connector[1:])
+            chain_connector_ranges.append(
+                (connector_entry_index, len(chain_points) - 1)
+            )
             incoming_connector = oriented_connector
             incoming_is_tangent_u_turn = is_tangent_u_turn
             current_endpoint = next_endpoint
 
         if len(chain_points) >= 2:
-            connected_paths.append(
-                _dedupe_consecutive(np.asarray(chain_points, dtype=np.float32), tolerance)
+            connected_paths.extend(
+                validated_chain_chunks(
+                    np.asarray(chain_points, dtype=np.float32),
+                    chain_connector_ranges,
+                    component,
+                )
             )
 
     for index, path in enumerate(paths):
@@ -4995,6 +6778,11 @@ def _resin_connector_is_clear(
     tolerance: float,
     *,
     minimum_clearance: float = 0.0,
+    maximum_overlap_spacing: float | None = None,
+    bead_width: float | None = None,
+    safe_geometry=None,
+    smoothing_angle_degrees: float | None = None,
+    smoothing_corner_cut: float | None = None,
 ) -> bool:
     first_index = first_endpoint // 2
     second_index = second_endpoint // 2
@@ -5012,13 +6800,64 @@ def _resin_connector_is_clear(
             )
         ),
     }
-    return _centerline_connector_is_clear(
+    centerline_is_clear = _centerline_connector_is_clear(
         connector,
         path_lines,
         allowed_intersections,
         accepted,
         tolerance,
         minimum_clearance,
+    )
+    if not centerline_is_clear:
+        return False
+    if maximum_overlap_spacing is None:
+        return True
+    if bead_width is None:
+        raise ValueError("bead_width is required for strict connector spacing")
+    first_path = np.asarray(paths[first_index][:, :2], dtype=np.float32)
+    if first_endpoint % 2 == 0:
+        first_path = first_path[::-1].copy()
+    second_path = np.asarray(paths[second_index][:, :2], dtype=np.float32)
+    if second_endpoint % 2 == 1:
+        second_path = second_path[::-1].copy()
+    connector_path = np.asarray(connector.coords, dtype=np.float32)
+    if not _close(connector_path[0], first_path[-1], tolerance):
+        connector_path = connector_path[::-1].copy()
+    candidate = _dedupe_consecutive(
+        np.vstack(
+            (
+                first_path,
+                connector_path[1:],
+                second_path[1:],
+            )
+        ).astype(np.float32),
+        tolerance,
+    )
+    candidate_paths = [candidate]
+    if (
+        safe_geometry is not None
+        and smoothing_corner_cut is not None
+        and smoothing_corner_cut > tolerance
+    ):
+        candidate_paths = _smooth_resin_infill_paths(
+            candidate_paths,
+            safe_geometry,
+            smoothing_corner_cut,
+            (
+                DEFAULT_RESIN_SMOOTHING_ANGLE_DEGREES
+                if smoothing_angle_degrees is None
+                else smoothing_angle_degrees
+            ),
+            tolerance,
+            cut_fraction=0.3,
+        )
+    return _solid_fill_spacing_postcondition(
+        candidate_paths,
+        Polygon(),
+        maximum_overlap_spacing,
+        tolerance,
+        bead_width=bead_width,
+        allow_boundary_bridges=True,
     )
 
 
@@ -5364,20 +7203,22 @@ def _resin_infill_surface_geometry(geometry, config: SliceConfig):
     if geometry.is_empty:
         return geometry
 
-    path_spacing = _resin_path_spacing(config.line_width, config.infill_overlap)
-    last_perimeter_centerline = config.line_width * 0.5 + (
-        config.perimeter_count - 1
-    ) * path_spacing
-    # Start at the physical inner edge of the last perimeter bead.  The
-    # previous implementation started at its centerline, omitting half of the
-    # configured 2 mm bead before applying overlap and creating a long wall-
-    # parallel overfill strip.
-    inner_perimeter_edge = last_perimeter_centerline + config.line_width * 0.5
-    overlap_offset = _libslic3r_fill_surface_overlap_offset(
+    perimeter_path_spacing = _resin_path_spacing(
         config.line_width,
         config.infill_overlap,
     )
-    centerline_inset = inner_perimeter_edge - overlap_offset
+    infill_path_spacing = _resin_planning_path_spacing(config)
+    last_perimeter_centerline = config.line_width * 0.5 + (
+        config.perimeter_count - 1
+    ) * perimeter_path_spacing
+    # Keep the already-good nominal perimeter placement unchanged.  The first
+    # infill centreline is separated from the innermost perimeter by the pitch
+    # derived from the independently measured, pressure-flattened footprint.
+    # For 2.2 mm and 10% the semantic maximum-overlap pitch is 1.98 mm.  An
+    # additional sub-print-resolution safety margin keeps all later numerical
+    # operations on the conservative side of that value; nominal process
+    # line_width remains 2.0 mm.
+    centerline_inset = last_perimeter_centerline + infill_path_spacing
     return _libslic3r_offset_geometry(
         geometry,
         -centerline_inset,
@@ -5520,6 +7361,8 @@ def _concentric_infill_geometry(
     line_width: float,
     path_spacing: float,
     tolerance: float,
+    *,
+    minimum_spacing: float | None = None,
 ) -> list[np.ndarray]:
     if line_width <= 0:
         raise ValueError("line_width must be positive")
@@ -5529,11 +7372,22 @@ def _concentric_infill_geometry(
         return []
 
     max_offset = _max_geometry_offset(geometry, tolerance)
-    offsets = _uniform_concentric_offsets(max_offset, line_width, path_spacing)
+    offsets = _uniform_concentric_offsets(
+        max_offset,
+        line_width,
+        path_spacing,
+        minimum_spacing=minimum_spacing,
+    )
     paths: list[np.ndarray] = []
     for offset in offsets:
         paths.extend(_concentric_paths_at_offset(geometry, offset, tolerance))
-    paths = _filter_concentric_paths_by_spacing(paths, path_spacing, tolerance)
+    paths = _filter_concentric_paths_by_spacing(
+        paths,
+        path_spacing,
+        tolerance,
+        minimum_spacing=minimum_spacing,
+        bead_width=line_width,
+    )
     return paths
 
 
@@ -5541,6 +7395,8 @@ def _uniform_concentric_offsets(
     max_offset: float,
     line_width: float,
     path_spacing: float,
+    *,
+    minimum_spacing: float | None = None,
 ) -> list[float]:
     # ``geometry`` is a centerline-safe corridor, so its boundary is the first
     # valid concentric centerline.  Older code applied another half-width inset
@@ -5553,13 +7409,27 @@ def _uniform_concentric_offsets(
         offset += path_spacing
 
     residual = max_offset - offsets[-1]
-    if residual > line_width * 0.2:
+    if minimum_spacing is not None:
+        # The maximum offset is the geometric collapse point.  Even when its
+        # nominal distance from the preceding ring is large enough, the tiny
+        # residual ring can fold back on itself and print two nearly coincident
+        # long sides.  Strict measured-width mode therefore keeps only the
+        # uniform sequence and conservatively leaves the centre residual empty.
+        append_residual = False
+    else:
+        append_residual = residual > line_width * 0.2
+    if append_residual:
         offsets.append(max_offset)
     return offsets
 
 
 def _filter_concentric_paths_by_spacing(
-    paths: list[np.ndarray], path_spacing: float, tolerance: float
+    paths: list[np.ndarray],
+    path_spacing: float,
+    tolerance: float,
+    *,
+    minimum_spacing: float | None = None,
+    bead_width: float | None = None,
 ) -> list[np.ndarray]:
     accepted: list[np.ndarray] = []
     accepted_lines: list[LineString] = []
@@ -5567,8 +7437,15 @@ def _filter_concentric_paths_by_spacing(
     # measure a fraction of a percent closer than their requested pitch.  Keep
     # a tight numerical allowance without accepting a genuinely under-spaced
     # ring (for example 1.7 mm at a requested 1.8 mm pitch).
-    spacing_tolerance = max(tolerance * 100.0, path_spacing * 0.001)
-    minimum_spacing = path_spacing - spacing_tolerance
+    if minimum_spacing is None:
+        spacing_tolerance = max(tolerance * 100.0, path_spacing * 0.001)
+        required_spacing = path_spacing - spacing_tolerance
+        comparison_epsilon = tolerance
+    else:
+        required_spacing = minimum_spacing
+        # The strict threshold is a physical contract, not a geometry cleanup
+        # tolerance.  Admit only floating-point noise measured in sub-microns.
+        comparison_epsilon = max(1e-7, required_spacing * 1e-7)
 
     for path in paths:
         if path.shape[0] < 2:
@@ -5576,7 +7453,22 @@ def _filter_concentric_paths_by_spacing(
         line = LineString([(float(point[0]), float(point[1])) for point in path])
         if line.is_empty:
             continue
-        if any(line.distance(existing) < minimum_spacing - tolerance for existing in accepted_lines):
+        if minimum_spacing is not None and not _solid_fill_spacing_postcondition(
+            [path],
+            GeometryCollection(),
+            required_spacing,
+            tolerance,
+            bead_width=bead_width,
+        ):
+            # A single offset ring can fold through a narrow neck and create
+            # two long, nearly coincident sides even though it is topologically
+            # simple.  Dropping that whole ring is the conservative alternative
+            # to locally doubling the measured bead dose.
+            continue
+        if any(
+            line.distance(existing) < required_spacing - comparison_epsilon
+            for existing in accepted_lines
+        ):
             continue
         accepted.append(path)
         accepted_lines.append(line)
@@ -5738,6 +7630,8 @@ def _solid_zigzag_infill_paths(
     *,
     smoothing_angle_degrees: float = DEFAULT_RESIN_SMOOTHING_ANGLE_DEGREES,
     smoothing_corner_cut: float | None = None,
+    enforce_maximum_overlap: bool = False,
+    maximum_overlap_spacing: float | None = None,
 ) -> list[np.ndarray]:
     """Plan full-density hatch lines with bounded bead-spacing correction.
 
@@ -5746,10 +7640,10 @@ def _solid_zigzag_infill_paths(
     a wall.  Each printable island therefore uses an unchanged, centered pitch
     by default.  When long boundaries are parallel to the hatch, their levels
     are safe phase anchors only if every intervening band can be divided close
-    to the requested overlap pitch.  The small symmetric adjustment is capped
-    by both bead width and configured overlap, so it cannot silently turn a
-    10% overlap into either zero overlap or a dense pile.  A corridor narrower
-    than one pitch still receives exactly one centered stroke.
+    to the requested overlap pitch.  A small expansion-only adjustment may
+    reduce overlap beside an anchored boundary, but centre-lines are never
+    compressed below the requested pitch.  A corridor narrower than one pitch
+    still receives exactly one centered stroke.
     """
 
     if spacing <= 0:
@@ -5761,7 +7655,12 @@ def _solid_zigzag_infill_paths(
 
     paths: list[np.ndarray] = []
     spacing_adjustment = _solid_spacing_adjustment_limit(spacing, line_width)
-    minimum_scan_spacing = max(tolerance, spacing - spacing_adjustment)
+    # Coverage phasing may leave a slightly wider band, but it must never
+    # compress parallel centre-lines below the requested overlap pitch.
+    minimum_scan_spacing = max(
+        tolerance,
+        spacing if enforce_maximum_overlap else spacing - spacing_adjustment,
+    )
     maximum_scan_spacing = min(line_width, spacing + spacing_adjustment)
     for polygon in _iter_polygons(geometry):
         rotated = affinity.rotate(
@@ -5776,6 +7675,7 @@ def _solid_zigzag_infill_paths(
             spacing,
             line_width,
             tolerance,
+            enforce_maximum_overlap=enforce_maximum_overlap,
         )
         padding = spacing * 2.0
 
@@ -5820,7 +7720,9 @@ def _solid_zigzag_infill_paths(
         tolerance,
         maximum_spacing=maximum_scan_spacing,
         solid_bead_width=line_width,
-        wall_seam_clearance=minimum_clearance,
+        wall_seam_clearance=(
+            line_width if enforce_maximum_overlap else minimum_clearance
+        ),
         solid_smoothing_angle_degrees=smoothing_angle_degrees,
         solid_smoothing_corner_cut=(
             min(
@@ -5830,16 +7732,22 @@ def _solid_zigzag_infill_paths(
             if smoothing_corner_cut is None
             else smoothing_corner_cut
         ),
+        maximum_connector_overlap_spacing=(
+            maximum_overlap_spacing
+            if enforce_maximum_overlap
+            else None
+        ),
     )
 
 
 def _solid_spacing_adjustment_limit(spacing: float, line_width: float) -> float:
     """Return the maximum symmetric solid-pitch correction.
 
-    At 2 mm width and 10% overlap the requested pitch is 1.8 mm and the
-    correction is limited to 0.1 mm, so local pitches stay within 1.7..1.9 mm.
-    Zero-overlap fill remains exact, while extremely high overlap cannot create
-    a wide connector search window.
+    The value is now an expansion-only phase allowance.  At 2.2 mm measured
+    footprint and 10% overlap the requested pitch is 1.98 mm; anchored bands
+    may relax toward 2.09 mm, but may not compress below 1.98 mm.  This keeps
+    local material contact at or below the UI overlap instead of silently
+    creating a denser strip.
     """
 
     available_overlap = max(0.0, line_width - spacing)
@@ -5858,6 +7766,8 @@ def _solid_zigzag_scan_levels(
     spacing: float,
     line_width: float,
     tolerance: float,
+    *,
+    enforce_maximum_overlap: bool = False,
 ) -> list[float]:
     min_y = float(rotated_polygon.bounds[1])
     max_y = float(rotated_polygon.bounds[3])
@@ -5877,7 +7787,10 @@ def _solid_zigzag_scan_levels(
     anchors_minimum = abs(anchors[0] - min_y) <= anchor_tolerance
     anchors_maximum = abs(anchors[-1] - max_y) <= anchor_tolerance
     spacing_adjustment = _solid_spacing_adjustment_limit(spacing, line_width)
-    minimum_scan_spacing = max(tolerance, spacing - spacing_adjustment)
+    minimum_scan_spacing = max(
+        tolerance,
+        spacing if enforce_maximum_overlap else spacing - spacing_adjustment,
+    )
     maximum_scan_spacing = min(line_width, spacing + spacing_adjustment)
     if anchors_minimum and anchors_maximum:
         anchored = _scan_levels_between_anchors(
@@ -6493,10 +8406,14 @@ def _multi_axis_infill_spacing(
 
 
 def _infill_geometry_inset(config: SliceConfig) -> float:
-    return config.line_width * 0.5 + config.perimeter_count * _resin_path_spacing(
+    perimeter_path_spacing = _resin_path_spacing(
         config.line_width,
         config.infill_overlap,
     )
+    last_perimeter_centerline = config.line_width * 0.5 + (
+        config.perimeter_count - 1
+    ) * perimeter_path_spacing
+    return last_perimeter_centerline + _resin_planning_path_spacing(config)
 
 
 def _resin_path_spacing(line_width: float, overlap_percent: float) -> float:

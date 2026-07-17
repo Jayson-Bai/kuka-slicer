@@ -23,6 +23,7 @@ from .slicer import (
     DEFAULT_RESIN_INFILL_OVERLAP_PERCENT,
     DEFAULT_RESIN_LAYER_HEIGHT_MM,
     DEFAULT_RESIN_LINE_WIDTH_MM,
+    DEFAULT_RESIN_PLANNING_LINE_WIDTH_MM,
     DEFAULT_RAFT_LAYER_COUNT,
     DEFAULT_RAFT_OUTWARD_OFFSETS_MM,
     DEFAULT_RAFT_TOP_GAP_MM,
@@ -98,6 +99,11 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             DEFAULT_RESIN_LAYER_HEIGHT_MM,
         )
         line_width = _float_param(params, "line_width", DEFAULT_RESIN_LINE_WIDTH_MM)
+        planning_line_width = _float_param(
+            params,
+            "planning_line_width",
+            DEFAULT_RESIN_PLANNING_LINE_WIDTH_MM,
+        )
         pyslm_strategy_defaults = recommended_pyslm_strategy_defaults(layer_height, line_width)
         requested_build_axis = params.get("build_axis", ["auto"])[0]
         z_min = _optional_float_param(params, "z_min")
@@ -137,6 +143,8 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             True,
         )
         slicing_kernel = params.get("slicing_kernel", ["legacy"])[0]
+        if slicing_kernel != "legacy":
+            planning_line_width = None
         pyslm_config = PySLMConfig(
             hatcher=params.get("pyslm_hatcher", ["basic"])[0],  # type: ignore[arg-type]
             hatch_angle=_optional_float_param(params, "pyslm_hatch_angle"),
@@ -223,6 +231,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             material="R",
             layer_height=layer_height,
             line_width=line_width,
+            planning_line_width=planning_line_width,
             z_min=z_min,
             z_max=z_max,
             tolerance=tolerance,
@@ -260,6 +269,9 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         path_count = sum(len(group.paths) for group in job.material_paths)
         preview = _preview_payload(mesh, config, job, fiber_preview_paths)
         recommendation = _triangle_infill_recommendation(mesh, config, job)
+        slicing_metadata = job.meta.get("slicing", {})
+        if not isinstance(slicing_metadata, dict):
+            slicing_metadata = {}
         return {
             "download_url": f"/outputs/{quote(stamp)}/{quote(npz_path.name)}",
             "filename": npz_path.name,
@@ -270,6 +282,21 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             "fiber_json": fiber_json_name,
             "build_axis": build_axis,
             "slicing_kernel": config.slicing_kernel,
+            "effective_infill_pattern": slicing_metadata.get(
+                "effective_infill_pattern",
+                config.infill_pattern,
+            ),
+            "infill_pattern_execution": slicing_metadata.get(
+                "infill_pattern_execution"
+            ),
+            "planning_line_width": float(
+                config.line_width
+                if (
+                    config.slicing_kernel != "legacy"
+                    or config.planning_line_width is None
+                )
+                else config.planning_line_width
+            ),
         }
 
     def _read_slice_request(
@@ -634,10 +661,16 @@ def _preview_payload(
             "fiber_paths": serialized_fiber_paths,
         }
 
+    planning_line_width = (
+        config.line_width
+        if config.slicing_kernel != "legacy" or config.planning_line_width is None
+        else config.planning_line_width
+    )
     return {
         "bounds": bounds,
         "line_widths": {
-            "resin": float(config.line_width),
+            "resin": float(planning_line_width),
+            "resin_nominal": float(config.line_width),
             "fiber": DEFAULT_FIBER_LINE_WIDTH_MM,
         },
         "layers": list(layers_by_index.values()),
@@ -1159,14 +1192,21 @@ def _index_html() -> str:
           <h3>树脂路径内核</h3>
           <div class="grid">
             <div>
-              <label for="lineWidth">树脂线宽 mm</label>
+              <label for="lineWidth">名义树脂线宽 mm</label>
               <input id="lineWidth" name="lineWidth" type="number" min="0.001" step="0.001" value="{DEFAULT_RESIN_LINE_WIDTH_MM}">
             </div>
             <div>
-              <label for="perimeterCount">边界圈数</label>
-              <input id="perimeterCount" name="perimeterCount" type="number" min="1" step="1" value="2">
+              <label for="planningLineWidth">实测压平线宽 mm</label>
+              <input id="planningLineWidth" name="planningLineWidth" type="number" min="0.001" step="0.001" value="{DEFAULT_RESIN_PLANNING_LINE_WIDTH_MM}">
             </div>
           </div>
+          <div class="notice warning">
+            实测压平线宽仅用于 Prusa 树脂轨迹间距、搭边计算和实际铺展预览；不会修改 NPZ 中的名义线宽，也不会改变挤出倍率。
+            为保证相邻有效填充段和轮廓的最大搭边，网格、三角形和陀螺曲线在此严格模式中会自动改为按层轮换的单方向之字形，避免同层交叉；结果区和 NPZ 元数据会明确显示实际执行策略。
+          </div>
+
+          <label for="perimeterCount">边界圈数</label>
+          <input id="perimeterCount" name="perimeterCount" type="number" min="1" step="1" value="2">
 
           <label for="slicingKernel">切片内核</label>
           <select id="slicingKernel" name="slicingKernel">
@@ -1296,13 +1336,14 @@ def _index_html() -> str:
             <option value="rectilinear">交替直线填充</option>
             <option value="aligned_rectilinear">对齐直线填充</option>
             <option value="line">单向线填充</option>
-            <option value="grid">网格填充</option>
-            <option value="triangles">三角形填充</option>
-            <option value="gyroid">陀螺曲线填充</option>
+            <option value="grid">网格填充（严格模式按层 0°/90°）</option>
+            <option value="triangles">三角形填充（严格模式按层 0°/60°/120°）</option>
+            <option value="gyroid">陀螺曲线填充（严格模式按层 45°/-45°）</option>
             <option value="concentric">同心轮廓填充</option>
             <option value="zigzag">之字形填充</option>
             <option value="isotropic">各向同性填充</option>
           </select>
+          <div id="infillSafetyNote" class="notice warning"></div>
           <label class="checkboxLabel" title="仅 Prusa 三角形填充生效；先排序/反向，再合并数值上共点的路径，所有实体连接仍需通过线宽净距检查。"><input id="trianglePathOptimization" type="checkbox" checked> 三角形填充路径优化</label>
           <label class="checkboxLabel" title="相邻扫描线在安全填充区域内沿外边界或孔洞边界连续折返；legacy 与 PySLM 均使用该连接路径。"><input id="zigzagPathOptimization" type="checkbox" checked> 之字形填充路径优化</label>
           </div>
@@ -1369,6 +1410,9 @@ def _index_html() -> str:
         <div class="metric"><span>层数</span><strong id="layers">-</strong></div>
         <div class="metric"><span>路径数</span><strong id="paths">-</strong></div>
         <div class="metric"><span>输出</span><strong id="outputName">-</strong></div>
+        <div class="metric"><span>实际执行内核</span><strong id="executedKernel">-</strong></div>
+        <div class="metric"><span>实际规划线宽（仅轨迹规划）</span><strong id="executedPlanningLineWidth">-</strong></div>
+        <div class="metric"><span>实际填充策略</span><strong id="executedInfillPattern">-</strong></div>
       </div>
       <a id="download" class="download" href="#">下载 NPZ</a>
       <div class="viewerControls">
@@ -1411,6 +1455,9 @@ def _index_html() -> str:
     const layersEl = document.getElementById('layers');
     const pathsEl = document.getElementById('paths');
     const outputNameEl = document.getElementById('outputName');
+    const executedKernelEl = document.getElementById('executedKernel');
+    const executedPlanningLineWidthEl = document.getElementById('executedPlanningLineWidth');
+    const executedInfillPatternEl = document.getElementById('executedInfillPattern');
     const previewSurface = document.getElementById('previewSurface');
     const previewCanvas = document.getElementById('previewCanvas');
     const layerSlider = document.getElementById('layerSlider');
@@ -1432,14 +1479,21 @@ def _index_html() -> str:
     const slicingKernelInput = document.getElementById('slicingKernel');
     const layerHeightInput = document.getElementById('layerHeight');
     const lineWidthInput = document.getElementById('lineWidth');
+    const planningLineWidthInput = document.getElementById('planningLineWidth');
     const legacyInfillControl = document.getElementById('legacyInfillControl');
     const infillPatternInput = document.getElementById('infillPattern');
+    const infillSafetyNote = document.getElementById('infillSafetyNote');
     const pyslmNativeSettings = document.getElementById('pyslmNativeSettings');
     const pyslmHatcherInput = document.getElementById('pyslmHatcher');
     const pyslmPatternAutoInput = document.getElementById('pyslmPatternAuto');
     const stripeParameterIds = ['pyslmStripeWidth', 'pyslmStripeOverlap', 'pyslmStripeOffset'];
     const islandParameterIds = ['pyslmIslandWidth', 'pyslmIslandOverlap', 'pyslmIslandOffset'];
     const pyslmSupportedPatterns = new Set(['none', 'line', 'aligned_rectilinear', 'rectilinear', 'zigzag', 'isotropic']);
+    const strictLayeredFallbackPatterns = {{
+      grid: '严格实测线宽模式下，同层交叉会改为按层 0°/90° 单向之字形。',
+      triangles: '严格实测线宽模式下，同层交叉会改为按层 0°/60°/120° 单向之字形。',
+      gyroid: '严格实测线宽模式下，曲线局部近接会改为按层 45°/-45° 单向之字形。'
+    }};
     const pyslmSettingsIds = [
       'pyslmHatcher', 'pyslmHatchSort', 'pyslmHatchAngle', 'pyslmLayerAngleIncrement',
       'pyslmHatchDistance', 'pyslmContourOffset', 'pyslmSpotCompensation',
@@ -1478,6 +1532,7 @@ def _index_html() -> str:
     }}
     function syncKernelControls() {{
       const isPyslm = slicingKernelInput.value === 'pyslm';
+      planningLineWidthInput.disabled = isPyslm;
       pyslmNativeSettings.hidden = !isPyslm;
       legacyInfillControl.hidden = false;
       infillPatternInput.disabled = false;
@@ -1487,6 +1542,9 @@ def _index_html() -> str:
       if (isPyslm && !pyslmSupportedPatterns.has(infillPatternInput.value)) {{
         infillPatternInput.value = 'rectilinear';
       }}
+      infillSafetyNote.textContent = !isPyslm
+        ? (strictLayeredFallbackPatterns[infillPatternInput.value] || '')
+        : '';
       for (const id of pyslmSettingsIds) {{
         document.getElementById(id).disabled = !isPyslm;
       }}
@@ -1529,6 +1587,9 @@ def _index_html() -> str:
       formData.append('filename', file.name);
       formData.append('layer_height', document.getElementById('layerHeight').value);
       formData.append('line_width', document.getElementById('lineWidth').value);
+      if (slicingKernelInput.value === 'legacy') {{
+        formData.append('planning_line_width', document.getElementById('planningLineWidth').value);
+      }}
       formData.append('build_axis', document.getElementById('buildAxis').value);
       formData.append('z_min', document.getElementById('zMin').value);
       formData.append('z_max', document.getElementById('zMax').value);
@@ -1579,6 +1640,25 @@ def _index_html() -> str:
         layersEl.textContent = result.layers;
         pathsEl.textContent = result.paths;
         outputNameEl.textContent = result.filename;
+        executedKernelEl.textContent = result.slicing_kernel === 'legacy'
+          ? 'Prusa'
+          : result.slicing_kernel === 'pyslm'
+            ? 'PySLM'
+            : String(result.slicing_kernel || '-');
+        const executedPlanningLineWidth = Number(result.planning_line_width);
+        executedPlanningLineWidthEl.textContent = result.slicing_kernel === 'pyslm'
+          ? '不适用（PySLM 后端自行控制）'
+          : Number.isFinite(executedPlanningLineWidth)
+            ? String(Number(executedPlanningLineWidth.toFixed(3))) + ' mm'
+            : '-';
+        const patternExecution = result.infill_pattern_execution;
+        if (patternExecution?.applied) {{
+          const angles = (patternExecution.angle_schedule_degrees || []).join('° / ');
+          executedInfillPatternEl.textContent = '安全分层单向之字形'
+            + (angles ? '（' + angles + '°）' : '');
+        }} else {{
+          executedInfillPatternEl.textContent = String(result.effective_infill_pattern || '-');
+        }}
         previewData = result.preview;
         configureViewer();
         drawPreview();
