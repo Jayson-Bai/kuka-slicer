@@ -1438,7 +1438,7 @@ def _index_html() -> str:
         <label class="legendItem"><input id="showFiberPaths" type="checkbox" checked><span class="swatch fiberSwatch"></span>纤维路径</label>
       </div>
       <div class="viewOptions" aria-label="显示选项">
-        <label><input id="showLineWidth" type="checkbox">按线宽显示</label>
+        <label title="仅改变预览笔触宽度，不改变轨迹中心线或挤出倍率"><input id="showLineWidth" type="checkbox">按实际规划线宽显示（当前 <span id="previewLineWidthValue">2.2 mm</span>）</label>
         <label><input id="showPathPoints" type="checkbox">显示当前路径点</label>
         <label><input id="showDirection" type="checkbox" checked>显示打印方向</label>
         <span id="printSizeLabel">打印范围 -</span>
@@ -1470,6 +1470,7 @@ def _index_html() -> str:
     const fiberJsonInput = document.getElementById('fiberJsonFile');
     const fiberNotice = document.getElementById('fiberNotice');
     const showLineWidthInput = document.getElementById('showLineWidth');
+    const previewLineWidthValueEl = document.getElementById('previewLineWidthValue');
     const showPathPointsInput = document.getElementById('showPathPoints');
     const showDirectionInput = document.getElementById('showDirection');
     const showOuterContourInput = document.getElementById('showOuterContour');
@@ -1559,6 +1560,19 @@ def _index_html() -> str:
       for (const id of islandParameterIds) {{
         document.getElementById(id).disabled = !islandEnabled || pyslmPatternAutoInput.checked;
       }}
+      updatePreviewLineWidthValue();
+    }}
+    function updatePreviewLineWidthValue() {{
+      const previewWidth = Number(previewData?.line_widths?.resin);
+      const configuredWidth = slicingKernelInput.value === 'legacy'
+        ? Number(planningLineWidthInput.value)
+        : Number(lineWidthInput.value);
+      const width = Number.isFinite(previewWidth) && previewWidth > 0
+        ? previewWidth
+        : configuredWidth;
+      previewLineWidthValueEl.textContent = Number.isFinite(width) && width > 0
+        ? String(Number(width.toFixed(3))) + ' mm'
+        : '-';
     }}
     slicingKernelInput.addEventListener('change', syncKernelControls);
     infillPatternInput.addEventListener('change', syncKernelControls);
@@ -1566,6 +1580,7 @@ def _index_html() -> str:
     pyslmPatternAutoInput.addEventListener('change', syncKernelControls);
     layerHeightInput.addEventListener('input', syncKernelControls);
     lineWidthInput.addEventListener('input', syncKernelControls);
+    planningLineWidthInput.addEventListener('input', updatePreviewLineWidthValue);
     syncKernelControls();
     fiberNotice.textContent = 'JSON 中的单层纤维路径会复制到每个树脂层，最后一层树脂封顶不打印纤维。';
 
@@ -1660,6 +1675,7 @@ def _index_html() -> str:
           executedInfillPatternEl.textContent = String(result.effective_infill_pattern || '-');
         }}
         previewData = result.preview;
+        updatePreviewLineWidthValue();
         configureViewer();
         drawPreview();
         downloadEl.href = result.download_url;

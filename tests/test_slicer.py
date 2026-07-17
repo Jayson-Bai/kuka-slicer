@@ -3350,6 +3350,7 @@ def test_ui_exposes_slicing_kernel_input():
         "showInnerContour",
         "showResinInfill",
         "showFiberPaths",
+        "previewLineWidthValue",
         "printSizeLabel",
         "previewSurface",
         "previewCanvas",
@@ -3400,6 +3401,16 @@ def test_ui_result_summary_reports_backend_kernel_and_planning_width():
     assert '<span>实际填充策略</span><strong id="executedInfillPattern">-</strong>' in html
     assert "const patternExecution = result.infill_pattern_execution" in html
     assert "安全分层单向之字形" in html
+
+
+def test_ui_preview_labels_the_exact_planning_width_used_for_rendering():
+    html = _index_html()
+
+    assert "按实际规划线宽显示（当前" in html
+    assert "仅改变预览笔触宽度，不改变轨迹中心线或挤出倍率" in html
+    assert "previewData?.line_widths?.resin" in html
+    assert "planningLineWidthInput.addEventListener('input'" in html
+    assert "updatePreviewLineWidthValue();" in html
 
 
 def test_ui_preview_supports_filtered_ordered_progress_pan_zoom_and_rulers():
