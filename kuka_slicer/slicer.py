@@ -50,7 +50,9 @@ DEFAULT_FIBER_LAYER_HEIGHT_MM = 0.1
 DEFAULT_FIBER_LINE_WIDTH_MM = 1.0
 DEFAULT_RESIN_PERIMETER_COUNT = 2
 DEFAULT_RESIN_SMOOTHING_ANGLE_DEGREES = 150.0
+DEFAULT_PRUSA_CONTINUITY_SMOOTHING_ANGLE_DEGREES = 120.0
 DEFAULT_RESIN_SMOOTHING_RADIUS_FACTOR = 0.35
+MAX_SOLID_FILL_RECONNECT_PASSES = 5
 GYROID_WAVELENGTH_FACTOR = 2.35
 DEFAULT_RAFT_LAYER_COUNT = 2
 DEFAULT_RAFT_OUTWARD_OFFSETS_MM = (15.0, 10.0)
@@ -1013,15 +1015,21 @@ def _raft_paths_for_layer(
             centerline_regions=centerline_regions,
         )
         if config.planning_line_width is not None:
-            filled = _reconnect_finished_solid_fill_paths(
-                perimeters,
-                filled,
-                last_perimeter_linework,
-                config,
-                direct_allowed=(
-                    None if centerline_regions is None else centerline_regions[2]
-                ),
-            )
+            for _ in range(MAX_SOLID_FILL_RECONNECT_PASSES):
+                reconnected = _reconnect_finished_solid_fill_paths(
+                    perimeters,
+                    filled,
+                    last_perimeter_linework,
+                    config,
+                    direct_allowed=(
+                        None
+                        if centerline_regions is None
+                        else centerline_regions[2]
+                    ),
+                )
+                if len(reconnected) == len(filled):
+                    break
+                filled = reconnected
         measured_width_validated = config.planning_line_width is not None
     if (
         config.planning_line_width is not None
@@ -1599,15 +1607,21 @@ def _build_resin_paths(
             centerline_regions=centerline_regions,
         )
         if config.planning_line_width is not None:
-            filled = _reconnect_finished_solid_fill_paths(
-                perimeters,
-                filled,
-                last_perimeter_linework,
-                config,
-                direct_allowed=(
-                    None if centerline_regions is None else centerline_regions[2]
-                ),
-            )
+            for _ in range(MAX_SOLID_FILL_RECONNECT_PASSES):
+                reconnected = _reconnect_finished_solid_fill_paths(
+                    perimeters,
+                    filled,
+                    last_perimeter_linework,
+                    config,
+                    direct_allowed=(
+                        None
+                        if centerline_regions is None
+                        else centerline_regions[2]
+                    ),
+                )
+                if len(reconnected) == len(filled):
+                    break
+                filled = reconnected
         measured_width_validated = config.planning_line_width is not None
     if config.infill_pattern == "triangles" and config.triangle_path_optimization:
         triangle_merge_tolerance = _legacy_path_merge_tolerance(
@@ -3900,10 +3914,10 @@ def _reconnect_finished_solid_fill_paths(
         [*perimeter_paths, *source_paths],
         bead_radius,
     )
-    maximum_lost_diameter = planning_width * 0.35
-    # The useful solutions are short asymmetric trims: one side makes room
-    # for curvature while the other preserves wall coverage.  Keeping this
-    # measured set avoids an expensive 5x5 search for every endpoint pair.
+    maximum_lost_diameter = planning_width * 0.60
+    # Prefer short asymmetric trims: one side makes room for curvature while
+    # the other preserves coverage.  The relaxed coverage guard below permits
+    # a small local underfill instead of rejecting every non-identical return.
     trim_factors = (
         (0.1, 0.1),
         (0.1, 0.2),
@@ -3980,7 +3994,7 @@ def _reconnect_finished_solid_fill_paths(
         tuple[int, int, float, float, np.ndarray]
     ] = []
     minimum_gap = path_spacing * 0.95
-    maximum_gap = path_spacing * 1.65
+    maximum_gap = path_spacing * 4.0
     for first_index, first_source in enumerate(source_paths):
         for second_index in range(first_index + 1, len(source_paths)):
             second_source = source_paths[second_index]
@@ -4010,7 +4024,6 @@ def _reconnect_finished_solid_fill_paths(
                     if (
                         start_tangent is None
                         or end_tangent is None
-                        or float(np.dot(start_tangent, end_tangent)) > -0.8
                     ):
                         continue
 
@@ -4109,9 +4122,9 @@ def _reconnect_finished_solid_fill_paths(
                 assembled.append(path)
         return assembled
 
-    # Earlier scanline components retain priority.  This mirrors the useful
-    # same-side behavior of the historical planner while the complete-layer
-    # checks below prevent two individually safe returns from conflicting.
+    # Each accepted pair returns as a new trail on the next pass, so it may be
+    # extended again until no validated connection remains.  Complete-layer
+    # checks prevent individually safe returns from conflicting.
     for first_index, second_index, _, _, chain in sorted(
         candidates,
         key=lambda item: (item[0], item[1], item[2], item[3]),

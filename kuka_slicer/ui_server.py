@@ -23,6 +23,7 @@ from .slicer import (
     DEFAULT_RESIN_INFILL_OVERLAP_PERCENT,
     DEFAULT_RESIN_LAYER_HEIGHT_MM,
     DEFAULT_RESIN_LINE_WIDTH_MM,
+    DEFAULT_PRUSA_CONTINUITY_SMOOTHING_ANGLE_DEGREES,
     DEFAULT_RESIN_PLANNING_LINE_WIDTH_MM,
     DEFAULT_RAFT_LAYER_COUNT,
     DEFAULT_RAFT_OUTWARD_OFFSETS_MM,
@@ -115,7 +116,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         smoothing_angle = _float_param(
             params,
             "smoothing_angle",
-            DEFAULT_RESIN_SMOOTHING_ANGLE_DEGREES,
+            DEFAULT_PRUSA_CONTINUITY_SMOOTHING_ANGLE_DEGREES,
         )
         smoothing_radius_factor = _float_param(
             params,
@@ -1362,7 +1363,7 @@ def _index_html() -> str:
           <div class="grid">
             <div>
               <label for="smoothingAngle">平滑角阈值 °</label>
-              <input id="smoothingAngle" name="smoothingAngle" type="number" min="1" max="179" step="1" value="{DEFAULT_RESIN_SMOOTHING_ANGLE_DEGREES:g}">
+              <input id="smoothingAngle" name="smoothingAngle" type="number" min="1" max="179" step="1" value="{DEFAULT_PRUSA_CONTINUITY_SMOOTHING_ANGLE_DEGREES:g}">
             </div>
             <div>
               <label for="smoothingRadiusFactor">平滑半径系数</label>

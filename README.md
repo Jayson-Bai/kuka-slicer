@@ -72,7 +72,7 @@ python -m kuka_slicer slice input.stl output.npz `
   --infill-density 100 `
   --infill-overlap 10 `
   --perimeter-count 2 `
-  --smoothing-angle 150 `
+  --smoothing-angle 120 `
   --smoothing-radius-factor 0.35 `
   --z-min 0.2 `
   --z-max 10.0 `

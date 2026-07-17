@@ -13,6 +13,7 @@ from .slicer import (
     DEFAULT_RESIN_INFILL_OVERLAP_PERCENT,
     DEFAULT_RESIN_LAYER_HEIGHT_MM,
     DEFAULT_RESIN_LINE_WIDTH_MM,
+    DEFAULT_PRUSA_CONTINUITY_SMOOTHING_ANGLE_DEGREES,
     PySLMConfig,
     SliceConfig,
     normalize_job_xy_origin,
@@ -167,7 +168,7 @@ def main(argv: list[str] | None = None) -> int:
     slice_parser.add_argument(
         "--smoothing-angle",
         type=float,
-        default=150.0,
+        default=DEFAULT_PRUSA_CONTINUITY_SMOOTHING_ANGLE_DEGREES,
         help="corner angle threshold in degrees for resin path smoothing",
     )
     slice_parser.add_argument(

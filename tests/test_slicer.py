@@ -1506,6 +1506,36 @@ def test_finished_solid_fill_reconnects_parallel_trails_with_trimmed_tangent_ret
     )
 
 
+def test_finished_solid_fill_reconnects_distant_perpendicular_trails():
+    config = SliceConfig(
+        line_width=2.0,
+        planning_line_width=2.2,
+        infill_overlap=10.0,
+        tolerance=0.0005,
+        smoothing_angle=120.0,
+    )
+    first = np.asarray([[0.0, 0.0], [10.0, 0.0]], dtype=np.float32)
+    second = np.asarray([[14.0, 4.0], [14.0, 14.0]], dtype=np.float32)
+    safe_geometry = Polygon([(-5, -5), (25, -5), (25, 25), (-5, 25)])
+
+    reconnected = slicer_module._reconnect_finished_solid_fill_paths(
+        [],
+        [first, second],
+        Polygon(),
+        config,
+        direct_allowed=safe_geometry,
+    )
+
+    assert len(reconnected) == 1
+    assert LineString(reconnected[0]).is_simple
+    assert not slicer_module._effective_path_corner_candidates(
+        reconnected[0],
+        minimum_span=0.01,
+        angle_threshold_degrees=config.smoothing_angle,
+        tolerance=config.tolerance,
+    )
+
+
 def test_measured_width_reconnect_runs_on_all_dense_prusa_layers(monkeypatch):
     calls: list[int] = []
 
