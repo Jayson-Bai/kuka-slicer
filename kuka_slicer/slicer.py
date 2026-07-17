@@ -1012,6 +1012,19 @@ def _raft_paths_for_layer(
             config,
             centerline_regions=centerline_regions,
         )
+        if (
+            config.planning_line_width is not None
+            and layer_index == DEFAULT_RAFT_LAYER_COUNT - 1
+        ):
+            filled = _reconnect_finished_solid_fill_paths(
+                perimeters,
+                filled,
+                last_perimeter_linework,
+                config,
+                direct_allowed=(
+                    None if centerline_regions is None else centerline_regions[2]
+                ),
+            )
         measured_width_validated = config.planning_line_width is not None
     if (
         config.planning_line_width is not None
@@ -3830,6 +3843,305 @@ def _finish_solid_fill_paths(
             "measured-width infill cannot satisfy the configured maximum overlap"
         )
     return fallback
+
+
+def _reconnect_finished_solid_fill_paths(
+    perimeter_paths: list[np.ndarray],
+    infill_paths: list[np.ndarray],
+    last_perimeter_linework,
+    config: SliceConfig,
+    *,
+    direct_allowed,
+) -> list[np.ndarray]:
+    """Join compatible finished trails by replacing their short end tails.
+
+    A boundary arc added at the original endpoints can be centerline-clear yet
+    still form a sharp, over-deposited hook beside a hole.  Instead, retract a
+    fraction of one measured pitch from both incident hatches and replace those
+    tails with a tangent cubic return.  Every proposal is checked against the
+    complete layer for measured-width spacing, effective corner angle, simple
+    topology, and loss of physical bead coverage before it may reduce a stop.
+    """
+
+    if (
+        config.planning_line_width is None
+        or len(infill_paths) < 2
+        or direct_allowed is None
+        or direct_allowed.is_empty
+    ):
+        return infill_paths
+
+    planning_width = _resin_planning_line_width(config)
+    path_spacing = _resin_planning_path_spacing(config)
+    maximum_overlap_spacing = _resin_maximum_overlap_spacing(config)
+    tolerance = config.tolerance
+    safe_geometry = direct_allowed.buffer(
+        max(tolerance * 10.0, 1e-7),
+        join_style="round",
+    )
+    effective_span = max(tolerance * 20.0, config.line_width * 0.005)
+    source_paths = [
+        np.asarray(path[:, :2], dtype=np.float32).copy()
+        for path in infill_paths
+        if path.shape[0] >= 2
+    ]
+    if len(source_paths) < 2:
+        return infill_paths
+
+    bead_radius = planning_width * 0.5
+    baseline_coverage = _round_bead_coverage(
+        [*perimeter_paths, *source_paths],
+        bead_radius,
+    )
+    maximum_lost_diameter = planning_width * 0.35
+    # The useful solutions are short asymmetric trims: one side makes room
+    # for curvature while the other preserves wall coverage.  Keeping this
+    # measured set avoids an expensive 5x5 search for every endpoint pair.
+    trim_factors = (
+        (0.1, 0.1),
+        (0.1, 0.2),
+        (0.2, 0.1),
+        (0.1, 0.3),
+        (0.3, 0.1),
+        (0.2, 0.2),
+        (0.1, 0.5),
+        (0.5, 0.1),
+    )
+
+    def trim_path_end(path: np.ndarray, distance: float) -> np.ndarray | None:
+        reversed_trimmed = _trim_open_path_start(
+            path[::-1].copy(),
+            distance,
+            tolerance,
+        )
+        return (
+            None
+            if reversed_trimmed is None
+            else reversed_trimmed[::-1].copy()
+        )
+
+    def unit_direction(vector: np.ndarray) -> np.ndarray | None:
+        length = float(np.linalg.norm(vector))
+        if length <= tolerance:
+            return None
+        return np.asarray(vector, dtype=np.float64) / length
+
+    def tangent_cubic(
+        start: np.ndarray,
+        end: np.ndarray,
+        start_tangent: np.ndarray,
+        end_tangent: np.ndarray,
+    ) -> np.ndarray:
+        chord_length = float(np.linalg.norm(end - start))
+        handle_length = chord_length * 0.12
+        parameters = np.linspace(0.0, 1.0, 33, dtype=np.float64)[:, None]
+        one_minus = 1.0 - parameters
+        first_control = start + start_tangent * handle_length
+        second_control = end - end_tangent * handle_length
+        curve = (
+            one_minus**3 * start
+            + 3.0 * one_minus**2 * parameters * first_control
+            + 3.0 * one_minus * parameters**2 * second_control
+            + parameters**3 * end
+        ).astype(np.float32)
+        curve[0] = np.asarray(start, dtype=np.float32)
+        curve[-1] = np.asarray(end, dtype=np.float32)
+        return curve
+
+    def layer_is_valid(paths: list[np.ndarray]) -> bool:
+        return _solid_fill_spacing_postcondition(
+            paths,
+            last_perimeter_linework,
+            maximum_overlap_spacing,
+            tolerance,
+            bead_width=planning_width,
+        )
+
+    def coverage_is_preserved(paths: list[np.ndarray]) -> bool:
+        proposed_coverage = _round_bead_coverage(
+            [*perimeter_paths, *paths],
+            bead_radius,
+        )
+        lost_coverage = baseline_coverage.difference(proposed_coverage)
+        return (
+            lost_coverage.is_empty
+            or _maximum_inscribed_diameter(lost_coverage, tolerance)
+            <= maximum_lost_diameter + tolerance
+        )
+
+    candidates: list[
+        tuple[int, int, float, float, np.ndarray]
+    ] = []
+    minimum_gap = path_spacing * 0.95
+    maximum_gap = path_spacing * 1.65
+    for first_index, first_source in enumerate(source_paths):
+        for second_index in range(first_index + 1, len(source_paths)):
+            second_source = source_paths[second_index]
+            best_candidate: tuple[float, float, np.ndarray] | None = None
+            for first_side in (0, 1):
+                first_oriented = (
+                    first_source if first_side == 1 else first_source[::-1].copy()
+                )
+                for second_side in (0, 1):
+                    second_oriented = (
+                        second_source
+                        if second_side == 0
+                        else second_source[::-1].copy()
+                    )
+                    endpoint_gap = float(
+                        np.linalg.norm(
+                            second_oriented[0, :2] - first_oriented[-1, :2]
+                        )
+                    )
+                    if not (minimum_gap <= endpoint_gap <= maximum_gap):
+                        continue
+                    start_tangent = unit_direction(
+                        first_oriented[-1, :2] - first_oriented[-2, :2]
+                    )
+                    end_tangent = unit_direction(
+                        second_oriented[1, :2] - second_oriented[0, :2]
+                    )
+                    if (
+                        start_tangent is None
+                        or end_tangent is None
+                        or float(np.dot(start_tangent, end_tangent)) > -0.8
+                    ):
+                        continue
+
+                    for first_factor, second_factor in trim_factors:
+                        first_trimmed = trim_path_end(
+                            first_oriented,
+                            path_spacing * first_factor,
+                        )
+                        second_trimmed = _trim_open_path_start(
+                            second_oriented,
+                            path_spacing * second_factor,
+                            tolerance,
+                        )
+                        if first_trimmed is None or second_trimmed is None:
+                            continue
+                        start_tangent = unit_direction(
+                            first_trimmed[-1, :2] - first_trimmed[-2, :2]
+                        )
+                        end_tangent = unit_direction(
+                            second_trimmed[1, :2] - second_trimmed[0, :2]
+                        )
+                        if start_tangent is None or end_tangent is None:
+                            continue
+                        connector = tangent_cubic(
+                            np.asarray(first_trimmed[-1, :2], dtype=np.float64),
+                            np.asarray(second_trimmed[0, :2], dtype=np.float64),
+                            start_tangent,
+                            end_tangent,
+                        )
+                        chain = _dedupe_consecutive(
+                            np.vstack(
+                                (
+                                    first_trimmed,
+                                    connector[1:],
+                                    second_trimmed[1:],
+                                )
+                            ).astype(np.float32),
+                            tolerance,
+                        )
+                        chain_line = LineString(chain[:, :2])
+                        if (
+                            chain.shape[0] < 2
+                            or not chain_line.is_simple
+                            or not safe_geometry.covers(chain_line)
+                            or _effective_path_corner_candidates(
+                                chain,
+                                effective_span,
+                                config.smoothing_angle,
+                                tolerance,
+                            )
+                        ):
+                            continue
+                        if not _solid_fill_spacing_postcondition(
+                            [chain],
+                            Polygon(),
+                            maximum_overlap_spacing,
+                            tolerance,
+                            bead_width=planning_width,
+                            allow_boundary_bridges=True,
+                        ):
+                            continue
+                        proposed = [
+                            path
+                            for path_index, path in enumerate(source_paths)
+                            if path_index not in (first_index, second_index)
+                        ]
+                        proposed.append(chain)
+                        if not layer_is_valid(proposed):
+                            continue
+                        if not coverage_is_preserved(proposed):
+                            continue
+                        trim_total = path_spacing * (
+                            first_factor + second_factor
+                        )
+                        proposal = (trim_total, endpoint_gap, chain)
+                        if (
+                            best_candidate is None
+                            or proposal[:2] < best_candidate[:2]
+                        ):
+                            best_candidate = proposal
+                        break
+                    if best_candidate is not None:
+                        break
+                if best_candidate is not None:
+                    break
+            if best_candidate is not None:
+                candidates.append(
+                    (
+                        first_index,
+                        second_index,
+                        best_candidate[0],
+                        best_candidate[1],
+                        best_candidate[2],
+                    )
+                )
+
+    if not candidates:
+        return source_paths
+
+    selected: dict[int, tuple[int, np.ndarray]] = {}
+    consumed: set[int] = set()
+
+    def assembled_paths(
+        extra: tuple[int, int, np.ndarray] | None = None,
+    ) -> list[np.ndarray]:
+        local_selected = dict(selected)
+        local_consumed = set(consumed)
+        if extra is not None:
+            first_index, second_index, chain = extra
+            local_selected[first_index] = (second_index, chain)
+            local_consumed.update((first_index, second_index))
+        assembled: list[np.ndarray] = []
+        for path_index, path in enumerate(source_paths):
+            selection = local_selected.get(path_index)
+            if selection is not None:
+                assembled.append(selection[1])
+            elif path_index not in local_consumed:
+                assembled.append(path)
+        return assembled
+
+    # Earlier scanline components retain priority.  This mirrors the useful
+    # same-side behavior of the historical planner while the complete-layer
+    # checks below prevent two individually safe returns from conflicting.
+    for first_index, second_index, _, _, chain in sorted(
+        candidates,
+        key=lambda item: (item[0], item[1], item[2], item[3]),
+    ):
+        if first_index in consumed or second_index in consumed:
+            continue
+        proposed = assembled_paths((first_index, second_index, chain))
+        if not layer_is_valid(proposed) or not coverage_is_preserved(proposed):
+            continue
+        selected[first_index] = (second_index, chain)
+        consumed.update((first_index, second_index))
+
+    reconnected = assembled_paths()
+    return reconnected if len(reconnected) < len(source_paths) else source_paths
 
 
 def _reroute_residual_solid_bead_gaps(

@@ -1467,6 +1467,45 @@ def test_measured_width_caps_raft_parallel_overlap(angle: float):
     assert min(scan_gaps) >= 2.2 * 0.9 - 0.002
 
 
+def test_finished_solid_fill_reconnects_parallel_trails_with_trimmed_tangent_return():
+    planning_width = 2.2
+    requested_pitch = planning_width * 0.9
+    config = SliceConfig(
+        line_width=2.0,
+        planning_line_width=planning_width,
+        infill_overlap=10.0,
+        tolerance=0.0005,
+        smoothing_angle=150.0,
+    )
+    first = np.asarray([[0.0, 0.0], [10.0, 0.0]], dtype=np.float32)
+    second = np.asarray([[10.0, 2.0], [0.0, 2.0]], dtype=np.float32)
+    safe_geometry = Polygon([(-2, -2), (12, -2), (12, 4), (-2, 4)])
+
+    reconnected = slicer_module._reconnect_finished_solid_fill_paths(
+        [],
+        [first, second],
+        Polygon(),
+        config,
+        direct_allowed=safe_geometry,
+    )
+
+    assert len(reconnected) == 1
+    assert LineString(reconnected[0]).is_simple
+    assert not slicer_module._effective_path_corner_candidates(
+        reconnected[0],
+        minimum_span=0.01,
+        angle_threshold_degrees=config.smoothing_angle,
+        tolerance=config.tolerance,
+    )
+    assert slicer_module._solid_fill_spacing_postcondition(
+        reconnected,
+        Polygon(),
+        minimum_spacing=requested_pitch,
+        tolerance=config.tolerance,
+        bead_width=planning_width,
+    )
+
+
 @pytest.mark.parametrize("density", [20.0, 50.0, 99.0])
 def test_measured_width_validates_sparse_raft_endcaps(density: float):
     footprint = Polygon([(0, 0), (60, 0), (60, 40), (0, 40)])
