@@ -52,6 +52,7 @@ from kuka_slicer.ui_server import (
     _raft_layers_from_params,
     _simplify_preview_path,
     expand_fiber_template_for_resin_layers,
+    load_fiber_template_json,
 )
 
 
@@ -96,6 +97,49 @@ def test_fiber_template_z_is_offset_from_resin_layer_z():
     assert np.allclose(
         [fiber_paths_by_layer[layer_index][0][0][2] for layer_index in sorted(fiber_paths_by_layer)],
         [0.6, 1.1],
+    )
+
+
+def test_fiber_json_merges_multiple_path_families_at_the_same_layer_height(
+    tmp_path,
+):
+    json_path = tmp_path / "two_families.json"
+    json_path.write_text(
+        """
+        {
+          "S+-family": [
+            [{"x": 0.0, "y": 0.0}, {"x": 1.0, "y": 0.0}]
+          ],
+          "S--family": [
+            [[2.0, 0.0], [3.0, 0.0]]
+          ]
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    template_paths = load_fiber_template_json(json_path)
+
+    assert template_paths == [
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        [[2.0, 0.0, 0.0], [3.0, 0.0, 0.0]],
+    ]
+
+    mesh = Mesh(_cube_triangles(size=1.0))
+    job = slice_mesh_to_job(
+        mesh,
+        SliceConfig(layer_height=0.5, line_width=0.1, infill_pattern="none"),
+    )
+    fiber_paths_by_layer = expand_fiber_template_for_resin_layers(
+        job,
+        template_paths,
+    )
+
+    assert sorted(fiber_paths_by_layer) == [0]
+    assert len(fiber_paths_by_layer[0]) == 2
+    assert all(
+        np.allclose(np.asarray(path)[:, 2], 0.6)
+        for path in fiber_paths_by_layer[0]
     )
 
 

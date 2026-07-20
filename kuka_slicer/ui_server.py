@@ -490,11 +490,18 @@ def resolve_build_axis(mesh, requested_axis: str) -> str:
 def load_fiber_template_json(json_path: Path) -> list[list[list[float]]]:
     data = json.loads(json_path.read_text(encoding="utf-8"))
     if isinstance(data, dict):
-        if len(data) != 1:
-            raise ValueError("fiber JSON object must contain exactly one path-family key")
-        data = next(iter(data.values()))
+        merged_paths: list[object] = []
+        for family_name, family_paths in data.items():
+            if not isinstance(family_paths, list):
+                raise ValueError(
+                    f"fiber JSON path family {family_name!r} must be a list"
+                )
+            merged_paths.extend(family_paths)
+        data = merged_paths
     if not isinstance(data, list):
-        raise ValueError("fiber JSON must be a list of paths or an object containing one path list")
+        raise ValueError(
+            "fiber JSON must be a list of paths or an object containing path-family lists"
+        )
 
     paths: list[list[list[float]]] = []
     for path_index, raw_path in enumerate(data):
