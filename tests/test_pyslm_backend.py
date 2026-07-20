@@ -58,12 +58,19 @@ def test_native_pyslm_hatchers_preserve_project_output_contract(hatcher: str):
     assert job.meta["slicing"]["slicing_kernel"] == "pyslm"
     assert job.meta["slicing"]["pyslm"]["hatcher"] == hatcher
     assert job.meta["slicing"]["pyslm"]["native_patterns"]
-    assert job.meta["slicing"]["pyslm"]["project_patterns"] == ["isotropic", "zigzag"]
+    assert set(job.meta["slicing"]["pyslm"]["project_patterns"]) >= {
+        "zigzag_horizontal",
+        "zigzag_vertical",
+        "zigzag_plus45",
+        "zigzag_minus45",
+    }
     assert all(path.shape[1] == 3 for group in job.material_paths for path in group.paths)
 
 
 @pytest.mark.parametrize("overlap_percent", (0.0, 10.0, 25.0))
-def test_native_pyslm_hatch_offset_uses_full_bead_aware_pitch(overlap_percent: float):
+def test_native_pyslm_hatch_offset_uses_default_two_percent_contour_seam(
+    overlap_percent: float,
+):
     mesh = Mesh(_cube_triangles(size=20.0))
     config = SliceConfig(
         layer_height=5.0,
@@ -89,7 +96,11 @@ def test_native_pyslm_hatch_offset_uses_full_bead_aware_pitch(overlap_percent: f
         ]
     )
 
-    expected_pitch = config.line_width * (1.0 - overlap_percent / 100.0)
+    expected_pitch = config.line_width * 0.98 + max(
+        config.tolerance * 32.0,
+        config.line_width * 2e-5,
+        2e-6,
+    )
     assert inner_contours
     assert not infill.is_empty
     assert min(contour.distance(infill) for contour in inner_contours) == pytest.approx(
@@ -126,7 +137,7 @@ def test_native_pyslm_contour_override_does_not_change_fixed_cap_clearance():
             ]
         )
         assert min(contour.distance(infill) for contour in inner_contours) == pytest.approx(
-            1.8,
+            1.96032,
             abs=2e-3,
         )
 

@@ -14,10 +14,12 @@ from .slicer import (
     SliceConfig,
     _build_z_projector,
     _connect_zigzag_infill_paths,
+    _fixed_zigzag_angle,
     _isotropic_part_layer_angle,
     _isotropic_schedule_metadata,
     _layer_z_values,
     _path_2d_to_3d,
+    _resin_contour_infill_spacing,
     _resin_infill_surface_geometry,
     _resin_path_spacing,
     _solid_geometry_from_contours,
@@ -31,7 +33,14 @@ PYSLM_NATIVE_PATTERNS = {
     "aligned_rectilinear",
     "rectilinear",
 }
-PROJECT_ZIGZAG_PATTERNS = {"zigzag", "isotropic"}
+PROJECT_ZIGZAG_PATTERNS = {
+    "zigzag",
+    "isotropic",
+    "zigzag_horizontal",
+    "zigzag_vertical",
+    "zigzag_plus45",
+    "zigzag_minus45",
+}
 SUPPORTED_PYSLM_PATTERNS = PYSLM_NATIVE_PATTERNS | PROJECT_ZIGZAG_PATTERNS
 
 
@@ -108,6 +117,7 @@ def slice_mesh_to_job_with_pyslm(mesh: Mesh, config: SliceConfig) -> ExternalSou
                 "slicing_kernel": config.slicing_kernel,
                 "slicing_kernel_status": "experimental",
                 "perimeter_count": config.perimeter_count,
+                "print_perimeters": config.print_perimeters,
                 "smoothing_angle": config.smoothing_angle,
                 "smoothing_radius_factor": config.smoothing_radius_factor,
                 "part_cap_layers": (
@@ -225,6 +235,13 @@ def _effective_layer_config(
     layer_index: int,
     layer_count: int,
 ) -> SliceConfig:
+    fixed_zigzag_angle = _fixed_zigzag_angle(config.infill_pattern)
+    if config.material == "R" and fixed_zigzag_angle is not None:
+        return replace(
+            config,
+            infill_density=(100.0 if layer_index in {0, layer_count - 1} else config.infill_density),
+            pyslm=_project_pattern_pyslm_config(config.pyslm, fixed_zigzag_angle),
+        )
     if config.material == "R" and config.infill_pattern == "isotropic":
         hatch_angle = _isotropic_part_layer_angle(layer_index, layer_count)
         is_cap_layer = layer_index in {0, layer_count - 1}
@@ -354,14 +371,18 @@ def _make_hatcher(pyslm_hatching: Any, config: SliceConfig, layer_index: int, la
     }[settings.hatcher]
     hatcher = hatcher_class()
     hatcher.scanContourFirst = settings.scan_contour_first
-    if settings.num_outer_contours is None:
+    if not config.print_perimeters:
+        hatcher.numOuterContours = 0
+        hatcher.numInnerContours = 0
+    elif settings.num_outer_contours is None:
         hatcher.numOuterContours = 1 if config.perimeter_count >= 1 else 0
     else:
         hatcher.numOuterContours = settings.num_outer_contours
-    if settings.num_inner_contours is None:
-        hatcher.numInnerContours = max(0, config.perimeter_count - hatcher.numOuterContours)
-    else:
-        hatcher.numInnerContours = settings.num_inner_contours
+    if config.print_perimeters:
+        if settings.num_inner_contours is None:
+            hatcher.numInnerContours = max(0, config.perimeter_count - hatcher.numOuterContours)
+        else:
+            hatcher.numInnerContours = settings.num_inner_contours
     hatcher.spotCompensation = (
         config.line_width * 0.5
         if settings.spot_compensation is None
@@ -412,9 +433,9 @@ def _pyslm_sort_method(pyslm_hatching: Any, sort_name: str, hatch_angle: float) 
 
 def _volume_offset_between_contour_and_hatch(config: SliceConfig) -> float:
     # PySLM applies this offset after emitting the innermost contour
-    # centerline.  Use the full bead-aware centerline pitch; using only the
-    # inner-edge offset would place a 2 mm hatch just 0.8 mm from that contour.
-    return _resin_path_spacing(config.line_width, config.infill_overlap)
+    # centerline.  Use the same independently configured seam as the legacy
+    # kernel; infill overlap remains reserved for spacing between hatch runs.
+    return _resin_contour_infill_spacing(config)
 
 
 def _pyslm_hatch_spacing(config: SliceConfig) -> float:
@@ -427,6 +448,9 @@ def _pyslm_hatch_spacing(config: SliceConfig) -> float:
 
 
 def _pyslm_hatch_angle(config: SliceConfig, layer_index: int, layer_count: int) -> float:
+    fixed_zigzag_angle = _fixed_zigzag_angle(config.infill_pattern)
+    if fixed_zigzag_angle is not None:
+        return fixed_zigzag_angle
     if config.material == "R" and config.infill_pattern == "isotropic":
         return _isotropic_part_layer_angle(layer_index, layer_count)
     if config.material == "R" and config.infill_pattern == "zigzag":

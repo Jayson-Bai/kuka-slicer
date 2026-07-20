@@ -17,10 +17,10 @@ from .external_npz import MaterialPaths, write_external_source_npz
 from .slicer import (
     DEFAULT_FIBER_LINE_WIDTH_MM,
     DEFAULT_FIBER_LAYER_HEIGHT_MM,
+    DEFAULT_RESIN_CONTOUR_INFILL_OVERLAP_PERCENT,
     DEFAULT_RESIN_SMOOTHING_ANGLE_DEGREES,
     DEFAULT_RESIN_SMOOTHING_RADIUS_FACTOR,
     DEFAULT_RESIN_INFILL_DENSITY_PERCENT,
-    DEFAULT_RESIN_INFILL_OVERLAP_PERCENT,
     DEFAULT_RESIN_LAYER_HEIGHT_MM,
     DEFAULT_RESIN_LINE_WIDTH_MM,
     DEFAULT_PRUSA_CONTINUITY_SMOOTHING_ANGLE_DEGREES,
@@ -44,6 +44,9 @@ from .slicer import (
     _smooth_path_corners,
 )
 from .stl_io import load_stl
+
+
+DEFAULT_UI_RESIN_INFILL_OVERLAP_PERCENT = 0.0
 
 
 def run_ui_server(host: str, port: int, output_dir: Path) -> None:
@@ -113,6 +116,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         if tolerance is None:
             tolerance = recommended_geometry_tolerance(layer_height, line_width)
         perimeter_count = _int_param(params, "perimeter_count", 2)
+        print_perimeters = _bool_param(params, "print_perimeters", True)
         smoothing_angle = _float_param(
             params,
             "smoothing_angle",
@@ -131,7 +135,12 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         infill_overlap = _float_param(
             params,
             "infill_overlap",
-            DEFAULT_RESIN_INFILL_OVERLAP_PERCENT,
+            DEFAULT_UI_RESIN_INFILL_OVERLAP_PERCENT,
+        )
+        contour_infill_overlap = _float_param(
+            params,
+            "contour_infill_overlap",
+            DEFAULT_RESIN_CONTOUR_INFILL_OVERLAP_PERCENT,
         )
         triangle_path_optimization = _bool_param(
             params,
@@ -197,7 +206,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             ),
             simplification_mode=params.get("pyslm_simplification_mode", ["absolute"])[0],  # type: ignore[arg-type]
         )
-        infill_pattern = params.get("infill_pattern", ["rectilinear"])[0]
+        infill_pattern = params.get("infill_pattern", ["zigzag_horizontal"])[0]
         curve_mode = params.get("curve_mode", ["flat"])[0]
         curve_amplitude = _float_param(params, "curve_amplitude", 0.0)
         curve_period = _float_param(params, "curve_period", 50.0)
@@ -243,11 +252,13 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             infill_pattern=infill_pattern,  # type: ignore[arg-type]
             infill_density=infill_density,
             infill_overlap=infill_overlap,
+            contour_infill_overlap=contour_infill_overlap,
             triangle_path_optimization=triangle_path_optimization,
             zigzag_path_optimization=zigzag_path_optimization,
             slicing_kernel=slicing_kernel,  # type: ignore[arg-type]
             pyslm=pyslm_config,
             perimeter_count=perimeter_count,
+            print_perimeters=print_perimeters,
             smoothing_angle=smoothing_angle,
             smoothing_radius_factor=smoothing_radius_factor,
         )
@@ -372,6 +383,8 @@ def _bool_param(params: dict[str, list[str]], name: str, default: bool) -> bool:
 
 
 def _raft_layers_from_params(params: dict[str, list[str]]) -> list[RaftLayerConfig]:
+    if not _bool_param(params, "print_raft", True):
+        return []
     layer_count = DEFAULT_RAFT_LAYER_COUNT
     default_offsets = ",".join(f"{offset:g}" for offset in DEFAULT_RAFT_OUTWARD_OFFSETS_MM)
     offsets = _float_list_param(params, "raft_offsets", default_offsets, layer_count)
@@ -854,108 +867,304 @@ def _index_html() -> str:
       --accent-dark: #084f96;
       --ok: #16754c;
       --error: #b42318;
+      --space-1: 4px;
+      --space-2: 8px;
+      --space-3: 12px;
+      --space-4: 16px;
+      --space-5: 20px;
+      --space-6: 24px;
+      --radius-sm: 6px;
+      --radius-md: 8px;
+      --control-height: 40px;
+      --z-tooltip: 10;
     }}
     * {{ box-sizing: border-box; }}
     body {{
       margin: 0;
       font-family: Segoe UI, Arial, sans-serif;
       color: var(--ink);
-      background: #ffffff;
+      background: #f5f7f9;
+      line-height: 1.5;
     }}
     header {{
-      min-height: 64px;
+      min-height: 68px;
       display: flex;
       align-items: center;
-      padding: 12px 28px;
+      padding: 14px max(20px, calc((100vw - 960px) / 2));
       border-bottom: 1px solid var(--line);
       background: #ffffff;
     }}
     h1 {{
       margin: 0;
-      font-size: 19px;
+      font-size: 20px;
       font-weight: 650;
       line-height: 1.35;
       letter-spacing: 0;
+      text-wrap: balance;
     }}
     main {{
-      max-width: 1120px;
+      max-width: 960px;
       margin: 0 auto;
-      padding: 28px;
+      padding: 28px 20px 36px;
       display: grid;
-      grid-template-columns: minmax(320px, 440px) 1fr;
-      gap: 28px;
+      grid-template-columns: 1fr;
+      gap: 24px;
+      align-items: start;
     }}
     section {{
       min-width: 0;
     }}
+    .resultsColumn {{
+      min-width: 0;
+      position: static;
+    }}
     .panel {{
       border: 1px solid var(--line);
-      border-radius: 8px;
-      background: var(--panel);
-      padding: 18px;
+      border-radius: var(--radius-md);
+      background: #ffffff;
+      padding: var(--space-5);
+      box-shadow: 0 2px 8px rgba(23, 32, 38, 0.04);
     }}
     h2 {{
-      margin: 0 0 16px;
-      font-size: 15px;
+      margin: 0 0 var(--space-5);
+      font-size: 16px;
       font-weight: 650;
       letter-spacing: 0;
+      line-height: 1.35;
+      text-wrap: balance;
     }}
     .subhead {{
-      margin-top: 18px;
-      padding-top: 16px;
+      margin-top: var(--space-5);
+      padding-top: var(--space-4);
       border-top: 1px solid var(--line);
     }}
     .formSection {{
-      margin-top: 18px;
-      padding-top: 16px;
-      border-top: 1px solid var(--line);
+      margin-top: 0;
+      padding: var(--space-2);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-md);
+      background: #fbfcfd;
     }}
     .formSection:first-of-type {{
       margin-top: 0;
-      padding-top: 0;
-      border-top: 0;
+      padding-top: var(--space-2);
+    }}
+    #sliceForm {{
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: var(--space-1);
+      align-items: start;
+    }}
+    #sliceForm > .formSection {{
+      grid-column: 1 / -1;
     }}
     .formSection h3 {{
-      margin: 0 0 4px;
+      margin: 0;
       font-size: 13px;
       font-weight: 700;
       letter-spacing: 0;
       color: var(--ink);
+      line-height: 1.4;
+      text-wrap: balance;
     }}
     label {{
       display: block;
-      margin: 14px 0 6px;
+      margin: var(--space-3) 0 var(--space-1);
       font-size: 13px;
       color: var(--muted);
+      line-height: 1.35;
+      text-wrap: pretty;
     }}
-    input, select {{
-      width: 100%;
-      min-height: 38px;
-      border: 1px solid #bcc5cd;
+    .inputBand label,
+    .kernelBand label,
+    .processBand label {{
+      margin-top: var(--space-1);
+    }}
+    .labelWithHelp {{
+      display: flex;
+      align-items: center;
+      gap: var(--space-2);
+    }}
+    .helpTip {{
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 16px;
+      height: 16px;
+      border: 1px solid #8aa0b8;
+      border-radius: 50%;
+      color: #47627e;
+      font-size: 11px;
+      font-weight: 700;
+      cursor: help;
+      outline: none;
+    }}
+    .helpTip::after {{
+      content: attr(data-tooltip);
+      position: absolute;
+      left: 50%;
+      bottom: calc(100% + 8px);
+      z-index: var(--z-tooltip);
+      width: min(360px, 75vw);
+      padding: 9px 11px;
       border-radius: 6px;
+      background: #243447;
+      color: #fff;
+      font-size: 12px;
+      font-weight: 400;
+      line-height: 1.5;
+      white-space: normal;
+      box-shadow: 0 4px 14px rgba(0, 0, 0, 0.2);
+      opacity: 0;
+      visibility: hidden;
+      transform: translate(-50%, 3px);
+      transition: opacity 0.12s ease-out, transform 0.12s ease-out;
+      pointer-events: none;
+    }}
+    .helpTip:hover::after,
+    .helpTip:focus::after {{
+      opacity: 1;
+      visibility: visible;
+      transform: translate(-50%, 0);
+    }}
+    input:not([type="checkbox"]):not([type="range"]), select {{
+      width: 100%;
+      height: var(--control-height);
+      min-height: var(--control-height);
+      border: 1px solid #bcc5cd;
+      border-radius: var(--radius-sm);
       padding: 7px 10px;
       font: inherit;
       background: #ffffff;
       color: var(--ink);
     }}
-    input[type="file"] {{
-      padding: 8px;
+    input:focus-visible, select:focus-visible, button:focus-visible, a:focus-visible, summary:focus-visible {{
+      outline: 3px solid rgba(11, 107, 203, 0.24);
+      outline-offset: 2px;
+      border-color: var(--accent);
+    }}
+    .inputBand input[type="file"] {{
+      padding: 0;
+      line-height: calc(var(--control-height) - 2px);
+    }}
+    input[type="file"]::file-selector-button {{
+      box-sizing: border-box;
+      height: 100%;
+      margin: 0 10px 0 0;
+      border: 0;
+      border-right: 1px solid #bcc5cd;
+      border-radius: 0;
+      padding: 0 12px;
+      font: inherit;
+      background: var(--panel);
+      color: var(--ink);
+      cursor: pointer;
     }}
     .grid {{
       display: grid;
       grid-template-columns: 1fr 1fr;
-      gap: 12px;
+      gap: var(--space-2);
+    }}
+    .bandGrid {{
+      display: grid;
+      grid-template-columns: repeat(12, minmax(0, 1fr));
+      gap: var(--space-2);
+      align-items: start;
+    }}
+    .fieldGroup {{ min-width: 0; }}
+    .span-2 {{ grid-column: span 2; }}
+    .span-3 {{ grid-column: span 3; }}
+    .span-4 {{ grid-column: span 4; }}
+    .span-5 {{ grid-column: span 5; }}
+    .span-8 {{ grid-column: span 8; }}
+    .span-12 {{ grid-column: 1 / -1; }}
+    .compactGrid {{
+      gap: var(--space-2);
+    }}
+    .compactOptions {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--space-2) var(--space-4);
+      align-items: center;
+      align-content: center;
+      align-self: end;
+      height: var(--control-height);
+      min-height: var(--control-height);
+      padding-top: 0;
+    }}
+    .compactOptions .checkboxLabel {{
+      margin: 0;
+    }}
+    .formSection > .grid,
+    .formSection > .advancedSettings {{
+      margin-top: var(--space-2);
+    }}
+    .bandGrid > .advancedSettings {{
+      margin-top: var(--space-3);
+    }}
+    .kernelBand > .bandGrid:not(:first-of-type),
+    .kernelBand > #pyslmNativeSettings:not([hidden]) {{
+      margin-top: var(--space-2);
+    }}
+    .processGroup {{
+      min-width: 0;
+      align-self: stretch;
+    }}
+    .processGroup + .processGroup {{
+      padding-left: var(--space-3);
+      border-left: 1px solid var(--line);
+    }}
+    .processGroup h3 {{
+      margin: 0;
+    }}
+    .processTitleRow {{
+      min-height: 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: var(--space-2);
+      margin-bottom: var(--space-1);
+    }}
+    .processTitleRow .checkboxLabel {{
+      margin: 0;
+    }}
+    .curveFields {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: var(--space-2);
+    }}
+    .processBand .actions {{
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+      align-self: stretch;
+      justify-content: flex-end;
+      gap: var(--space-2);
+      margin: 0;
+      min-height: 0;
+    }}
+    .processBand > .bandGrid {{
+      align-items: stretch;
+    }}
+    .processBand .actions button {{
+      width: 100%;
+    }}
+    .processBand .status:empty {{
+      display: none;
     }}
     .actions {{
       display: flex;
       align-items: center;
-      gap: 12px;
-      margin-top: 18px;
+      gap: var(--space-3);
+      margin-top: var(--space-6);
+      flex-wrap: wrap;
     }}
     button {{
-      min-height: 40px;
+      min-height: var(--control-height);
+      height: var(--control-height);
       border: 0;
-      border-radius: 6px;
+      border-radius: var(--radius-sm);
       padding: 0 16px;
       font: inherit;
       font-weight: 650;
@@ -979,9 +1188,10 @@ def _index_html() -> str:
       color: var(--muted);
     }}
     .notice.warning {{ color: #9a5b00; }}
+    .notice:empty {{ display: none; }}
     .advancedSettings {{
-      margin-top: 12px;
-      padding-top: 10px;
+      margin-top: var(--space-4);
+      padding-top: var(--space-3);
       border-top: 1px solid var(--line);
     }}
     .advancedSettings summary {{
@@ -992,18 +1202,22 @@ def _index_html() -> str:
       user-select: none;
     }}
     .advancedSettings[open] summary {{
-      margin-bottom: 8px;
+      margin-bottom: var(--space-3);
+    }}
+    .advancedSettings:not([open]) {{
+      padding-top: var(--space-2);
     }}
     .summary {{
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 12px;
+      gap: var(--space-3);
     }}
     .metric {{
       border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 14px;
+      border-radius: var(--radius-md);
+      padding: var(--space-4);
       background: #ffffff;
+      min-width: 0;
     }}
     .metric span {{
       display: block;
@@ -1012,12 +1226,16 @@ def _index_html() -> str:
     }}
     .metric strong {{
       display: block;
-      margin-top: 6px;
-      font-size: 22px;
+      margin-top: var(--space-2);
+      font-size: 21px;
       line-height: 1.1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
     }}
     .download {{
-      margin-top: 16px;
+      margin-top: var(--space-4);
       display: none;
       color: var(--accent-dark);
       font-weight: 650;
@@ -1025,10 +1243,10 @@ def _index_html() -> str:
     }}
     .download.visible {{ display: inline-block; }}
     .viewerControls {{
-      margin-top: 16px;
+      margin-top: var(--space-5);
       display: grid;
-      grid-template-columns: 1fr;
-      gap: 12px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: var(--space-4);
     }}
     .viewerControls label {{
       margin-top: 0;
@@ -1036,7 +1254,7 @@ def _index_html() -> str:
     .rangeRow {{
       display: grid;
       grid-template-columns: 1fr auto;
-      gap: 10px;
+      gap: var(--space-3);
       align-items: center;
     }}
     .rangeRow input {{
@@ -1049,10 +1267,10 @@ def _index_html() -> str:
       color: var(--muted);
     }}
     .legend {{
-      margin-top: 14px;
+      margin-top: var(--space-4);
       display: flex;
       flex-wrap: wrap;
-      gap: 12px 18px;
+      gap: var(--space-3) var(--space-5);
       align-items: center;
       font-size: 13px;
       color: var(--muted);
@@ -1082,10 +1300,10 @@ def _index_html() -> str:
     .infillSwatch {{ background: #0b6bcb; }}
     .fiberSwatch {{ background: #e66f00; }}
     .viewOptions {{
-      margin-top: 12px;
+      margin-top: var(--space-3);
       display: flex;
       flex-wrap: wrap;
-      gap: 10px 16px;
+      gap: var(--space-2) var(--space-4);
       align-items: center;
       font-size: 13px;
       color: var(--muted);
@@ -1112,18 +1330,28 @@ def _index_html() -> str:
       min-height: 0;
       padding: 0;
     }}
+    input[type="checkbox"] {{
+      width: 14px;
+      height: 14px;
+      min-height: 14px;
+      margin: 0;
+      padding: 0;
+      flex: 0 0 auto;
+      accent-color: var(--accent);
+    }}
     .preview {{
-      margin-top: 18px;
+      margin-top: var(--space-5);
       border: 1px solid var(--line);
-      border-radius: 8px;
-      height: min(68vh, 620px);
-      min-height: 480px;
+      border-radius: var(--radius-md);
+      height: min(58vh, 560px);
+      min-height: 420px;
       background: #ffffff;
       position: relative;
       overflow: hidden;
       cursor: grab;
       user-select: none;
       touch-action: none;
+      box-shadow: 0 2px 8px rgba(23, 32, 38, 0.04);
     }}
     .preview.dragging {{
       cursor: grabbing;
@@ -1134,38 +1362,107 @@ def _index_html() -> str:
       display: block;
     }}
     @media (max-width: 820px) {{
-      main {{ grid-template-columns: 1fr; padding: 18px; }}
+      main {{ padding: 24px 18px 32px; }}
+      .bandGrid {{ grid-template-columns: repeat(6, minmax(0, 1fr)); }}
+      .inputBand .fieldGroup {{ grid-column: span 3; }}
+      .inputBand .fiberNotice,
+      .inputBand .layerAdvanced {{ grid-column: 1 / -1; }}
+      .kernelBand > .bandGrid > .span-3 {{ grid-column: span 3; }}
+      .kernelBand > .bandGrid > .span-4 {{ grid-column: span 2; }}
+      .kernelBand > .bandGrid > .span-12,
+      .kernelBand .span-8 {{ grid-column: 1 / -1; }}
+      .processBand .processGroup {{ grid-column: 1 / -1; }}
+      .processGroup + .processGroup {{
+        padding-top: var(--space-3);
+        padding-left: 0;
+        border-top: 1px solid var(--line);
+        border-left: 0;
+      }}
       .summary {{ grid-template-columns: 1fr; }}
       .viewerControls {{ grid-template-columns: 1fr; }}
-      header {{ padding: 0 18px; }}
+      header {{ padding: 14px 18px; }}
       .preview {{ height: 460px; min-height: 420px; }}
+    }}
+    @media (max-width: 520px) {{
+      main {{ padding: 20px 12px 28px; }}
+      .panel {{ padding: var(--space-4); }}
+      .bandGrid {{ grid-template-columns: 1fr; }}
+      .span-2, .span-3, .span-4, .span-5, .span-8, .span-12,
+      .inputBand .fieldGroup,
+      .inputBand .fiberNotice,
+      .inputBand .layerAdvanced,
+      .kernelBand > .bandGrid > .span-3,
+      .kernelBand > .bandGrid > .span-4 {{ grid-column: auto; }}
+      .grid {{ grid-template-columns: 1fr; }}
+      .curveFields {{ grid-template-columns: 1fr; }}
+      h1 {{ font-size: 18px; }}
+      .preview {{ height: 380px; min-height: 340px; }}
     }}
   </style>
 </head>
 <body>
   <header><h1>机械臂空间复合材料增材制造系统切片器</h1></header>
   <main>
+    <section class="resultsColumn">
+      <div class="summary">
+        <div class="metric"><span>层数</span><strong id="layers">-</strong></div>
+        <div class="metric"><span>路径数</span><strong id="paths">-</strong></div>
+        <div class="metric"><span>输出</span><strong id="outputName">-</strong></div>
+        <div class="metric"><span>实际执行内核</span><strong id="executedKernel">-</strong></div>
+        <div class="metric"><span>实际规划线宽（仅轨迹规划）</span><strong id="executedPlanningLineWidth">-</strong></div>
+        <div class="metric"><span>实际填充策略</span><strong id="executedInfillPattern">-</strong></div>
+      </div>
+      <a id="download" class="download" href="#">下载 NPZ</a>
+      <div class="viewerControls">
+        <div>
+          <label for="layerSlider">层</label>
+          <div class="rangeRow">
+            <input id="layerSlider" type="range" min="0" max="0" value="0" disabled>
+            <output id="layerLabel">-</output>
+          </div>
+        </div>
+        <div id="pathProgressControl">
+          <label for="pathProgressSlider">所选路径进度</label>
+          <div class="rangeRow">
+            <input id="pathProgressSlider" type="range" min="0" max="0" value="0" disabled>
+            <output id="pathProgressLabel">-</output>
+          </div>
+        </div>
+      </div>
+      <div class="legend" aria-label="预览图例">
+        <label class="legendItem"><input id="showOuterContour" type="checkbox" checked><span class="swatch outerSwatch"></span>外轮廓</label>
+        <label class="legendItem"><input id="showInnerContour" type="checkbox" checked><span class="swatch innerSwatch"></span>内轮廓</label>
+        <label class="legendItem"><input id="showResinInfill" type="checkbox" checked><span class="swatch infillSwatch"></span>树脂填充</label>
+        <label class="legendItem"><input id="showFiberPaths" type="checkbox" checked><span class="swatch fiberSwatch"></span>纤维路径</label>
+      </div>
+      <div class="viewOptions" aria-label="显示选项">
+        <label title="仅改变预览笔触宽度，不改变轨迹中心线或挤出倍率"><input id="showLineWidth" type="checkbox">按实际规划线宽显示（当前 <span id="previewLineWidthValue">2.2 mm</span>）</label>
+        <label><input id="showPathPoints" type="checkbox">显示当前路径点</label>
+        <label><input id="showDirection" type="checkbox" checked>显示打印方向</label>
+        <span id="printSizeLabel">打印范围 -</span>
+      </div>
+      <div id="previewSurface" class="preview"><canvas id="previewCanvas" title="滚轮缩放；鼠标左键、右键或中键拖动视图"></canvas></div>
+    </section>
+
     <section class="panel">
       <h2>模型切片</h2>
       <form id="sliceForm">
-        <div class="formSection">
-          <h3>输入文件</h3>
-          <label for="stlFile">STL 文件</label>
-          <input id="stlFile" name="stlFile" type="file" accept=".stl" required>
-
-          <label for="fiberJsonFile">纤维路径 JSON</label>
-          <input id="fiberJsonFile" name="fiberJsonFile" type="file" accept=".json,application/json">
-          <div id="fiberNotice" class="notice"></div>
-        </div>
-
-        <div class="formSection">
-          <h3>模型与分层</h3>
-          <div class="grid">
-            <div>
+        <div class="formSection inputBand" data-layout-band="input-layer">
+          <h3>输入与分层</h3>
+          <div class="bandGrid">
+            <div class="fieldGroup span-4">
+              <label for="stlFile">STL 文件</label>
+              <input id="stlFile" name="stlFile" type="file" accept=".stl" required>
+            </div>
+            <div class="fieldGroup span-4">
+              <label for="fiberJsonFile">纤维路径 JSON</label>
+              <input id="fiberJsonFile" name="fiberJsonFile" type="file" accept=".json,application/json">
+            </div>
+            <div class="fieldGroup span-2">
               <label for="layerHeight">树脂层高 mm</label>
               <input id="layerHeight" name="layerHeight" type="number" min="0.001" step="0.001" value="{DEFAULT_RESIN_LAYER_HEIGHT_MM}">
             </div>
-            <div>
+            <div class="fieldGroup span-2">
               <label for="buildAxis">层高方向</label>
               <select id="buildAxis" name="buildAxis">
                 <option value="auto" selected>自动</option>
@@ -1174,46 +1471,50 @@ def _index_html() -> str:
                 <option value="x">X 轴</option>
               </select>
             </div>
+            <div id="fiberNotice" class="notice fiberNotice span-8"></div>
+            <details class="advancedSettings layerAdvanced span-4">
+              <summary>高级分层范围与容差设置</summary>
+              <div class="grid">
+                <div>
+                  <label for="zMin">起始 Z mm</label>
+                  <input id="zMin" name="zMin" type="number" step="0.001" placeholder="自动">
+                </div>
+                <div>
+                  <label for="zMax">结束 Z mm</label>
+                  <input id="zMax" name="zMax" type="number" step="0.001" placeholder="自动">
+                </div>
+              </div>
+              <label for="tolerance">几何容差 mm</label>
+              <input id="tolerance" name="tolerance" type="number" min="0.000001" step="0.000001" placeholder="自动">
+            </details>
           </div>
-          <div class="grid">
-            <div>
-              <label for="zMin">起始 Z mm</label>
-              <input id="zMin" name="zMin" type="number" step="0.001" placeholder="自动">
-            </div>
-            <div>
-              <label for="zMax">结束 Z mm</label>
-              <input id="zMax" name="zMax" type="number" step="0.001" placeholder="自动">
-            </div>
-          </div>
-          <label for="tolerance">几何容差 mm</label>
-          <input id="tolerance" name="tolerance" type="number" min="0.000001" step="0.000001" placeholder="自动">
         </div>
 
-        <div class="formSection">
+        <div class="formSection kernelBand" data-layout-band="kernel">
           <h3>树脂路径内核</h3>
-          <div class="grid">
-            <div>
+          <div class="bandGrid">
+            <div class="fieldGroup span-3">
               <label for="lineWidth">名义树脂线宽 mm</label>
               <input id="lineWidth" name="lineWidth" type="number" min="0.001" step="0.001" value="{DEFAULT_RESIN_LINE_WIDTH_MM}">
             </div>
-            <div>
-              <label for="planningLineWidth">实测压平线宽 mm</label>
+            <div class="fieldGroup span-3">
+              <label class="labelWithHelp" for="planningLineWidth">实测压平线宽 mm
+                <span class="helpTip" tabindex="0" data-tooltip="实测压平线宽仅用于 Prusa 树脂轨迹间距、搭边计算和实际铺展预览；不会修改 NPZ 中的名义线宽，也不会改变挤出倍率。">?</span>
+              </label>
               <input id="planningLineWidth" name="planningLineWidth" type="number" min="0.001" step="0.001" value="{DEFAULT_RESIN_PLANNING_LINE_WIDTH_MM}">
             </div>
+            <div class="fieldGroup span-3">
+              <label for="perimeterCount">边界圈数</label>
+              <input id="perimeterCount" name="perimeterCount" type="number" min="1" step="1" value="2">
+            </div>
+            <div class="fieldGroup span-3">
+              <label for="slicingKernel">切片内核</label>
+              <select id="slicingKernel" name="slicingKernel">
+                <option value="legacy" selected>Prusa</option>
+                <option value="pyslm">PySLM</option>
+              </select>
+            </div>
           </div>
-          <div class="notice warning">
-            实测压平线宽仅用于 Prusa 树脂轨迹间距、搭边计算和实际铺展预览；不会修改 NPZ 中的名义线宽，也不会改变挤出倍率。
-            为保证相邻有效填充段和轮廓的最大搭边，网格、三角形和陀螺曲线在此严格模式中会自动改为按层轮换的单方向之字形，避免同层交叉；结果区和 NPZ 元数据会明确显示实际执行策略。
-          </div>
-
-          <label for="perimeterCount">边界圈数</label>
-          <input id="perimeterCount" name="perimeterCount" type="number" min="1" step="1" value="2">
-
-          <label for="slicingKernel">切片内核</label>
-          <select id="slicingKernel" name="slicingKernel">
-            <option value="legacy" selected>Prusa</option>
-            <option value="pyslm">PySLM</option>
-          </select>
 
           <div id="pyslmNativeSettings" hidden>
             <h3>PySLM 原生扫描参数</h3>
@@ -1330,122 +1631,108 @@ def _index_html() -> str:
             <label class="checkboxLabel"><input id="pyslmSimplificationPreserveTopology" type="checkbox" checked> 保持拓扑结构</label>
           </div>
 
-          <div id="legacyInfillControl">
-          <label for="infillPattern" title="原始内核与 PySLM 共用；各向同性填充使用固定的四方向之字形循环。">树脂填充路径</label>
-          <select id="infillPattern" name="infillPattern">
-            <option value="none">仅轮廓</option>
-            <option value="rectilinear">交替直线填充</option>
-            <option value="aligned_rectilinear">对齐直线填充</option>
-            <option value="line">单向线填充</option>
-            <option value="grid">网格填充（严格模式按层 0°/90°）</option>
-            <option value="triangles">三角形填充（严格模式按层 0°/60°/120°）</option>
-            <option value="gyroid">陀螺曲线填充（严格模式按层 45°/-45°）</option>
-            <option value="concentric">同心轮廓填充</option>
-            <option value="zigzag">之字形填充</option>
-            <option value="isotropic">各向同性填充</option>
-          </select>
-          <div id="infillSafetyNote" class="notice warning"></div>
-          <label class="checkboxLabel" title="仅 Prusa 三角形填充生效；先排序/反向，再合并数值上共点的路径，所有实体连接仍需通过线宽净距检查。"><input id="trianglePathOptimization" type="checkbox" checked> 三角形填充路径优化</label>
-          <label class="checkboxLabel" title="相邻扫描线在安全填充区域内沿外边界或孔洞边界连续折返；legacy 与 PySLM 均使用该连接路径。"><input id="zigzagPathOptimization" type="checkbox" checked> 之字形填充路径优化</label>
+          <div id="legacyInfillControl" class="bandGrid compactGrid">
+            <div class="fieldGroup span-4">
+              <label for="infillPattern" title="原始内核与 PySLM 共用；各向同性填充使用固定的四方向之字形循环。">树脂填充路径</label>
+              <select id="infillPattern" name="infillPattern">
+                <option value="zigzag_horizontal" selected>横向 Zigzag</option>
+                <option value="zigzag_vertical">竖向 Zigzag</option>
+                <option value="zigzag_plus45">+45° Zigzag</option>
+                <option value="zigzag_minus45">-45° Zigzag</option>
+                <option value="triangles">三角填充</option>
+                <option value="concentric">同心轮廓填充</option>
+              </select>
+              <div id="infillSafetyNote" class="notice warning"></div>
+            </div>
+            <div class="compactOptions span-8">
+              <label class="checkboxLabel" title="关闭时保留现有填充几何与路径规划，仅不输出内外轮廓路径"><input id="printPerimeters" type="checkbox" checked> 打印内外轮廓</label>
+              <label class="checkboxLabel" title="仅 Prusa 三角形填充生效；先排序/反向，再合并数值上共点的路径，所有实体连接仍需通过线宽净距检查。"><input id="trianglePathOptimization" type="checkbox" checked> 三角形填充路径优化</label>
+              <label class="checkboxLabel" title="相邻扫描线在安全填充区域内沿外边界或孔洞边界连续折返；legacy 与 PySLM 均使用该连接路径。"><input id="zigzagPathOptimization" type="checkbox" checked> 之字形填充路径优化</label>
+            </div>
           </div>
 
-          <div class="grid">
-            <div>
+          <div class="bandGrid">
+            <div class="fieldGroup span-4">
               <label for="infillDensity">填充率 %</label>
               <input id="infillDensity" name="infillDensity" type="number" min="0" max="100" step="1" value="{DEFAULT_RESIN_INFILL_DENSITY_PERCENT:g}">
             </div>
-            <div>
-              <label for="infillOverlap">填充搭边 %</label>
-              <input id="infillOverlap" name="infillOverlap" type="number" min="0" max="99" step="1" value="{DEFAULT_RESIN_INFILL_OVERLAP_PERCENT:g}">
+            <div class="fieldGroup span-4">
+              <label class="labelWithHelp" for="infillOverlap">填充线间搭边 %
+                <span class="helpTip" tabindex="0" data-tooltip="只控制相邻填充线之间的搭边，不影响填充与最内层轮廓的交界。">?</span>
+              </label>
+              <input id="infillOverlap" name="infillOverlap" type="number" min="0" max="99" step="0.1" value="{DEFAULT_UI_RESIN_INFILL_OVERLAP_PERCENT:g}">
+            </div>
+            <div class="fieldGroup span-4">
+              <label class="labelWithHelp" for="contourInfillOverlap">轮廓与填充搭边 %
+                <span class="helpTip" tabindex="0" data-tooltip="独立控制最内层轮廓与填充路径交界处的搭边，不改变填充线之间的搭边。">?</span>
+              </label>
+              <input id="contourInfillOverlap" name="contourInfillOverlap" type="number" min="0" max="99" step="0.1" value="{DEFAULT_RESIN_CONTOUR_INFILL_OVERLAP_PERCENT:g}">
             </div>
           </div>
 
-          <div class="grid">
-            <div>
-              <label for="smoothingAngle">平滑角阈值 °</label>
-              <input id="smoothingAngle" name="smoothingAngle" type="number" min="1" max="179" step="1" value="{DEFAULT_PRUSA_CONTINUITY_SMOOTHING_ANGLE_DEGREES:g}">
+          <details class="advancedSettings">
+            <summary>高级路径平滑设置</summary>
+            <div class="grid">
+              <div>
+                <label for="smoothingAngle">平滑角阈值 °</label>
+                <input id="smoothingAngle" name="smoothingAngle" type="number" min="1" max="179" step="1" value="{DEFAULT_PRUSA_CONTINUITY_SMOOTHING_ANGLE_DEGREES:g}">
+              </div>
+              <div>
+                <label for="smoothingRadiusFactor">平滑半径系数</label>
+                <input id="smoothingRadiusFactor" name="smoothingRadiusFactor" type="number" min="0" step="0.01" value="{DEFAULT_RESIN_SMOOTHING_RADIUS_FACTOR:g}">
+              </div>
             </div>
-            <div>
-              <label for="smoothingRadiusFactor">平滑半径系数</label>
-              <input id="smoothingRadiusFactor" name="smoothingRadiusFactor" type="number" min="0" step="0.01" value="{DEFAULT_RESIN_SMOOTHING_RADIUS_FACTOR:g}">
+          </details>
+
+        </div>
+
+        <div class="formSection processBand" data-layout-band="process-action">
+          <div class="bandGrid">
+            <div class="processGroup span-4">
+              <div class="processTitleRow">
+                <h3>筏板</h3>
+                <label class="checkboxLabel" title="关闭后不生成筏板层，零件层也不会为筏板向上平移"><input id="printRaft" type="checkbox" checked> 打印筏板</label>
+              </div>
+              <div class="grid">
+                <div>
+                  <label for="raftBottomOffset" title="底层筏板外扩距离 mm">底层外扩 mm</label>
+                  <input id="raftBottomOffset" name="raftBottomOffset" type="number" min="0" step="0.1" value="{DEFAULT_RAFT_OUTWARD_OFFSETS_MM[0]:g}">
+                </div>
+                <div>
+                  <label for="raftSecondOffset" title="第 2 层筏板打印外扩距离 mm">第 2 层外扩 mm</label>
+                  <input id="raftSecondOffset" name="raftSecondOffset" type="number" min="0" step="0.1" value="{DEFAULT_RAFT_OUTWARD_OFFSETS_MM[1]:g}">
+                </div>
+              </div>
+            </div>
+            <div class="processGroup span-5">
+              <div class="processTitleRow"><h3>曲面 Z</h3></div>
+              <div class="curveFields">
+                <div class="fieldGroup">
+                  <label for="curveMode">Z 模式</label>
+                  <select id="curveMode" name="curveMode">
+                    <option value="flat">平面层</option>
+                    <option value="sinusoidal">正弦曲面</option>
+                  </select>
+                </div>
+                <div class="fieldGroup">
+                  <label for="curveAmplitude" title="曲面幅值 mm">幅值 mm</label>
+                  <input id="curveAmplitude" name="curveAmplitude" type="number" step="0.001" value="0">
+                </div>
+                <div class="fieldGroup">
+                  <label for="curvePeriod" title="曲面周期 mm">周期 mm</label>
+                  <input id="curvePeriod" name="curvePeriod" type="number" min="0.001" step="0.001" value="50">
+                </div>
+              </div>
+            </div>
+            <div class="actions span-3">
+              <button id="sliceButton" type="submit">生成 NPZ</button>
+              <span id="status" class="status"></span>
             </div>
           </div>
-
-        </div>
-
-        <div class="formSection">
-          <h3>筏板</h3>
-        <label for="raftOffsets">每层外扩距离 mm</label>
-        <input id="raftOffsets" name="raftOffsets" type="text" value="15,10" placeholder="单值或逗号分隔，例如 8,6,4">
-        </div>
-
-        <div class="formSection">
-          <h3>曲面 Z</h3>
-        <label for="curveMode">Z 模式</label>
-        <select id="curveMode" name="curveMode">
-          <option value="flat">平面层</option>
-          <option value="sinusoidal">正弦曲面</option>
-        </select>
-
-        <div class="grid">
-          <div>
-            <label for="curveAmplitude">曲面幅值 mm</label>
-            <input id="curveAmplitude" name="curveAmplitude" type="number" step="0.001" value="0">
-          </div>
-          <div>
-            <label for="curvePeriod">曲面周期 mm</label>
-            <input id="curvePeriod" name="curvePeriod" type="number" min="0.001" step="0.001" value="50">
-          </div>
-        </div>
-        </div>
-
-        <div class="actions">
-          <button id="sliceButton" type="submit">生成 NPZ</button>
-          <span id="status" class="status"></span>
         </div>
       </form>
     </section>
 
-    <section>
-      <div class="summary">
-        <div class="metric"><span>层数</span><strong id="layers">-</strong></div>
-        <div class="metric"><span>路径数</span><strong id="paths">-</strong></div>
-        <div class="metric"><span>输出</span><strong id="outputName">-</strong></div>
-        <div class="metric"><span>实际执行内核</span><strong id="executedKernel">-</strong></div>
-        <div class="metric"><span>实际规划线宽（仅轨迹规划）</span><strong id="executedPlanningLineWidth">-</strong></div>
-        <div class="metric"><span>实际填充策略</span><strong id="executedInfillPattern">-</strong></div>
-      </div>
-      <a id="download" class="download" href="#">下载 NPZ</a>
-      <div class="viewerControls">
-        <div>
-          <label for="layerSlider">层</label>
-          <div class="rangeRow">
-            <input id="layerSlider" type="range" min="0" max="0" value="0" disabled>
-            <output id="layerLabel">-</output>
-          </div>
-        </div>
-        <div id="pathProgressControl">
-          <label for="pathProgressSlider">所选路径进度</label>
-          <div class="rangeRow">
-            <input id="pathProgressSlider" type="range" min="0" max="0" value="0" disabled>
-            <output id="pathProgressLabel">-</output>
-          </div>
-        </div>
-      </div>
-      <div class="legend" aria-label="预览图例">
-        <label class="legendItem"><input id="showOuterContour" type="checkbox" checked><span class="swatch outerSwatch"></span>外轮廓</label>
-        <label class="legendItem"><input id="showInnerContour" type="checkbox" checked><span class="swatch innerSwatch"></span>内轮廓</label>
-        <label class="legendItem"><input id="showResinInfill" type="checkbox" checked><span class="swatch infillSwatch"></span>树脂填充</label>
-        <label class="legendItem"><input id="showFiberPaths" type="checkbox" checked><span class="swatch fiberSwatch"></span>纤维路径</label>
-      </div>
-      <div class="viewOptions" aria-label="显示选项">
-        <label title="仅改变预览笔触宽度，不改变轨迹中心线或挤出倍率"><input id="showLineWidth" type="checkbox">按实际规划线宽显示（当前 <span id="previewLineWidthValue">2.2 mm</span>）</label>
-        <label><input id="showPathPoints" type="checkbox">显示当前路径点</label>
-        <label><input id="showDirection" type="checkbox" checked>显示打印方向</label>
-        <span id="printSizeLabel">打印范围 -</span>
-      </div>
-      <div id="previewSurface" class="preview"><canvas id="previewCanvas" title="滚轮缩放；鼠标左键、右键或中键拖动视图"></canvas></div>
-    </section>
   </main>
 
   <script>
@@ -1482,6 +1769,9 @@ def _index_html() -> str:
     const layerHeightInput = document.getElementById('layerHeight');
     const lineWidthInput = document.getElementById('lineWidth');
     const planningLineWidthInput = document.getElementById('planningLineWidth');
+    const printRaftInput = document.getElementById('printRaft');
+    const raftBottomOffsetInput = document.getElementById('raftBottomOffset');
+    const raftSecondOffsetInput = document.getElementById('raftSecondOffset');
     const legacyInfillControl = document.getElementById('legacyInfillControl');
     const infillPatternInput = document.getElementById('infillPattern');
     const infillSafetyNote = document.getElementById('infillSafetyNote');
@@ -1490,7 +1780,7 @@ def _index_html() -> str:
     const pyslmPatternAutoInput = document.getElementById('pyslmPatternAuto');
     const stripeParameterIds = ['pyslmStripeWidth', 'pyslmStripeOverlap', 'pyslmStripeOffset'];
     const islandParameterIds = ['pyslmIslandWidth', 'pyslmIslandOverlap', 'pyslmIslandOffset'];
-    const pyslmSupportedPatterns = new Set(['none', 'line', 'aligned_rectilinear', 'rectilinear', 'zigzag', 'isotropic']);
+    const pyslmSupportedPatterns = new Set(['zigzag_horizontal', 'zigzag_vertical', 'zigzag_plus45', 'zigzag_minus45']);
     const strictLayeredFallbackPatterns = {{
       grid: '严格实测线宽模式下，同层交叉会改为按层 0°/90° 单向之字形。',
       triangles: '严格实测线宽模式下，同层交叉会改为按层 0°/60°/120° 单向之字形。',
@@ -1542,7 +1832,7 @@ def _index_html() -> str:
         option.disabled = isPyslm && !pyslmSupportedPatterns.has(option.value);
       }}
       if (isPyslm && !pyslmSupportedPatterns.has(infillPatternInput.value)) {{
-        infillPatternInput.value = 'rectilinear';
+        infillPatternInput.value = 'zigzag_horizontal';
       }}
       infillSafetyNote.textContent = !isPyslm
         ? (strictLayeredFallbackPatterns[infillPatternInput.value] || '')
@@ -1582,6 +1872,10 @@ def _index_html() -> str:
     layerHeightInput.addEventListener('input', syncKernelControls);
     lineWidthInput.addEventListener('input', syncKernelControls);
     planningLineWidthInput.addEventListener('input', updatePreviewLineWidthValue);
+    printRaftInput.addEventListener('change', () => {{
+      raftBottomOffsetInput.disabled = !printRaftInput.checked;
+      raftSecondOffsetInput.disabled = !printRaftInput.checked;
+    }});
     syncKernelControls();
     fiberNotice.textContent = 'JSON 中的单层纤维路径会复制到每个树脂层，最后一层树脂封顶不打印纤维。';
 
@@ -1611,9 +1905,11 @@ def _index_html() -> str:
       formData.append('z_max', document.getElementById('zMax').value);
       formData.append('tolerance', document.getElementById('tolerance').value);
       formData.append('perimeter_count', document.getElementById('perimeterCount').value);
+      formData.append('print_perimeters', document.getElementById('printPerimeters').checked ? 'true' : 'false');
       formData.append('infill_pattern', document.getElementById('infillPattern').value);
       formData.append('infill_density', document.getElementById('infillDensity').value);
       formData.append('infill_overlap', document.getElementById('infillOverlap').value);
+      formData.append('contour_infill_overlap', document.getElementById('contourInfillOverlap').value);
       formData.append('triangle_path_optimization', document.getElementById('trianglePathOptimization').checked ? 'true' : 'false');
       formData.append('zigzag_path_optimization', document.getElementById('zigzagPathOptimization').checked ? 'true' : 'false');
       formData.append('slicing_kernel', document.getElementById('slicingKernel').value);
@@ -1640,7 +1936,8 @@ def _index_html() -> str:
       formData.append('pyslm_simplification_preserve_topology', document.getElementById('pyslmSimplificationPreserveTopology').checked ? 'true' : 'false');
       formData.append('smoothing_angle', document.getElementById('smoothingAngle').value);
       formData.append('smoothing_radius_factor', document.getElementById('smoothingRadiusFactor').value);
-      formData.append('raft_offsets', document.getElementById('raftOffsets').value);
+      formData.append('print_raft', printRaftInput.checked ? 'true' : 'false');
+      formData.append('raft_offsets', raftBottomOffsetInput.value + ',' + raftSecondOffsetInput.value);
       formData.append('curve_mode', document.getElementById('curveMode').value);
       formData.append('curve_amplitude', document.getElementById('curveAmplitude').value);
       formData.append('curve_period', document.getElementById('curvePeriod').value);

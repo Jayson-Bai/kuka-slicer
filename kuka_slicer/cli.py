@@ -9,6 +9,7 @@ from .external_npz import ExternalSourceJob, MaterialPaths, write_external_sourc
 from .slicer import (
     DEFAULT_FIBER_LAYER_HEIGHT_MM,
     DEFAULT_FIBER_LINE_WIDTH_MM,
+    DEFAULT_RESIN_CONTOUR_INFILL_OVERLAP_PERCENT,
     DEFAULT_RESIN_INFILL_DENSITY_PERCENT,
     DEFAULT_RESIN_INFILL_OVERLAP_PERCENT,
     DEFAULT_RESIN_LAYER_HEIGHT_MM,
@@ -54,9 +55,7 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "measured flattened resin width used only for Prusa toolpath spacing, "
             "overlap, and deposited-width checks; defaults to --line-width and "
-            "does not change the NPZ nominal line width or extrusion multiplier; "
-            "strict measured-width mode safely executes grid, triangles, and "
-            "gyroid as documented single-axis layer schedules"
+            "does not change the NPZ nominal line width or extrusion multiplier"
         ),
     )
     slice_parser.add_argument("--z-min", type=float)
@@ -126,19 +125,15 @@ def main(argv: list[str] | None = None) -> int:
     slice_parser.add_argument(
         "--infill-pattern",
         choices=[
-            "none",
-            "rectilinear",
-            "aligned_rectilinear",
-            "line",
-            "grid",
+            "zigzag_horizontal",
+            "zigzag_vertical",
+            "zigzag_plus45",
+            "zigzag_minus45",
             "triangles",
-            "gyroid",
             "concentric",
-            "zigzag",
-            "isotropic",
         ],
-        default="rectilinear",
-        help="resin fill pattern",
+        default="zigzag_horizontal",
+        help="resin fill pattern: horizontal/vertical/+45/-45 zigzag, triangles, or concentric",
     )
     slice_parser.add_argument(
         "--infill-density",
@@ -150,7 +145,17 @@ def main(argv: list[str] | None = None) -> int:
         "--infill-overlap",
         type=float,
         default=DEFAULT_RESIN_INFILL_OVERLAP_PERCENT,
-        help="resin path overlap percent used for infill spacing and wall overlap",
+        help=(
+            "resin overlap percent used only between infill runs"
+        ),
+    )
+    slice_parser.add_argument(
+        "--contour-infill-overlap",
+        type=float,
+        default=DEFAULT_RESIN_CONTOUR_INFILL_OVERLAP_PERCENT,
+        help=(
+            "independent overlap percent between the innermost contour and infill"
+        ),
     )
     slice_parser.add_argument(
         "--triangle-path-optimization",
@@ -165,6 +170,12 @@ def main(argv: list[str] | None = None) -> int:
         help="reorder, reverse, and merge legacy zigzag paths",
     )
     slice_parser.add_argument("--perimeter-count", type=int, default=2)
+    slice_parser.add_argument(
+        "--print-perimeters",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="print outer and inner contours while keeping existing infill geometry",
+    )
     slice_parser.add_argument(
         "--smoothing-angle",
         type=float,
@@ -279,9 +290,11 @@ def _slice_command(args: argparse.Namespace) -> int:
         infill_pattern=args.infill_pattern,
         infill_density=args.infill_density,
         infill_overlap=args.infill_overlap,
+        contour_infill_overlap=args.contour_infill_overlap,
         triangle_path_optimization=args.triangle_path_optimization,
         zigzag_path_optimization=args.zigzag_path_optimization,
         perimeter_count=args.perimeter_count,
+        print_perimeters=args.print_perimeters,
         smoothing_angle=args.smoothing_angle,
         smoothing_radius_factor=args.smoothing_radius_factor,
     )

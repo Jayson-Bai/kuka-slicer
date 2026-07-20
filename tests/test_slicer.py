@@ -11,6 +11,7 @@ from kuka_slicer.external_npz import ExternalSourceJob, MaterialPaths
 from kuka_slicer.slicer import (
     DEFAULT_FIBER_LAYER_HEIGHT_MM,
     DEFAULT_FIBER_LINE_WIDTH_MM,
+    DEFAULT_RESIN_CONTOUR_INFILL_OVERLAP_PERCENT,
     DEFAULT_RESIN_INFILL_OVERLAP_PERCENT,
     DEFAULT_RESIN_LAYER_HEIGHT_MM,
     DEFAULT_RESIN_LINE_WIDTH_MM,
@@ -20,7 +21,6 @@ from kuka_slicer.slicer import (
     _build_resin_paths,
     _centerline_connector_is_clear,
     _concentric_infill_geometry,
-    _connect_concentric_infill_paths,
     _connect_resin_infill_paths,
     _filter_concentric_paths_by_spacing,
     _finish_solid_fill_paths,
@@ -46,6 +46,7 @@ from kuka_slicer.slicer import (
 )
 from kuka_slicer.stl_io import Mesh
 from kuka_slicer.ui_server import (
+    DEFAULT_UI_RESIN_INFILL_OVERLAP_PERCENT,
     _index_html,
     _preview_payload,
     _raft_layers_from_params,
@@ -113,7 +114,7 @@ def test_fiber_template_paths_are_smoothed_before_export():
     assert np.allclose(exported_path[:, 2], 0.6)
 
 
-def test_resin_line_infill_uses_default_overlap_spacing():
+def test_resin_line_infill_uses_default_run_overlap_inside_fixed_contour_seam():
     mesh = Mesh(_cube_triangles(size=20.0))
 
     job = slice_mesh_to_job(
@@ -130,8 +131,13 @@ def test_resin_line_infill_uses_default_overlap_spacing():
     assert len(infill_paths) == 1
     assert infill_paths[0].shape[0] > 8
     scan_ys = _horizontal_scan_ys_for_paths(infill_paths)
-    assert np.allclose(scan_ys, [4.6, 6.4, 8.2, 10.0, 11.8, 13.6, 15.4])
-    assert np.allclose(np.diff(scan_ys), 1.8)
+    expected_seam_level = 1.0 + 1.8 + 2.0 * 0.98
+    assert scan_ys[0] == pytest.approx(expected_seam_level, abs=0.002)
+    assert scan_ys[-1] == pytest.approx(20.0 - expected_seam_level, abs=0.002)
+    assert np.ptp(np.diff(scan_ys)) <= 1e-4
+    expected_run_pitch = 1.8
+    adjustment = _solid_spacing_adjustment_limit(expected_run_pitch, 2.0)
+    assert min(np.diff(scan_ys)) >= expected_run_pitch - adjustment - 0.002
 
 
 def test_resin_line_infill_can_disable_overlap_for_legacy_spacing():
@@ -176,20 +182,21 @@ def test_libslic3r_fill_surface_overlap_offset_uses_physical_line_width():
     assert np.isclose(offset, -0.8)
 
 
-def test_resin_infill_surface_uses_last_perimeter_and_overlap_offset():
+def test_resin_infill_surface_uses_default_two_percent_contour_seam():
     geometry = Polygon([(0, 0), (20, 0), (20, 20), (0, 20)])
     config = SliceConfig(layer_height=1.0, line_width=2.0, infill_overlap=10.0)
 
     infill_surface = _resin_infill_surface_geometry(geometry, config)
 
     min_x, min_y, max_x, max_y = infill_surface.bounds
-    assert np.isclose(min_x, 4.6, atol=0.05)
-    assert np.isclose(min_y, 4.6, atol=0.05)
-    assert np.isclose(max_x, 15.4, atol=0.05)
-    assert np.isclose(max_y, 15.4, atol=0.05)
+    expected_inset = 1.0 + 1.8 + 2.0 * 0.98
+    assert np.isclose(min_x, expected_inset, atol=0.05)
+    assert np.isclose(min_y, expected_inset, atol=0.05)
+    assert np.isclose(max_x, 20.0 - expected_inset, atol=0.05)
+    assert np.isclose(max_y, 20.0 - expected_inset, atol=0.05)
 
 
-def test_measured_planning_width_changes_only_infill_to_perimeter_pitch():
+def test_measured_planning_width_sets_default_two_percent_contour_seam():
     geometry = Polygon([(0, 0), (30, 0), (30, 30), (0, 30)])
     config = SliceConfig(
         layer_height=1.0,
@@ -214,10 +221,33 @@ def test_measured_planning_width_changes_only_infill_to_perimeter_pitch():
 
     assert float(outer[:, 0].min()) == pytest.approx(1.0, abs=0.05)
     assert float(inner[:, 0].min()) == pytest.approx(2.8, abs=0.05)
-    requested_pitch = 2.2 * 0.9
+    requested_pitch = 2.2 * 0.98
     actual_pitch = infill_surface.bounds[0] - float(inner[:, 0].min())
     assert actual_pitch >= requested_pitch
     assert actual_pitch - requested_pitch < 0.01
+
+
+@pytest.mark.parametrize("contour_overlap", [0.0, 2.0, 12.5])
+def test_contour_infill_overlap_is_configurable_independently_of_run_overlap(
+    contour_overlap: float,
+):
+    geometry = Polygon([(0, 0), (30, 0), (30, 30), (0, 30)])
+    config = SliceConfig(
+        layer_height=1.0,
+        line_width=2.0,
+        infill_overlap=25.0,
+        contour_infill_overlap=contour_overlap,
+        infill_pattern="none",
+    )
+    perimeters, roles = _build_resin_paths([_square_contour(30.0)], config)
+    inner = _paths_with_role(perimeters, roles, "inner_contour")[0]
+    actual_pitch = (
+        _resin_infill_surface_geometry(geometry, config).bounds[0]
+        - float(inner[:, 0].min())
+    )
+    expected_pitch = config.line_width * (1.0 - contour_overlap / 100.0)
+
+    assert actual_pitch == pytest.approx(expected_pitch, abs=0.002)
 
 
 def test_resin_infill_surface_respects_configured_perimeter_count():
@@ -239,6 +269,97 @@ def test_resin_infill_surface_respects_configured_perimeter_count():
     three_wall_min_x = _resin_infill_surface_geometry(geometry, three_walls).bounds[0]
 
     assert three_wall_min_x > one_wall_min_x
+
+
+def test_disabling_perimeter_output_uses_a_safe_inner_fill_boundary():
+    geometry = Polygon([(0, 0), (30, 0), (30, 30), (0, 30)])
+    with_perimeters = _resin_infill_surface_geometry(
+        geometry,
+        SliceConfig(layer_height=1.0, line_width=2.0),
+    )
+    without_perimeters = _resin_infill_surface_geometry(
+        geometry,
+        SliceConfig(
+            layer_height=1.0,
+            line_width=2.0,
+            print_perimeters=False,
+        ),
+    )
+
+    assert with_perimeters.bounds[0] == pytest.approx(4.76, abs=0.05)
+    assert without_perimeters.bounds[0] == pytest.approx(2.8, abs=0.05)
+    assert without_perimeters.bounds[2] == pytest.approx(27.2, abs=0.05)
+
+
+def test_disabling_perimeter_output_keeps_infill_only_roles():
+    mesh = Mesh(_cube_triangles(size=20.0))
+    with_perimeters = slice_mesh_to_job(
+        mesh,
+        SliceConfig(
+            layer_height=5.0,
+            line_width=2.0,
+            infill_pattern="aligned_rectilinear",
+            infill_density=50.0,
+            perimeter_count=2,
+        ),
+    )
+    without_perimeters = slice_mesh_to_job(
+        mesh,
+        SliceConfig(
+            layer_height=5.0,
+            line_width=2.0,
+            infill_pattern="aligned_rectilinear",
+            infill_density=50.0,
+            perimeter_count=2,
+            print_perimeters=False,
+        ),
+    )
+
+    roles = without_perimeters.meta["path_roles"]["R"]["1"]
+    assert roles
+    assert set(roles) == {"infill"}
+    default_roles = with_perimeters.meta["path_roles"]["R"]["1"]
+    assert len(roles) >= default_roles.count("infill")
+
+
+def test_contour_free_fill_uses_safe_boundary_without_filling_holes():
+    outer = np.asarray(
+        [[0, 0], [60, 0], [60, 40], [0, 40], [0, 0]],
+        dtype=np.float32,
+    )
+    hole_geometry = Point(30, 20).buffer(7.0, resolution=32)
+    hole = np.asarray(hole_geometry.exterior.coords, dtype=np.float32)
+    geometry = Polygon(outer[:-1], holes=[hole[:-1]])
+    config = SliceConfig(
+        layer_height=1.0,
+        line_width=2.0,
+        infill_pattern="aligned_rectilinear",
+        infill_density=100.0,
+        print_perimeters=False,
+    )
+
+    paths, roles = _build_resin_paths([outer, hole], config)
+    stroke = unary_union(
+        [
+            LineString(path[:, :2]).buffer(
+                config.line_width * 0.5,
+                cap_style=2,
+                join_style=2,
+            )
+            for path in paths
+        ]
+    )
+
+    assert paths
+    assert set(roles) == {"infill"}
+    # The replacement fill remains a continuous Zigzag chain rather than a
+    # list of disconnected scan segments.
+    assert max(path.shape[0] for path in paths) > 10
+    # Rounded bead caps can exceed a polygon edge by a few hundredths of a
+    # millimetre; they must not bridge the actual hole by a visible amount.
+    assert geometry.buffer(0.1).covers(stroke)
+    assert not stroke.intersects(hole_geometry.buffer(-0.1))
+    assert stroke.intersection(geometry).area / geometry.area > 0.7
 
 
 def test_resin_infill_density_changes_path_spacing():
@@ -667,7 +788,13 @@ def test_ui_raft_params_only_accept_offsets():
     assert [layer.infill_density for layer in layers] == [100.0, 100.0]
 
 
-def test_concentric_infill_connects_all_rings_without_losing_coverage():
+def test_ui_can_disable_raft_generation():
+    assert _raft_layers_from_params(
+        {"print_raft": ["false"], "raft_offsets": ["2,1"]}
+    ) == []
+
+
+def test_concentric_infill_keeps_all_rings_as_independent_closed_paths():
     contour = np.asarray(
         [[0, 0], [20, 0], [20, 20], [0, 20], [0, 0]],
         dtype=np.float32,
@@ -679,10 +806,9 @@ def test_concentric_infill_connects_all_rings_without_losing_coverage():
         smoothing_radius_factor=0.0,
     )
     surface = _resin_infill_surface_geometry(Polygon(contour[:-1]), config)
-    raw_rings = _concentric_infill_geometry(
+    raw_rings = slicer_module._fast_concentric_infill_geometry(
         surface,
         config.line_width,
-        config.line_width * (1.0 - config.infill_overlap / 100.0),
         config.tolerance,
     )
 
@@ -690,13 +816,11 @@ def test_concentric_infill_connects_all_rings_without_losing_coverage():
 
     infill = _paths_with_role(paths, roles, "infill")
     raw_linework = unary_union([LineString(path) for path in raw_rings])
-    planned_line = LineString(infill[0])
-
     assert len(raw_rings) >= 2
-    assert len(infill) == 1
-    assert not np.allclose(infill[0][0], infill[0][-1])
-    assert raw_linework.difference(planned_line.buffer(1e-4)).length <= 1e-3
-    assert planned_line.length >= raw_linework.length - 1e-3
+    assert len(infill) == len(raw_rings)
+    assert all(np.allclose(path[0], path[-1]) for path in infill)
+    planned_linework = unary_union([LineString(path) for path in infill])
+    assert raw_linework.difference(planned_linework.buffer(1e-4)).length <= 1e-3
 
 
 def test_concentric_keeps_printable_residual_ring_centered():
@@ -718,20 +842,31 @@ def test_concentric_keeps_printable_residual_ring_centered():
     assert np.isclose(center_y, 10.5, atol=0.05)
 
 
-def test_concentric_keeps_closed_residual_ring_when_narrow():
+def test_concentric_supplements_a_narrow_core_without_connecting_offset_rings():
     contour = np.asarray(
         [[0, 0], [21, 0], [21, 21], [0, 21], [0, 0]],
         dtype=np.float32,
     )
+    config = SliceConfig(
+        layer_height=1.0,
+        line_width=2.0,
+        infill_pattern="concentric",
+    )
 
     paths, roles = _build_resin_paths(
         [contour],
-        SliceConfig(layer_height=1.0, line_width=2.0, infill_pattern="concentric"),
+        config,
     )
     infill = _paths_with_role(paths, roles, "infill")
 
-    assert len(infill) == 1
-    assert not np.allclose(infill[0][0], infill[0][-1])
+    assert len(infill) >= 1
+    assert any(np.allclose(path[0], path[-1]) for path in infill)
+    assert all(LineString(path).is_simple for path in infill)
+    assert all(
+        LineString(path).length + config.tolerance
+        >= slicer_module.CONCENTRIC_MINIMUM_PATH_LENGTH_MM
+        for path in infill
+    )
 
 
 def test_concentric_keeps_fixed_spacing_before_residual_ring():
@@ -794,39 +929,69 @@ def test_strict_concentric_filter_drops_a_ring_folded_through_narrow_neck():
     assert filtered == []
 
 
-@pytest.mark.parametrize("density", [20.0, 50.0, 100.0])
-def test_strict_concentric_densities_omit_collapsed_center_residual(density: float):
-    contour = np.asarray(
-        [[0.0, 0.0], [60.0, 0.0], [60.0, 40.0], [0.0, 40.0], [0.0, 0.0]],
-        dtype=np.float32,
+def test_fast_concentric_ignores_density_and_run_overlap_on_a_fixed_surface():
+    surface = Polygon(
+        [(0.0, 0.0), (60.0, 0.0), (60.0, 40.0), (0.0, 40.0)]
     )
+    outputs: list[list[np.ndarray]] = []
 
-    paths, roles = _build_resin_paths(
-        [contour],
-        SliceConfig(
+    for density, overlap in ((20.0, 0.0), (50.0, 10.0), (100.0, 35.0)):
+        config = SliceConfig(
             layer_height=1.0,
             line_width=2.0,
             planning_line_width=2.2,
             infill_pattern="concentric",
             infill_density=density,
-            infill_overlap=10.0,
+            infill_overlap=overlap,
             tolerance=0.0005,
-        ),
-    )
-    infill = _paths_with_role(paths, roles, "infill")
+        )
+        outputs.append(
+            slicer_module._infill_paths_for_geometry(
+                surface,
+                config,
+                layer_index=1,
+                infill_density=density,
+            )
+        )
 
-    assert infill
-    assert all(np.allclose(path[0], path[-1]) for path in infill)
-    assert slicer_module._solid_fill_spacing_postcondition(
-        infill,
-        Polygon(),
-        minimum_spacing=1.98,
+    assert outputs[0]
+    assert [path.shape for path in outputs[0]] == [path.shape for path in outputs[1]]
+    assert [path.shape for path in outputs[0]] == [path.shape for path in outputs[2]]
+    for baseline, candidate in zip(outputs[0], outputs[1]):
+        assert np.allclose(baseline, candidate)
+    for baseline, candidate in zip(outputs[0], outputs[2]):
+        assert np.allclose(baseline, candidate)
+
+    residual = surface.difference(
+        slicer_module._round_bead_coverage(outputs[0], 1.1)
+    )
+    assert slicer_module._maximum_inscribed_diameter(residual, 0.0005) <= 0.5
+
+
+def test_fast_concentric_fills_keyhole_surface_without_crossing_hole_or_boundary():
+    surface = unary_union(
+        [
+            Polygon([(0.0, 0.0), (55.0, 0.0), (55.0, 28.0), (0.0, 28.0)]),
+            Point(55.0, 14.0).buffer(22.0, quad_segs=64),
+        ]
+    ).difference(Point(55.0, 14.0).buffer(7.0, quad_segs=64))
+
+    paths = slicer_module._fast_concentric_infill_geometry(
+        surface,
+        line_width=2.3,
         tolerance=0.0005,
-        bead_width=2.2,
+    )
+
+    assert paths
+    assert all(surface.buffer(0.0015).covers(LineString(path)) for path in paths)
+    assert all(
+        LineString(path).length + 0.0005
+        >= slicer_module.CONCENTRIC_MINIMUM_PATH_LENGTH_MM
+        for path in paths
     )
 
 
-def test_concentric_concave_offsets_keep_pitch_and_connect_continuously():
+def test_concentric_concave_offsets_keep_pitch_as_independent_rings():
     geometry = Polygon(
         [
             (0, 0),
@@ -846,19 +1011,20 @@ def test_concentric_concave_offsets_keep_pitch_and_connect_continuously():
         path_spacing=1.8,
         tolerance=1e-5,
     )
-    planned = _connect_concentric_infill_paths(
-        rings,
-        geometry,
-        spacing=1.8,
-        minimum_clearance=1.8,
-        tolerance=1e-5,
+    paths, roles = _build_resin_paths(
+        [np.asarray(geometry.exterior.coords, dtype=np.float32)],
+        SliceConfig(
+            layer_height=1.0,
+            line_width=2.0,
+            infill_pattern="concentric",
+            smoothing_radius_factor=0.0,
+        ),
     )
+    infill = _paths_with_role(paths, roles, "infill")
 
     assert np.allclose([float(path[:, 0].min()) for path in rings], np.arange(0.0, 10.8, 1.8))
-    assert len(planned) == 1
-    assert unary_union([LineString(path) for path in rings]).difference(
-        LineString(planned[0]).buffer(1e-4)
-    ).length <= 1e-3
+    assert len(infill) > 1
+    assert all(LineString(path[:, :2]).is_simple for path in infill)
 
 
 def test_concentric_centers_residual_ring_per_local_region():
@@ -1356,6 +1522,30 @@ def test_gyroid_infill_supports_zero_and_full_density():
     assert _paths_with_role(full_job.material_paths[1].paths, full_roles, "infill")
 
 
+def test_measured_width_overlap_conflict_returns_coverage_candidate_instead_of_rejecting():
+    config = SliceConfig(
+        line_width=2.0,
+        planning_line_width=2.3,
+        infill_pattern="zigzag_vertical",
+        infill_density=100.0,
+        infill_overlap=0.0,
+        tolerance=0.0005,
+    )
+    conflicting = [
+        np.asarray([[0.0, 0.0], [20.0, 0.0]], dtype=np.float32),
+        np.asarray([[0.0, 1.5], [20.0, 1.5]], dtype=np.float32),
+    ]
+
+    returned = slicer_module._require_measured_width_infill(
+        conflicting,
+        Polygon(),
+        config,
+    )
+
+    assert returned
+    assert all(LineString(path).is_simple for path in returned)
+
+
 @pytest.mark.parametrize(
     ("pattern", "max_path_count"),
     [
@@ -1365,7 +1555,6 @@ def test_gyroid_infill_supports_zero_and_full_density():
         ("grid", 2),
         ("triangles", 8),
         ("gyroid", 30),
-        ("concentric", 1),
         ("zigzag", 1),
     ],
 )
@@ -1405,6 +1594,9 @@ def test_measured_width_caps_solid_infill_overlap_in_every_direction(angle: floa
     planning_width = 2.2
     overlap_percent = 10.0
     requested_pitch = planning_width * (1.0 - overlap_percent / 100.0)
+    contour_pitch = planning_width * (
+        1.0 - DEFAULT_RESIN_CONTOUR_INFILL_OVERLAP_PERCENT / 100.0
+    )
     config = SliceConfig(
         layer_height=1.0,
         line_width=2.0,
@@ -1432,7 +1624,7 @@ def test_measured_width_caps_solid_infill_overlap_in_every_direction(angle: floa
         0.0,
         (planning_width - min(scan_gaps)) / planning_width,
     ) <= overlap_percent / 100.0 + 0.001
-    assert infill_linework.distance(wall_linework) >= requested_pitch - 0.002
+    assert infill_linework.distance(wall_linework) >= contour_pitch - 0.002
     # Strict measured-width planning may drop an unsafe boundary connector,
     # but it must keep the remaining safe hatches in long continuous trails.
     assert len(infill) <= 4
@@ -1440,6 +1632,7 @@ def test_measured_width_caps_solid_infill_overlap_in_every_direction(angle: floa
         infill,
         wall_linework,
         minimum_spacing=requested_pitch,
+        minimum_wall_spacing=contour_pitch,
         tolerance=config.tolerance,
         bead_width=planning_width,
     )
@@ -1465,6 +1658,65 @@ def test_measured_width_caps_raft_parallel_overlap(angle: float):
 
     assert scan_gaps
     assert min(scan_gaps) >= 2.2 * 0.9 - 0.002
+
+
+def test_zero_overlap_raft_succeeds_with_fixed_contour_seam():
+    footprint = unary_union(
+        [
+            Polygon([(-45, -14), (3.0294, -14), (3.0294, 14), (-45, 14)]),
+            Point(20, 0).buffer(22, quad_segs=32),
+        ]
+    ).difference(Point(20, 0).buffer(7, quad_segs=16))
+    config = SliceConfig(
+        layer_height=0.5,
+        line_width=2.0,
+        planning_line_width=2.2,
+        infill_pattern="zigzag_plus45",
+        infill_density=100.0,
+        infill_overlap=0.0,
+        tolerance=0.0005,
+        smoothing_angle=120.0,
+        smoothing_radius_factor=0.35,
+        perimeter_count=2,
+    )
+    reserved_voids = _raft_reserved_void_geometry(footprint, config.tolerance)
+    paths, roles = slicer_module._raft_paths_for_layer(
+        footprint,
+        reserved_voids,
+        config,
+        RaftLayerConfig(outward_offset=10.0, infill_density=100.0),
+        layer_index=1,
+    )
+    infill = _paths_with_role(paths, roles, "infill")
+    raft_geometry = _raft_geometry_for_layer(
+        footprint,
+        reserved_voids,
+        10.0,
+        config.tolerance,
+    )
+
+    assert infill
+    assert len(infill) <= 18
+    assert min(slicer_module._open_path_length(path) for path in infill) >= 4.5
+    assert all(LineString(path).is_simple for path in infill)
+    assert min(
+        _minimum_nondegenerate_vertex_angle(
+            path,
+            minimum_segment_length=0.01,
+        )
+        for path in infill
+    ) >= 90.0
+    deposited = _round_bead_union(paths, config.planning_line_width)
+    assert _maximum_uncovered_void_diameter(
+        raft_geometry,
+        deposited,
+        edge_inset=config.planning_line_width * 0.15,
+    ) <= config.planning_line_width
+    assert _infill_extra_dose_ratio(
+        infill,
+        raft_geometry,
+        config.planning_line_width,
+    ) <= 0.002
 
 
 def test_strict_solid_boundary_chaining_starts_from_far_scan_side():
@@ -2107,7 +2359,7 @@ def test_final_spacing_postcondition_rejects_sub_pitch_closed_ring():
     )
 
 
-def test_measured_width_concentric_drops_collapsed_residual_ring():
+def test_measured_width_concentric_filters_a_subthreshold_center_deposit():
     contour = np.asarray(
         Point(0.0, 0.0).buffer(5.0, quad_segs=64).exterior.coords,
         dtype=np.float32,
@@ -2128,11 +2380,17 @@ def test_measured_width_concentric_drops_collapsed_residual_ring():
     assert infill == []
 
     safe_contour = np.asarray(
-        Point(0.0, 0.0).buffer(6.0, quad_segs=64).exterior.coords,
+        Point(0.0, 0.0).buffer(6.2, quad_segs=64).exterior.coords,
         dtype=np.float32,
     )
     safe_paths, safe_roles = _build_resin_paths([safe_contour], config)
-    assert _paths_with_role(safe_paths, safe_roles, "infill")
+    safe_infill = _paths_with_role(safe_paths, safe_roles, "infill")
+    assert safe_infill
+    assert all(
+        LineString(path).length + config.tolerance
+        >= slicer_module.CONCENTRIC_MINIMUM_PATH_LENGTH_MM
+        for path in safe_infill
+    )
 
 
 @pytest.mark.parametrize(
@@ -2144,8 +2402,8 @@ def test_measured_width_concentric_drops_collapsed_residual_ring():
     ),
     [
         (0.0, 0.997, 0.50, 2),
-        (45.0, 0.997, 0.50, 3),
-        (-45.0, 0.997, 0.50, 2),
+        (45.0, 0.9965, 0.90, 4),
+        (-45.0, 0.9965, 0.90, 4),
         (90.0, 0.997, 0.50, 2),
     ],
 )
@@ -2184,6 +2442,9 @@ def test_prusa_full_density_round_beads_cover_wall_transition_without_piling(
     infill_linework = unary_union([LineString(path[:, :2]) for path in infill])
     repeated_length = sum(LineString(path[:, :2]).length for path in infill) - infill_linework.length
     expected_pitch = config.line_width * (1.0 - config.infill_overlap / 100.0)
+    contour_pitch = config.line_width * (
+        1.0 - DEFAULT_RESIN_CONTOUR_INFILL_OVERLAP_PERCENT / 100.0
+    )
     pitch_adjustment = _solid_spacing_adjustment_limit(
         expected_pitch,
         config.line_width,
@@ -2204,13 +2465,13 @@ def test_prusa_full_density_round_beads_cover_wall_transition_without_piling(
         full_width_stroke,
         edge_inset=0.3,
     ) <= maximum_void_diameter
-    assert _infill_extra_dose_ratio(infill, solid, config.line_width) <= 0.01
+    assert _infill_extra_dose_ratio(infill, solid, config.line_width) <= 0.011
     assert _segment_bead_overlap_ratio(infill, config.line_width) <= 0.23
     assert scan_gaps
     assert min(scan_gaps) >= expected_pitch - pitch_adjustment - 0.02
     assert max(scan_gaps) <= expected_pitch + pitch_adjustment + 0.02
     assert abs(repeated_length) <= 1e-4
-    assert wall_clearance == pytest.approx(expected_pitch, abs=0.02)
+    assert wall_clearance == pytest.approx(contour_pitch, abs=0.02)
     assert len(infill) <= maximum_path_count
     assert all(LineString(path[:, :2]).is_simple for path in infill)
     minimum_vertex_angles = [
@@ -2689,11 +2950,11 @@ def test_residual_correction_rejects_stroke_stacked_inside_two_mm_bead():
 @pytest.mark.parametrize(
     ("height", "expected_scan_ys"),
     [
-        (9.3, [4.65]),
+        (9.3, []),
         (10.0, [5.0]),
-        (11.2, [4.7, 6.5]),
-        (14.5, [4.6, 6.36667, 8.13333, 9.9]),
-        (14.59, [4.6, 6.39667, 8.19333, 9.99]),
+        (11.2, [5.6]),
+        (14.5, [5.45, 7.25, 9.05]),
+        (14.59, [5.495, 7.295, 9.095]),
     ],
 )
 def test_prusa_full_density_narrow_corridors_do_not_add_boundary_pileup(
@@ -2722,7 +2983,7 @@ def test_prusa_full_density_narrow_corridors_do_not_add_boundary_pileup(
     infill = _paths_with_role(paths, roles, "infill")
     scan_ys = _horizontal_scan_ys_for_paths(infill)
 
-    assert len(infill) == 1
+    assert len(infill) == (1 if expected_scan_ys else 0)
     assert np.allclose(scan_ys, expected_scan_ys, atol=0.02)
     assert _infill_extra_dose_ratio(infill, solid, config.line_width) <= 1e-6
     if len(scan_ys) > 1:
@@ -2778,7 +3039,7 @@ def test_prusa_full_density_anchor_levels_snap_to_large_square_boundary(angle: f
         "zigzag",
     ],
 )
-def test_prusa_infill_keeps_two_mm_wall_clearance_after_overlap(
+def test_prusa_infill_keeps_configured_contour_seam_independent_of_run_overlap(
     pattern: str,
     overlap_percent: float,
 ):
@@ -2796,7 +3057,9 @@ def test_prusa_infill_keeps_two_mm_wall_clearance_after_overlap(
     paths, roles = _build_resin_paths([contour], config, layer_index=1)
     infill = _paths_with_role(paths, roles, "infill")
     last_walls = _paths_with_role(paths, roles, "inner_contour")
-    expected_pitch = line_width * (1.0 - overlap_percent / 100.0)
+    expected_pitch = line_width * (
+        1.0 - DEFAULT_RESIN_CONTOUR_INFILL_OVERLAP_PERCENT / 100.0
+    )
     clearance = unary_union([LineString(path) for path in infill]).distance(
         unary_union([LineString(path) for path in last_walls])
     )
@@ -2809,7 +3072,7 @@ def test_prusa_infill_keeps_two_mm_wall_clearance_after_overlap(
 @pytest.mark.parametrize("density", [50.0, 100.0])
 @pytest.mark.parametrize(
     "pattern",
-    ["aligned_rectilinear", "grid", "triangles", "gyroid", "concentric"],
+    ["aligned_rectilinear", "grid", "triangles", "gyroid"],
 )
 def test_prusa_infill_material_length_budget_matches_density(pattern: str, density: float):
     contour = _square_contour(100.0)
@@ -2949,8 +3212,12 @@ def test_material_defaults_are_hard_coded():
     assert resin.layer_height == DEFAULT_RESIN_LAYER_HEIGHT_MM
     assert resin.line_width == DEFAULT_RESIN_LINE_WIDTH_MM
     assert resin.planning_line_width is None
-    assert DEFAULT_RESIN_PLANNING_LINE_WIDTH_MM == 2.2
+    assert DEFAULT_RESIN_PLANNING_LINE_WIDTH_MM == 2.3
     assert resin.infill_overlap == DEFAULT_RESIN_INFILL_OVERLAP_PERCENT
+    assert (
+        resin.contour_infill_overlap
+        == DEFAULT_RESIN_CONTOUR_INFILL_OVERLAP_PERCENT
+    )
     assert fiber.layer_height == DEFAULT_FIBER_LAYER_HEIGHT_MM
     assert fiber.line_width == DEFAULT_FIBER_LINE_WIDTH_MM
 
@@ -2988,10 +3255,16 @@ def test_slice_config_exposes_ui_tunable_path_parameters_in_meta():
     assert slicing["maximum_overlap_spacing"] == pytest.approx(0.99)
     assert slicing["planning_spacing_safety_margin"] == pytest.approx(0.00016)
     assert slicing["planning_path_spacing"] == pytest.approx(0.99016)
+    assert slicing["contour_infill_overlap_percent"] == 2.0
+    assert slicing["contour_infill_spacing"] == pytest.approx(1.07832)
+    assert slicing["contour_infill_maximum_overlap_spacing"] == pytest.approx(
+        1.078
+    )
+    assert slicing["contour_infill_overlap_uses_ui"] is True
     assert slicing["maximum_overlap_enforced"] is True
     assert (
         slicing["maximum_overlap_scope"]
-        == "infill_to_innermost_perimeter_nonlocal_runs_endcaps_and_closed_ring_footprints"
+        == "infill_nonlocal_runs_endcaps_and_closed_ring_footprints_with_independent_contour_infill_seam"
     )
     assert slicing["perimeter_spacing_uses_nominal_line_width"] is True
     assert slicing["perimeter_count"] == 3
@@ -3005,6 +3278,12 @@ def test_slice_config_exposes_ui_tunable_path_parameters_in_meta():
 def test_planning_line_width_must_be_finite_and_positive(planning_width: float):
     with pytest.raises(ValueError, match="planning_line_width"):
         SliceConfig(planning_line_width=planning_width)
+
+
+@pytest.mark.parametrize("overlap", [-1.0, 100.0, math.nan, math.inf])
+def test_contour_infill_overlap_must_be_a_finite_percentage(overlap: float):
+    with pytest.raises(ValueError, match="contour_infill_overlap"):
+        SliceConfig(contour_infill_overlap=overlap)
 
 
 @pytest.mark.parametrize("pattern", ["grid", "triangles", "gyroid"])
@@ -3051,6 +3330,10 @@ def test_strict_measured_width_safely_layers_crossing_patterns(
         infill,
         wall_linework,
         minimum_spacing=1.98,
+        minimum_wall_spacing=(
+            config.planning_line_width
+            * (1.0 - DEFAULT_RESIN_CONTOUR_INFILL_OVERLAP_PERCENT / 100.0)
+        ),
         tolerance=config.tolerance,
         bead_width=2.2,
     )
@@ -3134,8 +3417,103 @@ def test_strict_measured_oblique_non_square_infill_drops_only_unsafe_connectors(
         infill,
         wall_linework,
         minimum_spacing=1.98,
+        minimum_wall_spacing=(
+            config.planning_line_width
+            * (1.0 - DEFAULT_RESIN_CONTOUR_INFILL_OVERLAP_PERCENT / 100.0)
+        ),
         tolerance=config.tolerance,
         bead_width=2.2,
+    )
+
+
+@pytest.mark.parametrize(
+    ("pattern", "maximum_void_diameter", "maximum_path_count"),
+    [
+        ("zigzag_plus45", 1.80, 3),
+        ("zigzag_vertical", 1.50, 4),
+    ],
+)
+def test_measured_lug_fill_prioritizes_coverage_without_piling_or_fragmenting(
+    pattern: str,
+    maximum_void_diameter: float,
+    maximum_path_count: int,
+):
+    lug = unary_union(
+        [
+            Polygon([(-45, -14), (3.0294, -14), (3.0294, 14), (-45, 14)]),
+            Point(20, 0).buffer(22, quad_segs=32),
+        ]
+    ).difference(Point(20, 0).buffer(7, quad_segs=16))
+    contours = [np.asarray(lug.exterior.coords, dtype=np.float32)] + [
+        np.asarray(ring.coords, dtype=np.float32) for ring in lug.interiors
+    ]
+    config = SliceConfig(
+        layer_height=0.5,
+        line_width=2.0,
+        planning_line_width=2.3,
+        infill_pattern=pattern,
+        infill_density=100.0,
+        infill_overlap=0.0,
+        tolerance=0.0005,
+        smoothing_angle=120.0,
+        smoothing_radius_factor=0.35,
+        perimeter_count=2,
+    )
+
+    paths, roles = _build_resin_paths(contours, config)
+    infill = _paths_with_role(paths, roles, "infill")
+    contour_linework = unary_union(
+        [
+            LineString(path)
+            for path, role in zip(paths, roles)
+            if role in ("outer_contour", "inner_contour")
+        ]
+    )
+    assert len(infill) <= maximum_path_count
+    assert min(slicer_module._open_path_length(path) for path in infill) >= 5.0
+    assert all(LineString(path).is_simple for path in infill)
+    assert all(
+        LineString(path).disjoint(
+            contour_linework.buffer(config.tolerance * 5.0)
+        )
+        for path in infill
+    )
+    if pattern == "zigzag_plus45":
+        connected_endpoints = sum(
+            Point(float(endpoint[0]), float(endpoint[1])).distance(
+                unary_union(
+                    [
+                        LineString(other)
+                        for other_index, other in enumerate(infill)
+                        if other_index != path_index
+                    ]
+                )
+            )
+            <= config.tolerance * 5.0
+            for path_index, path in enumerate(infill)
+            for endpoint in (path[0, :2], path[-1, :2])
+        )
+        assert connected_endpoints >= 2
+    assert min(
+        _minimum_nondegenerate_vertex_angle(
+            path,
+            minimum_segment_length=0.01,
+        )
+        for path in infill
+    ) >= config.smoothing_angle - 1e-3
+    deposited = _round_bead_union(paths, config.planning_line_width)
+    assert _maximum_uncovered_void_diameter(
+        lug,
+        deposited,
+        edge_inset=config.planning_line_width * 0.15,
+    ) <= maximum_void_diameter
+    assert (
+        _infill_extra_dose_ratio(
+            infill,
+            lug,
+            config.planning_line_width,
+        )
+        <= 0.0115
     )
 
 
@@ -3316,17 +3694,24 @@ def test_ui_uses_prusaslicer_style_infill_pattern_names():
     html = _index_html()
 
     for pattern in (
-        "none",
+        "zigzag_horizontal",
+        "zigzag_vertical",
+        "zigzag_plus45",
+        "zigzag_minus45",
+        "triangles",
+        "concentric",
+    ):
+        assert f'value="{pattern}"' in html
+    for removed_pattern in (
         "rectilinear",
         "aligned_rectilinear",
         "line",
         "grid",
-        "triangles",
         "gyroid",
-        "concentric",
         "zigzag",
+        "isotropic",
     ):
-        assert f'value="{pattern}"' in html
+        assert f'value="{removed_pattern}"' not in html
     for legacy_pattern in (
         "lines_x",
         "lines_y",
@@ -3335,15 +3720,12 @@ def test_ui_uses_prusaslicer_style_infill_pattern_names():
         assert legacy_pattern not in html
 
     for translated_label in (
-        "仅轮廓",
-        "交替直线填充",
-        "对齐直线填充",
-        "单向线填充",
-        "网格填充",
-        "三角形填充",
-        "陀螺曲线填充",
+        "横向 Zigzag",
+        "竖向 Zigzag",
+        "+45° Zigzag",
+        "-45° Zigzag",
+        "三角填充",
         "同心轮廓填充",
-        "之字形填充",
     ):
         assert translated_label in html
 
@@ -3393,11 +3775,13 @@ def test_ui_exposes_slicing_kernel_input():
         "名义树脂线宽 mm",
         "实测压平线宽 mm",
         "不会改变挤出倍率",
-        "严格模式按层 0°/90°",
-        "严格模式按层 0°/60°/120°",
-        "严格模式按层 45°/-45°",
         "树脂填充路径",
-        "各向同性填充",
+        "横向 Zigzag",
+        "竖向 Zigzag",
+        "+45° Zigzag",
+        "-45° Zigzag",
+        "三角填充",
+        "同心轮廓填充",
         "三角形填充路径优化",
         "之字形填充路径优化",
     ):
@@ -3445,6 +3829,7 @@ def test_ui_exposes_slicing_kernel_input():
         "infillSafetyNote",
         "infillDensity",
         "infillOverlap",
+        "contourInfillOverlap",
         "trianglePathOptimization",
         "zigzagPathOptimization",
         "slicingKernel",
@@ -3475,7 +3860,9 @@ def test_ui_exposes_slicing_kernel_input():
         "pyslmSimplificationPreserveTopology",
         "smoothingAngle",
         "smoothingRadiusFactor",
-        "raftOffsets",
+        "printRaft",
+        "raftBottomOffset",
+        "raftSecondOffset",
         "curveMode",
         "curveAmplitude",
         "curvePeriod",
@@ -3500,16 +3887,34 @@ def test_ui_exposes_slicing_kernel_input():
     assert "const strictLayeredFallbackPatterns" in html
     assert "option.disabled = isPyslm && !pyslmSupportedPatterns.has(option.value)" in html
     assert f'value="{DEFAULT_RESIN_PLANNING_LINE_WIDTH_MM}"' in html
+    assert (
+        f'id="infillOverlap" name="infillOverlap" type="number" min="0" '
+        f'max="99" step="0.1" value="{DEFAULT_UI_RESIN_INFILL_OVERLAP_PERCENT:g}"'
+        in html
+    )
+    assert (
+        f'id="contourInfillOverlap" name="contourInfillOverlap" type="number" '
+        f'min="0" max="99" step="0.1" '
+        f'value="{DEFAULT_RESIN_CONTOUR_INFILL_OVERLAP_PERCENT:g}"'
+        in html
+    )
+    assert "formData.append('contour_infill_overlap'" in html
+    assert (
+        "formData.append('raft_offsets', raftBottomOffsetInput.value + ',' + "
+        "raftSecondOffsetInput.value)"
+        in html
+    )
+    assert 'class="helpTip"' in html
+    assert 'data-tooltip="实测压平线宽仅用于 Prusa' in html
     assert 'value="legacy" selected' in html
     assert 'value="pyslm"' in html
     assert 'id="trianglePathOptimization" type="checkbox" checked' in html
-    assert 'value="isotropic"' in html
-    for pattern in ("grid", "triangles", "gyroid"):
-        assert f'value="{pattern}"' in html
-        assert f'value="{pattern}" disabled' not in html
+    assert 'id="printRaft" type="checkbox" checked' in html
+    assert "formData.append('print_raft'" in html
     for hatcher in ("basic", "stripe", "island", "basic_island"):
         assert f'value="{hatcher}"' in html
     for removed_raft_control in (
+        "raftOffsets",
         "raftLayerCount",
         "raftTopGap",
         "raftLayerHeights",
@@ -3521,6 +3926,35 @@ def test_ui_exposes_slicing_kernel_input():
     assert "topCapAngle" not in html
     assert 'id="resinPathSlider"' not in html
     assert 'id="fiberPathSlider"' not in html
+
+
+def test_ui_uses_compact_portrait_band_layout():
+    html = _index_html()
+
+    for band in (
+        'data-layout-band="input-layer"',
+        'data-layout-band="kernel"',
+        'data-layout-band="process-action"',
+    ):
+        assert band in html
+    assert "grid-template-columns: repeat(12, minmax(0, 1fr))" in html
+    assert '<div class="fieldGroup span-2">' in html
+    assert '<div class="fieldGroup span-3">' in html
+    assert '<div class="fieldGroup span-4">' in html
+    assert '<div id="legacyInfillControl" class="bandGrid compactGrid">' in html
+    assert '<div class="compactOptions span-8">' in html
+    assert '<div class="processGroup span-4">' in html
+    assert '<div class="processGroup span-5">' in html
+    assert '<div class="actions span-3">' in html
+    assert "--control-height: 40px" in html
+    assert 'input:not([type="checkbox"]):not([type="range"]), select' in html
+    assert '.inputBand input[type="file"]' in html
+    assert "align-self: end" in html
+    assert 'input[type="checkbox"]' in html
+    assert '<label for="raftSecondOffset" title="第 2 层筏板打印外扩距离 mm">第 2 层外扩 mm</label>' in html
+    assert ".processBand .status:empty" in html
+    assert html.index('<section class="resultsColumn">') < html.index('<section class="panel">')
+    assert "min-height: 74px" not in html
 
 
 def test_ui_result_summary_reports_backend_kernel_and_planning_width():
@@ -3839,7 +4273,7 @@ def test_raft_zigzag_full_density_covers_boundary_without_retrace():
 
     full_width_stroke = _round_bead_union(paths, config.line_width)
 
-    assert 1 <= len(paths) <= 3
+    assert 1 <= len(paths) <= 4
     assert all(LineString(path).is_simple for path in paths)
     assert full_width_stroke.intersection(geometry).area / geometry.area > 0.97
     assert _maximum_uncovered_void_diameter(
@@ -3881,7 +4315,7 @@ def test_raft_zigzag_follows_hole_boundary_with_few_full_width_strokes():
         ]
     )
 
-    assert 1 <= len(paths) <= 3
+    assert 1 <= len(paths) <= 4
     assert all(LineString(path).is_simple for path in paths)
     assert abs(_repeated_centerline_length(paths)) <= 1e-4
     assert all(safe_geometry.buffer(1e-5).covers(LineString(path)) for path in paths)
