@@ -3,6 +3,40 @@
 Python tooling for converting STL geometry into the external source NPZ format
 expected by `external_npz_preprocessor.source_npz.load_source_npz()`.
 
+## Installation
+
+KUKA Surface Slicer supports Python 3.10 or newer. All runtime paths are
+resolved from command-line arguments or the directory where the program is
+started; the source distribution contains no machine-specific drive or user
+directory paths.
+
+Create an isolated environment after cloning the repository or extracting the
+release ZIP:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install .
+```
+
+On Linux or macOS, create and use the environment with:
+
+```bash
+python3 -m venv .venv
+./.venv/bin/python -m pip install --upgrade pip
+./.venv/bin/python -m pip install .
+```
+
+The optional PySLM kernel is installed with `.[pyslm]`. Development and test
+dependencies are installed with `.[test]`.
+
+After installation, both forms are equivalent:
+
+```powershell
+kuka-slicer --help
+python -m kuka_slicer --help
+```
+
 The first supported pipeline is:
 
 ```text
@@ -309,3 +343,15 @@ Run tests:
 ```powershell
 python -m pytest
 ```
+
+Build the standard wheel and source distribution from a clean checkout:
+
+```powershell
+python -m pip install build
+python -m build
+```
+
+The generated `dist/` directory is intentionally ignored by Git. Official
+release ZIP files bundle the portable source tree together with the wheel and
+source distribution, and exclude virtual environments, caches, generated
+outputs, logs, and machine-local configuration.
