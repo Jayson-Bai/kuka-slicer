@@ -1,0 +1,2 @@
+# Preserve handoff golden artifacts byte-for-byte on every platform.
+packages/offline_path_planner/handoff/golden/** -text
