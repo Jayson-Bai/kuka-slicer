@@ -1,0 +1,17 @@
+builtin_interfaces/Time stamp
+float64 x
+float64 y
+float64 z
+float64 a
+float64 b
+float64 c
+float64 e
+int32 tool_id
+uint32 seq
+uint32 layer_index
+uint32 total_layers
+uint32 path_id
+bool path_end_flag
+float32 planned_time_s
+float32 planned_total_time_s
+bool planned_time_valid
