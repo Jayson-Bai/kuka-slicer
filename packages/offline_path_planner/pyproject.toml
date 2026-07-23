@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kuka-offline-planner"
+version = "0.1.0"
+description = "Offline GCode and external source NPZ planning for the KUKA print system"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [{name = "Jayson-Bai"}]
+keywords = ["3d-printing", "gcode", "kuka", "npz", "toolpath"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering",
+]
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+kuka-offline-gcode = "gcode_planner.cli:main"
+kuka-offline-npz = "external_npz_preprocessor.cli:main"
+
+[project.urls]
+Repository = "https://github.com/Jayson-Bai/offline-path-planner"
+
+[tool.setuptools.packages.find]
+where = [
+  "src/my_project/path_processing_core",
+  "src/my_project/gcode_planner",
+  "src/my_project/external_npz_preprocessor",
+]
+include = [
+  "path_processing_core*",
+  "gcode_planner*",
+  "external_npz_preprocessor*",
+]

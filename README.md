@@ -3,6 +3,22 @@
 Python tooling for converting STL geometry into the external source NPZ format
 expected by `external_npz_preprocessor.source_npz.load_source_npz()`.
 
+## Two-package workspace
+
+The repository now keeps two independently installable packages in one
+workspace:
+
+- The root `kuka-slicer` package owns STL slicing and writes
+  `external_layer_paths_v1` source NPZ files.
+- `packages/offline_path_planner` owns GCode/source-NPZ preprocessing and
+  writes the existing system NPZ consumed by the upper computer.
+
+They share no production imports. Their integration boundary is a source NPZ
+file on disk, so installing or running either package does not activate the
+other. See [`packages/README.md`](packages/README.md) for the boundary and
+[`packages/offline_path_planner/README.md`](packages/offline_path_planner/README.md)
+for standalone planner commands.
+
 ## Installation
 
 KUKA Surface Slicer supports Python 3.10 or newer. All runtime paths are

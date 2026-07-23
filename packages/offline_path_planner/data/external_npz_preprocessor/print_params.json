@@ -1,0 +1,47 @@
+{
+  "format": "external_npz_preprocessor_print_params",
+  "version": 1,
+  "params": {
+    "resin": {
+      "layer_height_mm": 0.5,
+      "extrusion_scale": 1.0,
+      "feed_mm_s": 10.0,
+      "temperature_c": 250.0,
+      "fan_enabled": true,
+      "prime_length_mm": 18.0,
+      "prime_speed_mm_s": 15.0,
+      "retract_length_mm": 15.0,
+      "retract_speed_mm_s": 30.0,
+      "e_per_mm_override": null
+    },
+    "fiber": {
+      "layer_height_mm": 0.1,
+      "extrusion_scale": 1.0,
+      "feed_mm_s": 10.0,
+      "temperature_c": 250.0,
+      "fan_enabled": true,
+      "prime_length_mm": 8.0,
+      "prime_speed_mm_s": 5.0,
+      "retract_length_mm": 10.0,
+      "retract_speed_mm_s": 5.0
+    },
+    "travel_feed_mm_s": 10.0,
+    "default_a": 0.0,
+    "default_b": 0.0,
+    "default_c": 0.0,
+    "start_x_mm": 30.0,
+    "start_y_mm": 30.0,
+    "prime_settle_s": 0.5,
+    "dt": 0.004,
+    "corner_angle_deg": 45.0,
+    "corner_retreat_ratio": 0.65,
+    "spline_max_error_mm": 0.1,
+    "spline_max_angle_deg": 45.0,
+    "source_merge_distance_mm": 0.04,
+    "corner_retreat_max_mm": 0.4,
+    "corner_blend_segments": 8,
+    "density": 0,
+    "degree": 3,
+    "max_fit_points_per_segment": 20000
+  }
+}
