@@ -3,7 +3,10 @@ import json
 import numpy as np
 import pytest
 
-from external_npz_preprocessor.source_npz import load_source_npz
+from external_npz_preprocessor.source_npz import (
+    SOURCE_NPZ_CONTRACT_ID,
+    load_source_npz,
+)
 from external_npz_preprocessor.source_template import write_two_layer_template_npz
 
 
@@ -17,14 +20,14 @@ def test_loads_layer_material_paths_and_normalizes_nx3_to_xyzabc(tmp_path):
     fiber_paths[0, 1] = [7.0, 8.0, 0.8, 11.0, 21.0, 31.0]
     np.savez(
         source,
-        meta=np.array(json.dumps({"format": "external_layer_paths_v1"})),
+        meta=np.array(json.dumps({"format": SOURCE_NPZ_CONTRACT_ID})),
         layer_0000_R=resin_paths,
         layer_0000_F=fiber_paths,
     )
 
     job = load_source_npz(source, default_abc=(1.0, 2.0, 3.0))
 
-    assert job.meta["format"] == "external_layer_paths_v1"
+    assert job.meta["format"] == SOURCE_NPZ_CONTRACT_ID
     assert [layer.index for layer in job.layers] == [0]
     assert len(job.layers[0].resin_paths) == 1
     assert len(job.layers[0].fiber_paths) == 1
@@ -66,3 +69,19 @@ def test_two_layer_template_contains_numeric_xyz_resin_and_fiber_paths_per_layer
     assert all(layer.fiber_paths for layer in job.layers)
     assert job.layers[0].resin_paths[0].points.shape[1] == 6
     assert job.layers[1].fiber_paths[0].points.shape[1] == 6
+
+
+def test_rejects_explicit_unknown_source_contract(tmp_path):
+    source = tmp_path / "future_source.npz"
+    resin_paths = np.asarray(
+        [[[1.0, 2.0, 0.5], [3.0, 4.0, 0.5]]],
+        dtype=np.float32,
+    )
+    np.savez(
+        source,
+        meta=np.array(json.dumps({"format": "external_layer_paths_v999"})),
+        layer_0000_R=resin_paths,
+    )
+
+    with pytest.raises(ValueError, match="unsupported source NPZ format"):
+        load_source_npz(source)

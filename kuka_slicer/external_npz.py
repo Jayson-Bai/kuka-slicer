@@ -9,6 +9,7 @@ import numpy as np
 
 Material = Literal["R", "F"]
 DEFAULT_EXPORT_CHORD_TOLERANCE_MM = 0.05
+SOURCE_NPZ_CONTRACT_ID = "external_layer_paths_v1"
 
 
 @dataclass
@@ -178,7 +179,7 @@ def _normalize_path(path: np.ndarray) -> np.ndarray:
 
 def _defaulted_meta(meta: dict[str, object]) -> dict[str, object]:
     base: dict[str, object] = {
-        "format": "external_layer_paths_v1",
+        "format": SOURCE_NPZ_CONTRACT_ID,
         "unit": "mm",
         "point_columns": ["x", "y", "z"],
         "materials": {"R": "resin", "F": "fiber"},

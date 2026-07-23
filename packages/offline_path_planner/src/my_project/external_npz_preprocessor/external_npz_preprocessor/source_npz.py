@@ -12,6 +12,8 @@ import numpy as np
 
 
 _LAYER_KEY_RE = re.compile(r"^layer_(\d{4})_([RF])$")
+SOURCE_NPZ_CONTRACT_ID = "external_layer_paths_v1"
+SUPPORTED_SOURCE_NPZ_CONTRACTS = frozenset({SOURCE_NPZ_CONTRACT_ID})
 
 
 @dataclass(frozen=True)
@@ -49,6 +51,7 @@ def load_source_npz(path: str | Path, default_abc: tuple[float, float, float] = 
 
     with np.load(source, allow_pickle=True) as npz:
         meta = _read_meta(npz)
+        _validate_source_contract(meta)
         layer_map: dict[int, dict[str, list[MaterialPath]]] = {}
         for key in sorted(npz.files):
             match = _LAYER_KEY_RE.match(key)
@@ -68,6 +71,21 @@ def load_source_npz(path: str | Path, default_abc: tuple[float, float, float] = 
         for idx, values in sorted(layer_map.items())
     ]
     return SourceJob(meta=meta, layers=layers)
+
+
+def _validate_source_contract(meta: dict[str, Any]) -> None:
+    """Accept the documented v1 contract and unversioned legacy source files."""
+    contract_id = meta.get("format")
+    if contract_id is None:
+        return
+    if (
+        not isinstance(contract_id, str)
+        or contract_id not in SUPPORTED_SOURCE_NPZ_CONTRACTS
+    ):
+        supported = ", ".join(sorted(SUPPORTED_SOURCE_NPZ_CONTRACTS))
+        raise ValueError(
+            f"unsupported source NPZ format {contract_id!r}; supported: {supported}"
+        )
 
 
 def _read_meta(npz) -> dict[str, Any]:
