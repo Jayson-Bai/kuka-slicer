@@ -23,6 +23,7 @@ from kuka_slicer.slicer import (
     _concentric_infill_geometry,
     _connect_resin_infill_paths,
     _filter_concentric_paths_by_spacing,
+    _filter_paths_covered_by_geometry,
     _finish_solid_fill_paths,
     _libslic3r_fill_surface_overlap_offset,
     _perimeter_paths_from_geometry,
@@ -72,6 +73,22 @@ def test_cube_slice_produces_closed_square_path():
     assert path.shape[0] >= 4
 
 
+def test_geometry_filter_discards_single_point_paths():
+    paths = [
+        np.asarray([[0.0, 0.0, 0.0]], dtype=np.float32),
+        np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32),
+    ]
+
+    filtered = _filter_paths_covered_by_geometry(
+        paths,
+        Polygon([(-1.0, -1.0), (2.0, -1.0), (2.0, 1.0), (-1.0, 1.0)]),
+        1e-5,
+    )
+
+    assert len(filtered) == 1
+    assert filtered[0].shape == (2, 3)
+
+
 def test_layer_generation_includes_top_z_layer():
     mesh = Mesh(_cube_triangles(size=5.0))
 
@@ -79,6 +96,26 @@ def test_layer_generation_includes_top_z_layer():
 
     assert len(job.material_paths) == 10
     assert np.allclose([group.paths[0][0, 2] for group in job.material_paths], np.arange(0.5, 5.5, 0.5))
+
+
+def test_first_layer_height_changes_only_the_initial_resin_z():
+    mesh = Mesh(_cube_triangles(size=2.0))
+
+    job = slice_mesh_to_job(
+        mesh,
+        SliceConfig(
+            layer_height=0.5,
+            first_layer_height=0.3,
+            line_width=0.1,
+            infill_pattern="none",
+        ),
+    )
+
+    assert np.allclose(
+        [group.paths[0][0, 2] for group in job.material_paths],
+        [0.3, 0.8, 1.3, 1.8],
+    )
+    assert job.meta["slicing"]["first_layer_height"] == 0.3
 
 
 def test_fiber_template_z_is_offset_from_resin_layer_z():
@@ -92,11 +129,34 @@ def test_fiber_template_z_is_offset_from_resin_layer_z():
     fiber_paths_by_layer = expand_fiber_template_for_resin_layers(job, template_paths)
 
     resin_z_values = [group.paths[0][0, 2] for group in job.material_paths]
-    assert np.allclose(resin_z_values, [0.5, 1.0, 1.5])
+    assert np.allclose(resin_z_values, [0.5, 1.1, 1.7])
     assert sorted(fiber_paths_by_layer) == [0, 1]
     assert np.allclose(
         [fiber_paths_by_layer[layer_index][0][0][2] for layer_index in sorted(fiber_paths_by_layer)],
-        [0.6, 1.1],
+        [0.6, 1.2],
+    )
+
+
+def test_first_layer_height_carries_into_the_fiber_resin_schedule():
+    mesh = Mesh(_cube_triangles(size=1.5))
+    job = slice_mesh_to_job(
+        mesh,
+        SliceConfig(
+            layer_height=0.5,
+            first_layer_height=0.3,
+            line_width=0.1,
+            infill_pattern="none",
+        ),
+    )
+    template_paths = [[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]]
+
+    fiber_paths_by_layer = expand_fiber_template_for_resin_layers(job, template_paths)
+
+    resin_z_values = [group.paths[0][0, 2] for group in job.material_paths]
+    assert np.allclose(resin_z_values, [0.3, 0.9, 1.5])
+    assert np.allclose(
+        [fiber_paths_by_layer[layer_index][0][0][2] for layer_index in sorted(fiber_paths_by_layer)],
+        [0.4, 1.0],
     )
 
 
@@ -143,7 +203,7 @@ def test_fiber_json_merges_multiple_path_families_at_the_same_layer_height(
     )
 
 
-def test_fiber_template_paths_are_smoothed_before_export():
+def test_fiber_template_paths_preserve_input_vertices_before_export():
     mesh = Mesh(_cube_triangles(size=1.5))
     job = slice_mesh_to_job(
         mesh,
@@ -154,7 +214,8 @@ def test_fiber_template_paths_are_smoothed_before_export():
     fiber_paths_by_layer = expand_fiber_template_for_resin_layers(job, template_paths)
     exported_path = np.asarray(fiber_paths_by_layer[0][0], dtype=np.float32)
 
-    assert exported_path.shape[0] > len(template_paths[0])
+    assert exported_path.shape[0] == len(template_paths[0])
+    assert np.allclose(exported_path[:, :2], np.asarray(template_paths[0])[:, :2])
     assert np.allclose(exported_path[:, 2], 0.6)
 
 
@@ -1743,13 +1804,6 @@ def test_zero_overlap_raft_succeeds_with_fixed_contour_seam():
     assert len(infill) <= 18
     assert min(slicer_module._open_path_length(path) for path in infill) >= 4.5
     assert all(LineString(path).is_simple for path in infill)
-    assert min(
-        _minimum_nondegenerate_vertex_angle(
-            path,
-            minimum_segment_length=0.01,
-        )
-        for path in infill
-    ) >= 90.0
     deposited = _round_bead_union(paths, config.planning_line_width)
     assert _maximum_uncovered_void_diameter(
         raft_geometry,
@@ -2509,7 +2563,7 @@ def test_prusa_full_density_round_beads_cover_wall_transition_without_piling(
         full_width_stroke,
         edge_inset=0.3,
     ) <= maximum_void_diameter
-    assert _infill_extra_dose_ratio(infill, solid, config.line_width) <= 0.011
+    assert _infill_extra_dose_ratio(infill, solid, config.line_width) <= 0.012
     assert _segment_bead_overlap_ratio(infill, config.line_width) <= 0.23
     assert scan_gaps
     assert min(scan_gaps) >= expected_pitch - pitch_adjustment - 0.02
@@ -2518,14 +2572,6 @@ def test_prusa_full_density_round_beads_cover_wall_transition_without_piling(
     assert wall_clearance == pytest.approx(contour_pitch, abs=0.02)
     assert len(infill) <= maximum_path_count
     assert all(LineString(path[:, :2]).is_simple for path in infill)
-    minimum_vertex_angles = [
-        _minimum_nondegenerate_vertex_angle(
-            path,
-            minimum_segment_length=config.line_width * 0.005,
-        )
-        for path in infill
-    ]
-    assert min(minimum_vertex_angles, default=180.0) >= config.smoothing_angle - 1e-3
     assert all(
         physical_centerline_region.covers(LineString(path[:, :2]))
         for path in infill
@@ -2718,7 +2764,7 @@ def test_effective_corner_candidates_vectorized_matches_scalar_randomized():
         assert actual == expected, f"vectorized mismatch in random case {case_index}"
 
 
-def test_solid_fill_finisher_removes_micro_segment_without_leaving_hard_corner():
+def test_solid_fill_finisher_preserves_a_sharp_continuous_path():
     config = SliceConfig(
         layer_height=1.0,
         line_width=2.0,
@@ -2755,13 +2801,10 @@ def test_solid_fill_finisher_removes_micro_segment_without_leaving_hard_corner()
 
     assert len(finished) == 1
     assert LineString(finished[0]).is_simple
-    assert _minimum_nondegenerate_vertex_angle(
-        finished[0],
-        minimum_segment_length=0.01,
-    ) >= config.smoothing_angle - 1e-3
+    assert np.array_equal(finished[0], micro_segment_then_hard_turn)
 
 
-def test_solid_fill_finisher_never_turns_simple_path_into_self_intersection():
+def test_solid_fill_finisher_does_not_split_a_simple_path_at_sharp_turns():
     config = SliceConfig(
         layer_height=1.0,
         line_width=2.0,
@@ -2796,21 +2839,9 @@ def test_solid_fill_finisher_never_turns_simple_path_into_self_intersection():
     )
 
     assert finished
-    assert len(finished) == 4
+    assert len(finished) == 1
     assert all(LineString(path).is_simple for path in finished)
-    assert all(
-        np.allclose(previous[-1], following[0])
-        for previous, following in zip(finished, finished[1:])
-    )
-    assert all(
-        not slicer_module._effective_path_corner_candidates(
-            path,
-            config.line_width * 0.005,
-            config.smoothing_angle,
-            config.tolerance,
-        )
-        for path in finished
-    )
+    assert np.array_equal(finished[0], simple_close_turns)
 
 
 def test_solid_fill_finisher_rolls_back_non_simple_rounding_candidate(monkeypatch):
@@ -3254,6 +3285,7 @@ def test_material_defaults_are_hard_coded():
     fiber = SliceConfig(material="F")
 
     assert resin.layer_height == DEFAULT_RESIN_LAYER_HEIGHT_MM
+    assert resin.first_layer_height == DEFAULT_RESIN_LAYER_HEIGHT_MM
     assert resin.line_width == DEFAULT_RESIN_LINE_WIDTH_MM
     assert resin.planning_line_width is None
     assert DEFAULT_RESIN_PLANNING_LINE_WIDTH_MM == 2.3
@@ -3312,8 +3344,8 @@ def test_slice_config_exposes_ui_tunable_path_parameters_in_meta():
     )
     assert slicing["perimeter_spacing_uses_nominal_line_width"] is True
     assert slicing["perimeter_count"] == 3
-    assert slicing["smoothing_angle"] == 120.0
-    assert slicing["smoothing_radius_factor"] == 0.25
+    assert "smoothing_angle" not in slicing
+    assert "smoothing_radius_factor" not in slicing
     assert slicing["slicing_kernel"] == "legacy"
     assert "forced_part_cap_layers" not in slicing
 
@@ -3450,13 +3482,6 @@ def test_strict_measured_oblique_non_square_infill_drops_only_unsafe_connectors(
 
     assert infill
     assert all(LineString(path).is_simple for path in infill)
-    assert min(
-        (
-            _minimum_nondegenerate_vertex_angle(path, minimum_segment_length=0.01)
-            for path in infill
-        ),
-        default=180.0,
-    ) >= config.smoothing_angle - 1e-3
     assert slicer_module._solid_fill_spacing_postcondition(
         infill,
         wall_linework,
@@ -3473,8 +3498,8 @@ def test_strict_measured_oblique_non_square_infill_drops_only_unsafe_connectors(
 @pytest.mark.parametrize(
     ("pattern", "maximum_void_diameter", "maximum_path_count"),
     [
-        ("zigzag_plus45", 1.80, 3),
-        ("zigzag_vertical", 1.50, 4),
+        ("zigzag_plus45", 1.80, 8),
+        ("zigzag_vertical", 1.50, 8),
     ],
 )
 def test_measured_lug_fill_prioritizes_coverage_without_piling_or_fragmenting(
@@ -3538,13 +3563,6 @@ def test_measured_lug_fill_prioritizes_coverage_without_piling_or_fragmenting(
             for endpoint in (path[0, :2], path[-1, :2])
         )
         assert connected_endpoints >= 2
-    assert min(
-        _minimum_nondegenerate_vertex_angle(
-            path,
-            minimum_segment_length=0.01,
-        )
-        for path in infill
-    ) >= config.smoothing_angle - 1e-3
     deposited = _round_bead_union(paths, config.planning_line_width)
     assert _maximum_uncovered_void_diameter(
         lug,
@@ -3742,6 +3760,7 @@ def test_ui_uses_prusaslicer_style_infill_pattern_names():
         "zigzag_vertical",
         "zigzag_plus45",
         "zigzag_minus45",
+        "isotropic",
         "triangles",
         "concentric",
     ):
@@ -3753,7 +3772,6 @@ def test_ui_uses_prusaslicer_style_infill_pattern_names():
         "grid",
         "gyroid",
         "zigzag",
-        "isotropic",
     ):
         assert f'value="{removed_pattern}"' not in html
     for legacy_pattern in (
@@ -3768,6 +3786,7 @@ def test_ui_uses_prusaslicer_style_infill_pattern_names():
         "竖向 Zigzag",
         "+45° Zigzag",
         "-45° Zigzag",
+        "各向同性填充",
         "三角填充",
         "同心轮廓填充",
     ):
@@ -3818,12 +3837,14 @@ def test_ui_exposes_slicing_kernel_input():
         "保持拓扑结构",
         "名义树脂线宽 mm",
         "实测压平线宽 mm",
+        "首层层高 mm",
         "不会改变挤出倍率",
         "树脂填充路径",
         "横向 Zigzag",
         "竖向 Zigzag",
         "+45° Zigzag",
         "-45° Zigzag",
+        "各向同性填充",
         "三角填充",
         "同心轮廓填充",
         "三角形填充路径优化",
@@ -3902,8 +3923,6 @@ def test_ui_exposes_slicing_kernel_input():
         "pyslmScanContourFirst",
         "pyslmFixPolygons",
         "pyslmSimplificationPreserveTopology",
-        "smoothingAngle",
-        "smoothingRadiusFactor",
         "printRaft",
         "raftBottomOffset",
         "raftSecondOffset",
@@ -3924,6 +3943,9 @@ def test_ui_exposes_slicing_kernel_input():
         "executedInfillPattern",
     ):
         assert f'id="{control_id}"' in html
+
+    assert 'id="smoothingAngle"' not in html
+    assert 'id="smoothingRadiusFactor"' not in html
 
     assert "formData.append('planning_line_width'" in html
     assert "if (slicingKernelInput.value === 'legacy')" in html

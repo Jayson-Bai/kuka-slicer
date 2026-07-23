@@ -104,6 +104,7 @@ def slice_mesh_to_job_with_pyslm(mesh: Mesh, config: SliceConfig) -> ExternalSou
             "source": "kuka_slicer",
             "slicing": {
                 "layer_height": config.layer_height,
+                "first_layer_height": config.first_layer_height,
                 "line_width": config.line_width,
                 "z_min": float(z_values[0]) if len(z_values) else None,
                 "z_max": float(z_values[-1]) if len(z_values) else None,
@@ -118,8 +119,6 @@ def slice_mesh_to_job_with_pyslm(mesh: Mesh, config: SliceConfig) -> ExternalSou
                 "slicing_kernel_status": "experimental",
                 "perimeter_count": config.perimeter_count,
                 "print_perimeters": config.print_perimeters,
-                "smoothing_angle": config.smoothing_angle,
-                "smoothing_radius_factor": config.smoothing_radius_factor,
                 "part_cap_layers": (
                     {
                         "bottom": 0 if len(z_values) else None,

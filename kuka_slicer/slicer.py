@@ -245,12 +245,15 @@ class SliceConfig:
     pyslm: PySLMConfig = field(default_factory=PySLMConfig)
     perimeter_count: int = DEFAULT_RESIN_PERIMETER_COUNT
     print_perimeters: bool = True
-    smoothing_angle: float = DEFAULT_RESIN_SMOOTHING_ANGLE_DEGREES
-    smoothing_radius_factor: float = DEFAULT_RESIN_SMOOTHING_RADIUS_FACTOR
     triangle_path_optimization: bool = True
     zigzag_path_optimization: bool = True
     planning_line_width: float | None = None
     contour_infill_overlap: float = DEFAULT_RESIN_CONTOUR_INFILL_OVERLAP_PERCENT
+    first_layer_height: float | None = None
+    # Deprecated compatibility inputs. They are intentionally ignored; final
+    # toolpaths are no longer rounded or split by a corner-angle constraint.
+    smoothing_angle: float = DEFAULT_RESIN_SMOOTHING_ANGLE_DEGREES
+    smoothing_radius_factor: float = DEFAULT_RESIN_SMOOTHING_RADIUS_FACTOR
 
     def __post_init__(self) -> None:
         if self.material not in ("R", "F"):
@@ -269,6 +272,10 @@ class SliceConfig:
             )
         if self.layer_height <= 0:
             raise ValueError("layer_height must be positive")
+        if self.first_layer_height is None:
+            object.__setattr__(self, "first_layer_height", self.layer_height)
+        if not math.isfinite(self.first_layer_height) or self.first_layer_height <= 0:
+            raise ValueError("first_layer_height must be positive")
         if not math.isfinite(self.line_width) or self.line_width <= 0:
             raise ValueError("line_width must be positive")
         if self.planning_line_width is not None and (
@@ -313,10 +320,6 @@ class SliceConfig:
             raise ValueError("slicing_kernel must be legacy or pyslm")
         if self.perimeter_count < 1:
             raise ValueError("perimeter_count must be at least 1")
-        if self.smoothing_angle <= 0 or self.smoothing_angle >= 180:
-            raise ValueError("smoothing_angle must be in the range (0, 180)")
-        if self.smoothing_radius_factor < 0:
-            raise ValueError("smoothing_radius_factor must be non-negative")
 
 
 def _strict_measured_pattern_angle(
@@ -620,6 +623,7 @@ def _slice_mesh_to_job_legacy(mesh: Mesh, config: SliceConfig) -> ExternalSource
         "source": "kuka_slicer",
         "slicing": {
             "layer_height": config.layer_height,
+            "first_layer_height": config.first_layer_height,
             "line_width": config.line_width,
             "z_min": float(z_values[0]) if len(z_values) else None,
             "z_max": float(z_values[-1]) if len(z_values) else None,
@@ -651,8 +655,6 @@ def _slice_mesh_to_job_legacy(mesh: Mesh, config: SliceConfig) -> ExternalSource
             "slicing_kernel": config.slicing_kernel,
             "perimeter_count": config.perimeter_count,
             "print_perimeters": config.print_perimeters,
-            "smoothing_angle": config.smoothing_angle,
-            "smoothing_radius_factor": config.smoothing_radius_factor,
             "part_cap_layers": (
                 {
                     "bottom": 0 if len(z_values) else None,
@@ -1428,11 +1430,10 @@ def _raft_zigzag_infill_paths(
             angle_degrees,
             path_spacing,
             config.tolerance,
-            smoothing_angle_degrees=config.smoothing_angle,
             smoothing_corner_cut=(
-                _solid_fill_initial_smoothing_cut_distance(config)
+                config.line_width * 0.04
                 if config.planning_line_width is not None
-                else _solid_fill_final_smoothing_cut_distance(config)
+                else config.line_width * 0.15
             ),
             enforce_maximum_overlap=config.planning_line_width is not None,
             maximum_overlap_spacing=(
@@ -1442,14 +1443,6 @@ def _raft_zigzag_infill_paths(
             ),
             connect_adjacent=True,
             follow_boundaries=config.print_perimeters,
-        )
-        filled = _smooth_resin_infill_paths(
-            filled,
-            geometry,
-            _solid_fill_initial_smoothing_cut_distance(config),
-            config.smoothing_angle,
-            config.tolerance,
-            cut_fraction=0.3,
         )
     else:
         filled = _zigzag_infill_geometry(
@@ -1477,12 +1470,7 @@ def _raft_zigzag_infill_paths(
             path_spacing,
             config.tolerance,
             solid_bead_width=planning_width,
-            solid_smoothing_angle_degrees=config.smoothing_angle,
-            solid_smoothing_corner_cut=(
-                _solid_fill_final_smoothing_cut_distance(config)
-                if config.planning_line_width is not None
-                else None
-            ),
+            solid_smoothing_corner_cut=0.0,
             maximum_connector_overlap_spacing=(
                 _resin_maximum_overlap_spacing(config)
                 if config.planning_line_width is not None
@@ -1514,8 +1502,7 @@ def _strict_unconnected_solid_zigzag_fallback(
         angle_degrees,
         path_spacing,
         config.tolerance,
-        smoothing_angle_degrees=config.smoothing_angle,
-        smoothing_corner_cut=_solid_fill_initial_smoothing_cut_distance(config),
+        smoothing_corner_cut=0.0,
         enforce_maximum_overlap=True,
         maximum_overlap_spacing=_resin_maximum_overlap_spacing(config),
         connect_adjacent=False,
@@ -1548,6 +1535,11 @@ def _filter_paths_covered_by_geometry(
         join_style="round",
     )
     for path in paths:
+        # Clipping/cleanup can leave a degenerate one-point stub.  GEOS
+        # rejects that input when constructing a LineString; it cannot carry
+        # any printable length, so discard it at the geometry boundary.
+        if path.ndim != 2 or path.shape[0] < 2:
+            continue
         line = LineString([(float(point[0]), float(point[1])) for point in path[:, :2]])
         if safe_geometry.covers(line):
             filtered.append(path)
@@ -1607,7 +1599,7 @@ def _layer_z_values(mesh: Mesh, config: SliceConfig) -> np.ndarray:
     start = (
         z_min
         if config.z_min is not None and config.infill_pattern != "isotropic"
-        else z_min + config.layer_height
+        else z_min + config.first_layer_height
     )
     end = z_max
     if start > end:
@@ -1911,14 +1903,6 @@ def _build_resin_paths(
         )
         filled = optimize_triangle_infill_travel(filled, config.tolerance)
         filled = merge_adjacent_connected_paths(filled, triangle_merge_tolerance)
-        filled = _smooth_resin_infill_paths(
-            filled,
-            infill_geometry,
-            config.line_width * config.smoothing_radius_factor,
-            config.smoothing_angle,
-            config.tolerance,
-            merge_tolerance=triangle_merge_tolerance,
-        )
     if (
         config.planning_line_width is not None
         and filled
@@ -1982,11 +1966,10 @@ def _infill_paths_for_geometry(
                 angle,
                 path_spacing,
                 config.tolerance,
-                smoothing_angle_degrees=config.smoothing_angle,
                 smoothing_corner_cut=(
-                    _solid_fill_initial_smoothing_cut_distance(config)
+                    config.line_width * 0.04
                     if config.planning_line_width is not None
-                    else _solid_fill_final_smoothing_cut_distance(config)
+                    else config.line_width * 0.15
                 ),
                 enforce_maximum_overlap=config.planning_line_width is not None,
                 maximum_overlap_spacing=(
@@ -2073,12 +2056,7 @@ def _infill_paths_for_geometry(
             path_spacing,
             config.tolerance,
             solid_bead_width=planning_width,
-            solid_smoothing_angle_degrees=config.smoothing_angle,
-            solid_smoothing_corner_cut=(
-                _solid_fill_final_smoothing_cut_distance(config)
-                if config.planning_line_width is not None
-                else None
-            ),
+            solid_smoothing_corner_cut=0.0,
             maximum_connector_overlap_spacing=(
                 _resin_maximum_overlap_spacing(config)
                 if config.planning_line_width is not None
@@ -2110,60 +2088,7 @@ def _infill_paths_for_geometry(
         filled = optimize_open_path_travel(filled, config.tolerance)
         filled = merge_adjacent_connected_paths(filled, zigzag_merge_tolerance)
 
-    if config.infill_pattern not in ("triangles", "gyroid", "concentric"):
-        smoothing_radius = config.line_width * config.smoothing_radius_factor
-        smoothing_cut_fraction = 0.35
-        if config.infill_pattern in ("rectilinear", "zigzag", *FIXED_ZIGZAG_PATTERNS):
-            # Keep the bend as a small line-width-sized fillet. Larger radii
-            # turn boundary turns into semicircles and force excessive splits.
-            smoothing_radius = min(smoothing_radius, config.line_width * 0.2)
-            smoothing_cut_fraction = 0.3
-        if solid_single_axis:
-            # Ordinary boundary fillets use a conservative physical radius so
-            # their 2 mm bead does not reopen a wall-transition void.  The
-            # much sharper seam hairpins are replaced separately by analytical
-            # tangent returns with the wider final radius.
-            smoothing_radius = min(
-                smoothing_radius,
-                _solid_fill_initial_smoothing_cut_distance(config),
-            )
-        filled = _smooth_resin_infill_paths(
-            filled,
-            geometry,
-            smoothing_radius,
-            config.smoothing_angle,
-            config.tolerance,
-            cut_fraction=smoothing_cut_fraction,
-            merge_tolerance=zigzag_merge_tolerance,
-        )
     return filled
-
-
-def _solid_fill_nominal_smoothing_cut_distance(config: SliceConfig) -> float:
-    """Return the requested physical turn radius independently of overlap."""
-
-    if config.smoothing_radius_factor <= 0:
-        return 0.0
-    return config.line_width * config.smoothing_radius_factor
-
-
-def _solid_fill_initial_smoothing_cut_distance(config: SliceConfig) -> float:
-    """Use the largest initial radius that preserves full-width coverage."""
-
-    return min(
-        _solid_fill_nominal_smoothing_cut_distance(config),
-        config.line_width * 0.04,
-    )
-
-
-def _solid_fill_final_smoothing_cut_distance(config: SliceConfig) -> float:
-    """Use a wider radius for isolated seam and residual-correction turns."""
-
-    return min(
-        _solid_fill_nominal_smoothing_cut_distance(config),
-        config.line_width * 0.15,
-    )
-
 
 def _solid_residual_centerline_regions(
     solid_geometry,
@@ -4051,173 +3976,13 @@ def _finish_solid_fill_paths(
     *,
     centerline_regions=None,
 ) -> list[np.ndarray]:
-    """Remove hard corners introduced by wall-seam and residual corrections."""
+    """Validate final spacing without rounding or splitting continuous paths."""
 
-    if not infill_paths:
-        return infill_paths
-    corner_cut = _solid_fill_final_smoothing_cut_distance(config)
-    if corner_cut <= config.tolerance:
-        return _require_measured_width_infill(
-            infill_paths,
-            last_perimeter_linework,
-            config,
-        )
-    regions = centerline_regions
-    if regions is None:
-        planning_width = _resin_planning_line_width(config)
-        regions = _solid_residual_centerline_regions(
-            solid_geometry,
-            infill_geometry,
-            perimeter_paths,
-            last_perimeter_linework,
-            planning_width,
-            _resin_planning_path_spacing(config),
-            config.tolerance,
-            enforce_maximum_overlap=config.planning_line_width is not None,
-            wall_clearance=_resin_contour_infill_spacing(config),
-        )
-    if regions is None:
-        return _require_measured_width_infill(
-            infill_paths,
-            last_perimeter_linework,
-            config,
-        )
-    direct_allowed = regions[2]
-    if direct_allowed.is_empty:
-        return _require_measured_width_infill(
-            infill_paths,
-            last_perimeter_linework,
-            config,
-        )
-
-    safe_geometry = direct_allowed.buffer(
-        max(config.tolerance * 10.0, 1e-7),
-        join_style="round",
-    )
-    prepare(safe_geometry)
-    minimum_segment_length = max(
-        config.tolerance * 20.0,
-        config.line_width * 0.005,
-    )
-    effective_span = max(
-        config.tolerance * 20.0,
-        config.line_width * 0.005,
-    )
-    finished: list[np.ndarray] = []
-    for source_path in infill_paths:
-        source = np.asarray(source_path[:, :2], dtype=np.float32)
-        # Removing tiny arc samples and then fitting another fillet can replace
-        # an otherwise straight hatch with one long diagonal chord.  On the
-        # measured-width plan that reduced a requested 1.98 mm pitch to about
-        # 1.90 mm on real geometry.  Keep the already-simple source in strict
-        # mode; the effective-corner pass below still rounds or minimally splits
-        # every remaining turn below the configured angle threshold.
-        cleaned = (
-            source
-            if config.planning_line_width is not None
-            else _remove_smoothing_micro_segments(
-                source_path,
-                safe_geometry,
-                minimum_segment_length,
-                config.tolerance,
-            )
-        )
-        last_known_simple = cleaned if LineString(cleaned).is_simple else None
-        if last_known_simple is None and LineString(source).is_simple:
-            last_known_simple = source
-        if last_known_simple is None:
-            # Never disguise a centerline crossing by converting every edge to
-            # a separate path: the 2 mm beads would still cross and pile up.
-            raise ValueError("solid-fill finisher received a non-simple baseline")
-
-        # Most tangent U-turns already consist of short sampled arcs whose
-        # effective turn angle is above the configured threshold.  Running two
-        # full Shapely smoothing passes over those paths cannot change them and
-        # dominates measured-width slicing time on vertical fills.  Keep the
-        # independently generated smooth path and reserve the finisher for
-        # paths that still contain a real, effective corner.
-        if not _effective_path_corner_candidates(
-            last_known_simple,
-            effective_span,
-            config.smoothing_angle,
-            config.tolerance,
-        ):
-            finished.append(last_known_simple)
-            continue
-
-        rounded_candidates = _smooth_resin_infill_paths(
-            [last_known_simple],
-            direct_allowed,
-            corner_cut,
-            config.smoothing_angle,
-            config.tolerance,
-            cut_fraction=0.3,
-        )
-        if len(rounded_candidates) == 1:
-            rounded = rounded_candidates[0]
-            if rounded.shape[0] >= 2 and LineString(rounded).is_simple:
-                last_known_simple = rounded
-
-        effective = _smooth_effective_path_corners(
-            last_known_simple,
-            safe_geometry,
-            corner_cut,
-            config.smoothing_angle,
-            effective_span,
-            config.tolerance,
-        )
-        if effective.shape[0] >= 2 and LineString(effective).is_simple:
-            last_known_simple = effective
-
-        # Every retained chord and fitted arc was checked against the prepared
-        # safe region.  Remaining unsmoothable corners become the minimum set
-        # of path boundaries; the accepted simple centerline itself is unchanged.
-        finished.extend(
-            _split_path_at_unresolved_effective_corners(
-                last_known_simple,
-                effective_span,
-                config.smoothing_angle,
-                config.tolerance,
-            )
-        )
-    if config.planning_line_width is None:
-        return finished
-
-    finished, finished_is_valid = _measured_width_infill_result(
-        finished,
+    return _require_measured_width_infill(
+        infill_paths,
         last_perimeter_linework,
         config,
     )
-    if finished_is_valid:
-        return finished
-
-    # Fail conservatively: retain the proven pre-finisher centreline geometry,
-    # then turn every unresolved hard corner into the minimum number of path
-    # boundaries.  This fallback may add a stop only when the smoother would
-    # otherwise violate the user's maximum-overlap contract.
-    fallback: list[np.ndarray] = []
-    for source_path in infill_paths:
-        source = np.asarray(source_path[:, :2], dtype=np.float32)
-        if source.shape[0] < 2 or not LineString(source).is_simple:
-            raise ValueError("measured-width infill baseline is not a simple path")
-        fallback.extend(
-            _split_path_at_unresolved_effective_corners(
-                source,
-                effective_span,
-                config.smoothing_angle,
-                config.tolerance,
-            )
-        )
-    fallback, fallback_is_valid = _measured_width_infill_result(
-        fallback,
-        last_perimeter_linework,
-        config,
-    )
-    # The caller must always receive a printable candidate.  Coverage-first
-    # layer optimization below compares this fallback with later corrections
-    # instead of rejecting the complete slice when strict spacing and coverage
-    # are locally incompatible.
-    return fallback
 
 
 def _reconnect_finished_solid_fill_paths(
@@ -4427,12 +4192,6 @@ def _reconnect_finished_solid_fill_paths(
                             chain.shape[0] < 2
                             or not chain_line.is_simple
                             or not safe_geometry.covers(chain_line)
-                            or _effective_path_corner_candidates(
-                                chain,
-                                effective_span,
-                                config.smoothing_angle,
-                                tolerance,
-                            )
                         ):
                             continue
                         trim_total = path_spacing * (
@@ -5453,8 +5212,6 @@ def _maximize_full_density_continuity(
         if contour_lines
         else GeometryCollection()
     )
-    effective_span = max(tolerance * 20.0, config.line_width * 0.005)
-    corner_cut = _solid_fill_final_smoothing_cut_distance(config)
     maximum_connector_length = line_width * 8.0
     maximum_third_path_overlap = max(
         tolerance * tolerance * 20.0,
@@ -5554,12 +5311,6 @@ def _maximize_full_density_continuity(
                     and (
                         contour_exclusion.is_empty
                         or not tangent_line.intersects(contour_exclusion)
-                    )
-                    and not _effective_path_corner_candidates(
-                        tangent_chain,
-                        effective_span,
-                        config.smoothing_angle,
-                        tolerance,
                     )
                 ):
                     return tangent_connector
@@ -5796,20 +5547,6 @@ def _maximize_full_density_continuity(
                         )
                         if chain.shape[0] < 2 or not LineString(chain).is_simple:
                             continue
-                        if _effective_path_corner_candidates(
-                            chain,
-                            effective_span,
-                            config.smoothing_angle,
-                            tolerance,
-                        ):
-                            chain = _smooth_effective_path_corners(
-                                chain,
-                                physical_centerlines,
-                                corner_cut,
-                                config.smoothing_angle,
-                                effective_span,
-                                tolerance,
-                            )
                         chain_line = LineString(chain[:, :2])
                         if (
                             not chain_line.is_simple
@@ -5817,12 +5554,6 @@ def _maximize_full_density_continuity(
                             or (
                                 not contour_exclusion.is_empty
                                 and chain_line.intersects(contour_exclusion)
-                            )
-                            or _effective_path_corner_candidates(
-                                chain,
-                                effective_span,
-                                config.smoothing_angle,
-                                tolerance,
                             )
                         ):
                             continue
@@ -6046,20 +5777,6 @@ def _maximize_full_density_continuity(
                     )
                     if chain.shape[0] < 2 or not LineString(chain).is_simple:
                         continue
-                    if _effective_path_corner_candidates(
-                        chain,
-                        effective_span,
-                        config.smoothing_angle,
-                        tolerance,
-                    ):
-                        chain = _smooth_effective_path_corners(
-                            chain,
-                            physical_centerlines,
-                            corner_cut,
-                            config.smoothing_angle,
-                            effective_span,
-                            tolerance,
-                        )
                     chain_line = LineString(chain[:, :2])
                     if (
                         not chain_line.is_simple
@@ -6067,12 +5784,6 @@ def _maximize_full_density_continuity(
                         or (
                             not contour_exclusion.is_empty
                             and chain_line.intersects(contour_exclusion)
-                        )
-                        or _effective_path_corner_candidates(
-                            chain,
-                            effective_span,
-                            config.smoothing_angle,
-                            tolerance,
                         )
                     ):
                         continue

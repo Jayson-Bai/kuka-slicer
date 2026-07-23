@@ -5,7 +5,12 @@ from pathlib import Path
 
 import numpy as np
 
-from .external_npz import ExternalSourceJob, MaterialPaths, write_external_source_npz
+from .external_npz import (
+    ExternalSourceJob,
+    MaterialPaths,
+    simplify_job_paths_for_export,
+    write_external_source_npz,
+)
 from .slicer import (
     DEFAULT_FIBER_LAYER_HEIGHT_MM,
     DEFAULT_FIBER_LINE_WIDTH_MM,
@@ -14,7 +19,6 @@ from .slicer import (
     DEFAULT_RESIN_INFILL_OVERLAP_PERCENT,
     DEFAULT_RESIN_LAYER_HEIGHT_MM,
     DEFAULT_RESIN_LINE_WIDTH_MM,
-    DEFAULT_PRUSA_CONTINUITY_SMOOTHING_ANGLE_DEGREES,
     PySLMConfig,
     SliceConfig,
     normalize_job_xy_origin,
@@ -47,6 +51,11 @@ def main(argv: list[str] | None = None) -> int:
             f"nominal process line width in mm; defaults by material "
             f"(R={DEFAULT_RESIN_LINE_WIDTH_MM}, F={DEFAULT_FIBER_LINE_WIDTH_MM})"
         ),
+    )
+    slice_parser.add_argument(
+        "--first-layer-height",
+        type=float,
+        help="first resin layer height in mm; defaults to --layer-height",
     )
     slice_parser.add_argument(
         "--planning-line-width",
@@ -176,19 +185,6 @@ def main(argv: list[str] | None = None) -> int:
         default=True,
         help="print outer and inner contours while keeping existing infill geometry",
     )
-    slice_parser.add_argument(
-        "--smoothing-angle",
-        type=float,
-        default=DEFAULT_PRUSA_CONTINUITY_SMOOTHING_ANGLE_DEGREES,
-        help="corner angle threshold in degrees for resin path smoothing",
-    )
-    slice_parser.add_argument(
-        "--smoothing-radius-factor",
-        type=float,
-        default=0.35,
-        help="resin smoothing radius as a fraction of line width",
-    )
-
     template_parser = subparsers.add_parser(
         "make-template", help="write the documented two-layer R/F template"
     )
@@ -230,6 +226,7 @@ def _slice_command(args: argparse.Namespace) -> int:
     pyslm_strategy_defaults = recommended_pyslm_strategy_defaults(layer_height, line_width)
     config = SliceConfig(
         layer_height=layer_height,
+        first_layer_height=args.first_layer_height,
         line_width=line_width,
         planning_line_width=args.planning_line_width,
         material=args.material,
@@ -295,11 +292,10 @@ def _slice_command(args: argparse.Namespace) -> int:
         zigzag_path_optimization=args.zigzag_path_optimization,
         perimeter_count=args.perimeter_count,
         print_perimeters=args.print_perimeters,
-        smoothing_angle=args.smoothing_angle,
-        smoothing_radius_factor=args.smoothing_radius_factor,
     )
     job = slice_mesh_to_job(mesh, config)
     normalize_job_xy_origin(job)
+    simplify_job_paths_for_export(job)
     write_external_source_npz(job, args.output_npz)
     path_count = sum(len(group.paths) for group in job.material_paths)
     print(f"wrote {args.output_npz} with {len(job.material_paths)} layer/material groups and {path_count} paths")

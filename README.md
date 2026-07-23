@@ -81,7 +81,7 @@ measured-width planning adds only a conservative
 numerical safety margin (`16 * geometry_tolerance`; `0.008 mm` with the normal
 UI tolerance), so this example is generated at `1.988 mm`. A final guard keeps
 non-local infill runs, independent endcaps, and opposing sides of closed rings
-on the conservative side of the semantic `1.98 mm` limit after smoothing; the
+on the conservative side of the semantic `1.98 mm` limit after continuity planning; the
 innermost-perimeter seam is checked against its separately configured contract.
 Local continuous turns and point-only continuation splits are topology, not a
 second parallel hatch, and are excluded from the percentage-overlap contract.
@@ -102,6 +102,7 @@ Useful options:
 ```powershell
 python -m kuka_slicer slice input.stl output.npz `
   --layer-height 0.5 `
+  --first-layer-height 0.3 `
   --line-width 2.0 `
   --planning-line-width 2.2 `
   --build-axis y `
@@ -110,8 +111,6 @@ python -m kuka_slicer slice input.stl output.npz `
   --infill-overlap 10 `
   --contour-infill-overlap 2 `
   --perimeter-count 2 `
-  --smoothing-angle 120 `
-  --smoothing-radius-factor 0.35 `
   --z-min 0.2 `
   --z-max 10.0 `
   --material R `
@@ -194,7 +193,7 @@ centerline generation:
 
 
 The four Zigzag choices use the existing one-stroke ordering, boundary-following
-connectors, endpoint merging, and smoothing logic. Triangle fill keeps its
+connectors, and endpoint merging. Triangle fill keeps its
 existing noding, optimization, and safe-connector logic. Concentric fill keeps
 each offset ring independent and never creates a material-bearing ring-to-ring
 seam. Local residual strokes are also standalone, so this mode is not
@@ -240,29 +239,17 @@ topology-collapse core may receive a short standalone residual stroke, but
 rings are never joined through a material-bearing seam.
 
 Coverage is evaluated with the configured planning bead width, not centerlines
-or the nominal NPZ line width alone.
-Short wall-seam doglegs and free-end tails are folded into an existing zigzag,
-and residual narrow-neck pockets may replace a short original interval with a
-triangle visit. These corrections keep the path count unchanged, reject
-retrace/self-intersection, remain inside the physical part, and keep at least
-the bounded clearance from the last perimeter. They are also limited by a
-small added-length budget. Solid-fill turns are rounded before correction and
-again after wall-seam/residual detours are inserted. In measured-width strict
-mode, the second pass deliberately preserves micro arc samples: removing them
-before another fillet fit can turn a straight hatch into an under-spaced long
-diagonal chord. It fits the largest fillet covered by the same physical
-centerline-safe region and samples it at no more than 10 degrees of heading
-change per segment. A final indexed postcondition verifies fill-to-wall distance
-and materially overlapping parallel returns; an unsafe smoothing result falls
-back to the proven baseline with only the minimum required path splits. The
-smoothing factor is interpreted as a physical centerline radius rather than a
-tangent-cut length. Acute wall-seam hairpins
-use analytical constant-radius/C1 returns; a return that cannot be rounded
-inside the safe region is omitted instead of exporting a hidden sharp hook.
-The ordinary initial radius remains coverage-limited, residual correction aims
-below 40% of the physical bead width, and every added route remains subject to
-novel-area/dose guards so the measured bead is neither treated as a zero-width
-line nor stacked onto an already printed stroke.
+or the nominal NPZ line width alone. Short wall-seam and residual corrections
+remain part of the one-stroke planner and must stay simple, inside the physical
+part, and within the dose/clearance guards. Analytical arcs may be generated
+when they are the actual connection geometry. No final fillet pass, minimum
+corner-angle constraint, or sharp-corner path split is applied.
+
+Before NPZ serialization, every XYZ path is simplified with a `0.05 mm`
+three-dimensional chord-error tolerance. Collinear runs retain only their start
+and end points; arcs and other curves retain only the vertices needed to stay
+within that shape tolerance. Path count, path order, and one-stroke continuity
+are unchanged.
 
 For constant-section models, resin planning results are cached by the effective
 fill direction and copied into repeated layers. The browser preview serializes
@@ -286,15 +273,14 @@ start/stop.
 
 Legacy triangle infill enables endpoint-based path optimization by default. It
 first reverses or reorders open triangle paths, then merges consecutive paths
-whose endpoints already coincide, and finally applies the existing smoothing
-optimization. Post-planning merges are limited to the configured numerical
+whose endpoints already coincide. Post-planning merges are limited to the configured numerical
 geometry tolerance; material-bearing joins remain subject to the bead-aware
 safe-connector checks. Disable it with
 `--no-triangle-path-optimization` or the UI checkbox when the original path
 order is required. This option is ignored by the PySLM kernel.
 Legacy zigzag infill, including forced part cap layers and explicit raft
-zigzag layers, uses the same ordering, reversal, endpoint merge, and final
-smoothing cleanup by default. It can be disabled with
+zigzag layers, uses the same ordering, reversal, and endpoint merge by default.
+It can be disabled with
 `--no-zigzag-path-optimization` or its UI checkbox.
 Only path centerlines are exported. The measured planning width is recorded as
 separate slicing metadata for traceability, but it does not add or alter any
@@ -327,8 +313,8 @@ The UI groups adjustable inputs into:
 | Group | Parameters |
 | --- | --- |
 | Input files | STL upload, optional single-layer fiber JSON |
-| Model and layers | layer height, build axis, optional `z_min`/`z_max`, geometric tolerance |
-| Resin path kernel | slicing kernel (`Prusa` or `PySLM`), nominal line width, Prusa measured flattened/planning width, perimeter count, infill pattern, density, independent infill-run/contour-seam overlaps, triangle/zigzag path optimization, smoothing, PySLM native settings |
+| Model and layers | resin layer height, optional first-layer height, build axis, optional `z_min`/`z_max`, geometric tolerance |
+| Resin path kernel | slicing kernel (`Prusa` or `PySLM`), nominal line width, Prusa measured flattened/planning width, perimeter count, infill pattern, density, independent infill-run/contour-seam overlaps, triangle/zigzag path optimization, PySLM native settings |
 | Raft | fixed two-layer raft with one outward-offset input per layer; layer height, density, gap, and zigzag angles follow the fixed print schedule |
 | Curved Z | flat/sinusoidal mode, amplitude, period |
 

@@ -46,7 +46,7 @@ kernel:
 - `triangles`
 - `gyroid`
 - `concentric`
-- legacy smoothing and connector semantics remain project-owned
+- one-stroke connector semantics and NPZ chord-error sampling remain project-owned
 
 The PySLM adapter fails fast for the four legacy-only patterns instead of
 silently mixing algorithms. This keeps the two kernels independently
@@ -86,8 +86,9 @@ Native PySLM patterns may retain contour and hatch-distance overrides on
 ordinary middle layers. The fixed top and bottom caps are project-owned
 zigzags, so those cap layers reset the overrides to bead-aware defaults and
 remain full density. When an isotropic slice uses explicit `z_min`/`z_max`,
-`z_min` is the lower print bound and the first layer plane is one 0.5 mm layer
-above it, preserving the required `4N+2` schedule.
+`z_min` is the lower print bound and the first layer plane is one configured
+first-layer height above it (0.5 mm by default), preserving the required
+`4N+2` schedule when the configured layer schedule is valid.
 
 ## Native Visualization Boundary
 

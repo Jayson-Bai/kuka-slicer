@@ -45,9 +45,16 @@ are padded with full `NaN` rows.
 A row whose every column is `NaN` is padding. A row with only some `NaN` values
 is invalid for downstream loading.
 
+## Path Sampling
+
+Exported paths use a `0.05 mm` three-dimensional chord-error tolerance. A
+collinear run contains only its start and end rows. Curves and closed contours
+retain the minimum sampled vertices needed to preserve their XYZ shape within
+that tolerance. Simplification never changes path order, path count, or path
+continuity.
+
 ## Z Ownership
 
 The source NPZ explicitly owns Z. This slicer writes the Z values that should be
 used by later processing. Downstream UI layer-height fields are process
 parameters and must not overwrite trajectory Z.
-

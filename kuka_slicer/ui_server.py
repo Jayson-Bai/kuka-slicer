@@ -13,17 +13,18 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import numpy as np
 
-from .external_npz import MaterialPaths, write_external_source_npz
+from .external_npz import (
+    MaterialPaths,
+    simplify_job_paths_for_export,
+    write_external_source_npz,
+)
 from .slicer import (
     DEFAULT_FIBER_LINE_WIDTH_MM,
     DEFAULT_FIBER_LAYER_HEIGHT_MM,
     DEFAULT_RESIN_CONTOUR_INFILL_OVERLAP_PERCENT,
-    DEFAULT_RESIN_SMOOTHING_ANGLE_DEGREES,
-    DEFAULT_RESIN_SMOOTHING_RADIUS_FACTOR,
     DEFAULT_RESIN_INFILL_DENSITY_PERCENT,
     DEFAULT_RESIN_LAYER_HEIGHT_MM,
     DEFAULT_RESIN_LINE_WIDTH_MM,
-    DEFAULT_PRUSA_CONTINUITY_SMOOTHING_ANGLE_DEGREES,
     DEFAULT_RESIN_PLANNING_LINE_WIDTH_MM,
     DEFAULT_RAFT_LAYER_COUNT,
     DEFAULT_RAFT_OUTWARD_OFFSETS_MM,
@@ -41,7 +42,6 @@ from .slicer import (
     recommended_geometry_tolerance,
     recommended_pyslm_strategy_defaults,
     slice_mesh_to_job,
-    _smooth_path_corners,
 )
 from .stl_io import load_stl
 
@@ -102,6 +102,11 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             "layer_height",
             DEFAULT_RESIN_LAYER_HEIGHT_MM,
         )
+        first_layer_height = _float_param(
+            params,
+            "first_layer_height",
+            layer_height,
+        )
         line_width = _float_param(params, "line_width", DEFAULT_RESIN_LINE_WIDTH_MM)
         planning_line_width = _float_param(
             params,
@@ -117,16 +122,6 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             tolerance = recommended_geometry_tolerance(layer_height, line_width)
         perimeter_count = _int_param(params, "perimeter_count", 2)
         print_perimeters = _bool_param(params, "print_perimeters", True)
-        smoothing_angle = _float_param(
-            params,
-            "smoothing_angle",
-            DEFAULT_PRUSA_CONTINUITY_SMOOTHING_ANGLE_DEGREES,
-        )
-        smoothing_radius_factor = _float_param(
-            params,
-            "smoothing_radius_factor",
-            DEFAULT_RESIN_SMOOTHING_RADIUS_FACTOR,
-        )
         infill_density = _float_param(
             params,
             "infill_density",
@@ -240,6 +235,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         config = SliceConfig(
             material="R",
             layer_height=layer_height,
+            first_layer_height=first_layer_height,
             line_width=line_width,
             planning_line_width=planning_line_width,
             z_min=z_min,
@@ -259,8 +255,6 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             pyslm=pyslm_config,
             perimeter_count=perimeter_count,
             print_perimeters=print_perimeters,
-            smoothing_angle=smoothing_angle,
-            smoothing_radius_factor=smoothing_radius_factor,
         )
         job = slice_mesh_to_job(mesh, config)
         fiber_preview_paths = {}
@@ -275,6 +269,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                 z_shift,
             )
         normalize_job_xy_origin(job)
+        simplify_job_paths_for_export(job)
         fiber_preview_paths = _fiber_preview_paths_from_job(job)
         write_external_source_npz(job, npz_path)
 
@@ -535,12 +530,34 @@ def expand_fiber_template_for_resin_layers(
     resin_groups.sort(key=lambda group: group.layer_index)
     paths_by_layer: dict[int, list[list[list[float]]]] = {}
 
+    # The fiber is physically printed between resin layers.  Include its
+    # thickness in the exported Z schedule instead of letting every resin
+    # layer continue to use the original resin-only grid.
+    fiber_layer_height = DEFAULT_FIBER_LAYER_HEIGHT_MM
+    for layer_order, group in enumerate(resin_groups):
+        z_offset = layer_order * fiber_layer_height
+        if z_offset == 0.0:
+            continue
+        group.paths = [
+            np.asarray(path, dtype=np.float32).copy()
+            for path in group.paths
+        ]
+        for path in group.paths:
+            path[:, 2] += np.float32(z_offset)
+
+    slicing_metadata = job.meta.get("slicing")
+    if isinstance(slicing_metadata, dict) and resin_groups:
+        z_max = slicing_metadata.get("z_max")
+        if isinstance(z_max, (int, float)):
+            slicing_metadata["z_max"] = float(z_max) + (len(resin_groups) - 1) * fiber_layer_height
+        slicing_metadata["fiber_layer_height_applied_mm"] = fiber_layer_height
+
     # Fiber is printed between resin layers; the final resin layer is a cap.
     for group in resin_groups[:-1]:
-        z = _group_layer_z(group) + DEFAULT_FIBER_LAYER_HEIGHT_MM
+        z = _group_layer_z(group) + fiber_layer_height
         layer_paths = []
         for template_path in template_paths:
-            layer_paths.append(_smooth_fiber_template_path(template_path, z))
+            layer_paths.append(_fiber_template_path_at_z(template_path, z))
         layer_paths = [
             path.tolist()
             for path in optimize_open_path_travel(
@@ -551,15 +568,11 @@ def expand_fiber_template_for_resin_layers(
     return paths_by_layer
 
 
-def _smooth_fiber_template_path(template_path: list[list[float]], z: float) -> list[list[float]]:
-    path = np.asarray([[float(x), float(y), z] for x, y, _ in template_path], dtype=np.float32)
-    smoothed_xy = _smooth_path_corners(
-        path,
-        DEFAULT_FIBER_LINE_WIDTH_MM * DEFAULT_RESIN_SMOOTHING_RADIUS_FACTOR,
-        DEFAULT_RESIN_SMOOTHING_ANGLE_DEGREES,
-        1e-5,
-    )
-    return [[float(x), float(y), z] for x, y in smoothed_xy[:, :2]]
+def _fiber_template_path_at_z(
+    template_path: list[list[float]],
+    z: float,
+) -> list[list[float]]:
+    return [[float(x), float(y), z] for x, y, _ in template_path]
 
 
 def _shift_fiber_preview_paths(
@@ -1470,6 +1483,10 @@ def _index_html() -> str:
               <input id="layerHeight" name="layerHeight" type="number" min="0.001" step="0.001" value="{DEFAULT_RESIN_LAYER_HEIGHT_MM}">
             </div>
             <div class="fieldGroup span-2">
+              <label for="firstLayerHeight">首层层高 mm</label>
+              <input id="firstLayerHeight" name="firstLayerHeight" type="number" min="0.001" step="0.001" value="{DEFAULT_RESIN_LAYER_HEIGHT_MM}">
+            </div>
+            <div class="fieldGroup span-2">
               <label for="buildAxis">层高方向</label>
               <select id="buildAxis" name="buildAxis">
                 <option value="auto" selected>自动</option>
@@ -1646,6 +1663,7 @@ def _index_html() -> str:
                 <option value="zigzag_vertical">竖向 Zigzag</option>
                 <option value="zigzag_plus45">+45° Zigzag</option>
                 <option value="zigzag_minus45">-45° Zigzag</option>
+                <option value="isotropic">各向同性填充</option>
                 <option value="triangles">三角填充</option>
                 <option value="concentric">同心轮廓填充</option>
               </select>
@@ -1676,20 +1694,6 @@ def _index_html() -> str:
               <input id="contourInfillOverlap" name="contourInfillOverlap" type="number" min="0" max="99" step="0.1" value="{DEFAULT_RESIN_CONTOUR_INFILL_OVERLAP_PERCENT:g}">
             </div>
           </div>
-
-          <details class="advancedSettings">
-            <summary>高级路径平滑设置</summary>
-            <div class="grid">
-              <div>
-                <label for="smoothingAngle">平滑角阈值 °</label>
-                <input id="smoothingAngle" name="smoothingAngle" type="number" min="1" max="179" step="1" value="{DEFAULT_PRUSA_CONTINUITY_SMOOTHING_ANGLE_DEGREES:g}">
-              </div>
-              <div>
-                <label for="smoothingRadiusFactor">平滑半径系数</label>
-                <input id="smoothingRadiusFactor" name="smoothingRadiusFactor" type="number" min="0" step="0.01" value="{DEFAULT_RESIN_SMOOTHING_RADIUS_FACTOR:g}">
-              </div>
-            </div>
-          </details>
 
         </div>
 
@@ -1774,6 +1778,7 @@ def _index_html() -> str:
     const showFiberPathsInput = document.getElementById('showFiberPaths');
     const slicingKernelInput = document.getElementById('slicingKernel');
     const layerHeightInput = document.getElementById('layerHeight');
+    const firstLayerHeightInput = document.getElementById('firstLayerHeight');
     const lineWidthInput = document.getElementById('lineWidth');
     const planningLineWidthInput = document.getElementById('planningLineWidth');
     const printRaftInput = document.getElementById('printRaft');
@@ -1787,7 +1792,7 @@ def _index_html() -> str:
     const pyslmPatternAutoInput = document.getElementById('pyslmPatternAuto');
     const stripeParameterIds = ['pyslmStripeWidth', 'pyslmStripeOverlap', 'pyslmStripeOffset'];
     const islandParameterIds = ['pyslmIslandWidth', 'pyslmIslandOverlap', 'pyslmIslandOffset'];
-    const pyslmSupportedPatterns = new Set(['zigzag_horizontal', 'zigzag_vertical', 'zigzag_plus45', 'zigzag_minus45']);
+    const pyslmSupportedPatterns = new Set(['zigzag_horizontal', 'zigzag_vertical', 'zigzag_plus45', 'zigzag_minus45', 'isotropic']);
     const strictLayeredFallbackPatterns = {{
       grid: '严格实测线宽模式下，同层交叉会改为按层 0°/90° 单向之字形。',
       triangles: '严格实测线宽模式下，同层交叉会改为按层 0°/60°/120° 单向之字形。',
@@ -1884,7 +1889,7 @@ def _index_html() -> str:
       raftSecondOffsetInput.disabled = !printRaftInput.checked;
     }});
     syncKernelControls();
-    fiberNotice.textContent = 'JSON 中的单层纤维路径会复制到每个树脂层，最后一层树脂封顶不打印纤维。';
+    fiberNotice.textContent = 'JSON 中的单层纤维路径会复制到每个树脂层，纤维层高 0.1 mm 会计入后续树脂层 Z 位置，最后一层树脂封顶不打印纤维。';
 
     form.addEventListener('submit', async (event) => {{
       event.preventDefault();
@@ -1903,6 +1908,7 @@ def _index_html() -> str:
       if (fiberFile) formData.append('fiber_json', fiberFile, fiberFile.name);
       formData.append('filename', file.name);
       formData.append('layer_height', document.getElementById('layerHeight').value);
+      formData.append('first_layer_height', document.getElementById('firstLayerHeight').value);
       formData.append('line_width', document.getElementById('lineWidth').value);
       if (slicingKernelInput.value === 'legacy') {{
         formData.append('planning_line_width', document.getElementById('planningLineWidth').value);
@@ -1941,8 +1947,6 @@ def _index_html() -> str:
       formData.append('pyslm_simplification_factor', document.getElementById('pyslmSimplificationFactor').value);
       formData.append('pyslm_simplification_mode', document.getElementById('pyslmSimplificationMode').value);
       formData.append('pyslm_simplification_preserve_topology', document.getElementById('pyslmSimplificationPreserveTopology').checked ? 'true' : 'false');
-      formData.append('smoothing_angle', document.getElementById('smoothingAngle').value);
-      formData.append('smoothing_radius_factor', document.getElementById('smoothingRadiusFactor').value);
       formData.append('print_raft', printRaftInput.checked ? 'true' : 'false');
       formData.append('raft_offsets', raftBottomOffsetInput.value + ',' + raftSecondOffsetInput.value);
       formData.append('curve_mode', document.getElementById('curveMode').value);
