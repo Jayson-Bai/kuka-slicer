@@ -5,8 +5,20 @@ import os
 import re
 from typing import List
 
-import rclpy
-from rclpy.node import Node
+try:
+    import rclpy
+    from rclpy.node import Node
+except ModuleNotFoundError:
+    rclpy = None
+
+    class Node:
+        """Import placeholder used when the optional ROS 2 runtime is absent."""
+
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError(
+                "The ROS node entry point requires rclpy. "
+                "Use gcode_planner.cli for standalone offline conversion."
+            )
 
 from path_processing_core.types import (
     Position,
@@ -383,6 +395,11 @@ def default_data_root() -> str:
 
 
 def main(args=None):
+    if rclpy is None:
+        raise RuntimeError(
+            "The ROS node entry point requires rclpy. "
+            "Use kuka-offline-gcode for standalone offline conversion."
+        )
     rclpy.init(args=args)
     gcode_parser = GCodeParser()
     try:
