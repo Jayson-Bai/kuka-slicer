@@ -92,10 +92,11 @@ class NpzContractError(ValueError):
 
 
 def detect_system_npz_contract(arrays: Mapping[str, np.ndarray]) -> int | None:
-    """Return version 1 for archives containing every frozen v1 field."""
-    if set(SYSTEM_NPZ_DTYPES).issubset(arrays):
-        return SYSTEM_NPZ_CONTRACT_VERSION
-    return None
+    """Return version 1 only when all frozen v1 rules are satisfied."""
+    try:
+        return _validate_loaded_arrays(arrays)
+    except NpzContractError:
+        return None
 
 
 def validate_system_npz_contract(

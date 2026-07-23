@@ -59,6 +59,7 @@ def test_validator_rejects_missing_or_changed_v1_fields():
 
     changed_dtype = _valid_arrays()
     changed_dtype["e"] = changed_dtype["e"].astype(np.float64)
+    assert detect_system_npz_contract(changed_dtype) is None
     with pytest.raises(NpzContractError, match="dtype float32"):
         validate_system_npz_contract(changed_dtype)
 

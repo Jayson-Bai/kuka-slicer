@@ -8,7 +8,9 @@ from typing import List
 try:
     import rclpy
     from rclpy.node import Node
-except ModuleNotFoundError:
+except ModuleNotFoundError as exc:
+    if exc.name != "rclpy":
+        raise
     rclpy = None
 
     class Node:

@@ -3,9 +3,12 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-import tomllib
 
 import numpy as np
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 
 from kuka_slicer.external_npz import (
     SOURCE_NPZ_CONTRACT_ID,
