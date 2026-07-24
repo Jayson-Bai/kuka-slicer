@@ -9,6 +9,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import re
+from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import numpy as np
@@ -30,6 +31,8 @@ from .slicer import (
     DEFAULT_RAFT_OUTWARD_OFFSETS_MM,
     DEFAULT_RAFT_TOP_GAP_MM,
     PySLMConfig,
+    PrusaGeometryConfig,
+    PrusaRaftConfig,
     RaftLayerConfig,
     SliceConfig,
     _intersect_mesh_at_z,
@@ -97,116 +100,10 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
     def _handle_slice(self, query: str) -> dict[str, object]:
         params, files = self._read_slice_request(query)
         filename = _safe_filename(params.get("filename", ["input.stl"])[0])
-        layer_height = _float_param(
-            params,
-            "layer_height",
-            DEFAULT_RESIN_LAYER_HEIGHT_MM,
-        )
-        first_layer_height = _float_param(
-            params,
-            "first_layer_height",
-            layer_height,
-        )
-        line_width = _float_param(params, "line_width", DEFAULT_RESIN_LINE_WIDTH_MM)
-        planning_line_width = _float_param(
-            params,
-            "planning_line_width",
-            DEFAULT_RESIN_PLANNING_LINE_WIDTH_MM,
-        )
-        pyslm_strategy_defaults = recommended_pyslm_strategy_defaults(layer_height, line_width)
-        requested_build_axis = params.get("build_axis", ["auto"])[0]
-        z_min = _optional_float_param(params, "z_min")
-        z_max = _optional_float_param(params, "z_max")
-        tolerance = _optional_float_param(params, "tolerance")
-        if tolerance is None:
-            tolerance = recommended_geometry_tolerance(layer_height, line_width)
-        perimeter_count = _int_param(params, "perimeter_count", 2)
-        print_perimeters = _bool_param(params, "print_perimeters", True)
-        infill_density = _float_param(
-            params,
-            "infill_density",
-            DEFAULT_RESIN_INFILL_DENSITY_PERCENT,
-        )
-        infill_overlap = _float_param(
-            params,
-            "infill_overlap",
-            DEFAULT_UI_RESIN_INFILL_OVERLAP_PERCENT,
-        )
-        contour_infill_overlap = _float_param(
-            params,
-            "contour_infill_overlap",
-            DEFAULT_RESIN_CONTOUR_INFILL_OVERLAP_PERCENT,
-        )
-        triangle_path_optimization = _bool_param(
-            params,
-            "triangle_path_optimization",
-            True,
-        )
-        zigzag_path_optimization = _bool_param(
-            params,
-            "zigzag_path_optimization",
-            True,
-        )
-        slicing_kernel = params.get("slicing_kernel", ["legacy"])[0]
-        if slicing_kernel != "legacy":
-            planning_line_width = None
-        pyslm_config = PySLMConfig(
-            hatcher=params.get("pyslm_hatcher", ["basic"])[0],  # type: ignore[arg-type]
-            hatch_angle=_optional_float_param(params, "pyslm_hatch_angle"),
-            layer_angle_increment=_float_param(params, "pyslm_layer_angle_increment", 0.0),
-            hatch_distance=_optional_float_param(params, "pyslm_hatch_distance"),
-            contour_offset=_optional_float_param(params, "pyslm_contour_offset"),
-            spot_compensation=_optional_float_param(params, "pyslm_spot_compensation"),
-            volume_offset_hatch=_optional_float_param(params, "pyslm_volume_offset_hatch"),
-            num_outer_contours=_optional_int_param(params, "pyslm_num_outer_contours"),
-            num_inner_contours=_optional_int_param(params, "pyslm_num_inner_contours"),
-            scan_contour_first=_bool_param(params, "pyslm_scan_contour_first", True),
-            hatch_sort=params.get("pyslm_hatch_sort", ["none"])[0],  # type: ignore[arg-type]
-            stripe_width=_float_param(
-                params,
-                "pyslm_stripe_width",
-                pyslm_strategy_defaults.width,
-            ),
-            stripe_overlap=_float_param(
-                params,
-                "pyslm_stripe_overlap",
-                pyslm_strategy_defaults.overlap,
-            ),
-            stripe_offset=_float_param(
-                params,
-                "pyslm_stripe_offset",
-                pyslm_strategy_defaults.offset,
-            ),
-            island_width=_float_param(
-                params,
-                "pyslm_island_width",
-                pyslm_strategy_defaults.width,
-            ),
-            island_overlap=_float_param(
-                params,
-                "pyslm_island_overlap",
-                pyslm_strategy_defaults.overlap,
-            ),
-            island_offset=_float_param(
-                params,
-                "pyslm_island_offset",
-                pyslm_strategy_defaults.offset,
-            ),
-            fix_polygons=_bool_param(params, "pyslm_fix_polygons", True),
-            simplification_factor=_optional_float_param(params, "pyslm_simplification_factor"),
-            simplification_preserve_topology=_bool_param(
-                params,
-                "pyslm_simplification_preserve_topology",
-                True,
-            ),
-            simplification_mode=params.get("pyslm_simplification_mode", ["absolute"])[0],  # type: ignore[arg-type]
-        )
-        infill_pattern = params.get("infill_pattern", ["zigzag_horizontal"])[0]
-        curve_mode = params.get("curve_mode", ["flat"])[0]
-        curve_amplitude = _float_param(params, "curve_amplitude", 0.0)
-        curve_period = _float_param(params, "curve_period", 50.0)
-        raft_top_gap = DEFAULT_RAFT_TOP_GAP_MM
-        raft_layers = _raft_layers_from_params(params)
+        slicing_kernel = params.get("slicing_kernel", ["prusa"])[0]
+        if slicing_kernel not in {"prusa", "legacy", "pyslm"}:
+            raise ValueError("slicing_kernel must be prusa, legacy, or pyslm")
+        shared = _parse_shared_slice_config(params, slicing_kernel)
 
         stl_upload = files.get("stl_file")
         if stl_upload is None:
@@ -231,38 +128,27 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             fiber_template_paths = load_fiber_template_json(fiber_json_path)
 
         mesh = load_stl(stl_path)
-        build_axis = resolve_build_axis(mesh, requested_build_axis)
-        config = SliceConfig(
-            material="R",
-            layer_height=layer_height,
-            first_layer_height=first_layer_height,
-            line_width=line_width,
-            planning_line_width=planning_line_width,
-            z_min=z_min,
-            z_max=z_max,
-            tolerance=tolerance,
-            build_axis=build_axis,  # type: ignore[arg-type]
-            curve_mode=curve_mode,  # type: ignore[arg-type]
-            curve_amplitude=curve_amplitude,
-            curve_period=curve_period,
-            infill_pattern=infill_pattern,  # type: ignore[arg-type]
-            infill_density=infill_density,
-            infill_overlap=infill_overlap,
-            contour_infill_overlap=contour_infill_overlap,
-            triangle_path_optimization=triangle_path_optimization,
-            zigzag_path_optimization=zigzag_path_optimization,
-            slicing_kernel=slicing_kernel,  # type: ignore[arg-type]
-            pyslm=pyslm_config,
-            perimeter_count=perimeter_count,
-            print_perimeters=print_perimeters,
-        )
+        build_axis = resolve_build_axis(mesh, shared["requested_build_axis"])
+        if slicing_kernel == "prusa":
+            config = _parse_prusa_slice_config(params, shared, build_axis)
+            raft_layers: list[RaftLayerConfig] = []
+        elif slicing_kernel == "legacy":
+            config = _parse_legacy_slice_config(params, shared, build_axis)
+            raft_layers = _raft_layers_from_params(params)
+        else:
+            config = _parse_pyslm_slice_config(params, shared, build_axis)
+            raft_layers = []
         job = slice_mesh_to_job(mesh, config)
+        resolved_config = _resolved_slice_config(config)
+        slicing_meta = job.meta.get("slicing")
+        if isinstance(slicing_meta, dict):
+            slicing_meta["resolved_config"] = resolved_config
         fiber_preview_paths = {}
         if fiber_template_paths:
             fiber_preview_paths = expand_fiber_template_for_resin_layers(job, fiber_template_paths)
             merge_fiber_paths_into_job(job, fiber_preview_paths)
         if raft_layers:
-            z_shift = add_raft_to_job(job, mesh, config, raft_layers, raft_top_gap)
+            z_shift = add_raft_to_job(job, mesh, config, raft_layers, DEFAULT_RAFT_TOP_GAP_MM)
             fiber_preview_paths = _shift_fiber_preview_paths(
                 fiber_preview_paths,
                 len(raft_layers),
@@ -289,6 +175,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             "fiber_json": fiber_json_name,
             "build_axis": build_axis,
             "slicing_kernel": config.slicing_kernel,
+            "resolved_config": resolved_config,
             "effective_infill_pattern": slicing_metadata.get(
                 "effective_infill_pattern",
                 config.infill_pattern,
@@ -375,6 +262,284 @@ def _optional_int_param(params: dict[str, list[str]], name: str) -> int | None:
 def _bool_param(params: dict[str, list[str]], name: str, default: bool) -> bool:
     raw = params.get(name, [str(default).lower()])[0].strip().lower()
     return raw in ("1", "true", "yes", "on")
+
+
+def _parse_shared_slice_config(
+    params: dict[str, list[str]],
+    slicing_kernel: str,
+) -> dict[str, Any]:
+    """Read only inputs shared by every supported slicing backend."""
+
+    layer_height = _float_param(
+        params,
+        "layer_height",
+        DEFAULT_RESIN_LAYER_HEIGHT_MM,
+    )
+    line_width = _float_param(params, "line_width", DEFAULT_RESIN_LINE_WIDTH_MM)
+    tolerance = _optional_float_param(params, "tolerance")
+    return {
+        "slicing_kernel": slicing_kernel,
+        "layer_height": layer_height,
+        "first_layer_height": _float_param(
+            params,
+            "first_layer_height",
+            layer_height,
+        ),
+        "line_width": line_width,
+        "requested_build_axis": params.get("build_axis", ["auto"])[0],
+        "z_min": _optional_float_param(params, "z_min"),
+        "z_max": _optional_float_param(params, "z_max"),
+        "tolerance": (
+            tolerance
+            if tolerance is not None
+            else recommended_geometry_tolerance(layer_height, line_width)
+        ),
+    }
+
+
+def _base_slice_config_fields(
+    shared: dict[str, Any],
+    build_axis: str,
+) -> dict[str, Any]:
+    return {
+        "material": "R",
+        "layer_height": shared["layer_height"],
+        "first_layer_height": shared["first_layer_height"],
+        "line_width": shared["line_width"],
+        "z_min": shared["z_min"],
+        "z_max": shared["z_max"],
+        "tolerance": shared["tolerance"],
+        "build_axis": build_axis,
+    }
+
+
+def _parse_prusa_slice_config(
+    params: dict[str, list[str]],
+    shared: dict[str, Any],
+    build_axis: str,
+) -> SliceConfig:
+    """Build Prusa configuration without reading Legacy or PySLM fields."""
+
+    raft_enabled = _bool_param(params, "prusa_raft_enabled", False)
+    prusa_raft = (
+        PrusaRaftConfig(
+            layer_count=_int_param(params, "prusa_raft_layers", 3),
+            expansion=_float_param(params, "prusa_raft_expansion", 3.0),
+            first_layer_density=_float_param(
+                params,
+                "prusa_raft_first_layer_density",
+                80.0,
+            ),
+            first_layer_expansion=_float_param(
+                params,
+                "prusa_raft_first_layer_expansion",
+                3.0,
+            ),
+            contact_distance=_float_param(
+                params,
+                "prusa_raft_contact_distance",
+                0.25,
+            ),
+        )
+        if raft_enabled
+        else PrusaRaftConfig()
+    )
+    prusa_geometry = PrusaGeometryConfig(
+        perimeter_generator=params.get("prusa_perimeter_generator", ["arachne"])[0],  # type: ignore[arg-type]
+        gap_fill_enabled=_bool_param(params, "prusa_gap_fill_enabled", True),
+        infill_anchor=_optional_float_param(params, "prusa_infill_anchor"),
+        infill_anchor_max=_optional_float_param(params, "prusa_infill_anchor_max"),
+        external_perimeter_width=_optional_float_param(
+            params, "prusa_external_perimeter_width"
+        ),
+        perimeter_width=_optional_float_param(params, "prusa_perimeter_width"),
+        infill_width=_optional_float_param(params, "prusa_infill_width"),
+        xy_size_compensation=_float_param(params, "prusa_xy_size_compensation", 0.0),
+        elephant_foot_compensation=_float_param(
+            params, "prusa_elephant_foot_compensation", 0.0
+        ),
+        avoid_crossing_max_detour=_float_param(
+            params, "prusa_avoid_crossing_max_detour", 0.0
+        ),
+        seam_position=params.get("prusa_seam_position", ["aligned"])[0],  # type: ignore[arg-type]
+    )
+    return SliceConfig(
+        **_base_slice_config_fields(shared, build_axis),
+        slicing_kernel="prusa",
+        curve_mode="flat",
+        infill_pattern=params.get("prusa_infill_pattern", ["zigzag_horizontal"])[0],  # type: ignore[arg-type]
+        infill_density=_float_param(
+            params,
+            "prusa_infill_density",
+            DEFAULT_RESIN_INFILL_DENSITY_PERCENT,
+        ),
+        contour_infill_overlap=_float_param(
+            params,
+            "prusa_contour_infill_overlap",
+            DEFAULT_RESIN_CONTOUR_INFILL_OVERLAP_PERCENT,
+        ),
+        perimeter_count=_int_param(params, "prusa_perimeter_count", 2),
+        print_perimeters=_bool_param(params, "prusa_print_perimeters", True),
+        prusa_raft=prusa_raft,
+        prusa_geometry=prusa_geometry,
+    )
+
+
+def _parse_legacy_slice_config(
+    params: dict[str, list[str]],
+    shared: dict[str, Any],
+    build_axis: str,
+) -> SliceConfig:
+    """Build the existing project-native configuration from Legacy fields."""
+
+    return SliceConfig(
+        **_base_slice_config_fields(shared, build_axis),
+        slicing_kernel="legacy",
+        planning_line_width=_float_param(
+            params,
+            "planning_line_width",
+            DEFAULT_RESIN_PLANNING_LINE_WIDTH_MM,
+        ),
+        curve_mode=params.get("curve_mode", ["flat"])[0],  # type: ignore[arg-type]
+        curve_amplitude=_float_param(params, "curve_amplitude", 0.0),
+        curve_period=_float_param(params, "curve_period", 50.0),
+        infill_pattern=params.get("infill_pattern", ["zigzag_horizontal"])[0],  # type: ignore[arg-type]
+        infill_density=_float_param(
+            params,
+            "infill_density",
+            DEFAULT_RESIN_INFILL_DENSITY_PERCENT,
+        ),
+        infill_overlap=_float_param(
+            params,
+            "infill_overlap",
+            DEFAULT_UI_RESIN_INFILL_OVERLAP_PERCENT,
+        ),
+        contour_infill_overlap=_float_param(
+            params,
+            "contour_infill_overlap",
+            DEFAULT_RESIN_CONTOUR_INFILL_OVERLAP_PERCENT,
+        ),
+        triangle_path_optimization=_bool_param(
+            params,
+            "triangle_path_optimization",
+            True,
+        ),
+        zigzag_path_optimization=_bool_param(
+            params,
+            "zigzag_path_optimization",
+            True,
+        ),
+        perimeter_count=_int_param(params, "perimeter_count", 2),
+        print_perimeters=_bool_param(params, "print_perimeters", True),
+    )
+
+
+def _parse_pyslm_slice_config(
+    params: dict[str, list[str]],
+    shared: dict[str, Any],
+    build_axis: str,
+) -> SliceConfig:
+    """Build PySLM configuration without accepting Legacy path-planner fields."""
+
+    strategy_defaults = recommended_pyslm_strategy_defaults(
+        shared["layer_height"],
+        shared["line_width"],
+    )
+    pyslm_config = PySLMConfig(
+        hatcher=params.get("pyslm_hatcher", ["basic"])[0],  # type: ignore[arg-type]
+        hatch_angle=_optional_float_param(params, "pyslm_hatch_angle"),
+        layer_angle_increment=_float_param(params, "pyslm_layer_angle_increment", 0.0),
+        hatch_distance=_optional_float_param(params, "pyslm_hatch_distance"),
+        contour_offset=_optional_float_param(params, "pyslm_contour_offset"),
+        spot_compensation=_optional_float_param(params, "pyslm_spot_compensation"),
+        volume_offset_hatch=_optional_float_param(params, "pyslm_volume_offset_hatch"),
+        num_outer_contours=_optional_int_param(params, "pyslm_num_outer_contours"),
+        num_inner_contours=_optional_int_param(params, "pyslm_num_inner_contours"),
+        scan_contour_first=_bool_param(params, "pyslm_scan_contour_first", True),
+        hatch_sort=params.get("pyslm_hatch_sort", ["none"])[0],  # type: ignore[arg-type]
+        stripe_width=_float_param(params, "pyslm_stripe_width", strategy_defaults.width),
+        stripe_overlap=_float_param(params, "pyslm_stripe_overlap", strategy_defaults.overlap),
+        stripe_offset=_float_param(params, "pyslm_stripe_offset", strategy_defaults.offset),
+        island_width=_float_param(params, "pyslm_island_width", strategy_defaults.width),
+        island_overlap=_float_param(params, "pyslm_island_overlap", strategy_defaults.overlap),
+        island_offset=_float_param(params, "pyslm_island_offset", strategy_defaults.offset),
+        fix_polygons=_bool_param(params, "pyslm_fix_polygons", True),
+        simplification_factor=_optional_float_param(params, "pyslm_simplification_factor"),
+        simplification_preserve_topology=_bool_param(
+            params,
+            "pyslm_simplification_preserve_topology",
+            True,
+        ),
+        simplification_mode=params.get("pyslm_simplification_mode", ["absolute"])[0],  # type: ignore[arg-type]
+    )
+    return SliceConfig(
+        **_base_slice_config_fields(shared, build_axis),
+        slicing_kernel="pyslm",
+        curve_mode="flat",
+        infill_pattern=params.get("pyslm_infill_pattern", ["zigzag_horizontal"])[0],  # type: ignore[arg-type]
+        infill_density=_float_param(
+            params,
+            "pyslm_infill_density",
+            DEFAULT_RESIN_INFILL_DENSITY_PERCENT,
+        ),
+        infill_overlap=_float_param(
+            params,
+            "pyslm_infill_overlap",
+            DEFAULT_UI_RESIN_INFILL_OVERLAP_PERCENT,
+        ),
+        contour_infill_overlap=_float_param(
+            params,
+            "pyslm_contour_infill_overlap",
+            DEFAULT_RESIN_CONTOUR_INFILL_OVERLAP_PERCENT,
+        ),
+        perimeter_count=_int_param(params, "pyslm_perimeter_count", 2),
+        print_perimeters=_bool_param(params, "pyslm_print_perimeters", True),
+        pyslm=pyslm_config,
+    )
+
+
+def _resolved_slice_config(config: SliceConfig) -> dict[str, object]:
+    """Small auditable record of exactly the settings passed to one backend."""
+
+    resolved: dict[str, object] = {
+        "kernel": config.slicing_kernel,
+        "layer_height": config.layer_height,
+        "first_layer_height": config.first_layer_height,
+        "line_width": config.line_width,
+        "build_axis": config.build_axis,
+        "z_min": config.z_min,
+        "z_max": config.z_max,
+        "tolerance": config.tolerance,
+        "perimeter_count": config.perimeter_count,
+        "print_perimeters": config.print_perimeters,
+        "infill_pattern": config.infill_pattern,
+        "infill_density": config.infill_density,
+        "contour_infill_overlap": config.contour_infill_overlap,
+    }
+    if config.slicing_kernel == "prusa":
+        resolved.update(
+            path_backend="prusa_fff",
+            prusa_perimeter_infill_overlap=config.contour_infill_overlap,
+            prusa_raft=config.prusa_raft.to_metadata(),
+            prusa_geometry=config.prusa_geometry.to_metadata(),
+        )
+    elif config.slicing_kernel == "legacy":
+        resolved.update(
+            path_backend="legacy",
+            planning_line_width=config.planning_line_width,
+            infill_overlap=config.infill_overlap,
+            triangle_path_optimization=config.triangle_path_optimization,
+            zigzag_path_optimization=config.zigzag_path_optimization,
+            curve_mode=config.curve_mode,
+        )
+    else:
+        resolved.update(
+            path_backend="pyslm",
+            infill_overlap=config.infill_overlap,
+            pyslm_hatcher=config.pyslm.hatcher,
+            pyslm_hatch_sort=config.pyslm.hatch_sort,
+        )
+    return resolved
 
 
 def _raft_layers_from_params(params: dict[str, list[str]]) -> list[RaftLayerConfig]:
@@ -530,11 +695,21 @@ def expand_fiber_template_for_resin_layers(
     resin_groups.sort(key=lambda group: group.layer_index)
     paths_by_layer: dict[int, list[list[list[float]]]] = {}
 
+    slicing_metadata = job.meta.get("slicing")
+    raft_layer_count = 0
+    if isinstance(slicing_metadata, dict):
+        prusa_raft = slicing_metadata.get("prusa_raft")
+        if isinstance(prusa_raft, dict):
+            raw_count = prusa_raft.get("layer_count", 0)
+            if isinstance(raw_count, int) and raw_count > 0:
+                raft_layer_count = raw_count
+    part_resin_groups = resin_groups[raft_layer_count:]
+
     # The fiber is physically printed between resin layers.  Include its
     # thickness in the exported Z schedule instead of letting every resin
     # layer continue to use the original resin-only grid.
     fiber_layer_height = DEFAULT_FIBER_LAYER_HEIGHT_MM
-    for layer_order, group in enumerate(resin_groups):
+    for layer_order, group in enumerate(part_resin_groups):
         z_offset = layer_order * fiber_layer_height
         if z_offset == 0.0:
             continue
@@ -545,15 +720,14 @@ def expand_fiber_template_for_resin_layers(
         for path in group.paths:
             path[:, 2] += np.float32(z_offset)
 
-    slicing_metadata = job.meta.get("slicing")
-    if isinstance(slicing_metadata, dict) and resin_groups:
+    if isinstance(slicing_metadata, dict) and part_resin_groups:
         z_max = slicing_metadata.get("z_max")
         if isinstance(z_max, (int, float)):
-            slicing_metadata["z_max"] = float(z_max) + (len(resin_groups) - 1) * fiber_layer_height
+            slicing_metadata["z_max"] = float(z_max) + (len(part_resin_groups) - 1) * fiber_layer_height
         slicing_metadata["fiber_layer_height_applied_mm"] = fiber_layer_height
 
     # Fiber is printed between resin layers; the final resin layer is a cap.
-    for group in resin_groups[:-1]:
+    for group in part_resin_groups[:-1]:
         z = _group_layer_z(group) + fiber_layer_height
         layer_paths = []
         for template_path in template_paths:
@@ -639,36 +813,62 @@ def _preview_payload(
         if isinstance(job.meta.get("path_roles", {}), dict)
         else {}
     )
+    motion_order_by_layer = (
+        job.meta.get("motion_order", {})
+        if isinstance(job.meta.get("motion_order", {}), dict)
+        else {}
+    )
     groups_by_layer: dict[int, dict[str, list]] = {}
     for group in job.material_paths:
         groups_by_layer.setdefault(group.layer_index, {}).setdefault(group.material, []).append(group)
+    travel_groups_by_layer: dict[int, list] = {}
+    for group in job.travel_paths:
+        travel_groups_by_layer.setdefault(group.layer_index, []).append(group)
 
     layer_indices = {
         group.layer_index for group in job.material_paths
-    } | set(fiber_paths_by_layer)
+    } | set(fiber_paths_by_layer) | set(travel_groups_by_layer)
 
     for layer_index in sorted(layer_indices):
         resin_paths: list[dict[str, object]] = []
         group_resin_index = 0
         for group in groups_by_layer.get(layer_index, {}).get("R", []):
             layer_roles = resin_roles_by_layer.get(str(layer_index), [])
-            for path in group.paths:
-                points = _simplify_preview_path(
-                    [[float(point[0]), float(point[1]), float(point[2])] for point in path],
-                    max_points=2000,
+            for path_index, path in enumerate(group.paths):
+                raw_points = [
+                    [float(point[0]), float(point[1]), float(point[2])]
+                    for point in path
+                ]
+                raw_extrusion = (
+                    group.extrusion[path_index]
+                    if group.extrusion is not None and path_index < len(group.extrusion)
+                    else None
                 )
+                if raw_extrusion is not None and len(raw_extrusion) == len(raw_points):
+                    sample_count = min(len(raw_points), 2000)
+                    step = (len(raw_points) - 1) / max(sample_count - 1, 1)
+                    sample_indices = [round(index * step) for index in range(sample_count)]
+                    sample_indices[-1] = len(raw_points) - 1
+                    points = [raw_points[index] for index in sample_indices]
+                    extrusion = [float(raw_extrusion[index]) for index in sample_indices]
+                else:
+                    points = _simplify_preview_path(raw_points, max_points=2000)
+                    extrusion = None
                 role = (
                     layer_roles[group_resin_index]
                     if isinstance(layer_roles, list) and group_resin_index < len(layer_roles)
                     else None
                 )
                 group_resin_index += 1
-                if role in ("outer_contour", "inner_contour", "infill"):
-                    resin_paths.append({"role": role, "points": points})
+                if role in ("outer_contour", "inner_contour", "infill", "raft"):
+                    entry: dict[str, object] = {"role": role, "points": points}
                 elif path.shape[0] > 2:
-                    resin_paths.append({"role": "outer_contour", "points": points})
+                    entry = {"role": "outer_contour", "points": points}
                 else:
-                    resin_paths.append({"role": "infill", "points": points})
+                    entry = {"role": "infill", "points": points}
+                if extrusion is not None:
+                    entry["extrusion"] = extrusion
+                resin_paths.append(entry)
                 for x, y, z in points:
                     _expand_bounds(bounds, x, y, z)
 
@@ -689,10 +889,64 @@ def _preview_payload(
             for x, y, z in fiber_path:
                 _expand_bounds(bounds, x, y, z)
 
+        serialized_travel_paths: list[list[list[float]]] = []
+        for group in travel_groups_by_layer.get(layer_index, []):
+            serialized_travel_paths.extend(
+                _simplify_preview_path(
+                    [[float(point[0]), float(point[1]), float(point[2])] for point in path],
+                    max_points=2000,
+                )
+                for path in group.paths
+            )
+        for travel_path in serialized_travel_paths:
+            for x, y, z in travel_path:
+                _expand_bounds(bounds, x, y, z)
+
+        motion_paths: list[dict[str, object]] = []
+        motion_order = motion_order_by_layer.get(str(layer_index), [])
+        if isinstance(motion_order, list):
+            for motion in motion_order:
+                if not isinstance(motion, dict):
+                    continue
+                kind = motion.get("kind")
+                index = motion.get("index")
+                if not isinstance(index, int):
+                    continue
+                if kind == "deposit" and 0 <= index < len(resin_paths):
+                    source = resin_paths[index]
+                    motion_paths.append(
+                        {
+                            "kind": "deposit",
+                            "role": source["role"],
+                            "points": source["points"],
+                            "extrusion": source.get("extrusion"),
+                        }
+                    )
+                elif kind == "travel" and 0 <= index < len(serialized_travel_paths):
+                    motion_paths.append(
+                        {"kind": "travel", "points": serialized_travel_paths[index]}
+                    )
+        if not motion_paths:
+            motion_paths.extend(
+                {
+                    "kind": "deposit",
+                    "role": path["role"],
+                    "points": path["points"],
+                    "extrusion": path.get("extrusion"),
+                }
+                for path in resin_paths
+            )
+            motion_paths.extend(
+                {"kind": "travel", "points": path}
+                for path in serialized_travel_paths
+            )
+
         layers_by_index[layer_index] = {
             "index": layer_index,
             "resin_paths": resin_paths,
             "fiber_paths": serialized_fiber_paths,
+            "travel_paths": serialized_travel_paths,
+            "motion_paths": motion_paths,
         }
 
     planning_line_width = (
@@ -1048,6 +1302,44 @@ def _index_html() -> str:
       visibility: visible;
       transform: translate(-50%, 0);
     }}
+    .tooltipLabel[data-tooltip] {{
+      position: relative;
+      width: fit-content;
+      max-width: 100%;
+      cursor: help;
+      text-decoration: underline dotted rgba(92, 105, 114, 0.7);
+      text-underline-offset: 3px;
+    }}
+    .tooltipLabel[data-tooltip]::after {{
+      content: attr(data-tooltip);
+      position: absolute;
+      z-index: var(--z-tooltip);
+      top: calc(100% + 6px);
+      left: 0;
+      width: max-content;
+      max-width: min(340px, calc(100vw - 48px));
+      padding: 8px 10px;
+      border: 1px solid #27313a;
+      background: #ffffff;
+      color: var(--ink);
+      box-shadow: 0 4px 12px rgba(23, 32, 38, 0.16);
+      font-size: 13px;
+      font-weight: 400;
+      line-height: 1.45;
+      text-decoration: none;
+      white-space: normal;
+      pointer-events: none;
+      visibility: hidden;
+      opacity: 0;
+      transform: translateY(-2px);
+      transition: opacity 120ms ease, transform 120ms ease, visibility 120ms ease;
+    }}
+    .tooltipLabel[data-tooltip]:hover::after,
+    .tooltipLabel[data-tooltip]:focus-within::after {{
+      visibility: visible;
+      opacity: 1;
+      transform: translateY(0);
+    }}
     input:not([type="checkbox"]):not([type="range"]), select {{
       width: 100%;
       height: var(--control-height);
@@ -1092,12 +1384,44 @@ def _index_html() -> str:
       gap: var(--space-2);
       align-items: start;
     }}
+    .prusaSettingsGrid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(148px, 1fr));
+      gap: var(--space-2);
+      align-items: end;
+    }}
+    .prusaSettingsGrid > * {{ grid-column: auto; }}
+    .prusaFeatureToggle {{
+      display: flex;
+      align-items: center;
+      min-height: var(--control-height);
+      margin-top: var(--space-2);
+    }}
+    .prusaSubSettings {{
+      margin-top: var(--space-2);
+      padding: var(--space-2);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-sm);
+      background: #fbfcfd;
+    }}
+    .prusaAdvancedGroup + .prusaAdvancedGroup {{
+      margin-top: var(--space-3);
+      padding-top: var(--space-3);
+      border-top: 1px solid var(--line);
+    }}
+    .prusaAdvancedGroup h4 {{
+      margin: 0 0 var(--space-2);
+      font-size: 13px;
+      color: var(--ink);
+    }}
     .fieldGroup {{ min-width: 0; }}
     .span-2 {{ grid-column: span 2; }}
     .span-3 {{ grid-column: span 3; }}
     .span-4 {{ grid-column: span 4; }}
     .span-5 {{ grid-column: span 5; }}
+    .span-6 {{ grid-column: span 6; }}
     .span-8 {{ grid-column: span 8; }}
+    .span-9 {{ grid-column: span 9; }}
     .span-12 {{ grid-column: 1 / -1; }}
     .compactGrid {{
       gap: var(--space-2);
@@ -1124,8 +1448,21 @@ def _index_html() -> str:
       margin-top: var(--space-3);
     }}
     .kernelBand > .bandGrid:not(:first-of-type),
+    .kernelBand > #prusaNativeSettings:not([hidden]),
+    .kernelBand > #legacyNativeSettings:not([hidden]),
     .kernelBand > #pyslmNativeSettings:not([hidden]) {{
       margin-top: var(--space-2);
+    }}
+    .readOnlySummary {{
+      display: block;
+      min-height: var(--control-height);
+      padding: 9px 11px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-sm);
+      background: #f6f8fb;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
     }}
     .processGroup {{
       min-width: 0;
@@ -1318,7 +1655,12 @@ def _index_html() -> str:
     .outerSwatch {{ background: #146c43; }}
     .innerSwatch {{ background: #7b2cbf; }}
     .infillSwatch {{ background: #0b6bcb; }}
+    .raftSwatch {{ background: #7f5539; }}
     .fiberSwatch {{ background: #e66f00; }}
+    .travelSwatch {{
+      height: 4px;
+      background: repeating-linear-gradient(90deg, #526f8c 0 7px, transparent 7px 12px);
+    }}
     .viewOptions {{
       margin-top: var(--space-3);
       display: flex;
@@ -1339,6 +1681,20 @@ def _index_html() -> str:
       width: auto;
       min-height: 0;
       padding: 0;
+    }}
+    .extrusionColorLegend {{
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      white-space: nowrap;
+      font-size: 12px;
+    }}
+    .extrusionColorRamp {{
+      width: 82px;
+      height: 8px;
+      border: 1px solid rgba(23, 32, 38, 0.18);
+      border-radius: 999px;
+      background: linear-gradient(90deg, #1e40af, #0f96a0, #f59e0b, #dc2626);
     }}
     .checkboxLabel {{
       display: inline-flex;
@@ -1391,6 +1747,7 @@ def _index_html() -> str:
       .kernelBand > .bandGrid > .span-4 {{ grid-column: span 2; }}
       .kernelBand > .bandGrid > .span-12,
       .kernelBand .span-8 {{ grid-column: 1 / -1; }}
+      .processBand > .bandGrid > .span-9 {{ grid-column: 1 / -1; }}
       .processBand .processGroup {{ grid-column: 1 / -1; }}
       .processGroup + .processGroup {{
         padding-top: var(--space-3);
@@ -1407,7 +1764,7 @@ def _index_html() -> str:
       main {{ padding: 20px 12px 28px; }}
       .panel {{ padding: var(--space-4); }}
       .bandGrid {{ grid-template-columns: 1fr; }}
-      .span-2, .span-3, .span-4, .span-5, .span-8, .span-12,
+      .span-2, .span-3, .span-4, .span-5, .span-6, .span-8, .span-9, .span-12,
       .inputBand .fieldGroup,
       .inputBand .fiberNotice,
       .inputBand .layerAdvanced,
@@ -1453,10 +1810,14 @@ def _index_html() -> str:
         <label class="legendItem"><input id="showOuterContour" type="checkbox" checked><span class="swatch outerSwatch"></span>外轮廓</label>
         <label class="legendItem"><input id="showInnerContour" type="checkbox" checked><span class="swatch innerSwatch"></span>内轮廓</label>
         <label class="legendItem"><input id="showResinInfill" type="checkbox" checked><span class="swatch infillSwatch"></span>树脂填充</label>
+        <label class="legendItem"><input id="showRaftPaths" type="checkbox" checked><span class="swatch raftSwatch"></span>Prusa 筏层</label>
         <label class="legendItem"><input id="showFiberPaths" type="checkbox" checked><span class="swatch fiberSwatch"></span>纤维路径</label>
+        <label class="legendItem"><input id="showTravelPaths" type="checkbox" checked><span class="swatch travelSwatch"></span>空移 Travel</label>
       </div>
       <div class="viewOptions" aria-label="显示选项">
         <label title="仅改变预览笔触宽度，不改变轨迹中心线或挤出倍率"><input id="showLineWidth" type="checkbox">按实际规划线宽显示（当前 <span id="previewLineWidthValue">2.2 mm</span>）</label>
+        <label title="仅对包含 Prusa E 数据的树脂路径按单位长度挤出量着色；关闭时保持轮廓/填充原有配色。"><input id="showExtrusion" type="checkbox">显示挤出量颜色映射（ΔE / Δs）</label>
+        <span id="extrusionColorLegend" class="extrusionColorLegend" hidden>低 <span class="extrusionColorRamp"></span> 高</span>
         <label><input id="showPathPoints" type="checkbox">显示当前路径点</label>
         <label><input id="showDirection" type="checkbox" checked>显示打印方向</label>
         <span id="printSizeLabel">打印范围 -</span>
@@ -1522,26 +1883,179 @@ def _index_html() -> str:
               <input id="lineWidth" name="lineWidth" type="number" min="0.001" step="0.001" value="{DEFAULT_RESIN_LINE_WIDTH_MM}">
             </div>
             <div class="fieldGroup span-3">
-              <label class="labelWithHelp" for="planningLineWidth">实测压平线宽 mm
-                <span class="helpTip" tabindex="0" data-tooltip="实测压平线宽仅用于 Prusa 树脂轨迹间距、搭边计算和实际铺展预览；不会修改 NPZ 中的名义线宽，也不会改变挤出倍率。">?</span>
-              </label>
-              <input id="planningLineWidth" name="planningLineWidth" type="number" min="0.001" step="0.001" value="{DEFAULT_RESIN_PLANNING_LINE_WIDTH_MM}">
-            </div>
-            <div class="fieldGroup span-3">
-              <label for="perimeterCount">边界圈数</label>
-              <input id="perimeterCount" name="perimeterCount" type="number" min="1" step="1" value="2">
-            </div>
-            <div class="fieldGroup span-3">
               <label for="slicingKernel">切片内核</label>
               <select id="slicingKernel" name="slicingKernel">
-                <option value="legacy" selected>Prusa</option>
-                <option value="pyslm">PySLM</option>
+                <option value="prusa" selected>Prusa（推荐）</option>
+                <option value="legacy">Legacy（兼容 / 实验）</option>
+                <option value="pyslm">PySLM（实验）</option>
               </select>
             </div>
           </div>
 
+          <div id="prusaNativeSettings">
+            <h3>Prusa 原生路径参数</h3>
+            <p class="notice">由 Prusa 完整生成轮廓、填充与空移；不使用项目原生的连续路径、三角形或之字形优化。</p>
+            <div class="prusaSettingsGrid">
+              <div class="fieldGroup">
+                <label for="prusaPerimeterCount" class="tooltipLabel" data-tooltip="零件外轮廓和内轮廓的总圈数。更多圈数会提升边缘强度与尺寸稳定性，但会增加打印时间。">边界圈数</label>
+                <input id="prusaPerimeterCount" type="number" min="1" step="1" value="2">
+              </div>
+              <div class="fieldGroup">
+                <label for="prusaInfillDensity" class="tooltipLabel" data-tooltip="模型内部由填充覆盖的比例。100% 为实心；较低数值可缩短时间并降低材料用量。">填充率 %</label>
+                <input id="prusaInfillDensity" type="number" min="0" max="100" step="1" value="{DEFAULT_RESIN_INFILL_DENSITY_PERCENT:g}">
+              </div>
+              <div class="fieldGroup">
+                <label for="prusaContourInfillOverlap" class="tooltipLabel" data-tooltip="填充与最内侧轮廓的重叠比例。适当搭边能避免两者之间留缝；过大可能造成局部过挤。">轮廓与填充搭边 %</label>
+                <input id="prusaContourInfillOverlap" type="number" min="0" max="99" step="0.1" value="{DEFAULT_RESIN_CONTOUR_INFILL_OVERLAP_PERCENT:g}">
+              </div>
+              <div class="compactOptions">
+                <label for="prusaPrintPerimeters" class="tooltipLabel checkboxLabel" data-tooltip="是否生成模型的外轮廓与内轮廓。通常应开启；关闭后只保留内部填充路径。"><input id="prusaPrintPerimeters" type="checkbox" checked> 打印内外轮廓</label>
+              </div>
+              <div class="fieldGroup">
+                <label for="prusaInfillPattern" class="tooltipLabel" data-tooltip="内部填充的几何图案和主方向。不同图案会影响强度方向、路径连续性与打印耗时。">Prusa 填充图案</label>
+                <select id="prusaInfillPattern">
+                  <option value="zigzag_horizontal" selected>横向 Zigzag</option>
+                  <option value="zigzag_vertical">竖向 Zigzag</option>
+                  <option value="zigzag_plus45">+45° Zigzag</option>
+                  <option value="zigzag_minus45">-45° Zigzag</option>
+                  <option value="isotropic">各向同性填充</option>
+                  <option value="triangles">三角填充</option>
+                  <option value="concentric">同心轮廓填充</option>
+                </select>
+              </div>
+            </div>
+            <div class="prusaFeatureToggle">
+              <label for="prusaRaftEnabled" class="tooltipLabel checkboxLabel" data-tooltip="在零件底部生成可剥离的 Prusa 筏层，以改善首层附着与底面稳定性；不会额外生成悬垂支撑。"><input id="prusaRaftEnabled" type="checkbox"> 启用可剥离 Prusa 筏层</label>
+            </div>
+            <div id="prusaRaftSettings" class="prusaSettingsGrid prusaSubSettings" hidden>
+              <div class="fieldGroup">
+                <label for="prusaRaftLayers" class="tooltipLabel" data-tooltip="筏层的打印层数。层数越多，筏层越稳固，但材料和时间也会增加。">筏层数</label>
+                <input id="prusaRaftLayers" type="number" min="1" step="1" value="3">
+              </div>
+              <div class="fieldGroup">
+                <label for="prusaRaftExpansion" class="tooltipLabel" data-tooltip="筏层相对模型轮廓向外扩展的距离，用于增加与打印平台的接触面积。">筏层外扩 mm</label>
+                <input id="prusaRaftExpansion" type="number" min="0" step="0.1" value="3">
+              </div>
+              <div class="fieldGroup">
+                <label for="prusaRaftFirstLayerDensity" class="tooltipLabel" data-tooltip="筏层第一层的填充密度。较高密度通常能提升与打印平台的附着。">首层密度 %</label>
+                <input id="prusaRaftFirstLayerDensity" type="number" min="10" max="100" step="1" value="80">
+              </div>
+              <div class="fieldGroup">
+                <label for="prusaRaftFirstLayerExpansion" class="tooltipLabel" data-tooltip="仅对筏层第一层增加的额外外扩距离，可进一步提高底部附着面积。">首层额外外扩 mm</label>
+                <input id="prusaRaftFirstLayerExpansion" type="number" min="0" step="0.1" value="3">
+              </div>
+              <div class="fieldGroup">
+                <label for="prusaRaftContactDistance" class="tooltipLabel" data-tooltip="零件与筏层之间的 Z 向间隙。数值越大越易剥离，但底面支撑越弱；建议从 0.25 mm 开始实测。">可剥离间隙 mm</label>
+                <input id="prusaRaftContactDistance" type="number" min="0" step="0.01" value="0.25">
+              </div>
+            </div>
+            <details id="prusaAdvancedSettings" class="advancedSettings">
+              <summary>Prusa 高级几何与路径设置</summary>
+              <p class="notice">空白宽度和锚定长度保持 Prusa 默认值；其余项仅作用于 Prusa 内核。</p>
+              <section class="prusaAdvancedGroup">
+                <h4>轮廓与尺寸</h4>
+                <div class="prusaSettingsGrid">
+                  <div class="fieldGroup">
+                  <label for="prusaPerimeterGenerator" class="tooltipLabel" data-tooltip="Arachne 会通过变线宽填补薄壁和窄区；Classic 保持更固定的线宽，结果更可预测。">轮廓生成器</label>
+                  <select id="prusaPerimeterGenerator">
+                    <option value="arachne" selected>Arachne（变线宽）</option>
+                    <option value="classic">Classic（固定线宽）</option>
+                  </select>
+                  </div>
+                  <div class="compactOptions">
+                    <label for="prusaGapFillEnabled" class="tooltipLabel checkboxLabel" data-tooltip="让 Prusa 在常规轮廓无法覆盖的窄缝中生成额外填充路径。关闭可减少细小短路径。"><input id="prusaGapFillEnabled" type="checkbox" checked> 启用 Gap fill</label>
+                  </div>
+                  <div class="fieldGroup">
+                  <label for="prusaExternalPerimeterWidth" class="tooltipLabel" data-tooltip="最外侧轮廓的目标线宽，直接影响外观、尺寸精度与边缘强度。留空使用 Prusa 默认。">外轮廓线宽 mm</label>
+                  <input id="prusaExternalPerimeterWidth" type="number" min="0.001" step="0.001" placeholder="Prusa 默认">
+                  </div>
+                  <div class="fieldGroup">
+                  <label for="prusaPerimeterWidth" class="tooltipLabel" data-tooltip="内侧轮廓的目标线宽。留空时由 Prusa 根据名义线宽和层高自动计算。">内轮廓线宽 mm</label>
+                  <input id="prusaPerimeterWidth" type="number" min="0.001" step="0.001" placeholder="Prusa 默认">
+                  </div>
+                  <div class="fieldGroup">
+                  <label for="prusaInfillWidth" class="tooltipLabel" data-tooltip="内部填充的目标线宽。可单独调整填充效率与实体内部的覆盖效果；留空使用 Prusa 默认。">填充线宽 mm</label>
+                  <input id="prusaInfillWidth" type="number" min="0.001" step="0.001" placeholder="Prusa 默认">
+                  </div>
+                  <div class="fieldGroup">
+                  <label for="prusaXySizeCompensation" class="tooltipLabel" data-tooltip="整体补偿模型的 XY 尺寸：正值向外扩张，负值向内收缩。用于校准材料收缩或实际线宽偏差。">XY 尺寸补偿 mm</label>
+                  <input id="prusaXySizeCompensation" type="number" step="0.01" value="0">
+                  </div>
+                  <div class="fieldGroup">
+                  <label for="prusaElephantFootCompensation" class="tooltipLabel" data-tooltip="削减首层外缘因挤压变宽产生的象脚。只在首层尺寸偏大或边缘鼓起时增加。">象脚补偿 mm</label>
+                  <input id="prusaElephantFootCompensation" type="number" min="0" step="0.01" value="0">
+                  </div>
+                </div>
+              </section>
+              <section class="prusaAdvancedGroup">
+                <h4>填充连接</h4>
+                <div class="prusaSettingsGrid">
+                  <div class="fieldGroup">
+                    <label for="prusaInfillAnchor" class="tooltipLabel" data-tooltip="填充连接到轮廓时采用的目标锚定长度。较大可提高连接可靠性，但会让轮廓附近堆料更多；留空使用 Prusa 默认。">填充锚定长度 mm</label>
+                    <input id="prusaInfillAnchor" type="number" min="0" step="0.1" placeholder="Prusa 默认">
+                  </div>
+                  <div class="fieldGroup">
+                    <label for="prusaInfillAnchorMax" class="tooltipLabel" data-tooltip="限制填充连接轮廓时允许使用的最大锚定长度，避免为连接而沿轮廓走得过远；留空使用 Prusa 默认。">最大锚定长度 mm</label>
+                    <input id="prusaInfillAnchorMax" type="number" min="0" step="0.1" placeholder="Prusa 默认">
+                  </div>
+                </div>
+              </section>
+              <section class="prusaAdvancedGroup">
+                <h4>空移与接缝</h4>
+                <div class="prusaSettingsGrid">
+                  <div class="fieldGroup">
+                  <label for="prusaAvoidCrossingMaxDetour" class="tooltipLabel" data-tooltip="Prusa 为避免空移跨越轮廓时允许的最大绕行距离。0 表示不限制；较小值可减少绕行，但可能更常跨越轮廓。">空移最大绕行 mm</label>
+                  <input id="prusaAvoidCrossingMaxDetour" type="number" min="0" step="0.1" value="0">
+                  </div>
+                  <div class="fieldGroup">
+                  <label for="prusaSeamPosition" class="tooltipLabel" data-tooltip="每层轮廓起止点的布置策略。对齐会形成一条固定接缝；最近减少空移；后侧尝试隐藏在模型后方；随机会分散接缝。">Z 接缝位置</label>
+                  <select id="prusaSeamPosition">
+                    <option value="aligned" selected>对齐</option>
+                    <option value="nearest">最近</option>
+                    <option value="rear">后侧</option>
+                    <option value="random">随机</option>
+                  </select>
+                  </div>
+                </div>
+              </section>
+            </details>
+          </div>
+
           <div id="pyslmNativeSettings" hidden>
             <h3>PySLM 原生扫描参数</h3>
+            <div class="grid">
+              <div>
+                <label for="pyslmInfillPattern">基础填充方向</label>
+                <select id="pyslmInfillPattern">
+                  <option value="zigzag_horizontal" selected>横向 Zigzag</option>
+                  <option value="zigzag_vertical">竖向 Zigzag</option>
+                  <option value="zigzag_plus45">+45° Zigzag</option>
+                  <option value="zigzag_minus45">-45° Zigzag</option>
+                  <option value="isotropic">各向同性填充</option>
+                </select>
+              </div>
+              <div>
+                <label for="pyslmInfillDensity">填充率 %</label>
+                <input id="pyslmInfillDensity" type="number" min="0" max="100" step="1" value="{DEFAULT_RESIN_INFILL_DENSITY_PERCENT:g}">
+              </div>
+            </div>
+            <div class="grid">
+              <div>
+                <label for="pyslmPerimeterCount">边界圈数</label>
+                <input id="pyslmPerimeterCount" type="number" min="1" step="1" value="2">
+              </div>
+              <div>
+                <label for="pyslmContourInfillOverlap">轮廓与填充搭边 %</label>
+                <input id="pyslmContourInfillOverlap" type="number" min="0" max="99" step="0.1" value="{DEFAULT_RESIN_CONTOUR_INFILL_OVERLAP_PERCENT:g}">
+              </div>
+            </div>
+            <div class="grid">
+              <div>
+                <label for="pyslmInfillOverlap">填充线间搭边 %</label>
+                <input id="pyslmInfillOverlap" type="number" min="0" max="99" step="0.1" value="{DEFAULT_UI_RESIN_INFILL_OVERLAP_PERCENT:g}">
+              </div>
+              <label class="checkboxLabel"><input id="pyslmPrintPerimeters" type="checkbox" checked> 打印内外轮廓</label>
+            </div>
             <div class="grid">
               <div>
                 <label for="pyslmHatcher" title="决定 PySLM 使用基础、条带或岛状扫描组织方式。">PySLM 填充策略</label>
@@ -1655,9 +2169,23 @@ def _index_html() -> str:
             <label class="checkboxLabel"><input id="pyslmSimplificationPreserveTopology" type="checkbox" checked> 保持拓扑结构</label>
           </div>
 
+          <div id="legacyNativeSettings" hidden>
+          <h3>Legacy 兼容 / 实验参数</h3>
+          <div class="bandGrid compactGrid">
+            <div class="fieldGroup span-4">
+              <label class="labelWithHelp" for="planningLineWidth">实测压平线宽 mm
+                <span class="helpTip" tabindex="0" data-tooltip="仅项目原生内核使用：用于树脂轨迹间距、搭边计算和实际铺展预览；不会修改 NPZ 中的名义线宽，也不会改变挤出倍率。">?</span>
+              </label>
+              <input id="planningLineWidth" name="planningLineWidth" type="number" min="0.001" step="0.001" value="{DEFAULT_RESIN_PLANNING_LINE_WIDTH_MM}">
+            </div>
+            <div class="fieldGroup span-4">
+              <label for="perimeterCount">边界圈数</label>
+              <input id="perimeterCount" name="perimeterCount" type="number" min="1" step="1" value="2">
+            </div>
+          </div>
           <div id="legacyInfillControl" class="bandGrid compactGrid">
             <div class="fieldGroup span-4">
-              <label for="infillPattern" title="原始内核与 PySLM 共用；各向同性填充使用固定的四方向之字形循环。">树脂填充路径</label>
+              <label for="infillPattern" title="各向同性填充使用固定的 45°、0°、-45°、90° 循环；Prusa 会按此顺序写入原生逐层填充角。">树脂填充路径</label>
               <select id="infillPattern" name="infillPattern">
                 <option value="zigzag_horizontal" selected>横向 Zigzag</option>
                 <option value="zigzag_vertical">竖向 Zigzag</option>
@@ -1671,8 +2199,8 @@ def _index_html() -> str:
             </div>
             <div class="compactOptions span-8">
               <label class="checkboxLabel" title="关闭时保留现有填充几何与路径规划，仅不输出内外轮廓路径"><input id="printPerimeters" type="checkbox" checked> 打印内外轮廓</label>
-              <label class="checkboxLabel" title="仅 Prusa 三角形填充生效；先排序/反向，再合并数值上共点的路径，所有实体连接仍需通过线宽净距检查。"><input id="trianglePathOptimization" type="checkbox" checked> 三角形填充路径优化</label>
-              <label class="checkboxLabel" title="相邻扫描线在安全填充区域内沿外边界或孔洞边界连续折返；legacy 与 PySLM 均使用该连接路径。"><input id="zigzagPathOptimization" type="checkbox" checked> 之字形填充路径优化</label>
+              <label class="checkboxLabel" title="仅项目原生内核使用；Prusa 使用自身的路径排序与连接策略。"><input id="trianglePathOptimization" type="checkbox" checked> 三角形填充路径优化</label>
+              <label class="checkboxLabel" title="仅项目原生内核使用；Prusa 使用自身的路径排序与连接策略。"><input id="zigzagPathOptimization" type="checkbox" checked> 之字形填充路径优化</label>
             </div>
           </div>
 
@@ -1683,22 +2211,25 @@ def _index_html() -> str:
             </div>
             <div class="fieldGroup span-4">
               <label class="labelWithHelp" for="infillOverlap">填充线间搭边 %
-                <span class="helpTip" tabindex="0" data-tooltip="只控制相邻填充线之间的搭边，不影响填充与最内层轮廓的交界。">?</span>
+                <span class="helpTip" tabindex="0" data-tooltip="仅项目原生与 PySLM 使用。Prusa 的实体填充线距由线宽和填充率决定，没有相同的独立参数。">?</span>
               </label>
               <input id="infillOverlap" name="infillOverlap" type="number" min="0" max="99" step="0.1" value="{DEFAULT_UI_RESIN_INFILL_OVERLAP_PERCENT:g}">
             </div>
             <div class="fieldGroup span-4">
               <label class="labelWithHelp" for="contourInfillOverlap">轮廓与填充搭边 %
-                <span class="helpTip" tabindex="0" data-tooltip="独立控制最内层轮廓与填充路径交界处的搭边，不改变填充线之间的搭边。">?</span>
+                <span class="helpTip" tabindex="0" data-tooltip="Prusa 会映射为原生 infill_overlap（填充与最内层轮廓的搭边）；不改变填充线之间的线距。">?</span>
               </label>
               <input id="contourInfillOverlap" name="contourInfillOverlap" type="number" min="0" max="99" step="0.1" value="{DEFAULT_RESIN_CONTOUR_INFILL_OVERLAP_PERCENT:g}">
             </div>
+          </div>
           </div>
 
         </div>
 
         <div class="formSection processBand" data-layout-band="process-action">
           <div class="bandGrid">
+            <div id="legacyProcessSettings" class="span-9" hidden>
+            <div class="bandGrid">
             <div class="processGroup span-4">
               <div class="processTitleRow">
                 <h3>筏板</h3>
@@ -1735,6 +2266,8 @@ def _index_html() -> str:
                 </div>
               </div>
             </div>
+            </div>
+            </div>
             <div class="actions span-3">
               <button id="sliceButton" type="submit">生成 NPZ</button>
               <span id="status" class="status"></span>
@@ -1769,21 +2302,37 @@ def _index_html() -> str:
     const fiberJsonInput = document.getElementById('fiberJsonFile');
     const fiberNotice = document.getElementById('fiberNotice');
     const showLineWidthInput = document.getElementById('showLineWidth');
+    const showExtrusionInput = document.getElementById('showExtrusion');
+    const extrusionColorLegend = document.getElementById('extrusionColorLegend');
     const previewLineWidthValueEl = document.getElementById('previewLineWidthValue');
     const showPathPointsInput = document.getElementById('showPathPoints');
     const showDirectionInput = document.getElementById('showDirection');
     const showOuterContourInput = document.getElementById('showOuterContour');
     const showInnerContourInput = document.getElementById('showInnerContour');
     const showResinInfillInput = document.getElementById('showResinInfill');
+    const showRaftPathsInput = document.getElementById('showRaftPaths');
     const showFiberPathsInput = document.getElementById('showFiberPaths');
+    const showTravelPathsInput = document.getElementById('showTravelPaths');
     const slicingKernelInput = document.getElementById('slicingKernel');
     const layerHeightInput = document.getElementById('layerHeight');
     const firstLayerHeightInput = document.getElementById('firstLayerHeight');
     const lineWidthInput = document.getElementById('lineWidth');
     const planningLineWidthInput = document.getElementById('planningLineWidth');
+    const infillOverlapInput = document.getElementById('infillOverlap');
+    const trianglePathOptimizationInput = document.getElementById('trianglePathOptimization');
+    const zigzagPathOptimizationInput = document.getElementById('zigzagPathOptimization');
     const printRaftInput = document.getElementById('printRaft');
     const raftBottomOffsetInput = document.getElementById('raftBottomOffset');
     const raftSecondOffsetInput = document.getElementById('raftSecondOffset');
+    const prusaNativeSettings = document.getElementById('prusaNativeSettings');
+    const prusaRaftEnabledInput = document.getElementById('prusaRaftEnabled');
+    const prusaRaftSettings = document.getElementById('prusaRaftSettings');
+    const prusaRaftSettingIds = [
+      'prusaRaftLayers', 'prusaRaftExpansion', 'prusaRaftFirstLayerDensity',
+      'prusaRaftFirstLayerExpansion', 'prusaRaftContactDistance'
+    ];
+    const legacyNativeSettings = document.getElementById('legacyNativeSettings');
+    const legacyProcessSettings = document.getElementById('legacyProcessSettings');
     const legacyInfillControl = document.getElementById('legacyInfillControl');
     const infillPatternInput = document.getElementById('infillPattern');
     const infillSafetyNote = document.getElementById('infillSafetyNote');
@@ -1836,23 +2385,27 @@ def _index_html() -> str:
     }}
     function syncKernelControls() {{
       const isPyslm = slicingKernelInput.value === 'pyslm';
-      planningLineWidthInput.disabled = isPyslm;
-      pyslmNativeSettings.hidden = !isPyslm;
-      legacyInfillControl.hidden = false;
-      infillPatternInput.disabled = false;
-      for (const option of infillPatternInput.options) {{
-        option.disabled = isPyslm && !pyslmSupportedPatterns.has(option.value);
+      const isLegacy = slicingKernelInput.value === 'legacy';
+      const setPanelState = (panel, active) => {{
+        panel.hidden = !active;
+        for (const control of panel.querySelectorAll('input, select, textarea')) {{
+          control.disabled = !active;
+        }}
+      }};
+      setPanelState(prusaNativeSettings, !isPyslm && !isLegacy);
+      setPanelState(legacyNativeSettings, isLegacy);
+      setPanelState(legacyProcessSettings, isLegacy);
+      setPanelState(pyslmNativeSettings, isPyslm);
+      raftBottomOffsetInput.disabled = !isLegacy || !printRaftInput.checked;
+      raftSecondOffsetInput.disabled = !isLegacy || !printRaftInput.checked;
+      const prusaRaftEnabled = !isPyslm && !isLegacy && prusaRaftEnabledInput.checked;
+      prusaRaftSettings.hidden = !prusaRaftEnabled;
+      for (const id of prusaRaftSettingIds) {{
+        document.getElementById(id).disabled = !prusaRaftEnabled;
       }}
-      if (isPyslm && !pyslmSupportedPatterns.has(infillPatternInput.value)) {{
-        infillPatternInput.value = 'zigzag_horizontal';
-      }}
-      infillSafetyNote.textContent = !isPyslm
+      infillSafetyNote.textContent = isLegacy
         ? (strictLayeredFallbackPatterns[infillPatternInput.value] || '')
         : '';
-      for (const id of pyslmSettingsIds) {{
-        document.getElementById(id).disabled = !isPyslm;
-      }}
-      pyslmPatternAutoInput.disabled = !isPyslm;
       updatePyslmStrategyDefaults();
       const strategy = pyslmHatcherInput.value;
       const stripeEnabled = isPyslm && strategy === 'stripe';
@@ -1885,9 +2438,11 @@ def _index_html() -> str:
     lineWidthInput.addEventListener('input', syncKernelControls);
     planningLineWidthInput.addEventListener('input', updatePreviewLineWidthValue);
     printRaftInput.addEventListener('change', () => {{
-      raftBottomOffsetInput.disabled = !printRaftInput.checked;
-      raftSecondOffsetInput.disabled = !printRaftInput.checked;
+      const disabled = !printRaftInput.checked || slicingKernelInput.value !== 'legacy';
+      raftBottomOffsetInput.disabled = disabled;
+      raftSecondOffsetInput.disabled = disabled;
     }});
+    prusaRaftEnabledInput.addEventListener('change', syncKernelControls);
     syncKernelControls();
     fiberNotice.textContent = 'JSON 中的单层纤维路径会复制到每个树脂层，纤维层高 0.1 mm 会计入后续树脂层 Z 位置，最后一层树脂封顶不打印纤维。';
 
@@ -1910,48 +2465,78 @@ def _index_html() -> str:
       formData.append('layer_height', document.getElementById('layerHeight').value);
       formData.append('first_layer_height', document.getElementById('firstLayerHeight').value);
       formData.append('line_width', document.getElementById('lineWidth').value);
-      if (slicingKernelInput.value === 'legacy') {{
-        formData.append('planning_line_width', document.getElementById('planningLineWidth').value);
-      }}
       formData.append('build_axis', document.getElementById('buildAxis').value);
       formData.append('z_min', document.getElementById('zMin').value);
       formData.append('z_max', document.getElementById('zMax').value);
       formData.append('tolerance', document.getElementById('tolerance').value);
-      formData.append('perimeter_count', document.getElementById('perimeterCount').value);
-      formData.append('print_perimeters', document.getElementById('printPerimeters').checked ? 'true' : 'false');
-      formData.append('infill_pattern', document.getElementById('infillPattern').value);
-      formData.append('infill_density', document.getElementById('infillDensity').value);
-      formData.append('infill_overlap', document.getElementById('infillOverlap').value);
-      formData.append('contour_infill_overlap', document.getElementById('contourInfillOverlap').value);
-      formData.append('triangle_path_optimization', document.getElementById('trianglePathOptimization').checked ? 'true' : 'false');
-      formData.append('zigzag_path_optimization', document.getElementById('zigzagPathOptimization').checked ? 'true' : 'false');
-      formData.append('slicing_kernel', document.getElementById('slicingKernel').value);
-      formData.append('pyslm_hatcher', document.getElementById('pyslmHatcher').value);
-      formData.append('pyslm_hatch_sort', document.getElementById('pyslmHatchSort').value);
-      formData.append('pyslm_hatch_angle', document.getElementById('pyslmHatchAngle').value);
-      formData.append('pyslm_layer_angle_increment', document.getElementById('pyslmLayerAngleIncrement').value);
-      formData.append('pyslm_hatch_distance', document.getElementById('pyslmHatchDistance').value);
-      formData.append('pyslm_contour_offset', document.getElementById('pyslmContourOffset').value);
-      formData.append('pyslm_spot_compensation', document.getElementById('pyslmSpotCompensation').value);
-      formData.append('pyslm_volume_offset_hatch', document.getElementById('pyslmVolumeOffset').value);
-      formData.append('pyslm_num_outer_contours', document.getElementById('pyslmOuterContours').value);
-      formData.append('pyslm_num_inner_contours', document.getElementById('pyslmInnerContours').value);
-      formData.append('pyslm_stripe_width', document.getElementById('pyslmStripeWidth').value);
-      formData.append('pyslm_stripe_overlap', document.getElementById('pyslmStripeOverlap').value);
-      formData.append('pyslm_stripe_offset', document.getElementById('pyslmStripeOffset').value);
-      formData.append('pyslm_island_width', document.getElementById('pyslmIslandWidth').value);
-      formData.append('pyslm_island_overlap', document.getElementById('pyslmIslandOverlap').value);
-      formData.append('pyslm_island_offset', document.getElementById('pyslmIslandOffset').value);
-      formData.append('pyslm_fix_polygons', document.getElementById('pyslmFixPolygons').checked ? 'true' : 'false');
-      formData.append('pyslm_scan_contour_first', document.getElementById('pyslmScanContourFirst').checked ? 'true' : 'false');
-      formData.append('pyslm_simplification_factor', document.getElementById('pyslmSimplificationFactor').value);
-      formData.append('pyslm_simplification_mode', document.getElementById('pyslmSimplificationMode').value);
-      formData.append('pyslm_simplification_preserve_topology', document.getElementById('pyslmSimplificationPreserveTopology').checked ? 'true' : 'false');
-      formData.append('print_raft', printRaftInput.checked ? 'true' : 'false');
-      formData.append('raft_offsets', raftBottomOffsetInput.value + ',' + raftSecondOffsetInput.value);
-      formData.append('curve_mode', document.getElementById('curveMode').value);
-      formData.append('curve_amplitude', document.getElementById('curveAmplitude').value);
-      formData.append('curve_period', document.getElementById('curvePeriod').value);
+      formData.append('slicing_kernel', slicingKernelInput.value);
+      if (slicingKernelInput.value === 'prusa') {{
+        formData.append('prusa_perimeter_count', document.getElementById('prusaPerimeterCount').value);
+        formData.append('prusa_print_perimeters', document.getElementById('prusaPrintPerimeters').checked ? 'true' : 'false');
+        formData.append('prusa_infill_pattern', document.getElementById('prusaInfillPattern').value);
+        formData.append('prusa_infill_density', document.getElementById('prusaInfillDensity').value);
+        formData.append('prusa_contour_infill_overlap', document.getElementById('prusaContourInfillOverlap').value);
+        formData.append('prusa_raft_enabled', prusaRaftEnabledInput.checked ? 'true' : 'false');
+        formData.append('prusa_raft_layers', document.getElementById('prusaRaftLayers').value);
+        formData.append('prusa_raft_expansion', document.getElementById('prusaRaftExpansion').value);
+        formData.append('prusa_raft_first_layer_density', document.getElementById('prusaRaftFirstLayerDensity').value);
+        formData.append('prusa_raft_first_layer_expansion', document.getElementById('prusaRaftFirstLayerExpansion').value);
+        formData.append('prusa_raft_contact_distance', document.getElementById('prusaRaftContactDistance').value);
+        formData.append('prusa_perimeter_generator', document.getElementById('prusaPerimeterGenerator').value);
+        formData.append('prusa_gap_fill_enabled', document.getElementById('prusaGapFillEnabled').checked ? 'true' : 'false');
+        formData.append('prusa_infill_anchor', document.getElementById('prusaInfillAnchor').value);
+        formData.append('prusa_infill_anchor_max', document.getElementById('prusaInfillAnchorMax').value);
+        formData.append('prusa_external_perimeter_width', document.getElementById('prusaExternalPerimeterWidth').value);
+        formData.append('prusa_perimeter_width', document.getElementById('prusaPerimeterWidth').value);
+        formData.append('prusa_infill_width', document.getElementById('prusaInfillWidth').value);
+        formData.append('prusa_xy_size_compensation', document.getElementById('prusaXySizeCompensation').value);
+        formData.append('prusa_elephant_foot_compensation', document.getElementById('prusaElephantFootCompensation').value);
+        formData.append('prusa_avoid_crossing_max_detour', document.getElementById('prusaAvoidCrossingMaxDetour').value);
+        formData.append('prusa_seam_position', document.getElementById('prusaSeamPosition').value);
+      }} else if (slicingKernelInput.value === 'legacy') {{
+        formData.append('planning_line_width', document.getElementById('planningLineWidth').value);
+        formData.append('perimeter_count', document.getElementById('perimeterCount').value);
+        formData.append('print_perimeters', document.getElementById('printPerimeters').checked ? 'true' : 'false');
+        formData.append('infill_pattern', document.getElementById('infillPattern').value);
+        formData.append('infill_density', document.getElementById('infillDensity').value);
+        formData.append('infill_overlap', document.getElementById('infillOverlap').value);
+        formData.append('contour_infill_overlap', document.getElementById('contourInfillOverlap').value);
+        formData.append('triangle_path_optimization', trianglePathOptimizationInput.checked ? 'true' : 'false');
+        formData.append('zigzag_path_optimization', zigzagPathOptimizationInput.checked ? 'true' : 'false');
+        formData.append('print_raft', printRaftInput.checked ? 'true' : 'false');
+        formData.append('raft_offsets', raftBottomOffsetInput.value + ',' + raftSecondOffsetInput.value);
+        formData.append('curve_mode', document.getElementById('curveMode').value);
+        formData.append('curve_amplitude', document.getElementById('curveAmplitude').value);
+        formData.append('curve_period', document.getElementById('curvePeriod').value);
+      }} else {{
+        formData.append('pyslm_infill_pattern', document.getElementById('pyslmInfillPattern').value);
+        formData.append('pyslm_infill_density', document.getElementById('pyslmInfillDensity').value);
+        formData.append('pyslm_perimeter_count', document.getElementById('pyslmPerimeterCount').value);
+        formData.append('pyslm_print_perimeters', document.getElementById('pyslmPrintPerimeters').checked ? 'true' : 'false');
+        formData.append('pyslm_infill_overlap', document.getElementById('pyslmInfillOverlap').value);
+        formData.append('pyslm_contour_infill_overlap', document.getElementById('pyslmContourInfillOverlap').value);
+        formData.append('pyslm_hatcher', document.getElementById('pyslmHatcher').value);
+        formData.append('pyslm_hatch_sort', document.getElementById('pyslmHatchSort').value);
+        formData.append('pyslm_hatch_angle', document.getElementById('pyslmHatchAngle').value);
+        formData.append('pyslm_layer_angle_increment', document.getElementById('pyslmLayerAngleIncrement').value);
+        formData.append('pyslm_hatch_distance', document.getElementById('pyslmHatchDistance').value);
+        formData.append('pyslm_contour_offset', document.getElementById('pyslmContourOffset').value);
+        formData.append('pyslm_spot_compensation', document.getElementById('pyslmSpotCompensation').value);
+        formData.append('pyslm_volume_offset_hatch', document.getElementById('pyslmVolumeOffset').value);
+        formData.append('pyslm_num_outer_contours', document.getElementById('pyslmOuterContours').value);
+        formData.append('pyslm_num_inner_contours', document.getElementById('pyslmInnerContours').value);
+        formData.append('pyslm_stripe_width', document.getElementById('pyslmStripeWidth').value);
+        formData.append('pyslm_stripe_overlap', document.getElementById('pyslmStripeOverlap').value);
+        formData.append('pyslm_stripe_offset', document.getElementById('pyslmStripeOffset').value);
+        formData.append('pyslm_island_width', document.getElementById('pyslmIslandWidth').value);
+        formData.append('pyslm_island_overlap', document.getElementById('pyslmIslandOverlap').value);
+        formData.append('pyslm_island_offset', document.getElementById('pyslmIslandOffset').value);
+        formData.append('pyslm_fix_polygons', document.getElementById('pyslmFixPolygons').checked ? 'true' : 'false');
+        formData.append('pyslm_scan_contour_first', document.getElementById('pyslmScanContourFirst').checked ? 'true' : 'false');
+        formData.append('pyslm_simplification_factor', document.getElementById('pyslmSimplificationFactor').value);
+        formData.append('pyslm_simplification_mode', document.getElementById('pyslmSimplificationMode').value);
+        formData.append('pyslm_simplification_preserve_topology', document.getElementById('pyslmSimplificationPreserveTopology').checked ? 'true' : 'false');
+      }}
 
       try {{
         const response = await fetch('/slice', {{
@@ -1965,13 +2550,17 @@ def _index_html() -> str:
         pathsEl.textContent = result.paths;
         outputNameEl.textContent = result.filename;
         executedKernelEl.textContent = result.slicing_kernel === 'legacy'
-          ? 'Prusa'
+          ? '项目原生（Legacy）'
+          : result.slicing_kernel === 'prusa'
+            ? 'Prusa 完整路径内核'
           : result.slicing_kernel === 'pyslm'
             ? 'PySLM'
             : String(result.slicing_kernel || '-');
         const executedPlanningLineWidth = Number(result.planning_line_width);
         executedPlanningLineWidthEl.textContent = result.slicing_kernel === 'pyslm'
           ? '不适用（PySLM 后端自行控制）'
+          : result.slicing_kernel === 'prusa'
+            ? '不适用（Prusa 使用名义线宽）'
           : Number.isFinite(executedPlanningLineWidth)
             ? String(Number(executedPlanningLineWidth.toFixed(3))) + ' mm'
             : '-';
@@ -2027,25 +2616,33 @@ def _index_html() -> str:
     function roleIsSelected(role) {{
       if (role === 'outer_contour') return showOuterContourInput.checked;
       if (role === 'inner_contour') return showInnerContourInput.checked;
+      if (role === 'raft') return showRaftPathsInput.checked;
       if (role === 'fiber') return showFiberPathsInput.checked;
+      if (role === 'travel') return showTravelPathsInput.checked;
       return showResinInfillInput.checked;
     }}
 
     function selectedPrintEntries(layer) {{
       if (!layer) return [];
       const entries = [];
-      const resinEntries = layer.resin_paths
-        || (layer.paths || []).map((points) => ({{ role: 'infill', points }}));
-      for (const rawEntry of resinEntries) {{
-        const role = rawEntry.role || 'infill';
+      const motionEntries = Array.isArray(layer.motion_paths)
+        ? layer.motion_paths
+        : [
+          ...(layer.resin_paths || (layer.paths || []).map((points) => ({{ role: 'infill', points }})))
+            .map((entry) => ({{ ...entry, kind: 'deposit' }})),
+          ...(layer.travel_paths || []).map((points) => ({{ kind: 'travel', points }}))
+        ];
+      for (const rawEntry of motionEntries) {{
+        const kind = rawEntry.kind === 'travel' ? 'travel' : 'deposit';
+        const role = kind === 'travel' ? 'travel' : (rawEntry.role || 'infill');
         const points = rawEntry.points || rawEntry;
         if (roleIsSelected(role) && points && points.length >= 2) {{
-          entries.push({{ role, points }});
+          entries.push({{ kind, role, points, extrusion: rawEntry.extrusion || null }});
         }}
       }}
       if (showFiberPathsInput.checked) {{
         for (const points of layer.fiber_paths || []) {{
-          if (points && points.length >= 2) entries.push({{ role: 'fiber', points }});
+          if (points && points.length >= 2) entries.push({{ kind: 'deposit', role: 'fiber', points }});
         }}
       }}
       return entries;
@@ -2238,8 +2835,55 @@ def _index_html() -> str:
     function pathColor(role) {{
       if (role === 'outer_contour') return '#146c43';
       if (role === 'inner_contour') return '#7b2cbf';
+      if (role === 'raft') return '#7f5539';
       if (role === 'fiber') return '#e66f00';
+      if (role === 'travel') return '#526f8c';
       return '#0b6bcb';
+    }}
+
+    function extrusionDensity(path, extrusion, segmentIndex) {{
+      if (!Array.isArray(extrusion) || extrusion.length !== path.length) return null;
+      const deltaE = Number(extrusion[segmentIndex + 1]) - Number(extrusion[segmentIndex]);
+      const dx = Number(path[segmentIndex + 1][0]) - Number(path[segmentIndex][0]);
+      const dy = Number(path[segmentIndex + 1][1]) - Number(path[segmentIndex][1]);
+      const dz = Number(path[segmentIndex + 1][2]) - Number(path[segmentIndex][2]);
+      const distance = Math.hypot(dx, dy, dz);
+      if (!Number.isFinite(deltaE) || !Number.isFinite(distance) || distance <= 1e-9) return null;
+      return Math.max(0, deltaE) / distance;
+    }}
+
+    function extrusionDensityRange(entries) {{
+      const densities = [];
+      for (const entry of entries) {{
+        for (let index = 0; index < entry.points.length - 1; index++) {{
+          const density = extrusionDensity(entry.points, entry.extrusion, index);
+          if (density !== null && density > 0) densities.push(density);
+        }}
+      }}
+      if (!densities.length) return null;
+      densities.sort((a, b) => a - b);
+      const low = densities[Math.floor((densities.length - 1) * 0.05)];
+      const high = densities[Math.ceil((densities.length - 1) * 0.95)];
+      return high > low + 1e-12
+        ? {{ low, high }}
+        : {{ low: low * 0.9, high: low * 1.1 + 1e-12 }};
+    }}
+
+    function extrusionColorForSegment(density, range) {{
+      const t = Math.max(0, Math.min(1, (density - range.low) / (range.high - range.low)));
+      const stops = [
+        [30, 64, 175],
+        [15, 150, 160],
+        [245, 158, 11],
+        [220, 38, 38]
+      ];
+      const scaled = t * (stops.length - 1);
+      const lower = Math.min(stops.length - 2, Math.floor(scaled));
+      const fraction = scaled - lower;
+      const start = stops[lower];
+      const end = stops[lower + 1];
+      const channel = (index) => Math.round(start[index] + (end[index] - start[index]) * fraction);
+      return `rgb(${{channel(0)}}, ${{channel(1)}}, ${{channel(2)}})`;
     }}
 
     function drawPreview() {{
@@ -2256,6 +2900,7 @@ def _index_html() -> str:
       const bounds = previewData?.bounds;
       if (!layer || !bounds || [bounds.min_x, bounds.max_x, bounds.min_y, bounds.max_y]
         .some((value) => value === null || value === undefined)) {{
+        extrusionColorLegend.hidden = true;
         drawEmptyPreview(ctx, rect.width, rect.height);
         updateViewerLabels();
         return;
@@ -2268,6 +2913,10 @@ def _index_html() -> str:
       const currentEntry = visibleCount > 0 ? entries[visibleCount - 1] : null;
       const lineWidths = previewData.line_widths || {{ resin: 2.0, fiber: 1.0 }};
       const usePhysicalWidth = showLineWidthInput.checked;
+      const extrusionRange = showExtrusionInput.checked
+        ? extrusionDensityRange(entries.slice(0, visibleCount))
+        : null;
+      extrusionColorLegend.hidden = extrusionRange === null;
 
       function drawPath(path) {{
         const first = viewport.project(path[0]);
@@ -2286,6 +2935,23 @@ def _index_html() -> str:
         ctx.stroke();
       }}
 
+      function drawExtrusionPath(path, extrusion, fallbackColor) {{
+        for (let pointIndex = 0; pointIndex < path.length - 1; pointIndex++) {{
+          const density = extrusionDensity(path, extrusion, pointIndex);
+          if (density === null || extrusionRange === null) {{
+            ctx.strokeStyle = fallbackColor;
+          }} else {{
+            ctx.strokeStyle = extrusionColorForSegment(density, extrusionRange);
+          }}
+          const first = viewport.project(path[pointIndex]);
+          const last = viewport.project(path[pointIndex + 1]);
+          ctx.beginPath();
+          ctx.moveTo(first[0], first[1]);
+          ctx.lineTo(last[0], last[1]);
+          ctx.stroke();
+        }}
+      }}
+
       ctx.save();
       ctx.beginPath();
       ctx.rect(
@@ -2299,14 +2965,33 @@ def _index_html() -> str:
       ctx.lineJoin = 'round';
       for (let index = 0; index < visibleCount; index++) {{
         const entry = entries[index];
-        ctx.strokeStyle = pathColor(entry.role);
+        if (entry.kind === 'travel') {{
+          ctx.strokeStyle = '#526f8c';
+          ctx.globalAlpha = 0.95;
+          ctx.lineWidth = 1.5;
+          ctx.setLineDash([7, 5]);
+          drawPath(entry.points);
+          ctx.setLineDash([]);
+          ctx.globalAlpha = 1;
+          continue;
+        }}
         const physicalWidth = entry.role === 'fiber'
           ? Number(lineWidths.fiber || 1.0)
           : Number(lineWidths.resin || 2.0);
         ctx.lineWidth = usePhysicalWidth
           ? Math.max(1.0, physicalWidth * viewport.pixelsPerMm)
           : entry.role === 'fiber' ? 2.0 : 1.7;
-        drawPath(entry.points);
+        if (
+          extrusionRange !== null
+          && entry.role !== 'fiber'
+          && Array.isArray(entry.extrusion)
+          && entry.extrusion.length === entry.points.length
+        ) {{
+          drawExtrusionPath(entry.points, entry.extrusion, pathColor(entry.role));
+        }} else {{
+          ctx.strokeStyle = pathColor(entry.role);
+          drawPath(entry.points);
+        }}
       }}
       if (currentEntry && showPathPointsInput.checked) {{
         drawPathPoints(ctx, currentEntry.points, pathColor(currentEntry.role), viewport.project);
@@ -2490,7 +3175,9 @@ def _index_html() -> str:
       showOuterContourInput,
       showInnerContourInput,
       showResinInfillInput,
-      showFiberPathsInput
+      showRaftPathsInput,
+      showFiberPathsInput,
+      showTravelPathsInput
     ]) {{
       input.addEventListener('change', () => {{
         updatePathSlider();
@@ -2498,6 +3185,7 @@ def _index_html() -> str:
       }});
     }}
     showLineWidthInput.addEventListener('change', drawPreview);
+    showExtrusionInput.addEventListener('change', drawPreview);
     showPathPointsInput.addEventListener('change', drawPreview);
     showDirectionInput.addEventListener('change', drawPreview);
     window.addEventListener('resize', drawPreview);

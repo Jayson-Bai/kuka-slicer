@@ -18,7 +18,7 @@ from shapely.geometry import (
 from shapely.ops import linemerge, nearest_points, unary_union
 from shapely.strtree import STRtree
 
-from .external_npz import ExternalSourceJob, Material, MaterialPaths
+from .external_npz import ExternalSourceJob, Material, MaterialPaths, TravelPaths
 from .stl_io import Mesh
 
 CurveMode = Literal["flat", "sinusoidal"]
@@ -39,7 +39,7 @@ InfillPattern = Literal[
     "isotropic",
 ]
 BuildAxis = Literal["x", "y", "z"]
-SlicingKernel = Literal["legacy", "pyslm"]
+SlicingKernel = Literal["legacy", "pyslm", "prusa"]
 PySLMHatcher = Literal["basic", "stripe", "island", "basic_island"]
 PySLMHatchSort = Literal["none", "alternate", "unidirectional", "linear", "directional"]
 PySLMSimplificationMode = Literal["absolute", "bound"]
@@ -220,6 +220,101 @@ class PySLMConfig:
                 raise ValueError(f"pyslm {name} must be non-negative")
 
 
+@dataclass(frozen=True)
+class PrusaRaftConfig:
+    """Prusa FFF raft settings, kept independent from the legacy raft board."""
+
+    layer_count: int = 0
+    expansion: float = 3.0
+    first_layer_density: float = 80.0
+    first_layer_expansion: float = 3.0
+    contact_distance: float = 0.25
+
+    def __post_init__(self) -> None:
+        if self.layer_count < 0:
+            raise ValueError("prusa raft layer_count must be non-negative")
+        for name, value in (
+            ("expansion", self.expansion),
+            ("first_layer_expansion", self.first_layer_expansion),
+            ("contact_distance", self.contact_distance),
+        ):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"prusa raft {name} must be non-negative")
+        if (
+            not math.isfinite(self.first_layer_density)
+            or not 10.0 <= self.first_layer_density <= 100.0
+        ):
+            raise ValueError("prusa raft first_layer_density must be in [10, 100]")
+
+    def to_metadata(self) -> dict[str, int | float]:
+        return {
+            "layer_count": self.layer_count,
+            "expansion": self.expansion,
+            "first_layer_density": self.first_layer_density,
+            "first_layer_expansion": self.first_layer_expansion,
+            "contact_distance": self.contact_distance,
+        }
+
+
+@dataclass(frozen=True)
+class PrusaGeometryConfig:
+    """Advanced Prusa controls kept separate from Legacy and PySLM options."""
+
+    perimeter_generator: Literal["arachne", "classic"] = "arachne"
+    gap_fill_enabled: bool = True
+    infill_anchor: float | None = None
+    infill_anchor_max: float | None = None
+    external_perimeter_width: float | None = None
+    perimeter_width: float | None = None
+    infill_width: float | None = None
+    xy_size_compensation: float = 0.0
+    elephant_foot_compensation: float = 0.0
+    avoid_crossing_max_detour: float = 0.0
+    seam_position: Literal["aligned", "nearest", "rear", "random"] = "aligned"
+
+    def __post_init__(self) -> None:
+        if self.perimeter_generator not in ("arachne", "classic"):
+            raise ValueError("prusa perimeter_generator must be arachne or classic")
+        if self.seam_position not in ("aligned", "nearest", "rear", "random"):
+            raise ValueError("unsupported prusa seam_position")
+        for name, value in (
+            ("infill_anchor", self.infill_anchor),
+            ("infill_anchor_max", self.infill_anchor_max),
+        ):
+            if value is not None and (not math.isfinite(value) or value < 0):
+                raise ValueError(f"prusa {name} must be non-negative")
+        for name, value in (
+            ("external_perimeter_width", self.external_perimeter_width),
+            ("perimeter_width", self.perimeter_width),
+            ("infill_width", self.infill_width),
+        ):
+            if value is not None and (not math.isfinite(value) or value <= 0):
+                raise ValueError(f"prusa {name} must be positive")
+        if not math.isfinite(self.xy_size_compensation):
+            raise ValueError("prusa xy_size_compensation must be finite")
+        for name, value in (
+            ("elephant_foot_compensation", self.elephant_foot_compensation),
+            ("avoid_crossing_max_detour", self.avoid_crossing_max_detour),
+        ):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"prusa {name} must be non-negative")
+
+    def to_metadata(self) -> dict[str, str | bool | float | None]:
+        return {
+            "perimeter_generator": self.perimeter_generator,
+            "gap_fill_enabled": self.gap_fill_enabled,
+            "infill_anchor": self.infill_anchor,
+            "infill_anchor_max": self.infill_anchor_max,
+            "external_perimeter_width": self.external_perimeter_width,
+            "perimeter_width": self.perimeter_width,
+            "infill_width": self.infill_width,
+            "xy_size_compensation": self.xy_size_compensation,
+            "elephant_foot_compensation": self.elephant_foot_compensation,
+            "avoid_crossing_max_detour": self.avoid_crossing_max_detour,
+            "seam_position": self.seam_position,
+        }
+
+
 def recommended_geometry_tolerance(layer_height: float, line_width: float) -> float:
     print_scale = min(layer_height, line_width)
     tolerance = print_scale * 0.001
@@ -243,6 +338,8 @@ class SliceConfig:
     build_axis: BuildAxis = "z"
     slicing_kernel: SlicingKernel = "legacy"
     pyslm: PySLMConfig = field(default_factory=PySLMConfig)
+    prusa_raft: PrusaRaftConfig = field(default_factory=PrusaRaftConfig)
+    prusa_geometry: PrusaGeometryConfig = field(default_factory=PrusaGeometryConfig)
     perimeter_count: int = DEFAULT_RESIN_PERIMETER_COUNT
     print_perimeters: bool = True
     triangle_path_optimization: bool = True
@@ -316,8 +413,8 @@ class SliceConfig:
             )
         if self.build_axis not in ("x", "y", "z"):
             raise ValueError("build_axis must be x, y, or z")
-        if self.slicing_kernel not in ("legacy", "pyslm"):
-            raise ValueError("slicing_kernel must be legacy or pyslm")
+        if self.slicing_kernel not in ("legacy", "pyslm", "prusa"):
+            raise ValueError("slicing_kernel must be legacy, pyslm, or prusa")
         if self.perimeter_count < 1:
             raise ValueError("perimeter_count must be at least 1")
 
@@ -395,6 +492,10 @@ def slice_mesh_to_job(mesh: Mesh, config: SliceConfig) -> ExternalSourceJob:
         job = slice_mesh_to_job_with_pyslm(mesh, backend_config)
         _record_line_width_contract(job, backend_config, planning_applied=False)
         return job
+    if config.slicing_kernel == "prusa":
+        from .prusa_backend import slice_mesh_to_job_with_prusa
+
+        return slice_mesh_to_job_with_prusa(mesh, config)
     job = _slice_mesh_to_job_legacy(mesh, config)
     _record_line_width_contract(job, config, planning_applied=True)
     return job
@@ -867,8 +968,16 @@ def add_raft_to_job(
             group.layer_index + raft_count,
             group.material,
             [_shift_path_z(path, z_shift) for path in group.paths],
+            group.extrusion,
         )
         for group in job.material_paths
+    ]
+    shifted_travel = [
+        TravelPaths(
+            group.layer_index + raft_count,
+            [_shift_path_z(path, z_shift) for path in group.paths],
+        )
+        for group in job.travel_paths
     ]
 
     path_roles = job.meta.setdefault("path_roles", {})
@@ -904,6 +1013,7 @@ def add_raft_to_job(
 
     job.material_paths = raft_groups + shifted_groups
     job.material_paths.sort(key=lambda group: (group.layer_index, 0 if group.material == "R" else 1))
+    job.travel_paths = shifted_travel
     job.meta["raft"] = {
         "layer_count": raft_count,
         "top_gap": top_gap,
@@ -948,6 +1058,10 @@ def normalize_job_xy_origin(job: ExternalSourceJob) -> tuple[float, float]:
         return (0.0, 0.0)
 
     for group in job.material_paths:
+        for path in group.paths:
+            path[:, 0] -= np.float32(min_x)
+            path[:, 1] -= np.float32(min_y)
+    for group in job.travel_paths:
         for path in group.paths:
             path[:, 0] -= np.float32(min_x)
             path[:, 1] -= np.float32(min_y)

@@ -62,9 +62,9 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=None,
         help=(
-            "measured flattened resin width used only for Prusa toolpath spacing, "
-            "overlap, and deposited-width checks; defaults to --line-width and "
-            "does not change the NPZ nominal line width or extrusion multiplier"
+            "measured flattened resin width used only by the legacy planner for "
+            "spacing, overlap, and deposited-width checks; defaults to --line-width "
+            "and does not change the NPZ nominal line width or extrusion multiplier"
         ),
     )
     slice_parser.add_argument("--z-min", type=float)
@@ -78,9 +78,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     slice_parser.add_argument(
         "--slicing-kernel",
-        choices=["legacy", "pyslm"],
+        choices=["legacy", "prusa", "pyslm"],
         default="legacy",
-        help="toolpath kernel; pyslm is independent and requires optional dependencies",
+        help="toolpath kernel; prusa requires the compiled native bridge, pyslm requires optional dependencies",
     )
     slice_parser.add_argument(
         "--pyslm-hatcher",
@@ -138,6 +138,7 @@ def main(argv: list[str] | None = None) -> int:
             "zigzag_vertical",
             "zigzag_plus45",
             "zigzag_minus45",
+            "isotropic",
             "triangles",
             "concentric",
         ],

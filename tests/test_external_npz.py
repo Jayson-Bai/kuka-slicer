@@ -6,6 +6,7 @@ from kuka_slicer.external_npz import (
     DEFAULT_EXPORT_CHORD_TOLERANCE_MM,
     ExternalSourceJob,
     MaterialPaths,
+    TravelPaths,
     paths_to_padded_array,
     simplify_path_for_export,
     write_external_source_npz,
@@ -34,18 +35,27 @@ def test_write_external_source_npz(tmp_path):
                 0,
                 "R",
                 [np.asarray([[0, 0, 0.5], [1, 0, 0.5]], dtype=np.float32)],
+                extrusion=[np.asarray([0.0, 1.25], dtype=np.float32)],
             )
-        ]
+        ],
+        travel_paths=[
+            TravelPaths(
+                0,
+                [np.asarray([[1, 0, 0.5], [2, 1, 0.5]], dtype=np.float32)],
+            )
+        ],
     )
 
     write_external_source_npz(job, output)
 
     with np.load(output, allow_pickle=False) as archive:
-        assert set(archive.files) == {"meta", "layer_0000_R"}
+        assert set(archive.files) == {"meta", "layer_0000_R", "layer_0000_R_E", "layer_0000_T"}
         meta = json.loads(str(archive["meta"]))
         assert meta["format"] == "external_layer_paths_v1"
         assert meta["path_sampling"]["straight_segments"] == "endpoints_only"
         assert archive["layer_0000_R"].shape == (1, 2, 3)
+        assert np.allclose(archive["layer_0000_R_E"], [[0.0, 1.25]])
+        assert archive["layer_0000_T"].shape == (1, 2, 3)
 
 
 def test_export_sampling_keeps_only_straight_endpoints():

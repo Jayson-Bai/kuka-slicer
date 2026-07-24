@@ -14,6 +14,17 @@ htmlcov/
 venv/
 env/
 
+# Local PrusaSlicer source, downloaded archives, and build cache.
+deps/
+
+# Native bridge release/debug artifacts are produced locally or bundled by the
+# release workflow; keep only its source and Python package marker in Git.
+kuka_slicer/_native/*.pyd
+kuka_slicer/_native/*.dll
+kuka_slicer/_native/*.lib
+kuka_slicer/_native/*.exp
+kuka_slicer/_native/*.pdb
+
 outputs/
 tmp_json_fiber_check/
 *.log
@@ -22,3 +33,5 @@ dist/
 build/
 *.egg-info/
 *.zip
+
+.playwright-cli/*

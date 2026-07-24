@@ -7,7 +7,7 @@ from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import unary_union
 
 import kuka_slicer.slicer as slicer_module
-from kuka_slicer.external_npz import ExternalSourceJob, MaterialPaths
+from kuka_slicer.external_npz import ExternalSourceJob, MaterialPaths, TravelPaths
 from kuka_slicer.slicer import (
     DEFAULT_FIBER_LAYER_HEIGHT_MM,
     DEFAULT_FIBER_LINE_WIDTH_MM,
@@ -16,6 +16,8 @@ from kuka_slicer.slicer import (
     DEFAULT_RESIN_LAYER_HEIGHT_MM,
     DEFAULT_RESIN_LINE_WIDTH_MM,
     DEFAULT_RESIN_PLANNING_LINE_WIDTH_MM,
+    PrusaGeometryConfig,
+    PrusaRaftConfig,
     RaftLayerConfig,
     SliceConfig,
     _build_resin_paths,
@@ -49,6 +51,8 @@ from kuka_slicer.stl_io import Mesh
 from kuka_slicer.ui_server import (
     DEFAULT_UI_RESIN_INFILL_OVERLAP_PERCENT,
     _index_html,
+    _parse_prusa_slice_config,
+    _resolved_slice_config,
     _preview_payload,
     _raft_layers_from_params,
     _simplify_preview_path,
@@ -158,6 +162,29 @@ def test_first_layer_height_carries_into_the_fiber_resin_schedule():
         [fiber_paths_by_layer[layer_index][0][0][2] for layer_index in sorted(fiber_paths_by_layer)],
         [0.4, 1.0],
     )
+
+
+def test_fiber_template_skips_prusa_raft_layers():
+    raft = np.asarray([[0.0, 0.0, 0.5], [1.0, 0.0, 0.5]], dtype=np.float32)
+    first_part = np.asarray([[0.0, 0.0, 1.0], [1.0, 0.0, 1.0]], dtype=np.float32)
+    final_part = np.asarray([[0.0, 0.0, 1.5], [1.0, 0.0, 1.5]], dtype=np.float32)
+    job = ExternalSourceJob(
+        material_paths=[
+            MaterialPaths(0, "R", [raft]),
+            MaterialPaths(1, "R", [first_part]),
+            MaterialPaths(2, "R", [final_part]),
+        ],
+        meta={"slicing": {"prusa_raft": {"layer_count": 1}}},
+    )
+    template_paths = [[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]]
+
+    fiber_paths_by_layer = expand_fiber_template_for_resin_layers(job, template_paths)
+
+    assert np.allclose(job.material_paths[0].paths[0][:, 2], 0.5)
+    assert np.allclose(job.material_paths[1].paths[0][:, 2], 1.0)
+    assert np.allclose(job.material_paths[2].paths[0][:, 2], 1.6)
+    assert sorted(fiber_paths_by_layer) == [1]
+    assert np.allclose(fiber_paths_by_layer[1][0][0][2], 1.1)
 
 
 def test_fiber_json_merges_multiple_path_families_at_the_same_layer_height(
@@ -659,15 +686,28 @@ def test_preview_payload_uses_slim_role_aware_layer_schema_and_complete_bounds()
         [[-2, 2, 0.6], [12, 2, 0.6]],
         dtype=np.float32,
     )
+    travel = np.asarray(
+        [[0, 1, 0.5], [10, 1, 0.5]],
+        dtype=np.float32,
+    )
     job = ExternalSourceJob(
         material_paths=[
             MaterialPaths(0, "R", [resin_outer, resin_inner, resin_infill]),
             MaterialPaths(0, "F", [fiber]),
         ],
+        travel_paths=[TravelPaths(0, [travel])],
         meta={
             "path_roles": {
                 "R": {"0": ["outer_contour", "inner_contour", "infill"]}
-            }
+            },
+            "motion_order": {
+                "0": [
+                    {"kind": "deposit", "index": 0},
+                    {"kind": "travel", "index": 0},
+                    {"kind": "deposit", "index": 1},
+                    {"kind": "deposit", "index": 2},
+                ]
+            },
         },
     )
 
@@ -685,7 +725,9 @@ def test_preview_payload_uses_slim_role_aware_layer_schema_and_complete_bounds()
     }
     assert len(preview["layers"]) == 1
     layer = preview["layers"][0]
-    assert set(layer) == {"index", "resin_paths", "fiber_paths"}
+    assert set(layer) == {
+        "index", "resin_paths", "fiber_paths", "travel_paths", "motion_paths"
+    }
     assert layer["index"] == 0
     assert [entry["role"] for entry in layer["resin_paths"]] == [
         "outer_contour",
@@ -694,6 +736,11 @@ def test_preview_payload_uses_slim_role_aware_layer_schema_and_complete_bounds()
     ]
     assert layer["resin_paths"][2]["points"] == resin_infill.tolist()
     assert layer["fiber_paths"] == [fiber.tolist()]
+    assert layer["travel_paths"] == [travel.tolist()]
+    assert [entry["kind"] for entry in layer["motion_paths"]] == [
+        "deposit", "travel", "deposit", "deposit"
+    ]
+    assert layer["motion_paths"][1]["points"] == travel.tolist()
     assert preview["bounds"] == {
         "min_x": -2.0,
         "max_x": 12.0,
@@ -702,6 +749,33 @@ def test_preview_payload_uses_slim_role_aware_layer_schema_and_complete_bounds()
         "min_z": 0.5,
         "max_z": pytest.approx(0.6),
     }
+
+
+def test_preview_keeps_prusa_extrusion_values_aligned_with_resin_paths():
+    resin_path = np.asarray(
+        [[0, 0, 0.5], [4, 0, 0.5], [4, 3, 0.5]],
+        dtype=np.float32,
+    )
+    job = ExternalSourceJob(
+        material_paths=[
+            MaterialPaths(
+                0,
+                "R",
+                [resin_path],
+                extrusion=[np.asarray([10.0, 11.0, 12.5], dtype=np.float64)],
+            )
+        ]
+    )
+
+    preview = _preview_payload(
+        Mesh(_cube_triangles(size=10.0)),
+        SliceConfig(line_width=2.0),
+        job,
+    )
+
+    entry = preview["layers"][0]["resin_paths"][0]
+    assert entry["points"] == resin_path.tolist()
+    assert entry["extrusion"] == [10.0, 11.0, 12.5]
 
 
 def test_isotropic_infill_explicit_z_bounds_keep_four_direction_schedule():
@@ -3657,6 +3731,33 @@ def test_pyslm_backend_never_receives_prusa_planning_width(monkeypatch):
     assert slicing["perimeter_spacing_uses_nominal_line_width"] is False
 
 
+def test_prusa_kernel_uses_full_native_path_backend(monkeypatch):
+    import kuka_slicer.prusa_backend as prusa_backend
+
+    received: list[SliceConfig] = []
+    deposited = np.asarray([[1.0, 2.0, 0.5], [3.0, 2.0, 0.5]], dtype=np.float32)
+    travel = np.asarray([[3.0, 2.0, 0.5], [4.0, 2.0, 0.5]], dtype=np.float32)
+
+    def fake_backend(mesh: Mesh, config: SliceConfig) -> ExternalSourceJob:
+        received.append(config)
+        return ExternalSourceJob(
+            material_paths=[MaterialPaths(0, "R", [deposited], [np.asarray([0.0, 1.0])])],
+            travel_paths=[TravelPaths(0, [travel])],
+            meta={"slicing": {"slicing_kernel": "prusa", "path_planner": "prusa_fff"}},
+        )
+
+    monkeypatch.setattr(prusa_backend, "slice_mesh_to_job_with_prusa", fake_backend)
+    job = slice_mesh_to_job(
+        Mesh(_cube_triangles(size=10.0)),
+        SliceConfig(slicing_kernel="prusa", planning_line_width=2.3),
+    )
+
+    assert received and received[0].planning_line_width == 2.3
+    assert job.material_paths[0].extrusion is not None
+    assert np.array_equal(job.material_paths[0].extrusion[0], [0.0, 1.0])
+    assert np.array_equal(job.travel_paths[0].paths[0], travel)
+
+
 def test_slice_config_defaults_to_legacy_kernel():
     assert SliceConfig().slicing_kernel == "legacy"
 
@@ -3807,191 +3908,215 @@ def test_ui_uses_prusaslicer_style_infill_pattern_names():
 def test_ui_exposes_slicing_kernel_input():
     html = _index_html()
 
-    for translated_label in (
-        "机械臂空间复合材料增材制造系统切片器",
-        "模型切片",
-        "切片内核",
-        ">Prusa<",
-        ">PySLM<",
-        "PySLM 原生扫描参数",
-        "PySLM 填充策略",
-        "条带/岛状参数（自动）",
-        "自动设置条带/岛状参数",
-        "扫描线排序",
-        "填充角度 °",
-        "层间角度增量 °",
-        "填充线间距 mm",
-        "轮廓偏移 mm",
-        "光斑补偿 mm",
-        "体积填充偏移 mm",
-        "外轮廓数量",
-        "内轮廓数量",
-        "条带宽度 mm",
-        "条带平移系数",
-        "岛状宽度 mm",
-        "岛状平移系数",
-        "切层边界简化 mm",
-        "简化模式",
-        "轮廓优先扫描",
-        "修复切层多边形",
-        "保持拓扑结构",
-        "名义树脂线宽 mm",
-        "实测压平线宽 mm",
-        "首层层高 mm",
-        "不会改变挤出倍率",
-        "树脂填充路径",
-        "横向 Zigzag",
-        "竖向 Zigzag",
-        "+45° Zigzag",
-        "-45° Zigzag",
-        "各向同性填充",
-        "三角填充",
-        "同心轮廓填充",
-        "三角形填充路径优化",
-        "之字形填充路径优化",
-    ):
-        assert translated_label in html
-
-    for untranslated_label in (
-        "KUKA Slicer",
-        "树脂切片",
-        "原始内核（稳定）",
-        "PySLM（实验）",
-        "Slicing kernel",
-        "Legacy (stable)",
-        "PySLM (experimental)",
-        "PySLM native settings",
-        "Hatcher strategy",
-        "Hatch sort",
-        "Hatch angle deg",
-        "Layer angle increment deg",
-        "Hatch distance mm",
-        "Contour offset mm",
-        "Spot compensation mm",
-        "Volume offset hatch mm",
-        "Outer contours",
-        "Inner contours",
-        "Slice simplification mm",
-        "Simplification mode",
-        "Scan contours first",
-        "Fix slice polygons",
-        "Preserve topology",
-    ):
-        assert untranslated_label not in html
-
-    for control_id in (
-        "stlFile",
-        "fiberJsonFile",
-        "layerHeight",
-        "buildAxis",
-        "zMin",
-        "zMax",
-        "tolerance",
-        "lineWidth",
-        "planningLineWidth",
-        "perimeterCount",
-        "infillPattern",
-        "infillSafetyNote",
-        "infillDensity",
-        "infillOverlap",
-        "contourInfillOverlap",
-        "trianglePathOptimization",
-        "zigzagPathOptimization",
-        "slicingKernel",
+    for panel_id in (
+        "prusaNativeSettings",
+        "legacyNativeSettings",
         "pyslmNativeSettings",
-        "pyslmPatternSettings",
-        "pyslmPatternAuto",
-        "legacyInfillControl",
-        "pyslmHatcher",
-        "pyslmHatchSort",
-        "pyslmHatchAngle",
-        "pyslmLayerAngleIncrement",
-        "pyslmHatchDistance",
-        "pyslmContourOffset",
-        "pyslmSpotCompensation",
-        "pyslmVolumeOffset",
-        "pyslmOuterContours",
-        "pyslmInnerContours",
-        "pyslmStripeWidth",
-        "pyslmStripeOverlap",
-        "pyslmStripeOffset",
-        "pyslmIslandWidth",
-        "pyslmIslandOverlap",
-        "pyslmIslandOffset",
-        "pyslmSimplificationFactor",
-        "pyslmSimplificationMode",
-        "pyslmScanContourFirst",
-        "pyslmFixPolygons",
-        "pyslmSimplificationPreserveTopology",
-        "printRaft",
-        "raftBottomOffset",
-        "raftSecondOffset",
-        "curveMode",
-        "curveAmplitude",
-        "curvePeriod",
-        "pathProgressControl",
-        "pathProgressSlider",
-        "pathProgressLabel",
-        "showOuterContour",
-        "showInnerContour",
-        "showResinInfill",
-        "showFiberPaths",
-        "previewLineWidthValue",
-        "printSizeLabel",
-        "previewSurface",
-        "previewCanvas",
-        "executedInfillPattern",
     ):
-        assert f'id="{control_id}"' in html
-
+        assert f'id="{panel_id}"' in html
+    assert 'value="prusa" selected>Prusa（推荐）<' in html
+    assert 'value="legacy">Legacy（兼容 / 实验）<' in html
+    assert 'value="pyslm">PySLM（实验）<' in html
+    assert 'id="prusaPerimeterCount"' in html
+    assert 'id="prusaInfillPattern"' in html
+    assert 'id="prusaEffectiveConfig"' not in html
+    assert 'id="prusaRaftEnabled"' in html
+    assert 'id="prusaRaftLayers"' in html
+    assert 'id="prusaRaftContactDistance"' in html
+    assert 'id="prusaAdvancedSettings"' in html
+    assert 'id="prusaPerimeterGenerator"' in html
+    assert 'id="prusaGapFillEnabled"' in html
+    assert 'id="prusaInfillAnchor"' in html
+    assert 'id="prusaExternalPerimeterWidth"' in html
+    assert 'id="prusaXySizeCompensation"' in html
+    assert 'id="prusaAvoidCrossingMaxDetour"' in html
+    assert 'id="prusaSeamPosition"' in html
+    assert ".span-6 { grid-column: span 6; }" in html
+    assert 'id="planningLineWidth"' in html
+    assert 'id="trianglePathOptimization"' in html
+    assert 'id="pyslmHatcher"' in html
+    assert 'id="pyslmInfillPattern"' in html
+    assert 'id="legacyProcessSettings"' in html
+    assert "setPanelState(prusaNativeSettings, !isPyslm && !isLegacy)" in html
+    assert "setPanelState(legacyNativeSettings, isLegacy)" in html
+    assert "setPanelState(pyslmNativeSettings, isPyslm)" in html
+    assert "formData.append('prusa_infill_pattern'" in html
+    assert "formData.append('prusa_raft_enabled'" in html
+    assert "formData.append('prusa_perimeter_generator'" in html
+    assert "formData.append('prusa_gap_fill_enabled'" in html
+    assert "formData.append('planning_line_width'" in html
+    assert "formData.append('pyslm_hatcher'" in html
+    assert "formData.append('pyslm_hatcher'" in html
     assert 'id="smoothingAngle"' not in html
     assert 'id="smoothingRadiusFactor"' not in html
 
-    assert "formData.append('planning_line_width'" in html
-    assert "if (slicingKernelInput.value === 'legacy')" in html
-    assert "planningLineWidthInput.disabled = isPyslm" in html
-    assert "const strictLayeredFallbackPatterns" in html
-    assert "option.disabled = isPyslm && !pyslmSupportedPatterns.has(option.value)" in html
-    assert f'value="{DEFAULT_RESIN_PLANNING_LINE_WIDTH_MM}"' in html
-    assert (
-        f'id="infillOverlap" name="infillOverlap" type="number" min="0" '
-        f'max="99" step="0.1" value="{DEFAULT_UI_RESIN_INFILL_OVERLAP_PERCENT:g}"'
-        in html
-    )
-    assert (
-        f'id="contourInfillOverlap" name="contourInfillOverlap" type="number" '
-        f'min="0" max="99" step="0.1" '
-        f'value="{DEFAULT_RESIN_CONTOUR_INFILL_OVERLAP_PERCENT:g}"'
-        in html
-    )
-    assert "formData.append('contour_infill_overlap'" in html
-    assert (
-        "formData.append('raft_offsets', raftBottomOffsetInput.value + ',' + "
-        "raftSecondOffsetInput.value)"
-        in html
-    )
-    assert 'class="helpTip"' in html
-    assert 'data-tooltip="实测压平线宽仅用于 Prusa' in html
-    assert 'value="legacy" selected' in html
-    assert 'value="pyslm"' in html
-    assert 'id="trianglePathOptimization" type="checkbox" checked' in html
-    assert 'id="printRaft" type="checkbox" checked' in html
-    assert "formData.append('print_raft'" in html
-    for hatcher in ("basic", "stripe", "island", "basic_island"):
-        assert f'value="{hatcher}"' in html
-    for removed_raft_control in (
-        "raftOffsets",
-        "raftLayerCount",
-        "raftTopGap",
-        "raftLayerHeights",
-        "raftInfillDensities",
-        "raftInfillPatterns",
+
+def test_prusa_ui_uses_dense_grouped_settings_layout():
+    html = _index_html()
+
+    assert '.prusaSettingsGrid {' in html
+    assert 'repeat(auto-fit, minmax(148px, 1fr))' in html
+    assert 'id="prusaRaftSettings"' in html
+    assert 'prusaRaftSettings.hidden = !prusaRaftEnabled;' in html
+    assert '<h4>轮廓与尺寸</h4>' in html
+    assert '<h4>填充连接</h4>' in html
+    assert '<h4>空移与接缝</h4>' in html
+    assert 'id="prusaEffectiveConfig"' not in html
+
+
+def test_prusa_parameter_labels_offer_hover_help():
+    html = _index_html()
+
+    assert '.tooltipLabel[data-tooltip]::after {' in html
+    for control_id in (
+        "prusaPerimeterCount",
+        "prusaRaftEnabled",
+        "prusaPerimeterGenerator",
+        "prusaExternalPerimeterWidth",
+        "prusaInfillAnchor",
+        "prusaAvoidCrossingMaxDetour",
     ):
-        assert f'id="{removed_raft_control}"' not in html
-    assert "bottomCapAngle" not in html
-    assert "topCapAngle" not in html
-    assert 'id="resinPathSlider"' not in html
-    assert 'id="fiberPathSlider"' not in html
+        label_start = html.index(f'for="{control_id}"')
+        label_end = html.index(">", label_start)
+        label_markup = html[label_start:label_end]
+        assert "tooltipLabel" in label_markup
+        assert "data-tooltip=" in label_markup
+
+
+def test_prusa_config_ignores_legacy_path_parameters_and_reports_effective_values():
+    shared = {
+        "layer_height": 0.5,
+        "first_layer_height": 0.5,
+        "line_width": 2.0,
+        "z_min": None,
+        "z_max": None,
+        "tolerance": 0.001,
+    }
+    config = _parse_prusa_slice_config(
+        {
+            "prusa_perimeter_count": ["3"],
+            "prusa_infill_density": ["62"],
+            "prusa_infill_pattern": ["isotropic"],
+            "prusa_contour_infill_overlap": ["8"],
+            "planning_line_width": ["99"],
+            "infill_overlap": ["77"],
+            "triangle_path_optimization": ["false"],
+        },
+        shared,
+        "z",
+    )
+
+    assert config.slicing_kernel == "prusa"
+    assert config.planning_line_width is None
+    assert config.infill_overlap == DEFAULT_RESIN_INFILL_OVERLAP_PERCENT
+    assert config.triangle_path_optimization is True
+    assert _resolved_slice_config(config) == {
+        "kernel": "prusa",
+        "layer_height": 0.5,
+        "first_layer_height": 0.5,
+        "line_width": 2.0,
+        "build_axis": "z",
+        "z_min": None,
+        "z_max": None,
+        "tolerance": 0.001,
+        "perimeter_count": 3,
+        "print_perimeters": True,
+        "infill_pattern": "isotropic",
+        "infill_density": 62.0,
+        "contour_infill_overlap": 8.0,
+        "path_backend": "prusa_fff",
+        "prusa_perimeter_infill_overlap": 8.0,
+        "prusa_raft": {
+            "layer_count": 0,
+            "expansion": 3.0,
+            "first_layer_density": 80.0,
+            "first_layer_expansion": 3.0,
+            "contact_distance": 0.25,
+        },
+        "prusa_geometry": PrusaGeometryConfig().to_metadata(),
+    }
+
+
+def test_prusa_config_reads_detachable_native_raft_settings():
+    shared = {
+        "layer_height": 0.5,
+        "first_layer_height": 0.5,
+        "line_width": 2.0,
+        "z_min": None,
+        "z_max": None,
+        "tolerance": 0.001,
+    }
+
+    config = _parse_prusa_slice_config(
+        {
+            "prusa_raft_enabled": ["true"],
+            "prusa_raft_layers": ["3"],
+            "prusa_raft_expansion": ["3"],
+            "prusa_raft_first_layer_density": ["80"],
+            "prusa_raft_first_layer_expansion": ["3"],
+            "prusa_raft_contact_distance": ["0.25"],
+        },
+        shared,
+        "z",
+    )
+
+    assert config.prusa_raft == PrusaRaftConfig(
+        layer_count=3,
+        expansion=3.0,
+        first_layer_density=80.0,
+        first_layer_expansion=3.0,
+        contact_distance=0.25,
+    )
+    assert _resolved_slice_config(config)["prusa_raft"] == {
+        "layer_count": 3,
+        "expansion": 3.0,
+        "first_layer_density": 80.0,
+        "first_layer_expansion": 3.0,
+        "contact_distance": 0.25,
+    }
+
+
+def test_prusa_config_reads_advanced_native_geometry_and_path_settings():
+    shared = {
+        "layer_height": 0.5,
+        "first_layer_height": 0.5,
+        "line_width": 2.0,
+        "z_min": None,
+        "z_max": None,
+        "tolerance": 0.001,
+    }
+    config = _parse_prusa_slice_config(
+        {
+            "prusa_perimeter_generator": ["classic"],
+            "prusa_gap_fill_enabled": ["false"],
+            "prusa_infill_anchor": ["2"],
+            "prusa_infill_anchor_max": ["6"],
+            "prusa_external_perimeter_width": ["1.8"],
+            "prusa_perimeter_width": ["1.9"],
+            "prusa_infill_width": ["2.1"],
+            "prusa_xy_size_compensation": ["0.15"],
+            "prusa_elephant_foot_compensation": ["0.05"],
+            "prusa_avoid_crossing_max_detour": ["12"],
+            "prusa_seam_position": ["rear"],
+        },
+        shared,
+        "z",
+    )
+
+    assert config.prusa_geometry == PrusaGeometryConfig(
+        perimeter_generator="classic",
+        gap_fill_enabled=False,
+        infill_anchor=2.0,
+        infill_anchor_max=6.0,
+        external_perimeter_width=1.8,
+        perimeter_width=1.9,
+        infill_width=2.1,
+        xy_size_compensation=0.15,
+        elephant_foot_compensation=0.05,
+        avoid_crossing_max_detour=12.0,
+        seam_position="rear",
+    )
+    assert _resolved_slice_config(config)["prusa_geometry"] == config.prusa_geometry.to_metadata()
 
 
 def test_ui_uses_compact_portrait_band_layout():
@@ -4031,9 +4156,11 @@ def test_ui_result_summary_reports_backend_kernel_and_planning_width():
         '<span>实际规划线宽（仅轨迹规划）</span>'
         '<strong id="executedPlanningLineWidth">-</strong>'
     ) in html
-    assert "executedKernelEl.textContent = result.slicing_kernel" in html
+    assert "result.slicing_kernel === 'prusa'" in html
+    assert "Prusa 完整路径内核" in html
     assert "executedPlanningLineWidth = Number(result.planning_line_width)" in html
     assert "不适用（PySLM 后端自行控制）" in html
+    assert "不适用（Prusa 使用名义线宽）" in html
     assert '<span>实际填充策略</span><strong id="executedInfillPattern">-</strong>' in html
     assert "const patternExecution = result.infill_pattern_execution" in html
     assert "安全分层单向之字形" in html
@@ -4047,6 +4174,41 @@ def test_ui_preview_labels_the_exact_planning_width_used_for_rendering():
     assert "previewData?.line_widths?.resin" in html
     assert "planningLineWidthInput.addEventListener('input'" in html
     assert "updatePreviewLineWidthValue();" in html
+
+
+def test_ui_offers_an_optional_extrusion_color_mapping():
+    html = _index_html()
+
+    assert 'id="showExtrusion" type="checkbox"' in html
+    assert 'id="extrusionColorLegend"' in html
+    assert "showExtrusionInput.checked" in html
+    assert "extrusionColorForSegment" in html
+    assert "ΔE / Δs" in html
+
+
+def test_ui_offers_a_visible_gray_blue_dashed_travel_layer():
+    html = _index_html()
+
+    assert 'id="showTravelPaths" type="checkbox" checked' in html
+    assert "空移 Travel" in html
+    assert "layer.travel_paths" in html
+    assert "ctx.setLineDash([7, 5])" in html
+
+
+def test_ui_preserves_prusa_raft_as_a_separate_preview_role():
+    html = _index_html()
+
+    assert 'id="showRaftPaths" type="checkbox" checked' in html
+    assert "Prusa 筏层" in html
+    assert "role === 'raft'" in html
+    assert "if (role === 'raft') return '#7f5539';" in html
+
+
+def test_ui_path_progress_uses_the_unified_motion_timeline():
+    html = _index_html()
+
+    assert "layer.motion_paths" in html
+    assert "entry.kind === 'travel'" in html
 
 
 def test_ui_preview_supports_filtered_ordered_progress_pan_zoom_and_rulers():
