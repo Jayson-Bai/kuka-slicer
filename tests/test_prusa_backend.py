@@ -113,13 +113,76 @@ def test_prusa_backend_forwards_native_detachable_raft_configuration(monkeypatch
     assert received["raft_first_layer_density"] == 80.0
     assert received["raft_first_layer_expansion"] == 3.0
     assert received["raft_contact_distance"] == 0.25
+    assert received["raft_contact_layer_height"] == 0.0
+    assert received["raft_contact_density"] == 0.0
+    assert received["raft_contact_extrusion_width"] == 0.0
     assert job.meta["slicing"]["prusa_raft"] == {
         "layer_count": 3,
         "expansion": 3.0,
         "first_layer_density": 80.0,
         "first_layer_expansion": 3.0,
         "contact_distance": 0.25,
+        "contact_auto": True,
+        "contact_layer_height": 0.75,
+        "contact_density": 100.0,
+        "contact_extrusion_width": 1.5,
     }
+
+
+def test_prusa_backend_can_merge_brim_with_project_connector(monkeypatch):
+    class Native:
+        def slice_print_paths(self, vertices, faces, **kwargs):
+            return {
+                "layers": [
+                    {
+                        "z": 0.5,
+                        "paths": [
+                            [[0.0, 0.0, 0.5], [1.0, 0.0, 0.5]],
+                            [[2.0, 0.0, 0.5], [3.0, 0.0, 0.5]],
+                            [[4.0, 0.0, 0.5], [5.0, 0.0, 0.5]],
+                        ],
+                        "extrusion": [[0.0, 1.0], [1.0, 2.0], [2.0, 3.0]],
+                        "roles": ["brim", "brim", "brim"],
+                        "travel": [
+                            [[1.0, 0.0, 0.5], [2.0, 0.0, 0.5]],
+                            [[3.0, 0.0, 0.5], [4.0, 0.0, 0.5]],
+                        ],
+                        "motions": [
+                            {"kind": "deposit", "index": 0},
+                            {"kind": "travel", "index": 0},
+                            {"kind": "deposit", "index": 1},
+                            {"kind": "travel", "index": 1},
+                            {"kind": "deposit", "index": 2},
+                        ],
+                    }
+                ]
+            }
+
+    monkeypatch.setattr("kuka_slicer.prusa_backend.require_native", lambda: Native())
+    monkeypatch.setattr(
+        "kuka_slicer.prusa_backend._connect_brim_paths_one_stroke",
+        lambda paths, line_width, tolerance: [
+            np.vstack(paths).astype(np.float32)
+        ],
+    )
+    job = slice_mesh_to_job_with_prusa(
+        Mesh(_cube_triangles(10.0)),
+        SliceConfig(
+            slicing_kernel="prusa",
+            layer_height=0.5,
+            first_layer_height=0.5,
+            line_width=2.0,
+            brim_enabled=True,
+            brim_one_stroke=True,
+        ),
+    )
+
+    group = job.material_paths[0]
+    assert len(group.paths) == 1
+    assert len(group.extrusion or []) == 1
+    assert job.meta["slicing"]["prusa_brim"]["one_stroke"] is True
+    assert job.travel_paths == []
+    assert job.meta["motion_order"] == {"0": [{"kind": "deposit", "index": 0}]}
 
 
 def test_prusa_backend_forwards_native_geometry_and_path_controls(monkeypatch):

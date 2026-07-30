@@ -188,6 +188,8 @@ std::string upper_copy(std::string value)
 std::string path_role_from_gcode_type(const std::string &type)
 {
     const std::string upper = upper_copy(type);
+    if (upper.find("BRIM") != std::string::npos)
+        return "brim";
     if (upper.find("SUPPORT MATERIAL") != std::string::npos)
         return "raft";
     if (upper.find("EXTERNAL PERIMETER") != std::string::npos)
@@ -409,6 +411,9 @@ py::dict slice_print_paths(
     double raft_first_layer_density,
     double raft_first_layer_expansion,
     double raft_contact_distance,
+    double raft_contact_layer_height,
+    double raft_contact_density,
+    double raft_contact_extrusion_width,
     const std::string &perimeter_generator,
     bool gap_fill_enabled,
     const std::optional<double> &infill_anchor,
@@ -419,24 +424,34 @@ py::dict slice_print_paths(
     double xy_size_compensation,
     double elephant_foot_compensation,
     double avoid_crossing_max_detour,
-    const std::string &seam_position)
+    const std::string &seam_position,
+    bool brim_enabled,
+    double brim_width,
+    const std::string &brim_type,
+    double brim_separation)
 {
     if (!std::isfinite(layer_height) || !std::isfinite(first_layer_height) || !std::isfinite(line_width) || !std::isfinite(infill_density) || !std::isfinite(perimeter_infill_overlap) ||
         !std::isfinite(raft_expansion) || !std::isfinite(raft_first_layer_density) || !std::isfinite(raft_first_layer_expansion) || !std::isfinite(raft_contact_distance) ||
+        !std::isfinite(raft_contact_layer_height) || !std::isfinite(raft_contact_density) || !std::isfinite(raft_contact_extrusion_width) ||
         !std::isfinite(xy_size_compensation) || !std::isfinite(elephant_foot_compensation) || !std::isfinite(avoid_crossing_max_detour) ||
+        !std::isfinite(brim_width) || !std::isfinite(brim_separation) ||
         layer_height <= 0.0 || line_width <= 0.0 || perimeter_count < 0 ||
         infill_density < 0.0 || infill_density > 100.0 ||
         perimeter_infill_overlap < 0.0 || perimeter_infill_overlap >= 100.0 ||
         raft_layers < 0 || raft_expansion < 0.0 ||
         raft_first_layer_density < 10.0 || raft_first_layer_density > 100.0 ||
         raft_first_layer_expansion < 0.0 || raft_contact_distance < 0.0 ||
-        elephant_foot_compensation < 0.0 || avoid_crossing_max_detour < 0.0)
+        raft_contact_layer_height < 0.0 || raft_contact_density < 0.0 || raft_contact_density > 100.0 || raft_contact_extrusion_width < 0.0 ||
+        elephant_foot_compensation < 0.0 || avoid_crossing_max_detour < 0.0 ||
+        brim_width < 0.0 || brim_separation < 0.0)
         throw py::value_error("invalid Prusa print-path configuration");
     if (perimeter_generator != "arachne" && perimeter_generator != "classic")
         throw py::value_error("perimeter_generator must be arachne or classic");
     if (seam_position != "aligned" && seam_position != "nearest" &&
         seam_position != "rear" && seam_position != "random")
         throw py::value_error("unsupported seam_position");
+    if (brim_type != "outer_only" && brim_type != "outer_and_inner" && brim_type != "no_brim")
+        throw py::value_error("unsupported brim_type");
     for (const std::optional<double> *value : {
             &infill_anchor,
             &infill_anchor_max,
@@ -485,7 +500,9 @@ py::dict slice_print_paths(
     // resin layers during Print::validate().
     config.set_deserialize_strict("nozzle_diameter", std::to_string(line_width));
     config.set("skirts", 0);
-    config.set("brim_width", 0.0);
+    config.set("brim_width", brim_enabled ? brim_width : 0.0);
+    config.set_deserialize_strict("brim_type", brim_type);
+    config.set("brim_separation", brim_separation);
     config.set("support_material", false);
     config.set("support_material_auto", false);
     config.set("raft_layers", raft_layers);
@@ -493,6 +510,9 @@ py::dict slice_print_paths(
     config.set_deserialize_strict("raft_first_layer_density", std::to_string(raft_first_layer_density) + "%");
     config.set("raft_first_layer_expansion", raft_first_layer_expansion);
     config.set("raft_contact_distance", raft_contact_distance);
+    config.set("raft_contact_layer_height", raft_contact_layer_height);
+    config.set_deserialize_strict("raft_contact_density", std::to_string(raft_contact_density) + "%");
+    config.set("raft_contact_extrusion_width", raft_contact_extrusion_width);
     config.set("wipe_tower", false);
     config.set("avoid_crossing_perimeters", true);
     config.set_deserialize_strict("perimeter_generator", perimeter_generator);
@@ -605,6 +625,9 @@ PYBIND11_MODULE(prusa_bridge, module)
         py::arg("raft_first_layer_density") = 80.0,
         py::arg("raft_first_layer_expansion") = 3.0,
         py::arg("raft_contact_distance") = 0.25,
+        py::arg("raft_contact_layer_height") = 0.0,
+        py::arg("raft_contact_density") = 0.0,
+        py::arg("raft_contact_extrusion_width") = 0.0,
         py::arg("perimeter_generator") = "arachne",
         py::arg("gap_fill_enabled") = true,
         py::arg("infill_anchor") = std::nullopt,
@@ -615,6 +638,10 @@ PYBIND11_MODULE(prusa_bridge, module)
         py::arg("xy_size_compensation") = 0.0,
         py::arg("elephant_foot_compensation") = 0.0,
         py::arg("avoid_crossing_max_detour") = 0.0,
-        py::arg("seam_position") = "aligned",
+        py::arg("seam_position") = "random",
+        py::arg("brim_enabled") = false,
+        py::arg("brim_width") = 5.0,
+        py::arg("brim_type") = "outer_only",
+        py::arg("brim_separation") = 0.0,
         "Run the Prusa FFF path planner and return deposited XYZ/E paths plus travel XYZ paths.");
 }

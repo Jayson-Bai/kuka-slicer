@@ -74,6 +74,14 @@ GYROID_WAVELENGTH_FACTOR = 2.35
 DEFAULT_RAFT_LAYER_COUNT = 2
 DEFAULT_RAFT_OUTWARD_OFFSETS_MM = (15.0, 10.0)
 DEFAULT_RAFT_TOP_GAP_MM = 0.0
+# Native Prusa raft defaults used by the integrated UI.  The first-layer
+# expansion is an additional outward expansion on top of the regular raft
+# expansion, so 10 mm + 5 mm gives a 15 mm first raft layer.
+DEFAULT_PRUSA_RAFT_LAYER_COUNT = 2
+DEFAULT_PRUSA_RAFT_EXPANSION_MM = 10.0
+DEFAULT_PRUSA_RAFT_FIRST_LAYER_DENSITY_PERCENT = 80.0
+DEFAULT_PRUSA_RAFT_FIRST_LAYER_EXPANSION_MM = 5.0
+DEFAULT_PRUSA_RAFT_CONTACT_DISTANCE_MM = 0.25
 CONCENTRIC_RESIDUAL_GAP_TOLERANCE_MM = 0.5
 CONCENTRIC_MINIMUM_PATH_LENGTH_MM = 0.5
 RAFT_BOTTOM_ZIGZAG_ANGLE_DEGREES = 90.0
@@ -229,6 +237,10 @@ class PrusaRaftConfig:
     first_layer_density: float = 80.0
     first_layer_expansion: float = 3.0
     contact_distance: float = 0.25
+    contact_auto: bool = True
+    contact_layer_height: float = 0.75
+    contact_density: float = 100.0
+    contact_extrusion_width: float = 1.5
 
     def __post_init__(self) -> None:
         if self.layer_count < 0:
@@ -237,6 +249,8 @@ class PrusaRaftConfig:
             ("expansion", self.expansion),
             ("first_layer_expansion", self.first_layer_expansion),
             ("contact_distance", self.contact_distance),
+            ("contact_layer_height", self.contact_layer_height),
+            ("contact_extrusion_width", self.contact_extrusion_width),
         ):
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"prusa raft {name} must be non-negative")
@@ -245,6 +259,8 @@ class PrusaRaftConfig:
             or not 10.0 <= self.first_layer_density <= 100.0
         ):
             raise ValueError("prusa raft first_layer_density must be in [10, 100]")
+        if not math.isfinite(self.contact_density) or not 10.0 <= self.contact_density <= 100.0:
+            raise ValueError("prusa raft contact_density must be in [10, 100]")
 
     def to_metadata(self) -> dict[str, int | float]:
         return {
@@ -253,6 +269,10 @@ class PrusaRaftConfig:
             "first_layer_density": self.first_layer_density,
             "first_layer_expansion": self.first_layer_expansion,
             "contact_distance": self.contact_distance,
+            "contact_auto": self.contact_auto,
+            "contact_layer_height": self.contact_layer_height,
+            "contact_density": self.contact_density,
+            "contact_extrusion_width": self.contact_extrusion_width,
         }
 
 
@@ -270,7 +290,9 @@ class PrusaGeometryConfig:
     xy_size_compensation: float = 0.0
     elephant_foot_compensation: float = 0.0
     avoid_crossing_max_detour: float = 0.0
-    seam_position: Literal["aligned", "nearest", "rear", "random"] = "aligned"
+    # Randomize the contour start between layers so consecutive layers do not
+    # all begin at the same seam location.
+    seam_position: Literal["aligned", "nearest", "rear", "random"] = "random"
 
     def __post_init__(self) -> None:
         if self.perimeter_generator not in ("arachne", "classic"):
@@ -340,6 +362,16 @@ class SliceConfig:
     pyslm: PySLMConfig = field(default_factory=PySLMConfig)
     prusa_raft: PrusaRaftConfig = field(default_factory=PrusaRaftConfig)
     prusa_geometry: PrusaGeometryConfig = field(default_factory=PrusaGeometryConfig)
+    # Native Prusa brim controls.  The checkbox is kept separate from the
+    # width so a saved test value does not re-enable the brim by accident.
+    brim_enabled: bool = False
+    brim_width_mm: float = 5.0
+    brim_type: Literal["outer_only", "outer_and_inner", "no_brim"] = "outer_only"
+    brim_separation_mm: float = 0.0
+    # Optional project-owned continuity pass for Prusa Brim.  The native
+    # Prusa generator remains the source of the Brim geometry and E profile;
+    # this flag only asks the adapter to reuse the safe boundary connector.
+    brim_one_stroke: bool = False
     perimeter_count: int = DEFAULT_RESIN_PERIMETER_COUNT
     print_perimeters: bool = True
     triangle_path_optimization: bool = True
@@ -347,6 +379,9 @@ class SliceConfig:
     planning_line_width: float | None = None
     contour_infill_overlap: float = DEFAULT_RESIN_CONTOUR_INFILL_OVERLAP_PERCENT
     first_layer_height: float | None = None
+    # Prusa-side placement relative to the printable-plane origin.
+    start_x_mm: float = 0.0
+    start_y_mm: float = 0.0
     # Deprecated compatibility inputs. They are intentionally ignored; final
     # toolpaths are no longer rounded or split by a corner-angle constraint.
     smoothing_angle: float = DEFAULT_RESIN_SMOOTHING_ANGLE_DEGREES
@@ -375,6 +410,8 @@ class SliceConfig:
             raise ValueError("first_layer_height must be positive")
         if not math.isfinite(self.line_width) or self.line_width <= 0:
             raise ValueError("line_width must be positive")
+        if not math.isfinite(self.start_x_mm) or not math.isfinite(self.start_y_mm):
+            raise ValueError("start_x_mm and start_y_mm must be finite")
         if self.planning_line_width is not None and (
             not math.isfinite(self.planning_line_width)
             or self.planning_line_width <= 0
@@ -417,6 +454,14 @@ class SliceConfig:
             raise ValueError("slicing_kernel must be legacy, pyslm, or prusa")
         if self.perimeter_count < 1:
             raise ValueError("perimeter_count must be at least 1")
+        if self.brim_type not in ("outer_only", "outer_and_inner", "no_brim"):
+            raise ValueError("unsupported prusa brim_type")
+        for name, value in (
+            ("brim_width_mm", self.brim_width_mm),
+            ("brim_separation_mm", self.brim_separation_mm),
+        ):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be non-negative")
 
 
 def _strict_measured_pattern_angle(
@@ -1047,33 +1092,42 @@ def add_raft_to_job(
     return z_shift
 
 
-def normalize_job_xy_origin(job: ExternalSourceJob) -> tuple[float, float]:
-    """Translate all exported paths so the lower-left XY bound is at (0, 0)."""
+def normalize_job_xy_origin(
+    job: ExternalSourceJob,
+    *,
+    target_xy: tuple[float, float] = (0.0, 0.0),
+) -> tuple[float, float]:
+    """Translate all exported paths so the lower-left XY bound reaches target_xy."""
 
     bounds = _job_xy_bounds(job)
     if bounds is None:
         return (0.0, 0.0)
     min_x, min_y, _, _ = bounds
-    if abs(min_x) <= 1e-7 and abs(min_y) <= 1e-7:
+    target_x, target_y = (float(target_xy[0]), float(target_xy[1]))
+    translation_x = target_x - min_x
+    translation_y = target_y - min_y
+    if abs(translation_x) <= 1e-7 and abs(translation_y) <= 1e-7:
         return (0.0, 0.0)
 
     for group in job.material_paths:
         for path in group.paths:
-            path[:, 0] -= np.float32(min_x)
-            path[:, 1] -= np.float32(min_y)
+            path[:, 0] += translation_x
+            path[:, 1] += translation_y
     for group in job.travel_paths:
         for path in group.paths:
-            path[:, 0] -= np.float32(min_x)
-            path[:, 1] -= np.float32(min_y)
+            path[:, 0] += translation_x
+            path[:, 1] += translation_y
 
     job.meta["xy_origin_normalization"] = {
         "applied": True,
         "source_min_x": float(min_x),
         "source_min_y": float(min_y),
-        "translation_x": float(-min_x),
-        "translation_y": float(-min_y),
+        "target_x": target_x,
+        "target_y": target_y,
+        "translation_x": float(translation_x),
+        "translation_y": float(translation_y),
     }
-    return (float(-min_x), float(-min_y))
+    return (float(translation_x), float(translation_y))
 
 
 def _job_xy_bounds(job: ExternalSourceJob) -> tuple[float, float, float, float] | None:
@@ -6411,6 +6465,58 @@ def _connect_zigzag_infill_paths(
         maximum_connector_overlap_spacing=maximum_connector_overlap_spacing,
         follow_boundaries=follow_boundaries,
     )
+
+
+def _connect_brim_paths_one_stroke(
+    paths: list[np.ndarray],
+    line_width: float,
+    tolerance: float,
+) -> list[np.ndarray]:
+    """Try to connect Prusa Brim strokes with the existing safe connector.
+
+    Brim is still generated by Prusa.  This adapter builds a narrow corridor
+    around the returned Brim centerlines and feeds those open strokes through
+    the same boundary-following connector used by project-owned zigzag fill.
+    It deliberately returns multiple components when a safe single chain is
+    impossible; it never adds a non-depositing travel segment to claim
+    continuity.
+    """
+
+    valid = [
+        np.asarray(path[:, :2], dtype=np.float32).copy()
+        for path in paths
+        if np.asarray(path).ndim == 2 and np.asarray(path).shape[0] >= 2
+    ]
+    if len(valid) < 2 or line_width <= 0 or tolerance <= 0:
+        return valid
+
+    linework = [
+        LineString([(float(point[0]), float(point[1])) for point in path])
+        for path in valid
+    ]
+    corridor = unary_union(
+        [line.buffer(max(line_width * 0.55, tolerance * 10.0), join_style="round") for line in linework]
+    )
+    if corridor.is_empty:
+        return valid
+
+    connected = _connect_boundary_infill_paths(
+        valid,
+        corridor,
+        spacing=max(line_width, tolerance * 10.0),
+        # Brim rings are intentionally adjacent.  Requiring a full bead
+        # clearance here would split the same band back into several strokes;
+        # the shared connector still rejects non-incident intersections.
+        minimum_clearance=0.0,
+        tolerance=tolerance,
+        adjacent_scanlines_only=False,
+        follow_boundaries=True,
+    )
+    return [
+        np.asarray(path, dtype=np.float32)
+        for path in connected
+        if np.asarray(path).ndim == 2 and np.asarray(path).shape[0] >= 2
+    ]
 
 
 def _tangent_u_turn_connector(

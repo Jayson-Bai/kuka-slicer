@@ -1,9 +1,13 @@
 [CmdletBinding()]
 param(
-    [switch]$SkipDependencyBuild
+    [switch]$SkipDependencyBuild,
+    [ValidateRange(1, 32)]
+    [int]$Parallel = 2
 )
 
 $ErrorActionPreference = 'Stop'
+$env:CMAKE_BUILD_PARALLEL_LEVEL = [string]$Parallel
+$env:NINJAFLAGS = "-j$Parallel"
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $python = Join-Path $projectRoot '.venv\Scripts\python.exe'
@@ -13,8 +17,32 @@ $dependencyPrefix = Join-Path $projectRoot 'deps\prusa-deps'
 $bridgeBuild = Join-Path $projectRoot 'deps\prusa-bridge-build'
 $bridgeSource = Join-Path $projectRoot 'native\prusa_bridge'
 $nativeOutput = Join-Path $projectRoot 'kuka_slicer\_native'
-$vsDevCmd = 'D:\Program Files\Microsoft Visual Studio\2022\Professional\Common7\Tools\VsDevCmd.bat'
-$vsCmake = 'D:\Program Files\Microsoft Visual Studio\2022\Professional\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
+$programFilesX86 = [Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
+$vswhere = Join-Path $programFilesX86 'Microsoft Visual Studio\Installer\vswhere.exe'
+if (-not (Test-Path $vswhere)) {
+    throw "Visual Studio locator was not found: $vswhere"
+}
+$vsInstall = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1)
+if ($vsInstall) {
+    $vsInstall = $vsInstall.Trim()
+}
+if (-not $vsInstall) {
+    $candidateRoots = foreach ($drive in Get-PSDrive -PSProvider FileSystem) {
+        Join-Path $drive.Root 'Program Files\Microsoft Visual Studio\2022'
+        Join-Path $drive.Root 'Program Files (x86)\Microsoft Visual Studio\2022'
+    }
+    $vsInstall = Get-ChildItem -Path $candidateRoots -Directory -ErrorAction SilentlyContinue |
+        Where-Object {
+            (Test-Path (Join-Path $_.FullName 'Common7\Tools\VsDevCmd.bat')) -and
+            (Test-Path (Join-Path $_.FullName 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'))
+        } |
+        Select-Object -First 1 -ExpandProperty FullName
+}
+if (-not $vsInstall) {
+    throw 'No Visual Studio installation with the x64 C++ toolchain was found.'
+}
+$vsDevCmd = Join-Path $vsInstall 'Common7\Tools\VsDevCmd.bat'
+$vsCmake = Join-Path $vsInstall 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
 
 foreach ($requiredPath in @($python, $prusaSource, $bridgeSource)) {
     if (-not (Test-Path $requiredPath)) {
@@ -46,7 +74,8 @@ if (-not $vsCmakeShort) {
 }
 
 function Invoke-VsNinjaCommand([string]$command) {
-    & cmd.exe /d /s /c "call $vsDevCmdShort -arch=x64 -host_arch=x64 >nul && $vsCmakeShort $command"
+    $cmdLine = 'set "CMAKE_BUILD_PARALLEL_LEVEL=' + $Parallel + '" && set "NINJAFLAGS=-j' + $Parallel + '" && call "' + $vsDevCmd + '" -arch=x64 -host_arch=x64 >nul && "' + $vsCmake + '" ' + $command
+    & cmd.exe /d /s /c $cmdLine
     if ($LASTEXITCODE -ne 0) {
         throw "Command failed with exit code ${LASTEXITCODE}: $command"
     }
@@ -57,7 +86,7 @@ if (-not $SkipDependencyBuild) {
     # ExternalProject children.  libjpeg-turbo 3.x requires it on Windows, so
     # forward the x64 target explicitly through Prusa's shared dependency args.
     Invoke-VsNinjaCommand "-S `"$(Join-Path $prusaSource 'deps')`" -B `"$dependencyBuild`" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_SYSTEM_PROCESSOR=AMD64 -DDEP_CMAKE_OPTS:STRING=-DCMAKE_SYSTEM_PROCESSOR:STRING=AMD64 `"-DDESTDIR=$dependencyPrefix`" -DDEP_DEBUG=OFF"
-    Invoke-VsNinjaCommand "--build `"$dependencyBuild`" --parallel"
+    Invoke-VsNinjaCommand "--build `"$dependencyBuild`" --parallel $Parallel"
 }
 
 if (-not (Test-Path (Join-Path $dependencyPrefix 'usr\local'))) {
@@ -65,7 +94,7 @@ if (-not (Test-Path (Join-Path $dependencyPrefix 'usr\local'))) {
 }
 
 Invoke-VsNinjaCommand "-S `"$bridgeSource`" -B `"$bridgeBuild`" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_SYSTEM_PROCESSOR=AMD64 `"-DPRUSA_SOURCE_DIR=$prusaSource`" `"-DKUKA_NATIVE_OUTPUT_DIR=$nativeOutput`" `"-DCMAKE_PREFIX_PATH=$(Join-Path $dependencyPrefix 'usr\local')`" `"-Dpybind11_DIR=$pybind11Directory`" `"-DPython_EXECUTABLE=$python`""
-Invoke-VsNinjaCommand "--build `"$bridgeBuild`" --target prusa_bridge --parallel"
+Invoke-VsNinjaCommand "--build `"$bridgeBuild`" --target prusa_bridge --parallel $Parallel"
 
 $extension = Get-ChildItem -Path $nativeOutput -Filter 'prusa_bridge*.pyd' | Select-Object -First 1
 if ($null -eq $extension) {
