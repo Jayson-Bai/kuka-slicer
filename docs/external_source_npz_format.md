@@ -16,42 +16,66 @@ Layer/material arrays use keys:
 ```text
 layer_0000_R
 layer_0000_F
+layer_0000_T
 layer_0001_R
 layer_0001_F
+layer_0001_T
 ```
 
 Keys must match:
 
 ```text
-^layer_(\d{4})_([RF])$
+^layer_(\d{4})_([RFT])$
 ```
 
-`R` means resin and `F` means fiber. `meta` is optional and stores a JSON
-string.
+`R` means resin, `F` means fiber, and `T` means non-depositing travel paths
+for that layer. `meta` is optional and stores a JSON string.
+
+When `T` is present, `meta.motion_order` records the source resin travel and
+deposit order. A Prusa-integrated source may also set
+`meta.startup_travel_count` to identify origin-to-first-motion travel paths
+at the beginning of the first layer. The loader keeps these paths separate
+from material paths so the Core can use Prusa resin travel without changing
+the legacy R/F-only fallback behavior.
+
+For resin paths, an optional companion key may provide the cumulative Prusa
+extrusion values:
+
+```text
+layer_0000_R_E
+```
+
+The `_E` array has the same path and point dimensions as its matching `R`
+array, and contains one finite value per valid XYZ point. Padding positions
+must be `NaN`. Values are interpreted as cumulative source E, so they must be
+non-decreasing within each path. The converter subtracts the first value of
+each path before handing it to the runtime; this removes only the global
+offset needed by the runtime's per-path reset and preserves every local E
+increment. If `_E` is absent, the existing uniform `e_per_mm` calculation is
+used unchanged.
 
 ## Path Array Shape
 
-Arrays are numeric `float32` tensors:
+Formal high-precision source arrays are numeric `float64` (`<f8`) tensors:
 
 ```text
 [path_count, max_points_per_path, columns]
 ```
 
 `columns` is `3` for `[x, y, z]` or `6` for `[x, y, z, a, b, c]`. Short paths
-are padded with full `NaN` rows.
+are padded with full `NaN` rows. Legacy `float32` files remain readable, but
+their lost source precision cannot be restored.
 
 ## Padding
 
 A row whose every column is `NaN` is padding. A row with only some `NaN` values
 is invalid for downstream loading.
 
-## Path Sampling
+## Path Preservation
 
-Exported paths use a `0.05 mm` three-dimensional chord-error tolerance. A
-collinear run contains only its start and end rows. Curves and closed contours
-retain the minimum sampled vertices needed to preserve their XYZ shape within
-that tolerance. Simplification never changes path order, path count, or path
-continuity.
+The source writer does not simplify, smooth, resample, reorder, merge, or split
+paths. It preserves the original path order and point order. Smoothing and
+seven-order sampling happen only in the downstream Core processing pipeline.
 
 ## Z Ownership
 

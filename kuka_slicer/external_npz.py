@@ -37,28 +37,55 @@ class ExternalSourceJob:
 
 
 def write_external_source_npz(job: ExternalSourceJob, output_path: str | Path) -> None:
-    """Write the documented external source NPZ archive with G-code-like paths."""
+    """Write the high-precision external source NPZ without path transforms.
 
+    Source paths are intentionally written in their original order and point
+    density.  Simplification, smoothing, resampling, offsets, and process
+    actions belong to the downstream Core pipeline.
+    """
+
+    groups: dict[tuple[int, Material], list[MaterialPaths]] = {}
+    layer_indices = {group.layer_index for group in job.material_paths}
+    layer_indices.update(group.layer_index for group in job.travel_paths)
+    if not layer_indices:
+        raise ValueError("cannot write external source NPZ without any paths")
+
+    meta = _defaulted_meta(job.meta)
+    meta["point_columns"] = _point_columns_for_job(job)
     arrays: dict[str, np.ndarray] = {
-        "meta": np.array(json.dumps(_defaulted_meta(job.meta), ensure_ascii=False))
+        "meta": np.array(json.dumps(meta, ensure_ascii=False))
     }
-    valid_path_count = 0
 
+    valid_path_count = 0
     for group in job.material_paths:
-        key = f"layer_{group.layer_index:04d}_{group.material}"
-        paths = (
-            group.paths
-            if group.extrusion is not None
-            else simplify_paths_for_export(group.paths)
-        )
-        arrays[key] = paths_to_padded_array(paths)
-        if group.extrusion is not None:
-            arrays[f"{key}_E"] = extrusion_to_padded_array(paths, group.extrusion)
+        groups.setdefault((group.layer_index, group.material), []).append(group)
         valid_path_count += len(group.paths)
+
+    for (layer_index, material), material_groups in sorted(groups.items()):
+        paths = [path for group in material_groups for path in group.paths]
+        key = f"layer_{layer_index:04d}_{material}"
+        arrays[key] = paths_to_padded_array(paths)
+        extrusion_groups = [group.extrusion for group in material_groups]
+        if any(values is not None for values in extrusion_groups):
+            if any(values is None for values in extrusion_groups):
+                raise ValueError("material groups must either all provide E values or all omit them")
+            extrusion = [values for values in extrusion_groups if values is not None]
+            arrays[f"{key}_E"] = extrusion_to_padded_array(
+                paths,
+                [value for values in extrusion for value in values],
+            )
+
+    # Keep both material keys for every represented layer, including empty
+    # arrays, so consumers can rely on a stable R/F schema.
+    for layer_index in range(max(layer_indices) + 1):
+        for material in ("R", "F"):
+            key = f"layer_{layer_index:04d}_{material}"
+            if key not in arrays:
+                arrays[key] = paths_to_padded_array([])
 
     for group in job.travel_paths:
         key = f"layer_{group.layer_index:04d}_T"
-        arrays[key] = paths_to_padded_array(simplify_paths_for_export(group.paths))
+        arrays[key] = paths_to_padded_array(group.paths)
 
     if valid_path_count == 0:
         raise ValueError("cannot write external source NPZ without any paths")
@@ -124,7 +151,7 @@ def simplify_path_for_export(
             first_arc[first_keep][:-1],
             second_arc[second_keep],
         )
-    ).astype(np.float32, copy=False)
+    ).astype(np.float64, copy=False)
     if simplified.shape[0] < 4:
         return array.copy()
     simplified[-1] = simplified[0]
@@ -175,7 +202,7 @@ def _rdp_keep_indices(points: np.ndarray, tolerance: float) -> np.ndarray:
 def paths_to_padded_array(paths: list[np.ndarray]) -> np.ndarray:
     normalized = [_normalize_path(path) for path in paths]
     if not normalized:
-        return np.full((0, 0, 3), np.nan, dtype=np.float32)
+        return np.full((0, 0, 3), np.nan, dtype=np.float64)
 
     column_counts = {path.shape[1] for path in normalized}
     if len(column_counts) != 1:
@@ -183,7 +210,7 @@ def paths_to_padded_array(paths: list[np.ndarray]) -> np.ndarray:
 
     columns = column_counts.pop()
     max_points = max(path.shape[0] for path in normalized)
-    result = np.full((len(normalized), max_points, columns), np.nan, dtype=np.float32)
+    result = np.full((len(normalized), max_points, columns), np.nan, dtype=np.float64)
     for index, path in enumerate(normalized):
         result[index, : path.shape[0], :] = path
     return result
@@ -198,16 +225,16 @@ def extrusion_to_padded_array(
     if len(paths) != len(extrusion):
         raise ValueError("extrusion list must contain one array per path")
     if not paths:
-        return np.full((0, 0), np.nan, dtype=np.float32)
+        return np.full((0, 0), np.nan, dtype=np.float64)
 
     result = np.full(
         (len(paths), max(path.shape[0] for path in paths)),
         np.nan,
-        dtype=np.float32,
+        dtype=np.float64,
     )
     for index, (path, values) in enumerate(zip(paths, extrusion)):
         normalized_path = _normalize_path(path)
-        e_values = np.asarray(values, dtype=np.float32)
+        e_values = np.asarray(values, dtype=np.float64)
         if e_values.ndim != 1 or e_values.shape[0] != normalized_path.shape[0]:
             raise ValueError("each extrusion array must match its path point count")
         if not np.isfinite(e_values).all():
@@ -217,16 +244,31 @@ def extrusion_to_padded_array(
 
 
 def _normalize_path(path: np.ndarray) -> np.ndarray:
-    array = np.asarray(path, dtype=np.float32)
+    array = np.asarray(path, dtype=np.float64)
     if array.ndim != 2:
         raise ValueError("path must be a two-dimensional array")
     if array.shape[0] < 2:
         raise ValueError("path must contain at least two points")
     if array.shape[1] not in (3, 6):
         raise ValueError("path columns must be 3 or 6")
-    if np.isnan(array).any():
-        raise ValueError("paths passed to writer must not contain NaN values")
+    if not np.isfinite(array).all():
+        raise ValueError("paths passed to writer must contain only finite values")
     return array
+
+
+def _point_columns_for_job(job: ExternalSourceJob) -> list[str]:
+    column_counts: set[int] = set()
+    for group in [*job.material_paths, *job.travel_paths]:
+        for path in group.paths:
+            array = np.asarray(path)
+            if array.ndim != 2 or array.shape[1] not in (3, 6):
+                raise ValueError("path columns must be 3 or 6")
+            column_counts.add(int(array.shape[1]))
+    if not column_counts:
+        return ["x", "y", "z"]
+    if len(column_counts) != 1:
+        raise ValueError("all source paths must use the same 3 or 6 column format")
+    return ["x", "y", "z"] if column_counts == {3} else ["x", "y", "z", "a", "b", "c"]
 
 
 def _defaulted_meta(meta: dict[str, object]) -> dict[str, object]:
@@ -235,16 +277,19 @@ def _defaulted_meta(meta: dict[str, object]) -> dict[str, object]:
         "unit": "mm",
         "point_columns": ["x", "y", "z"],
         "materials": {"R": "resin", "F": "fiber"},
+        "precision": "float64",
+        "coordinate_system": "project_default",
         "optional_arrays": {
             "layer_xxxx_R_E": "cumulative E value for every point of layer_xxxx_R",
             "layer_xxxx_T": "non-depositing travel XYZ paths for the layer",
         },
         "description": "Layer/material path arrays for external_npz_preprocessor",
         "path_sampling": {
-            "method": "3d_chord_error",
-            "chord_tolerance_mm": DEFAULT_EXPORT_CHORD_TOLERANCE_MM,
-            "straight_segments": "endpoints_only",
+            "method": "source_preserved",
+            "simplification": "none",
+            "resampling": "none",
             "preserves_path_count_and_order": True,
+            "preserves_point_count_and_order": True,
         },
     }
     base.update(meta)

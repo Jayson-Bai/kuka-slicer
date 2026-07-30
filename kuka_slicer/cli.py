@@ -8,7 +8,6 @@ import numpy as np
 from .external_npz import (
     ExternalSourceJob,
     MaterialPaths,
-    simplify_job_paths_for_export,
     write_external_source_npz,
 )
 from .slicer import (
@@ -296,7 +295,6 @@ def _slice_command(args: argparse.Namespace) -> int:
     )
     job = slice_mesh_to_job(mesh, config)
     normalize_job_xy_origin(job)
-    simplify_job_paths_for_export(job)
     write_external_source_npz(job, args.output_npz)
     path_count = sum(len(group.paths) for group in job.material_paths)
     print(f"wrote {args.output_npz} with {len(job.material_paths)} layer/material groups and {path_count} paths")
@@ -324,4 +322,4 @@ def _template_command(args: argparse.Namespace) -> int:
 
 
 def _path(points: list[list[float]]) -> np.ndarray:
-    return np.asarray(points, dtype=np.float32)
+    return np.asarray(points, dtype=np.float64)
