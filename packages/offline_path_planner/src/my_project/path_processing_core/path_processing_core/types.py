@@ -106,6 +106,10 @@ class GlobalCurveCommand(CurveCommand):
 
     constraints: List[Tuple[float, float]] = field(default_factory=list)
     original_moves: List[MoveCommand] = field(default_factory=list)
+    # Optional absolute E values at the polyline control points.  When
+    # present, the sampler follows this profile segment-by-segment instead of
+    # distributing only the total delta_e by geometric arc length.
+    e_profile: Optional[List[float]] = None
 
 
 ParsedCommand = Union[MoveCommand, CurveCommand, GlobalCurveCommand,

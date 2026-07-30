@@ -48,6 +48,36 @@ move_type_vocab_keys, move_type_vocab_vals
 event_type_vocab_keys, event_type_vocab_vals
 ```
 
+### Embedded local-injection metadata
+
+The same system NPZ also contains optional metadata for fast site-side
+parameter injection.  It does not create or require a second manifest file:
+
+```text
+core_injection_manifest              0-D UTF-8 JSON string
+core_injection_block_id              int32, one value per motion row
+core_injection_role                  uint8, one value per motion row
+core_injection_role_vocab_keys       fixed-width string vocabulary
+core_injection_role_vocab_vals       uint8 vocabulary values
+```
+
+`core_injection_manifest` is versioned as
+`core_npz_local_injection_v1`.  It records the export-time values of
+`tool_offset`, resin-Z compensation, tool-change safe lift, CUT lift/wait,
+the sample period, and a complete catalog of tool-change/CUT blocks.  The
+per-row marker arrays identify the exact contiguous rows belonging to the
+pre-action, event, action, post-travel, and next-path anchor roles.  The
+markers are metadata only: they do not alter `seq`, `e`, planned time, or
+RSI timing.
+
+The intended site-side operation is to load the NPZ, read the embedded
+manifest, rebuild only the marked atomic regions with the new machine
+parameters, and atomically replace the same NPZ path.  Because NPZ is a
+compressed container, changing the number of rows cannot be a byte-level
+in-place edit; it is still a single final file and does not require a second
+user-visible input/output artifact.  Consumers that do not know these keys
+can continue to ignore them.
+
 其中 `preview_layer_index` 是三维预览优先使用的显示层编号；`layer_index` 保留为物理/解析层信息。这样可以避免同一物理 Z 或同一旧层编号导致阀座等短段在预览中被错误合并。
 
 ## 拟合与短线段采样

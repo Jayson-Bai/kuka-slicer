@@ -393,6 +393,7 @@ def sample_global_curve_iter(
 
     if (curve.cmd or "").upper() == "POLYLINE":
         points = [curve.start_pos] + list(curve.control_points)
+        e_profile = _polyline_e_profile(curve, len(points))
         seg_lengths = []
         total_length = 0.0
         for start, end in zip(points, points[1:]):
@@ -457,8 +458,15 @@ def sample_global_curve_iter(
             )
 
             delta_s = curr_s - prev_s
-            delta_e = curve.delta_e * (delta_s / total_length)
-            current_e += delta_e
+            if e_profile is None:
+                delta_e = curve.delta_e * (delta_s / total_length)
+                current_e += delta_e
+            else:
+                target_e = e_profile[seg_idx] + (
+                    e_profile[seg_idx + 1] - e_profile[seg_idx]
+                ) * local
+                delta_e = target_e - current_e
+                current_e = target_e
             prev_s = curr_s
             feed_mm_s = delta_s / dt if dt > 0 else 0.0
             feed_mm_min = feed_mm_s * 60.0
@@ -684,6 +692,28 @@ def sample_global_curve_iter(
             line=curve.line,
             raw=curve.raw,
         )
+
+
+def _polyline_e_profile(
+    curve: GlobalCurveCommand,
+    point_count: int,
+) -> Optional[List[float]]:
+    profile = getattr(curve, "e_profile", None)
+    if profile is None:
+        return None
+    values = [float(value) for value in profile]
+    if len(values) != point_count:
+        raise ValueError(
+            "polyline E profile must contain one absolute E value per control point"
+        )
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("polyline E profile must contain only finite values")
+    if any(right < left - 1e-6 for left, right in zip(values, values[1:])):
+        raise ValueError("polyline E profile must be non-decreasing")
+    start_e = float(curve.e_val - curve.delta_e)
+    if abs(values[0] - start_e) > 1e-5 or abs(values[-1] - float(curve.e_val)) > 1e-5:
+        raise ValueError("polyline E profile endpoints must match curve E state")
+    return values
 
 
 def sample_global_curve(
