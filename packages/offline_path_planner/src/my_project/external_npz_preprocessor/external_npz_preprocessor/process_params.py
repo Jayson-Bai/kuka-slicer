@@ -17,14 +17,14 @@ RESIN_FILAMENT_LENGTH_PER_MM3 = 1.0 / (
 class ResinProcessParams:
     layer_height_mm: float = 0.5
     extrusion_scale: float = 1.0
-    feed_mm_s: float = 10.0
+    feed_mm_s: float = 15.0
     first_layer_feed_mm_s: float = field(default=10.0, kw_only=True)
-    temperature_c: float = 250.0
+    temperature_c: float = 240.0
     fan_enabled: bool = True
-    prime_length_mm: float = 18.0
-    prime_speed_mm_s: float = 15.0
-    retract_length_mm: float = 15.0
-    retract_speed_mm_s: float = 30.0
+    prime_length_mm: float = 22.0
+    prime_speed_mm_s: float = 12.0
+    retract_length_mm: float = 19.0
+    retract_speed_mm_s: float = 12.0
     e_per_mm_override: float | None = None
 
     def e_per_mm(self) -> float:
@@ -42,11 +42,11 @@ class ResinProcessParams:
 class FiberProcessParams:
     layer_height_mm: float = 0.1
     extrusion_scale: float = 1.0
-    feed_mm_s: float = 10.0
-    first_layer_feed_mm_s: float = field(default=10.0, kw_only=True)
-    temperature_c: float = 250.0
+    feed_mm_s: float = 15.0
+    first_layer_feed_mm_s: float = field(default=15.0, kw_only=True)
+    temperature_c: float = 260.0
     fan_enabled: bool = True
-    prime_length_mm: float = 12.0
+    prime_length_mm: float = 9.5
     prime_speed_mm_s: float = 5.0
     retract_length_mm: float = 10.0
     retract_speed_mm_s: float = 5.0
@@ -58,16 +58,35 @@ class FiberProcessParams:
 
 
 @dataclass(frozen=True)
+class CoreExportParams:
+    """Machine-side exporter parameters kept outside Prusa geometry settings."""
+
+    # None keeps the existing shared head-calibration JSON as the source.
+    fiber_x_print_compensation_mm: float | None = None
+    fiber_y_print_compensation_mm: float | None = None
+    fiber_z_print_compensation_mm: float | None = None
+    resin_z_print_compensation_mm: float | None = None
+    enable_extrude_wait: bool = True
+    enable_travel_extrude_overlap: bool = True
+    initial_tool_id: int = 2
+    tool_change_safe_lift_mm: float = 20.0
+    cut_lift_mm: float = 20.0
+    cut_wait_s: float = 15.0
+    fiber_retract_length_mm: float | None = None
+    external_npz_cut_absolute_e: bool = True
+
+
+@dataclass(frozen=True)
 class ProcessParams:
     resin: ResinProcessParams = field(default_factory=ResinProcessParams)
     fiber: FiberProcessParams = field(default_factory=FiberProcessParams)
-    travel_feed_mm_s: float = 10.0
-    first_layer_travel_feed_mm_s: float = field(default=10.0, kw_only=True)
+    travel_feed_mm_s: float = 20.0
+    first_layer_travel_feed_mm_s: float = field(default=15.0, kw_only=True)
     default_a: float = 0.0
     default_b: float = 0.0
     default_c: float = 0.0
-    start_x_mm: float = 0.0
-    start_y_mm: float = 0.0
+    start_x_mm: float = 10.0
+    start_y_mm: float = 10.0
     primeline_x_mm: float = 0.0
     primeline_y_mm: float = -10.0
     primeline_length_mm: float = 100.0
@@ -83,6 +102,8 @@ class ProcessParams:
     density: int = 0
     degree: int = 3
     max_fit_points_per_segment: int = 20000
+    export: CoreExportParams = field(default_factory=CoreExportParams)
+    primeline_enabled: bool = field(default=True, kw_only=True)
 
     def __post_init__(self) -> None:
         first_layer_speeds = {

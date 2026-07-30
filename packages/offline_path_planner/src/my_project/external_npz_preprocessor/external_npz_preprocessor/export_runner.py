@@ -65,29 +65,68 @@ def convert_external_npz(
     params: ProcessParams,
     progress_callback=None,
     calibration_path: str | Path = DEFAULT_HEAD_CALIBRATION_PATH,
-    cut_lift_mm: float = 20.0,
-    cut_wait_s: float = 15.0,
+    cut_lift_mm: float | None = None,
+    cut_wait_s: float | None = None,
+    chunk_size: int = 100000,
+    commands_callback=None,
 ) -> dict:
     resolved_output = resolve_output_path(source_path, output_path)
     resolved_output.parent.mkdir(parents=True, exist_ok=True)
     job = load_source_npz(source_path, default_abc=params.default_abc)
     commands = source_job_to_parsed_commands(job, params)
-    tool_offset, resin_z_print_compensation_mm = load_shared_export_offsets(calibration_path)
+    if commands_callback is not None:
+        commands_callback(commands)
+    export_params = params.export
+    file_tool_offset, file_resin_z = load_shared_export_offsets(calibration_path)
+    tool_offset = (
+        (
+            float(export_params.fiber_x_print_compensation_mm),
+            float(export_params.fiber_y_print_compensation_mm),
+            float(export_params.fiber_z_print_compensation_mm),
+        )
+        if all(
+            value is not None
+            for value in (
+                export_params.fiber_x_print_compensation_mm,
+                export_params.fiber_y_print_compensation_mm,
+                export_params.fiber_z_print_compensation_mm,
+            )
+        )
+        else file_tool_offset
+    )
+    resin_z_print_compensation_mm = (
+        float(export_params.resin_z_print_compensation_mm)
+        if export_params.resin_z_print_compensation_mm is not None
+        else file_resin_z
+    )
+    export_kwargs = {
+        "dt": params.dt,
+        "chunk_size": chunk_size,
+        "default_feed_mm_s": params.travel_feed_mm_s,
+        "corner_angle_deg": params.corner_angle_deg,
+        "corner_retreat_ratio": params.corner_retreat_ratio,
+        "density": params.density,
+        "degree": params.degree,
+        "max_fit_points_per_segment": params.max_fit_points_per_segment,
+        "progress_callback": progress_callback,
+        "enable_extrude_wait": export_params.enable_extrude_wait,
+        "enable_travel_extrude_overlap": export_params.enable_travel_extrude_overlap,
+        "tool_offset": tool_offset,
+        "resin_z_print_compensation_mm": resin_z_print_compensation_mm,
+        "initial_tool_id": export_params.initial_tool_id,
+        "tool_change_safe_lift_mm": export_params.tool_change_safe_lift_mm,
+        "cut_lift_mm": (
+            export_params.cut_lift_mm if cut_lift_mm is None else float(cut_lift_mm)
+        ),
+        "cut_wait_s": (
+            export_params.cut_wait_s if cut_wait_s is None else float(cut_wait_s)
+        ),
+        "external_npz_cut_absolute_e": export_params.external_npz_cut_absolute_e,
+    }
+    if export_params.fiber_retract_length_mm is not None:
+        export_kwargs["fiber_retract_length_mm"] = export_params.fiber_retract_length_mm
     return export_npz(
         commands,
         str(resolved_output),
-        dt=params.dt,
-        default_feed_mm_s=params.travel_feed_mm_s,
-        corner_angle_deg=params.corner_angle_deg,
-        corner_retreat_ratio=params.corner_retreat_ratio,
-        density=params.density,
-        degree=params.degree,
-        max_fit_points_per_segment=params.max_fit_points_per_segment,
-        progress_callback=progress_callback,
-        enable_extrude_wait=True,
-        tool_offset=tool_offset,
-        resin_z_print_compensation_mm=resin_z_print_compensation_mm,
-        cut_lift_mm=cut_lift_mm,
-        cut_wait_s=cut_wait_s,
-        external_npz_cut_absolute_e=True,
+        **export_kwargs,
     )

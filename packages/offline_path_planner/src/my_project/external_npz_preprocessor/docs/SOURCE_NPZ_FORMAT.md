@@ -65,7 +65,7 @@ key 必须匹配：
 | `max_points_per_path` | 当前数组中最长路径的点数。短路径用 padding 补齐。 |
 | `columns` | 点列数，只允许 `3` 或 `6`。 |
 
-推荐 dtype 是 `float32`。loader 会把路径点转成 `float32`，但生成方应直接写 `float32`，便于用 `np.load(..., allow_pickle=False)` 读取并避免 object 序列化。
+正式高精度格式必须使用 `float64`（`<f8`）。loader 会保留输入的 `float64`；旧版 `float32` 仍可读取，但无法恢复已经丢失的几何精度。正式文件应使用 `np.load(..., allow_pickle=False)` 可读取的数值数组，不使用 object/pickle。
 
 ## Point Columns
 
@@ -108,9 +108,9 @@ padding 只能出现在路径末尾。即使中间出现整行 `NaN`，loader �
 
 ## Legacy Object Arrays
 
-当前 loader 仍兼容旧 object array：如果某个 `layer_xxxx_R/F` 的 dtype 是 `object`，会把每个元素当作一条 path 读取。
+当前 loader 仍兼容旧 object array：如果某个 `layer_xxxx_R/F` 的 dtype 是 `object`，会把每个元素当作一条 path 读取。该兼容路径不属于正式高精度格式。
 
-这个格式只用于历史兼容，不推荐新文件使用。新文件应使用数值型三维 `float32` 数组和整行 `NaN` padding。
+这个格式只用于历史兼容，不推荐新文件使用。新文件应使用数值型三维 `float64` 数组和整行 `NaN` padding。
 
 ## Z Ownership
 
@@ -156,6 +156,8 @@ z_prime = z
     "R": "resin",
     "F": "fiber"
   },
+  "precision": "float64",
+  "coordinate_system": "project_default",
   "description": "Layer/material path arrays for external_npz_preprocessor"
 }
 ```
@@ -220,7 +222,7 @@ SourceJob
 import json
 import numpy as np
 
-layer_0000_R = np.full((2, 3, 3), np.nan, dtype=np.float32)
+layer_0000_R = np.full((2, 3, 3), np.nan, dtype=np.float64)
 layer_0000_R[0, :3, :] = [
     [0.0, 0.0, 0.50],
     [30.0, 0.0, 0.50],
@@ -236,7 +238,7 @@ layer_0000_F = np.array([
         [2.0, 2.0, 0.60],
         [28.0, 18.0, 0.60],
     ]
-], dtype=np.float32)
+], dtype=np.float64)
 
 meta = {
     "format": "external_layer_paths_v1",
@@ -271,4 +273,4 @@ layer_0001_R
 layer_0001_F
 ```
 
-模板使用数值型 `float32` 三维数组和整行 `NaN` padding，可用 `np.load(..., allow_pickle=False)` 读取。
+模板使用数值型 `float64` 三维数组和整行 `NaN` padding，可用 `np.load(..., allow_pickle=False)` 读取。

@@ -11,7 +11,12 @@ from external_npz_preprocessor.process_params import (
     RESIN_FILAMENT_LENGTH_PER_MM3,
     ResinProcessParams,
 )
-from external_npz_preprocessor.source_npz import LayerPaths, MaterialPath, SourceJob
+from external_npz_preprocessor.source_npz import (
+    LayerPaths,
+    MaterialPath,
+    SourceJob,
+    TravelPath,
+)
 from path_processing_core.polynomial_interpolator import sample_global_curve_iter
 from path_processing_core.types import (
     ExtrudeWait,
@@ -161,8 +166,353 @@ def test_converts_ordered_resin_and_fiber_paths_to_planner_commands_without_over
     assert curves[1].control_points[-1].z == pytest.approx(3.3)
     assert travel_moves[-1].start_pos.z == pytest.approx(2.6)
     assert travel_moves[-1].pos.z == pytest.approx(3.1)
-    assert curves[0].layer == 0
-    assert curves[1].layer == 0
+
+
+def test_uses_source_resin_travel_and_core_layer_lift_without_synthetic_layer_end_travel():
+    job = SourceJob(
+        meta={
+            "motion_order": {
+                "0": [
+                    {"kind": "travel", "index": 0},
+                    {"kind": "deposit", "index": 0},
+                    {"kind": "travel", "index": 1},
+                    {"kind": "deposit", "index": 1},
+                ],
+                "1": [
+                    {"kind": "travel", "index": 0},
+                    {"kind": "deposit", "index": 0},
+                ],
+            }
+        },
+        layers=[
+            LayerPaths(
+                index=0,
+                resin_paths=[
+                    _straight_path("R", 0, 0.0, 1.0, z=0.5),
+                    _straight_path("R", 1, 3.0, 4.0, z=0.5),
+                ],
+                travel_paths=[
+                    TravelPath(0, np.asarray([[1.0, 0.0, 0.5, 0.0, 0.0, 0.0], [3.0, 0.0, 0.5, 0.0, 0.0, 0.0]], dtype=np.float32)),
+                ],
+            ),
+            LayerPaths(
+                index=1,
+                resin_paths=[_straight_path("R", 0, 4.0, 5.0, z=1.0)],
+                travel_paths=[
+                    TravelPath(0, np.asarray([[4.0, 0.0, 1.0, 0.0, 0.0, 0.0], [5.0, 0.0, 1.0, 0.0, 0.0, 0.0]], dtype=np.float32)),
+                ],
+            ),
+        ],
+    )
+
+    commands = source_job_to_parsed_commands(job, ProcessParams(primeline_enabled=False))
+    travel = [cmd for cmd in commands if isinstance(cmd, MoveCommand) and cmd.type == "TRAVEL"]
+
+    assert any(cmd.raw == "external_npz_prusa_travel" for cmd in travel)
+    assert any(cmd.raw == "external_npz_layer_lift" for cmd in travel)
+    assert not any(cmd.raw == "external_npz_resin_layer_end_travel" for cmd in travel)
+    lift = next(cmd for cmd in travel if cmd.raw == "external_npz_layer_lift")
+    assert lift.start_pos.x == pytest.approx(lift.pos.x)
+    assert lift.start_pos.y == pytest.approx(lift.pos.y)
+    assert lift.pos.z == pytest.approx(1.0)
+
+
+def test_bridges_prusa_travel_endpoint_to_print_start_when_source_z_differs():
+    job = SourceJob(
+        meta={
+            "motion_order": {
+                "0": [
+                    {"kind": "travel", "index": 0},
+                    {"kind": "deposit", "index": 0},
+                ]
+            }
+        },
+        layers=[
+            LayerPaths(
+                index=0,
+                resin_paths=[_straight_path("R", 0, 1.0, 2.0, z=1.5)],
+                travel_paths=[
+                    TravelPath(
+                        0,
+                        np.asarray(
+                            [[0.0, 0.0, 1.4, 0.0, 0.0, 0.0],
+                             [1.0, 0.0, 1.4, 0.0, 0.0, 0.0]],
+                            dtype=np.float32,
+                        ),
+                    )
+                ],
+            )
+        ],
+    )
+
+    commands = source_job_to_parsed_commands(job, ProcessParams(primeline_enabled=False))
+    bridges = [
+        command
+        for command in commands
+        if isinstance(command, MoveCommand)
+        and command.raw == "external_npz_travel"
+    ]
+
+    assert len(bridges) == 1
+    assert bridges[0].start_pos.z == pytest.approx(1.4)
+    assert bridges[0].pos.z == pytest.approx(1.5)
+    # Source geometry is normalized into ProcessParams.start_x_mm, so the
+    # source X=1.0 print start becomes the Core X=10.0 placement origin.
+    assert bridges[0].start_pos.x == pytest.approx(10.0)
+    assert bridges[0].pos.x == pytest.approx(10.0)
+
+
+def test_brim_one_stroke_orders_and_reverses_without_reusing_prusa_travel():
+    def path(order, start, end, e_start, e_end):
+        return MaterialPath(
+            material="R",
+            order=order,
+            points=_straight_path("R", order, start, end).points,
+            extrusion=np.asarray([e_start, e_end], dtype=np.float32),
+        )
+
+    job = SourceJob(
+        meta={
+            "path_roles": {"R": {"0": ["brim", "brim", "brim"]}},
+            "motion_order": {
+                "0": [
+                    {"kind": "travel", "index": 0},
+                    {"kind": "deposit", "index": 0},
+                    {"kind": "travel", "index": 1},
+                    {"kind": "deposit", "index": 1},
+                    {"kind": "travel", "index": 2},
+                    {"kind": "deposit", "index": 2},
+                ]
+            },
+        },
+        layers=[
+            LayerPaths(
+                index=0,
+                resin_paths=[
+                    path(0, 0.0, 1.0, 10.0, 12.0),
+                    path(1, 3.0, 2.0, 20.0, 23.0),
+                    path(2, 10.0, 11.0, 30.0, 35.0),
+                ],
+                travel_paths=[
+                    TravelPath(index, _straight_path("R", index, start, end).points)
+                    for index, (start, end) in enumerate(((0.0, 1.0), (3.0, 2.0), (10.0, 11.0)))
+                ],
+            )
+        ],
+    )
+
+    optimized = converter._prepare_brim_one_stroke(job)
+    optimized_paths = optimized.layers[0].resin_paths
+    assert [path.points[0, 0] for path in optimized_paths] == pytest.approx([0.0, 2.0, 10.0])
+    assert optimized_paths[1].extrusion.tolist() == pytest.approx([0.0, 3.0])
+    assert optimized.meta["brim_path_strategy"] == "nearest_endpoint_order_reverse_with_core_bridges"
+
+    commands = source_job_to_parsed_commands(job, ProcessParams(primeline_enabled=False))
+    travels = [command for command in commands if isinstance(command, MoveCommand)]
+    assert sum(command.raw == "external_npz_prusa_travel" for command in travels) == 3
+    # Reordered one-stroke Brim paths retain their native travel geometry,
+    # while any residual endpoint mismatch becomes an explicit Core bridge.
+    assert sum(command.raw == "external_npz_travel" for command in travels) == 5
+
+def test_bridges_previous_fiber_endpoint_to_next_prusa_layer_travel():
+    job = SourceJob(
+        meta={
+            "motion_order": {
+                "0": [
+                    {"kind": "travel", "index": 0},
+                    {"kind": "deposit", "index": 0},
+                ],
+                "1": [
+                    {"kind": "travel", "index": 0},
+                    {"kind": "deposit", "index": 0},
+                ],
+            }
+        },
+        layers=[
+            LayerPaths(
+                index=0,
+                resin_paths=[_straight_path("R", 0, 1.0, 2.0, z=0.5)],
+                fiber_paths=[_straight_path("F", 0, 10.0, 11.0, z=0.6)],
+                travel_paths=[
+                    TravelPath(
+                        0,
+                        np.asarray(
+                            [[0.0, 0.0, 0.5, 0.0, 0.0, 0.0], [1.0, 0.0, 0.5, 0.0, 0.0, 0.0]],
+                            dtype=np.float32,
+                        ),
+                    )
+                ],
+            ),
+            LayerPaths(
+                index=1,
+                resin_paths=[_straight_path("R", 0, 3.0, 4.0, z=1.0)],
+                travel_paths=[
+                    TravelPath(
+                        0,
+                        np.asarray(
+                            [[2.0, 0.0, 1.0, 0.0, 0.0, 0.0], [3.0, 0.0, 1.0, 0.0, 0.0, 0.0]],
+                            dtype=np.float32,
+                        ),
+                    )
+                ],
+            ),
+        ],
+    )
+
+    commands = source_job_to_parsed_commands(job, ProcessParams(primeline_enabled=False))
+    layer_one_travel = [
+        command
+        for command in commands
+        if isinstance(command, MoveCommand)
+        and command.type == "TRAVEL"
+        and command.layer == 1
+    ]
+
+    lift = next(command for command in layer_one_travel if command.raw == "external_npz_layer_lift")
+    bridge = next(command for command in layer_one_travel if command.raw == "external_npz_travel")
+    assert lift.start_pos.x == pytest.approx(10.0)
+    assert lift.pos.x == pytest.approx(10.0)
+    assert lift.pos.z == pytest.approx(1.0)
+    assert bridge.start_pos.x == pytest.approx(10.0)
+    assert bridge.pos.x == pytest.approx(1.0)
+    assert any(command.raw == "external_npz_prusa_travel" for command in layer_one_travel)
+
+
+def test_primeline_replaces_prusa_initial_travel_before_first_resin_path():
+    job = SourceJob(
+        meta={
+            "startup_travel_count": 1,
+            "motion_order": {
+                "0": [
+                    {"kind": "travel", "index": 0},
+                    {"kind": "travel", "index": 1},
+                    {"kind": "deposit", "index": 0},
+                ]
+            },
+        },
+        layers=[
+            LayerPaths(
+                index=0,
+                resin_paths=[_straight_path("R", 0, 0.0, 2.0)],
+                travel_paths=[
+                    TravelPath(
+                        0,
+                        np.asarray(
+                            [[0.0, 0.0, 0.5, 0.0, 0.0, 0.0], [10.0, 0.0, 0.5, 0.0, 0.0, 0.0]],
+                            dtype=np.float32,
+                        ),
+                    ),
+                    TravelPath(
+                        1,
+                        np.asarray(
+                            [[-10.0, -10.5, 0.5, 0.0, 0.0, 0.0], [0.0, 0.0, 0.5, 0.0, 0.0, 0.0]],
+                            dtype=np.float32,
+                        ),
+                    ),
+                ],
+            )
+        ],
+    )
+
+    commands = source_job_to_parsed_commands(job, ProcessParams(primeline_enabled=True))
+    travels = [
+        command
+        for command in commands
+        if isinstance(command, MoveCommand) and command.type == "TRAVEL"
+    ]
+
+    assert not any(command.raw == "external_npz_prusa_travel" for command in travels)
+    startup = next(command for command in travels if command.raw == "external_npz_start_xy_travel")
+    assert startup.start_pos.x == pytest.approx(0.0)
+    assert startup.start_pos.y == pytest.approx(0.0)
+    assert startup.pos.x == pytest.approx(10.0)
+    assert startup.pos.y == pytest.approx(0.0)
+    bridge = next(command for command in travels if command.raw == "external_npz_travel")
+    assert bridge.start_pos.x == pytest.approx(110.0)
+    assert bridge.start_pos.y == pytest.approx(0.0)
+    assert bridge.pos.x == pytest.approx(10.0)
+    assert bridge.pos.y == pytest.approx(10.0)
+
+
+def test_source_e_profile_replaces_uniform_resin_e_per_mm_without_changing_reset_flow():
+    job = _job_with_paths(
+        resin_paths=[
+            MaterialPath(
+                material="R",
+                order=0,
+                points=np.asarray(
+                    [
+                        [0.0, 0.0, 0.5, 0.0, 0.0, 0.0],
+                        [5.0, 0.0, 0.5, 0.0, 0.0, 0.0],
+                        [10.0, 0.0, 0.5, 0.0, 0.0, 0.0],
+                    ],
+                    dtype=np.float32,
+                ),
+                extrusion=np.asarray([100.0, 103.0, 111.0], dtype=np.float32),
+            )
+        ]
+    )
+
+    commands = source_job_to_parsed_commands(job, _params())
+    source_curve = _source_curves(commands)[0]
+    source_deltas = np.diff(source_curve.e_profile)
+
+    assert source_curve.e_profile is not None
+    assert source_curve.delta_e == pytest.approx(11.0)
+    np.testing.assert_allclose(source_deltas, [3.0, 8.0])
+    assert any(
+        isinstance(command, ResetECommand)
+        and command.raw == "external_npz_path_reset"
+        for command in commands
+    )
+    assert any(
+        isinstance(command, ExtrudeWait)
+        and command.raw == "external_npz_reset_anchor"
+        for command in commands
+    )
+
+
+def test_source_e_profile_is_remapped_through_smoothed_path_and_sampled_without_jump():
+    job = _job_with_paths(
+        resin_paths=[
+            MaterialPath(
+                material="R",
+                order=0,
+                points=np.asarray(
+                    [
+                        [0.0, 0.0, 0.5, 0.0, 0.0, 0.0],
+                        [10.0, 0.0, 0.5, 0.0, 0.0, 0.0],
+                        [10.0, 10.0, 0.5, 0.0, 0.0, 0.0],
+                    ],
+                    dtype=np.float32,
+                ),
+                extrusion=np.asarray([200.0, 202.0, 214.0], dtype=np.float32),
+            )
+        ]
+    )
+
+    source_curve = _source_curves(source_job_to_parsed_commands(job, _params()))[0]
+    assert source_curve.e_profile is not None
+    assert len(source_curve.e_profile) == len(source_curve.control_points) + 1
+    assert source_curve.e_profile[-1] - source_curve.e_profile[0] == pytest.approx(14.0)
+    assert all(
+        right >= left - 1e-6
+        for left, right in zip(source_curve.e_profile, source_curve.e_profile[1:])
+    )
+
+    samples = list(
+        sample_global_curve_iter(
+            source_curve,
+            dt=0.01,
+            target_velocity=100.0,
+            t_acc=0.0,
+            t_dec=0.0,
+        )
+    )
+    sampled_e = [point.e for point in samples]
+    assert sampled_e[0] == pytest.approx(source_curve.e_profile[0])
+    assert sampled_e[-1] == pytest.approx(source_curve.e_profile[-1])
+    assert all(right >= left - 1e-6 for left, right in zip(sampled_e, sampled_e[1:]))
 
 
 def test_first_material_layers_and_destination_travels_use_dedicated_speeds():

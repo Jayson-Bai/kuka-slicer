@@ -28,7 +28,7 @@ layer_0001_R
 layer_0001_F
 ```
 
-`R` 是树脂，`F` 是纤维。每个 `layer_xxxx_R/F` 是数值型 `float32` 三维数组：
+`R` 是树脂，`F` 是纤维。每个 `layer_xxxx_R/F` 是正式版本要求的数值型 `float64` 三维数组：
 
 ```text
 [path_count, max_points_per_path, columns]

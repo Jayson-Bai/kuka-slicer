@@ -886,3 +886,83 @@ def test_convert_skips_fiber_startup_events_when_source_has_no_fiber_paths(tmp_p
     assert "heat_resin" in non_empty_events
     assert "fan_cf" not in non_empty_events
     assert "heat_cf" not in non_empty_events
+
+
+def test_system_npz_embeds_local_injection_catalog_and_row_markers(tmp_path):
+    import json
+    import numpy as np
+
+    from path_processing_core.npz_exporter import export_npz
+    from path_processing_core.types import MCommand, MoveCommand, Position, ToolChangeCommand
+
+    p0 = Position(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    p1 = Position(5.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    p2 = Position(5.0, 5.0, 0.0, 0.0, 0.0, 0.0)
+    commands = [
+        MoveCommand(
+            type="PRINT", cmd="G1", start_pos=p0, pos=p1,
+            e_val=5.0, delta_e=5.0, feedrate=600.0, line=1,
+            layer=0, subtype="RESIN", raw="resin_print",
+        ),
+        ToolChangeCommand(
+            type="TOOL_CHANGE", tool=0, line=2, layer=0,
+            subtype="TRAVEL", raw="tool_change_to_fiber",
+        ),
+        MoveCommand(
+            type="PRINT", cmd="G1", start_pos=p1, pos=p2,
+            e_val=5.0, delta_e=5.0, feedrate=600.0, line=3,
+            layer=0, subtype="FIBER", raw="fiber_print",
+        ),
+        MCommand(
+            type="M_COMMAND", code="CUT", params={"P": 1.0}, line=4,
+            layer=0, subtype="FIBER", raw="external_npz_cut", tool=1,
+        ),
+        MoveCommand(
+            type="TRAVEL", cmd="G0", start_pos=p2, pos=p0,
+            e_val=0.0, delta_e=0.0, feedrate=600.0, line=5,
+            layer=0, subtype="TRAVEL", raw="after_cut_travel",
+        ),
+    ]
+    output = tmp_path / "marked.npz"
+
+    export_npz(
+        commands,
+        str(output),
+        dt=0.1,
+        chunk_size=8,
+        default_feed_mm_s=10.0,
+        enable_extrude_wait=True,
+        external_npz_cut_absolute_e=True,
+        tool_offset=(1.0, 2.0, 3.0),
+        tool_change_safe_lift_mm=4.0,
+        cut_lift_mm=1.0,
+        cut_wait_s=3.0,
+    )
+
+    parts = sorted(output.parent.glob("marked_part*.npz"))
+    assert len(parts) > 1
+    seq_parts = []
+    block_parts = []
+    role_parts = []
+    for part in parts:
+        with np.load(part, allow_pickle=False) as data:
+            manifest = json.loads(str(data["core_injection_manifest"].item()))
+            assert manifest["format"] == "core_npz_local_injection_v1"
+            assert manifest["sample_period_s"] == 0.1
+            assert manifest["base_parameters"]["tool_offset"] == [1.0, 2.0, 3.0]
+            assert {"tool_change", "cut", "resin_z_compensation"}.issubset(
+                block["kind"] for block in manifest["blocks"]
+            )
+            assert len(data["core_injection_block_id"]) == len(data["seq"])
+            seq_parts.append(data["seq"].copy())
+            block_parts.append(data["core_injection_block_id"].copy())
+            role_parts.append(data["core_injection_role"].copy())
+
+    seq = np.concatenate(seq_parts)
+    block_ids = np.concatenate(block_parts)
+    roles = np.concatenate(role_parts)
+    assert np.all(np.diff(seq) == 1)
+    marked = block_ids > 0
+    assert np.any(marked)
+    marked_roles = set(int(value) for value in roles[marked])
+    assert {1, 2, 4, 5, 6, 7}.issubset(marked_roles)

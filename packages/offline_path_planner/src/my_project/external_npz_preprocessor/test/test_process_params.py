@@ -49,31 +49,31 @@ def test_default_process_params_match_current_material_setup():
     assert not hasattr(params.resin, "bead_width_mm")
     assert params.resin.layer_height_mm == 0.5
     assert params.resin.extrusion_scale == 1.0
-    assert params.resin.feed_mm_s == 10.0
+    assert params.resin.feed_mm_s == 15.0
     assert params.resin.first_layer_feed_mm_s == 10.0
-    assert params.resin.temperature_c == 250.0
+    assert params.resin.temperature_c == 240.0
     assert params.resin.fan_enabled is True
     assert params.fiber.layer_height_mm == 0.1
     assert params.fiber.extrusion_scale == 1.0
-    assert params.fiber.feed_mm_s == 10.0
-    assert params.fiber.first_layer_feed_mm_s == 10.0
-    assert params.fiber.temperature_c == 250.0
+    assert params.fiber.feed_mm_s == 15.0
+    assert params.fiber.first_layer_feed_mm_s == 15.0
+    assert params.fiber.temperature_c == 260.0
     assert params.fiber.fan_enabled is True
     assert params.fiber.e_per_mm() == 1.0
-    assert params.resin.prime_length_mm == 18.0
-    assert params.resin.prime_speed_mm_s == 15.0
-    assert params.resin.retract_length_mm == 15.0
-    assert params.resin.retract_speed_mm_s == 30.0
-    assert params.fiber.prime_length_mm == 12.0
+    assert params.resin.prime_length_mm == 22.0
+    assert params.resin.prime_speed_mm_s == 12.0
+    assert params.resin.retract_length_mm == 19.0
+    assert params.resin.retract_speed_mm_s == 12.0
+    assert params.fiber.prime_length_mm == 9.5
     assert params.fiber.prime_speed_mm_s == 5.0
     assert params.fiber.retract_length_mm == 10.0
     assert params.fiber.retract_speed_mm_s == 5.0
     assert params.fiber.start_accel_s == 2.0
-    assert params.travel_feed_mm_s == 10.0
-    assert params.first_layer_travel_feed_mm_s == 10.0
+    assert params.travel_feed_mm_s == 20.0
+    assert params.first_layer_travel_feed_mm_s == 15.0
     assert params.prime_settle_s == pytest.approx(0.5)
-    assert params.start_x_mm == 0.0
-    assert params.start_y_mm == 0.0
+    assert params.start_x_mm == 10.0
+    assert params.start_y_mm == 10.0
     assert params.corner_angle_deg == 45.0
     assert params.corner_retreat_ratio == 0.65
     assert params.spline_max_error_mm == 0.1

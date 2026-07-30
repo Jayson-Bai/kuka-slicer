@@ -32,7 +32,7 @@ external source NPZ
 The package supports:
 
 - `layer_0000_R` / `layer_0000_F` source keys.
-- Per-key numeric `float32` arrays shaped `[path_count, max_points, columns]`; short paths use all-NaN padding rows.
+- Per-key numeric `float64` arrays shaped `[path_count, max_points, columns]`; short paths use all-NaN padding rows.
 - Nx3 `[x, y, z]` source paths as the required base format.
 - Nx6 `[x, y, z, a, b, c]` source paths when the source needs explicit pose values.
 - Source-side Z is trajectory geometry and is never overwritten by UI layer-height values.

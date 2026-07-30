@@ -9,7 +9,12 @@ from typing import Any
 
 from path_processing_core.head_calibration import DEFAULT_DATA_ROOT
 
-from .process_params import FiberProcessParams, ProcessParams, ResinProcessParams
+from .process_params import (
+    CoreExportParams,
+    FiberProcessParams,
+    ProcessParams,
+    ResinProcessParams,
+)
 
 
 _CONFIG_DIR_NAME = "external_npz_preprocessor"
@@ -50,6 +55,7 @@ def process_params_from_dict(data: dict[str, Any]) -> ProcessParams:
     merged = _deep_merge(defaults, data)
     resin_data = data.get("resin", {}) if isinstance(data.get("resin", {}), dict) else {}
     fiber_data = data.get("fiber", {}) if isinstance(data.get("fiber", {}), dict) else {}
+    export_data = data.get("export", {}) if isinstance(data.get("export", {}), dict) else {}
     if "first_layer_feed_mm_s" not in resin_data:
         merged["resin"]["first_layer_feed_mm_s"] = merged["resin"]["feed_mm_s"]
     if "first_layer_feed_mm_s" not in fiber_data:
@@ -83,6 +89,9 @@ def process_params_from_dict(data: dict[str, Any]) -> ProcessParams:
         default_c=float(merged.get("default_c", defaults["default_c"])),
         start_x_mm=float(merged.get("start_x_mm", defaults["start_x_mm"])),
         start_y_mm=float(merged.get("start_y_mm", defaults["start_y_mm"])),
+        primeline_enabled=bool(
+            merged.get("primeline_enabled", defaults["primeline_enabled"])
+        ),
         primeline_x_mm=float(
             merged.get("primeline_x_mm", defaults["primeline_x_mm"])
         ),
@@ -113,6 +122,9 @@ def process_params_from_dict(data: dict[str, Any]) -> ProcessParams:
         degree=int(merged.get("degree", defaults["degree"])),
         max_fit_points_per_segment=int(
             merged.get("max_fit_points_per_segment", defaults["max_fit_points_per_segment"])
+        ),
+        export=CoreExportParams(
+            **_known_fields(CoreExportParams, merged.get("export", export_data))
         ),
     )
 

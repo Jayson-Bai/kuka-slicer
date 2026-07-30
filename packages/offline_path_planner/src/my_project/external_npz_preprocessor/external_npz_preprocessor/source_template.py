@@ -11,9 +11,9 @@ import numpy as np
 def _padded_paths(paths: list[np.ndarray]) -> np.ndarray:
     max_points = max(np.asarray(path).shape[0] for path in paths)
     columns = np.asarray(paths[0]).shape[1]
-    out = np.full((len(paths), max_points, columns), np.nan, dtype=np.float32)
+    out = np.full((len(paths), max_points, columns), np.nan, dtype=np.float64)
     for idx, path in enumerate(paths):
-        arr = np.asarray(path, dtype=np.float32)
+        arr = np.asarray(path, dtype=np.float64)
         if arr.ndim != 2 or arr.shape[1] != columns:
             raise ValueError("all template paths must be 2D arrays with the same column count")
         out[idx, : arr.shape[0], :] = arr
@@ -30,6 +30,8 @@ def write_two_layer_template_npz(path: str | Path) -> Path:
         "unit": "mm",
         "point_columns": ["x", "y", "z"],
         "materials": {"R": "resin", "F": "fiber"},
+        "precision": "float64",
+        "coordinate_system": "project_default",
         "description": "Two layers; each layer contains ordered XYZ resin and fiber paths. Z comes from the source slicer."
     }
 
