@@ -16,6 +16,11 @@ from kuka_slicer.slicer import (
     DEFAULT_RESIN_LAYER_HEIGHT_MM,
     DEFAULT_RESIN_LINE_WIDTH_MM,
     DEFAULT_RESIN_PLANNING_LINE_WIDTH_MM,
+    DEFAULT_PRUSA_RAFT_CONTACT_DISTANCE_MM,
+    DEFAULT_PRUSA_RAFT_EXPANSION_MM,
+    DEFAULT_PRUSA_RAFT_FIRST_LAYER_DENSITY_PERCENT,
+    DEFAULT_PRUSA_RAFT_FIRST_LAYER_EXPANSION_MM,
+    DEFAULT_PRUSA_RAFT_LAYER_COUNT,
     PrusaGeometryConfig,
     PrusaRaftConfig,
     RaftLayerConfig,
@@ -141,6 +146,79 @@ def test_fiber_template_z_is_offset_from_resin_layer_z():
     )
 
 
+def test_brim_layer_skips_fiber_and_keeps_following_resin_fiber_schedule():
+    resin_paths = [
+        MaterialPaths(
+            index,
+            "R",
+            [np.asarray([[0.0, 0.0, z], [1.0, 0.0, z]], dtype=np.float64)],
+        )
+        for index, z in enumerate((0.4, 0.9, 1.4, 1.9))
+    ]
+    job = ExternalSourceJob(
+        material_paths=resin_paths,
+        meta={
+            "slicing": {
+                "prusa_brim": {"enabled": True},
+                "z_max": 1.9,
+            },
+            "path_roles": {"R": {"0": ["brim"], "1": ["infill"]}},
+        },
+    )
+    template_paths = [[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]]
+
+    fiber_paths_by_layer = expand_fiber_template_for_resin_layers(job, template_paths)
+
+    assert np.allclose(
+        [group.paths[0][0, 2] for group in job.material_paths],
+        [0.4, 0.9, 1.5, 2.1],
+    )
+    assert sorted(fiber_paths_by_layer) == [1, 2]
+    assert np.allclose(
+        [fiber_paths_by_layer[index][0][0][2] for index in (1, 2)],
+        [1.0, 1.6],
+    )
+    assert job.meta["slicing"]["fiber_layers_skipped_for_brim"] == 1
+
+
+def test_fiber_z_offset_keeps_prusa_travel_aligned_with_resin_layer():
+    resin_paths = [
+        MaterialPaths(
+            index,
+            "R",
+            [np.asarray([[0.0, 0.0, z], [1.0, 0.0, z]], dtype=np.float64)],
+        )
+        for index, z in enumerate((0.4, 0.9, 1.4, 1.9))
+    ]
+    travel_paths = [
+        TravelPaths(
+            index,
+            [np.asarray([[1.0, 0.0, z], [2.0, 0.0, z]], dtype=np.float64)],
+        )
+        for index, z in enumerate((0.4, 0.9, 1.4, 1.9))
+    ]
+    job = ExternalSourceJob(
+        material_paths=resin_paths,
+        travel_paths=travel_paths,
+        meta={
+            "slicing": {"prusa_brim": {"enabled": True}},
+            "path_roles": {"R": {"0": ["brim"], "1": ["infill"]}},
+        },
+    )
+    template_paths = [[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]]
+
+    expand_fiber_template_for_resin_layers(job, template_paths)
+
+    assert np.allclose(
+        [group.paths[0][0, 2] for group in job.material_paths if group.material == "R"],
+        [0.4, 0.9, 1.5, 2.1],
+    )
+    assert np.allclose(
+        [group.paths[0][0, 2] for group in job.travel_paths],
+        [0.4, 0.9, 1.5, 2.1],
+    )
+
+
 def test_first_layer_height_carries_into_the_fiber_resin_schedule():
     mesh = Mesh(_cube_triangles(size=1.5))
     job = slice_mesh_to_job(
@@ -228,6 +306,80 @@ def test_fiber_json_merges_multiple_path_families_at_the_same_layer_height(
         np.allclose(np.asarray(path)[:, 2], 0.6)
         for path in fiber_paths_by_layer[0]
     )
+
+
+def test_fiber_json_loads_optimized_final_paths_with_top_level_metadata(tmp_path):
+    json_path = tmp_path / "optimized_result.json"
+    json_path.write_text(
+        """
+        {
+          "contour_count": 25,
+          "contour_offset_mm": 1.5,
+          "domain": {"outer": [], "holes": []},
+          "accepted_connectors": [],
+          "final_paths": [
+            {
+              "path_id": "optimized-0000",
+              "source_family": "optimized",
+              "source_index": 0,
+              "closed": false,
+              "points": [
+                {"x": 1.25, "y": 2.5},
+                {"x": 3.75, "y": 4.0}
+              ]
+            }
+          ]
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    assert load_fiber_template_json(json_path) == [
+        [[1.25, 2.5, 0.0], [3.75, 4.0, 0.0]]
+    ]
+
+
+def test_fiber_json_loads_canonical_one_record_per_path_format(tmp_path):
+    json_path = tmp_path / "canonical_fiber_paths.json"
+    json_path.write_text(
+        """
+        {
+          "format": "external_fiber_paths_v1",
+          "unit": "mm",
+          "coordinate_system": "project_default",
+          "point_columns": ["x", "y"],
+          "path_order": "sequence",
+          "paths": [
+            {
+              "path_id": "S+-0000",
+              "family": "S+-family",
+              "source_index": 0,
+              "sequence": 0,
+              "closed": false,
+              "points": [
+                {"x": 1.0, "y": 2.0},
+                {"x": 3.0, "y": 4.0}
+              ]
+            },
+            {
+              "path_id": "T-0000",
+              "family": "T-family",
+              "source_index": 0,
+              "sequence": 1,
+              "closed": false,
+              "points": [[5.0, 6.0], [7.0, 8.0]]
+            }
+          ],
+          "connectors": []
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    assert load_fiber_template_json(json_path) == [
+        [[1.0, 2.0, 0.0], [3.0, 4.0, 0.0]],
+        [[5.0, 6.0, 0.0], [7.0, 8.0, 0.0]],
+    ]
 
 
 def test_fiber_template_paths_preserve_input_vertices_before_export():
@@ -3919,9 +4071,22 @@ def test_ui_exposes_slicing_kernel_input():
     assert 'value="pyslm">PySLM（实验）<' in html
     assert 'id="prusaPerimeterCount"' in html
     assert 'id="prusaInfillPattern"' in html
+    assert '<div class="sectionTitleRow">' in html
+    assert '<div id="fiberNotice" class="notice fiberNotice"></div>' in html
+    assert '.inputBand .bandGrid {' in html
+    assert 'grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 94px 94px 140px;' in html
+    assert html.index('id="slicingKernel"') < html.index('id="prusaInfillPattern"')
+    assert html.index('id="slicingKernel"') < html.index('id="prusaPrintPerimeters"')
+    assert 'class="fieldGroup compactDimensionField"' in html
     assert 'id="prusaEffectiveConfig"' not in html
     assert 'id="prusaRaftEnabled"' in html
+    assert 'id="prusaRaftEnabled" type="checkbox" checked' in html
     assert 'id="prusaRaftLayers"' in html
+    assert f'id="prusaRaftLayers" type="number" min="1" step="1" value="{DEFAULT_PRUSA_RAFT_LAYER_COUNT}"' in html
+    assert f'id="prusaRaftExpansion" type="number" min="0" step="0.1" value="{DEFAULT_PRUSA_RAFT_EXPANSION_MM:g}"' in html
+    assert f'id="prusaRaftFirstLayerExpansion" type="number" min="0" step="0.1" value="{DEFAULT_PRUSA_RAFT_FIRST_LAYER_EXPANSION_MM:g}"' in html
+    assert f'id="prusaRaftFirstLayerDensity" type="number" min="10" max="100" step="1" value="{DEFAULT_PRUSA_RAFT_FIRST_LAYER_DENSITY_PERCENT:g}"' in html
+    assert f'id="prusaRaftContactDistance" type="number" min="0" step="0.01" value="{DEFAULT_PRUSA_RAFT_CONTACT_DISTANCE_MM:g}"' in html
     assert 'id="prusaRaftContactDistance"' in html
     assert 'id="prusaAdvancedSettings"' in html
     assert 'id="prusaPerimeterGenerator"' in html
@@ -3962,6 +4127,35 @@ def test_prusa_ui_uses_dense_grouped_settings_layout():
     assert '<h4>填充连接</h4>' in html
     assert '<h4>空移与接缝</h4>' in html
     assert 'id="prusaEffectiveConfig"' not in html
+
+
+def test_ui_offers_large_advanced_settings_as_draggable_resizable_popups():
+    html = _index_html()
+
+    assert "installAdvancedPopups" in html
+    assert "advancedIds = ['prusaAdvancedSettings', 'coreProcessSettings']" in html
+    assert 'id="zMin"' not in html
+    assert 'id="zMax"' not in html
+    assert 'id="tolerance"' not in html
+    assert "advancedPopupTrigger" in html
+    assert "summary.hidden = true" in html
+    assert "const isCorePopup = popup.closest('#coreProcessSettings') !== null;" in html
+    assert "const widthLimit = isCorePopup ? 1180 : 900;" in html
+    assert "const heightLimit = isCorePopup ? 960 : 680;" in html
+    assert ".advancedPopup.coreAdvancedPopup {" in html
+    assert "height: auto;" in html
+    assert "overflow: visible;" in html
+    assert "popup.style.height = isCorePopup ? 'auto'" in html
+    assert ".advancedPopupBody {" in html
+    assert "overflow: auto;" in html
+    assert ".coreAdvancedPopup .coreParameterSubgroup {" in html
+    assert ".coreAdvancedPopup input:not([type=\"checkbox\"]):not([type=\"range\"])," in html
+    assert "height: 34px;" in html
+    assert ".advancedPopup {" in html
+    assert "resize: both;" in html
+    assert "advancedPopupHeader" in html
+    assert "advancedPopupClose" in html
+    assert "pointerdown" in html
 
 
 def test_prusa_parameter_labels_offer_hover_help():
@@ -4026,11 +4220,13 @@ def test_prusa_config_ignores_legacy_path_parameters_and_reports_effective_value
         "contour_infill_overlap": 8.0,
         "path_backend": "prusa_fff",
         "prusa_perimeter_infill_overlap": 8.0,
+        "start_x_mm": 0.0,
+        "start_y_mm": 0.0,
         "prusa_raft": {
-            "layer_count": 0,
-            "expansion": 3.0,
+            "layer_count": 2,
+            "expansion": 10.0,
             "first_layer_density": 80.0,
-            "first_layer_expansion": 3.0,
+            "first_layer_expansion": 5.0,
             "contact_distance": 0.25,
         },
         "prusa_geometry": PrusaGeometryConfig().to_metadata(),
@@ -4183,7 +4379,10 @@ def test_ui_offers_an_optional_extrusion_color_mapping():
     assert 'id="extrusionColorLegend"' in html
     assert "showExtrusionInput.checked" in html
     assert "extrusionColorForSegment" in html
-    assert "ΔE / Δs" in html
+    assert "绝对挤出量（E/mm）" in html
+    assert "ABSOLUTE_EXTRUSION_COLOR_RANGE" in html
+    assert "extrusionDensityRange(entries)" in html
+    assert "extrusionDensityRange(entries.slice(0, visibleCount))" not in html
 
 
 def test_ui_offers_a_visible_gray_blue_dashed_travel_layer():

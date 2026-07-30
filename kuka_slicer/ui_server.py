@@ -1,22 +1,29 @@
 from __future__ import annotations
 
 from datetime import datetime
+from dataclasses import asdict, replace
 from email import policy
 from email.parser import BytesParser
 import html
+import importlib
 import json
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import re
+import sys
+import threading
+import time
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlparse
+from uuid import uuid4
+import zipfile
 
 import numpy as np
 
 from .external_npz import (
     MaterialPaths,
-    simplify_job_paths_for_export,
+    TravelPaths,
     write_external_source_npz,
 )
 from .slicer import (
@@ -27,6 +34,11 @@ from .slicer import (
     DEFAULT_RESIN_LAYER_HEIGHT_MM,
     DEFAULT_RESIN_LINE_WIDTH_MM,
     DEFAULT_RESIN_PLANNING_LINE_WIDTH_MM,
+    DEFAULT_PRUSA_RAFT_CONTACT_DISTANCE_MM,
+    DEFAULT_PRUSA_RAFT_EXPANSION_MM,
+    DEFAULT_PRUSA_RAFT_FIRST_LAYER_DENSITY_PERCENT,
+    DEFAULT_PRUSA_RAFT_FIRST_LAYER_EXPANSION_MM,
+    DEFAULT_PRUSA_RAFT_LAYER_COUNT,
     DEFAULT_RAFT_LAYER_COUNT,
     DEFAULT_RAFT_OUTWARD_OFFSETS_MM,
     DEFAULT_RAFT_TOP_GAP_MM,
@@ -52,11 +64,314 @@ from .stl_io import load_stl
 DEFAULT_UI_RESIN_INFILL_OVERLAP_PERCENT = 0.0
 
 
+def _offline_planner_data_root() -> Path:
+    return (
+        Path(__file__).resolve().parent.parent
+        / "packages"
+        / "offline_path_planner"
+        / "data"
+    )
+
+
+def _core_print_params_path() -> Path:
+    return _offline_planner_data_root() / "external_npz_preprocessor" / "print_params.json"
+
+
+def _prusa_params_path() -> Path:
+    return _offline_planner_data_root() / "external_npz_preprocessor" / "prusa_params.json"
+
+
+def _core_output_download_path(core_npz_path: Path) -> Path:
+    """Return one downloadable artifact for a core export.
+
+    The core writer renames a one-part export to the requested NPZ path.  If a
+    large export is split, bundle its parts and sidecars so the browser does
+    not silently download only the first trajectory fragment.
+    """
+
+    if core_npz_path.is_file():
+        return core_npz_path
+
+    parts = sorted(core_npz_path.parent.glob(f"{core_npz_path.stem}_part*.npz"))
+    if not parts:
+        raise FileNotFoundError(f"core NPZ output was not written: {core_npz_path}")
+
+    package_path = core_npz_path.with_name(f"{core_npz_path.stem}_package.zip")
+    sidecars = [
+        core_npz_path.with_name(f"{core_npz_path.stem}.offset.json"),
+        core_npz_path.with_name(f"{core_npz_path.stem}.timing.json"),
+    ]
+    with zipfile.ZipFile(package_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for candidate in [*parts, *sidecars]:
+            if candidate.is_file():
+                archive.write(candidate, arcname=candidate.name)
+    return package_path
+
+
+def _preview_position(point, xy_offset: tuple[float, float] = (0.0, 0.0)) -> list[float]:
+    return [
+        float(point.x) + float(xy_offset[0]),
+        float(point.y) + float(xy_offset[1]),
+        float(point.z),
+    ]
+
+
+def _core_preview_overlay_from_commands(
+    commands,
+    *,
+    xy_offset: tuple[float, float] = (0.0, 0.0),
+) -> dict[str, object]:
+    """Collect Core-only geometry that is absent from the Prusa preview."""
+
+    overlay: dict[str, object] = {
+        "origin": [0.0, 0.0],
+        "primeline_paths": [],
+        "core_travel_paths": [],
+        "layer_lift_paths": [],
+        "sequence": [],
+    }
+    primeline_paths = overlay["primeline_paths"]
+    core_travel_paths = overlay["core_travel_paths"]
+    layer_lift_paths = overlay["layer_lift_paths"]
+    sequence = overlay["sequence"]
+
+    resin_base_counts: dict[int, int] = {}
+    previous_prusa_travel_layer: int | None = None
+    for command in commands:
+        layer = int(getattr(command, "layer", 0))
+        raw = getattr(command, "raw", None)
+        subtype = getattr(command, "subtype", None)
+        if raw in {"external_npz_start_xy_travel", "external_npz_prusa_travel"}:
+            if raw == "external_npz_start_xy_travel" or previous_prusa_travel_layer != layer:
+                resin_base_counts[layer] = resin_base_counts.get(layer, 0) + 1
+            previous_prusa_travel_layer = layer if raw == "external_npz_prusa_travel" else None
+        elif getattr(command, "type", None) == "PRINT":
+            previous_prusa_travel_layer = None
+            if subtype != "FIBER_PRINT" and raw != "external_npz_primeline":
+                resin_base_counts[layer] = resin_base_counts.get(layer, 0) + 1
+        else:
+            previous_prusa_travel_layer = None
+
+    source_index: dict[int, int] = {}
+    fiber_index: dict[int, int] = {}
+    previous_prusa_travel_layer: int | None = None
+    sequence_order = 0
+
+    def display_index(layer: int) -> int:
+        if fiber_index.get(layer, 0) > 0:
+            return resin_base_counts.get(layer, 0) + fiber_index[layer]
+        return source_index.get(layer, 0)
+
+    for command in commands:
+        raw = getattr(command, "raw", None)
+        layer = int(getattr(command, "layer", 0))
+        subtype = getattr(command, "subtype", None)
+        if raw == "external_npz_primeline":
+            points = [
+                _preview_position(getattr(command, "start_pos"), xy_offset),
+                *[
+                    _preview_position(point, xy_offset)
+                    for point in getattr(command, "control_points", [])
+                ],
+            ]
+            if len(points) >= 2:
+                item = {"layer": layer, "points": points}
+                primeline_paths.append(item)
+                sequence.append(
+                    {
+                        "layer": layer,
+                        "kind": "deposit",
+                        "role": "primeline",
+                        "points": points,
+                        "anchor": display_index(layer),
+                        "order": sequence_order,
+                    }
+                )
+        elif raw in {"external_npz_travel", "external_npz_layer_lift"}:
+            points = [
+                _preview_position(getattr(command, "start_pos"), xy_offset),
+                _preview_position(getattr(command, "pos"), xy_offset),
+            ]
+            if raw == "external_npz_layer_lift":
+                layer_lift_paths.append({"layer": layer, "points": points})
+                role = "layer_lift"
+            else:
+                core_travel_paths.append({"layer": layer, "points": points})
+                role = "core_travel"
+            sequence.append(
+                {
+                    "layer": layer,
+                    "kind": "travel",
+                    "role": role,
+                    "points": points,
+                    "anchor": display_index(layer),
+                    "order": sequence_order,
+                }
+            )
+        elif raw in {"external_npz_start_xy_travel", "external_npz_prusa_travel"}:
+            if raw == "external_npz_start_xy_travel" or previous_prusa_travel_layer != layer:
+                source_index[layer] = source_index.get(layer, 0) + 1
+            previous_prusa_travel_layer = layer if raw == "external_npz_prusa_travel" else None
+        elif getattr(command, "type", None) == "PRINT":
+            previous_prusa_travel_layer = None
+            if subtype == "FIBER_PRINT":
+                fiber_index[layer] = fiber_index.get(layer, 0) + 1
+            elif raw != "external_npz_primeline":
+                source_index[layer] = source_index.get(layer, 0) + 1
+        else:
+            previous_prusa_travel_layer = None
+        sequence_order += 1
+    return overlay
+
+
+def _core_preview_xy_offset(job, core_params) -> tuple[float, float]:
+    """Map Core command coordinates back into the Prusa preview frame.
+
+    The external converter normalizes material coordinates by the minimum XY
+    of all material paths before generating Core commands.  The browser keeps
+    showing the Prusa/source frame, so Core-only overlay geometry needs the
+    inverse translation for display.
+    """
+
+    min_x = float("inf")
+    min_y = float("inf")
+    for group in getattr(job, "material_paths", []):
+        for path in getattr(group, "paths", []):
+            points = np.asarray(path, dtype=np.float32)
+            if points.size == 0:
+                continue
+            finite = points[np.isfinite(points[:, :2]).all(axis=1)]
+            if finite.size == 0:
+                continue
+            min_x = min(min_x, float(np.min(finite[:, 0])))
+            min_y = min(min_y, float(np.min(finite[:, 1])))
+
+    if not np.isfinite(min_x) or not np.isfinite(min_y):
+        return (0.0, 0.0)
+    return (
+        min_x - float(getattr(core_params, "start_x_mm", 0.0)),
+        min_y - float(getattr(core_params, "start_y_mm", 0.0)),
+    )
+
+
+def _ensure_offline_planner_import_paths() -> None:
+    """Make the checked-out offline planner packages available to the UI.
+
+    The standalone slicer package intentionally does not statically import the
+    offline planner package.  The UI still needs the repository checkout when
+    both projects are run directly without installing the ROS-style packages.
+    """
+
+    package_root = (
+        Path(__file__).resolve().parent.parent
+        / "packages"
+        / "offline_path_planner"
+        / "src"
+        / "my_project"
+    )
+    for package_name in (
+        "external_npz_preprocessor",
+        "path_processing_core",
+        "gcode_planner",
+    ):
+        package_path = package_root / package_name
+        if package_path.is_dir() and str(package_path) not in sys.path:
+            sys.path.insert(0, str(package_path))
+
+
+def _load_core_print_params():
+    """Load the persisted process_core defaults used by the integrated UI."""
+
+    _ensure_offline_planner_import_paths()
+    module = importlib.import_module("external_npz_preprocessor.param_config")
+    return module.load_print_params(_core_print_params_path())
+
+
+def _load_prusa_params() -> dict[str, object]:
+    """Load the integrated Prusa UI defaults, tolerating an absent/old file."""
+
+    path = _prusa_params_path()
+    if not path.is_file():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    values = raw.get("params", raw) if isinstance(raw, dict) else {}
+    return values if isinstance(values, dict) else {}
+
+
+def _save_prusa_params(values: dict[str, object]) -> Path:
+    path = _prusa_params_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "format": "kuka_slicer_prusa_params",
+        "version": 1,
+        "params": values,
+    }
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _coerce_form_params(values: dict[str, object]) -> dict[str, list[str]]:
+    """Convert JSON scalar values into the parser's form-style mapping."""
+
+    return {key: [str(value).lower() if isinstance(value, bool) else str(value)] for key, value in values.items()}
+
+
+_PRUSA_FLOAT_KEYS = {
+    "layer_height", "first_layer_height", "line_width", "prusa_start_x_mm",
+    "prusa_start_y_mm", "prusa_infill_density", "prusa_contour_infill_overlap",
+    "prusa_raft_expansion", "prusa_raft_first_layer_density",
+    "prusa_raft_first_layer_expansion", "prusa_raft_contact_distance",
+    "prusa_raft_contact_layer_height", "prusa_raft_contact_density",
+    "prusa_raft_contact_extrusion_width",
+    "prusa_brim_width", "prusa_brim_separation",
+    "prusa_external_perimeter_width", "prusa_perimeter_width", "prusa_infill_width",
+    "prusa_xy_size_compensation", "prusa_elephant_foot_compensation",
+    "prusa_infill_anchor", "prusa_infill_anchor_max", "prusa_avoid_crossing_max_detour",
+}
+_PRUSA_INT_KEYS = {
+    "prusa_perimeter_count", "prusa_raft_layers",
+}
+_PRUSA_BOOL_KEYS = {
+    "prusa_print_perimeters", "prusa_raft_enabled", "prusa_raft_auto_contact",
+    "prusa_gap_fill_enabled", "prusa_brim_enabled", "prusa_brim_one_stroke",
+}
+_PRUSA_NULLABLE_FLOAT_KEYS = {
+    "prusa_external_perimeter_width", "prusa_perimeter_width", "prusa_infill_width",
+    "prusa_infill_anchor", "prusa_infill_anchor_max",
+}
+
+
+def _normalize_prusa_params(values: dict[str, object]) -> dict[str, object]:
+    normalized: dict[str, object] = {}
+    for key, value in values.items():
+        if key in _PRUSA_NULLABLE_FLOAT_KEYS and value in (None, ""):
+            normalized[key] = None
+        elif key in _PRUSA_FLOAT_KEYS:
+            normalized[key] = float(value)
+        elif key in _PRUSA_INT_KEYS:
+            normalized[key] = int(float(value))
+        elif key in _PRUSA_BOOL_KEYS:
+            normalized[key] = (
+                value if isinstance(value, bool) else str(value).strip().lower() in {"1", "true", "yes", "on"}
+            )
+        else:
+            normalized[key] = value
+    return normalized
+
+
 def run_ui_server(host: str, port: int, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     class SlicerUiHandler(_SlicerUiHandler):
         server_output_dir = output_dir.resolve()
+        slice_jobs: dict[str, dict[str, object]] = {}
+        slice_jobs_lock = threading.Lock()
 
     server = ThreadingHTTPServer((host, port), SlicerUiHandler)
     print(f"KUKA slicer UI running at http://{host}:{port}")
@@ -70,11 +385,16 @@ def run_ui_server(host: str, port: int, output_dir: Path) -> None:
 
 class _SlicerUiHandler(BaseHTTPRequestHandler):
     server_output_dir: Path
+    slice_jobs: dict[str, dict[str, object]] = {}
+    slice_jobs_lock = threading.Lock()
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/":
             self._send_html(_index_html())
+            return
+        if parsed.path == "/slice-status":
+            self._send_slice_status(parse_qs(parsed.query))
             return
         if parsed.path.startswith("/outputs/"):
             self._send_output_file(parsed.path.removeprefix("/outputs/"))
@@ -83,22 +403,142 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/ui-settings":
+            try:
+                self._save_ui_settings()
+            except Exception as exc:  # noqa: BLE001
+                self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json({"ok": True})
+            return
         if parsed.path != "/slice":
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
             return
 
         try:
-            result = self._handle_slice(parsed.query)
+            request_data = self._read_slice_request(parsed.query)
+            job_id = self._start_slice_job(parsed.query, request_data)
         except Exception as exc:  # noqa: BLE001
             self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
-        self._send_json({"ok": True, **result})
+        self._send_json(
+            {
+                "ok": True,
+                "job_id": job_id,
+                "state": "queued",
+                "progress": 0,
+                "message": "已接收任务，等待处理",
+            }
+        )
 
     def log_message(self, format: str, *args: object) -> None:
         print(f"{self.address_string()} - {format % args}")
 
-    def _handle_slice(self, query: str) -> dict[str, object]:
-        params, files = self._read_slice_request(query)
+    def _start_slice_job(
+        self,
+        query: str,
+        request_data: tuple[dict[str, list[str]], dict[str, tuple[str | None, bytes]]],
+    ) -> str:
+        job_id = uuid4().hex
+        self._update_slice_job(
+            job_id,
+            state="queued",
+            progress=0,
+            message="已接收任务，等待处理",
+            elapsed_s=0.0,
+        )
+        worker = threading.Thread(
+            target=self._run_slice_job,
+            args=(job_id, query, request_data),
+            daemon=True,
+            name=f"slicer-ui-{job_id[:8]}",
+        )
+        worker.start()
+        return job_id
+
+    def _run_slice_job(
+        self,
+        job_id: str,
+        query: str,
+        request_data: tuple[dict[str, list[str]], dict[str, tuple[str | None, bytes]]],
+    ) -> None:
+        started_at = time.perf_counter()
+
+        def update_progress(progress: int, message: str) -> None:
+            elapsed_s = time.perf_counter() - started_at
+            self._update_slice_job(
+                job_id,
+                state="running",
+                progress=max(0, min(99, int(progress))),
+                message=message,
+                elapsed_s=elapsed_s,
+            )
+
+        try:
+            result = self._handle_slice(
+                query,
+                request_data=request_data,
+                progress_callback=update_progress,
+            )
+            elapsed_s = time.perf_counter() - started_at
+            self._update_slice_job(
+                job_id,
+                state="complete",
+                progress=100,
+                message="导出完成",
+                elapsed_s=elapsed_s,
+                result=result,
+            )
+        except Exception as exc:  # noqa: BLE001
+            elapsed_s = time.perf_counter() - started_at
+            self._update_slice_job(
+                job_id,
+                state="error",
+                progress=0,
+                message="导出失败",
+                elapsed_s=elapsed_s,
+                error=str(exc),
+            )
+
+    def _update_slice_job(self, job_id: str, **updates: object) -> None:
+        cls = type(self)
+        with cls.slice_jobs_lock:
+            job = cls.slice_jobs.setdefault(job_id, {})
+            job.update(updates)
+
+    def _send_slice_status(self, query: dict[str, list[str]]) -> None:
+        job_id = query.get("job_id", [""])[0].strip()
+        if not job_id:
+            self._send_json(
+                {"ok": False, "error": "missing job_id"},
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+        cls = type(self)
+        with cls.slice_jobs_lock:
+            job = dict(cls.slice_jobs.get(job_id, {}))
+        if not job:
+            self._send_json(
+                {"ok": False, "error": "slice job not found"},
+                HTTPStatus.NOT_FOUND,
+            )
+            return
+        self._send_json({"ok": True, "job_id": job_id, **job})
+
+    def _handle_slice(
+        self,
+        query: str,
+        *,
+        request_data=None,
+        progress_callback=None,
+    ) -> dict[str, object]:
+        params, files = request_data or self._read_slice_request(query)
+
+        def progress(value: int, message: str) -> None:
+            if progress_callback is not None:
+                progress_callback(value, message)
+
+        progress(2, "正在读取模型和切片参数")
         filename = _safe_filename(params.get("filename", ["input.stl"])[0])
         slicing_kernel = params.get("slicing_kernel", ["prusa"])[0]
         if slicing_kernel not in {"prusa", "legacy", "pyslm"}:
@@ -119,7 +559,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         stl_path.write_bytes(stl_bytes)
 
         fiber_json_name = None
-        fiber_template_paths = []
+        fiber_template_paths: list[list[list[float]]] = []
         if "fiber_json" in files:
             fiber_filename, fiber_bytes = files["fiber_json"]
             fiber_json_name = _safe_filename(fiber_filename or "fiber_paths.json")
@@ -128,6 +568,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             fiber_template_paths = load_fiber_template_json(fiber_json_path)
 
         mesh = load_stl(stl_path)
+        progress(8, "正在准备 Prusa 路径")
         build_axis = resolve_build_axis(mesh, shared["requested_build_axis"])
         if slicing_kernel == "prusa":
             config = _parse_prusa_slice_config(params, shared, build_axis)
@@ -139,13 +580,16 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             config = _parse_pyslm_slice_config(params, shared, build_axis)
             raft_layers = []
         job = slice_mesh_to_job(mesh, config)
+        progress(35, "Prusa 路径生成完成，正在保留原始预览")
         resolved_config = _resolved_slice_config(config)
         slicing_meta = job.meta.get("slicing")
         if isinstance(slicing_meta, dict):
             slicing_meta["resolved_config"] = resolved_config
         fiber_preview_paths = {}
         if fiber_template_paths:
-            fiber_preview_paths = expand_fiber_template_for_resin_layers(job, fiber_template_paths)
+            fiber_preview_paths = expand_fiber_template_for_resin_layers(
+                job, fiber_template_paths
+            )
             merge_fiber_paths_into_job(job, fiber_preview_paths)
         if raft_layers:
             z_shift = add_raft_to_job(job, mesh, config, raft_layers, DEFAULT_RAFT_TOP_GAP_MM)
@@ -154,20 +598,76 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                 len(raft_layers),
                 z_shift,
             )
-        normalize_job_xy_origin(job)
-        simplify_job_paths_for_export(job)
+        normalize_job_xy_origin(
+            job,
+            target_xy=(float(config.start_x_mm), float(config.start_y_mm)),
+        )
+        primeline_enabled = _bool_param(params, "core_primeline_enabled", True)
+        if slicing_kernel == "prusa":
+            _prepend_prusa_startup_travel(
+                job,
+                start_xy=(float(config.start_x_mm), float(config.start_y_mm)),
+                primeline_enabled=primeline_enabled,
+                primeline_xy=(
+                    _float_param(params, "core_primeline_x_mm", 0.0),
+                    _float_param(params, "core_primeline_y_mm", -10.0),
+                ),
+            )
         fiber_preview_paths = _fiber_preview_paths_from_job(job)
         write_external_source_npz(job, npz_path)
+        progress(45, "Prusa 预览数据已保留，正在交给 path_processing_core")
 
         path_count = sum(len(group.paths) for group in job.material_paths)
-        preview = _preview_payload(mesh, config, job, fiber_preview_paths)
+        preview = _preview_payload(
+            mesh,
+            config,
+            job,
+            fiber_preview_paths,
+            hide_initial_prusa_travel=(slicing_kernel == "prusa" and primeline_enabled),
+        )
         recommendation = _triangle_infill_recommendation(mesh, config, job)
         slicing_metadata = job.meta.get("slicing", {})
         if not isinstance(slicing_metadata, dict):
             slicing_metadata = {}
+
+        _ensure_offline_planner_import_paths()
+        export_runner = importlib.import_module(
+            "external_npz_preprocessor.export_runner"
+        )
+        process_params_module = importlib.import_module(
+            "external_npz_preprocessor.process_params"
+        )
+        core_params = _parse_core_process_params(params, process_params_module)
+        core_preview_xy_offset = _core_preview_xy_offset(job, core_params)
+
+        core_npz_path = job_dir / f"{Path(filename).stem}_core.npz"
+
+        def core_progress(ratio: float) -> None:
+            bounded = max(0.0, min(1.0, float(ratio)))
+            progress(
+                50 + int(bounded * 45),
+                "正在执行 path_processing_core 并写出系统 NPZ",
+            )
+
+        def capture_core_preview(commands) -> None:
+            preview["core_overlay"] = _core_preview_overlay_from_commands(
+                commands,
+                xy_offset=core_preview_xy_offset,
+            )
+
+        core_stats = export_runner.convert_external_npz(
+            npz_path,
+            core_npz_path,
+            core_params,
+            progress_callback=core_progress,
+            chunk_size=5_000_000,
+            commands_callback=capture_core_preview,
+        )
+        progress(98, "正在完成系统 NPZ 和时间元数据写入")
+        download_path = _core_output_download_path(core_npz_path)
         return {
-            "download_url": f"/outputs/{quote(stamp)}/{quote(npz_path.name)}",
-            "filename": npz_path.name,
+            "download_url": f"/outputs/{quote(stamp)}/{quote(download_path.name)}",
+            "filename": download_path.name,
             "layers": len(preview["layers"]),
             "paths": path_count,
             "preview": preview,
@@ -191,6 +691,9 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                 )
                 else config.planning_line_width
             ),
+            "core_export_seconds": float(core_stats.get("total_s", 0.0)),
+            "core_rows": int(core_stats.get("rows", 0)),
+            "core_parts": int(core_stats.get("parts", 0)),
         }
 
     def _read_slice_request(
@@ -223,6 +726,44 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
         self.wfile.write(encoded)
+
+    def _save_ui_settings(self) -> None:
+        content_length = int(self.headers.get("Content-Length", "0"))
+        if content_length <= 0:
+            raise ValueError("missing settings payload")
+        raw = json.loads(self.rfile.read(content_length).decode("utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("settings payload must be an object")
+
+        core_values = raw.get("core", {})
+        if isinstance(core_values, dict):
+            _ensure_offline_planner_import_paths()
+            process_module = importlib.import_module(
+                "external_npz_preprocessor.process_params"
+            )
+            param_config = importlib.import_module(
+                "external_npz_preprocessor.param_config"
+            )
+            core_form_values = _coerce_form_params(core_values)
+            params = _parse_core_process_params(core_form_values, process_module)
+            prusa_values = raw.get("prusa", {})
+            if isinstance(prusa_values, dict):
+                existing = _load_core_print_params()
+                start_x = prusa_values.get("prusa_start_x_mm", existing.start_x_mm)
+                start_y = prusa_values.get("prusa_start_y_mm", existing.start_y_mm)
+                if start_x not in (None, "") and start_y not in (None, ""):
+                    params = replace(
+                        params,
+                        start_x_mm=float(start_x),
+                        start_y_mm=float(start_y),
+                    )
+            param_config.save_print_params(params, _core_print_params_path())
+
+        prusa_values = raw.get("prusa", {})
+        if isinstance(prusa_values, dict):
+            current = _load_prusa_params()
+            current.update(_normalize_prusa_params(prusa_values))
+            _save_prusa_params(current)
 
     def _send_output_file(self, relative_url_path: str) -> None:
         parts = [unquote(part) for part in relative_url_path.split("/") if part]
@@ -270,12 +811,17 @@ def _parse_shared_slice_config(
 ) -> dict[str, Any]:
     """Read only inputs shared by every supported slicing backend."""
 
+    prusa_defaults = _load_prusa_params()
     layer_height = _float_param(
         params,
         "layer_height",
-        DEFAULT_RESIN_LAYER_HEIGHT_MM,
+        float(prusa_defaults.get("layer_height", DEFAULT_RESIN_LAYER_HEIGHT_MM)),
     )
-    line_width = _float_param(params, "line_width", DEFAULT_RESIN_LINE_WIDTH_MM)
+    line_width = _float_param(
+        params,
+        "line_width",
+        float(prusa_defaults.get("line_width", DEFAULT_RESIN_LINE_WIDTH_MM)),
+    )
     tolerance = _optional_float_param(params, "tolerance")
     return {
         "slicing_kernel": slicing_kernel,
@@ -283,10 +829,12 @@ def _parse_shared_slice_config(
         "first_layer_height": _float_param(
             params,
             "first_layer_height",
-            layer_height,
+            float(prusa_defaults.get("first_layer_height", layer_height)),
         ),
         "line_width": line_width,
-        "requested_build_axis": params.get("build_axis", ["auto"])[0],
+        "requested_build_axis": params.get(
+            "build_axis", [str(prusa_defaults.get("build_axis", "auto"))]
+        )[0],
         "z_min": _optional_float_param(params, "z_min"),
         "z_max": _optional_float_param(params, "z_max"),
         "tolerance": (
@@ -313,6 +861,160 @@ def _base_slice_config_fields(
     }
 
 
+def _parse_core_process_params(
+    params: dict[str, list[str]], module, defaults=None
+) -> object:
+    """Build process_core parameters from the dedicated KUKA settings panel."""
+
+    defaults = defaults or _load_core_print_params()
+    resin_defaults = defaults.resin
+    fiber_defaults = defaults.fiber
+    export_defaults = defaults.export
+    resin = module.ResinProcessParams(
+        layer_height_mm=_float_param(params, "core_resin_layer_height", resin_defaults.layer_height_mm),
+        extrusion_scale=_float_param(params, "core_resin_extrusion_scale", resin_defaults.extrusion_scale),
+        feed_mm_s=_float_param(params, "core_resin_feed", resin_defaults.feed_mm_s),
+        first_layer_feed_mm_s=_float_param(params, "core_resin_first_layer_feed", resin_defaults.first_layer_feed_mm_s),
+        temperature_c=_float_param(params, "core_resin_temp", resin_defaults.temperature_c),
+        # Cooling is a fixed process requirement; it is intentionally not a UI option.
+        fan_enabled=True,
+        prime_length_mm=_float_param(params, "core_resin_prime_length", resin_defaults.prime_length_mm),
+        prime_speed_mm_s=_float_param(params, "core_resin_prime_speed", resin_defaults.prime_speed_mm_s),
+        retract_length_mm=_float_param(params, "core_resin_retract_length", resin_defaults.retract_length_mm),
+        retract_speed_mm_s=_float_param(params, "core_resin_retract_speed", resin_defaults.retract_speed_mm_s),
+        e_per_mm_override=_optional_float_param(params, "core_resin_e_override"),
+    )
+    fiber = module.FiberProcessParams(
+        layer_height_mm=_float_param(params, "core_fiber_layer_height", fiber_defaults.layer_height_mm),
+        extrusion_scale=_float_param(params, "core_fiber_extrusion_scale", fiber_defaults.extrusion_scale),
+        feed_mm_s=_float_param(params, "core_fiber_feed", fiber_defaults.feed_mm_s),
+        first_layer_feed_mm_s=_float_param(params, "core_fiber_first_layer_feed", fiber_defaults.first_layer_feed_mm_s),
+        temperature_c=_float_param(params, "core_fiber_temp", fiber_defaults.temperature_c),
+        fan_enabled=True,
+        prime_length_mm=_float_param(params, "core_fiber_prime_length", fiber_defaults.prime_length_mm),
+        prime_speed_mm_s=_float_param(params, "core_fiber_prime_speed", fiber_defaults.prime_speed_mm_s),
+        retract_length_mm=_float_param(params, "core_fiber_retract_length", fiber_defaults.retract_length_mm),
+        retract_speed_mm_s=_float_param(params, "core_fiber_retract_speed", fiber_defaults.retract_speed_mm_s),
+        start_accel_s=_float_param(params, "core_fiber_start_accel", fiber_defaults.start_accel_s),
+    )
+    export = module.CoreExportParams(
+        fiber_x_print_compensation_mm=_optional_float_param(params, "core_fiber_offset_x") if "core_fiber_offset_x" in params else export_defaults.fiber_x_print_compensation_mm,
+        fiber_y_print_compensation_mm=_optional_float_param(params, "core_fiber_offset_y") if "core_fiber_offset_y" in params else export_defaults.fiber_y_print_compensation_mm,
+        fiber_z_print_compensation_mm=_optional_float_param(params, "core_fiber_offset_z") if "core_fiber_offset_z" in params else export_defaults.fiber_z_print_compensation_mm,
+        resin_z_print_compensation_mm=_optional_float_param(params, "core_resin_z_comp") if "core_resin_z_comp" in params else export_defaults.resin_z_print_compensation_mm,
+        enable_extrude_wait=_bool_param(params, "core_enable_extrude_wait", export_defaults.enable_extrude_wait),
+        enable_travel_extrude_overlap=_bool_param(
+            params, "core_enable_travel_extrude_overlap", export_defaults.enable_travel_extrude_overlap
+        ),
+        initial_tool_id=_int_param(params, "core_initial_tool", export_defaults.initial_tool_id),
+        tool_change_safe_lift_mm=_float_param(params, "core_tool_safe_lift", export_defaults.tool_change_safe_lift_mm),
+        cut_lift_mm=_float_param(params, "core_cut_lift", export_defaults.cut_lift_mm),
+        cut_wait_s=_float_param(params, "core_cut_wait", export_defaults.cut_wait_s),
+        fiber_retract_length_mm=_optional_float_param(params, "core_fiber_retract_override") if "core_fiber_retract_override" in params else export_defaults.fiber_retract_length_mm,
+        external_npz_cut_absolute_e=_bool_param(
+            params, "core_external_npz_cut_absolute_e", export_defaults.external_npz_cut_absolute_e
+        ),
+    )
+    return module.ProcessParams(
+        resin=resin,
+        fiber=fiber,
+        travel_feed_mm_s=_float_param(params, "core_travel_feed", defaults.travel_feed_mm_s),
+        first_layer_travel_feed_mm_s=_float_param(
+            params, "core_first_layer_travel_feed", defaults.first_layer_travel_feed_mm_s
+        ),
+        default_a=_float_param(params, "core_default_a", defaults.default_a),
+        default_b=_float_param(params, "core_default_b", defaults.default_b),
+        default_c=_float_param(params, "core_default_c", defaults.default_c),
+        # The Prusa UI normalizes the source job to this placement before it
+        # is written. Pass the same placement into Core so the converter's
+        # source-minimum normalization preserves the requested machine frame
+        # instead of translating the material paths back to (0, 0).
+        start_x_mm=_float_param(params, "prusa_start_x_mm", defaults.start_x_mm),
+        start_y_mm=_float_param(params, "prusa_start_y_mm", defaults.start_y_mm),
+        primeline_enabled=_bool_param(params, "core_primeline_enabled", defaults.primeline_enabled),
+        primeline_x_mm=_float_param(params, "core_primeline_x_mm", defaults.primeline_x_mm),
+        primeline_y_mm=_float_param(params, "core_primeline_y_mm", defaults.primeline_y_mm),
+        primeline_length_mm=_float_param(params, "core_primeline_length", defaults.primeline_length_mm),
+        prime_settle_s=_float_param(params, "core_prime_settle", defaults.prime_settle_s),
+        dt=_float_param(params, "core_dt", defaults.dt),
+        corner_angle_deg=_float_param(params, "core_corner_angle", defaults.corner_angle_deg),
+        corner_retreat_ratio=_float_param(params, "core_corner_retreat_ratio", defaults.corner_retreat_ratio),
+        spline_max_error_mm=_float_param(params, "core_spline_max_error", defaults.spline_max_error_mm),
+        spline_max_angle_deg=_float_param(params, "core_spline_max_angle", defaults.spline_max_angle_deg),
+        source_merge_distance_mm=_float_param(
+            params, "core_source_merge_distance", defaults.source_merge_distance_mm
+        ),
+        corner_retreat_max_mm=_float_param(params, "core_corner_retreat_max", defaults.corner_retreat_max_mm),
+        corner_blend_segments=_int_param(params, "core_corner_blend_segments", defaults.corner_blend_segments),
+        density=_int_param(params, "core_density", defaults.density),
+        degree=_int_param(params, "core_degree", defaults.degree),
+        max_fit_points_per_segment=_int_param(params, "core_max_fit_points", defaults.max_fit_points_per_segment),
+        export=export,
+    )
+
+
+def _prepend_prusa_startup_travel(
+    job,
+    *,
+    start_xy: tuple[float, float],
+    primeline_enabled: bool,
+    primeline_xy: tuple[float, float],
+) -> None:
+    """Add the user-visible origin-to-first-motion travel to the Prusa source job."""
+
+    if not job.material_paths:
+        return
+    first_layer_index = min(group.layer_index for group in job.material_paths)
+    first_layer_travel = next(
+        (group for group in job.travel_paths if group.layer_index == first_layer_index),
+        None,
+    )
+    first_material = next(
+        (group for group in job.material_paths if group.layer_index == first_layer_index),
+        None,
+    )
+    if first_material is None or not first_material.paths:
+        return
+    first_z = float(first_material.paths[0][0, 2])
+    if primeline_enabled:
+        target = np.array(
+            [
+                float(start_xy[0]) + float(primeline_xy[0]),
+                float(start_xy[1]) + float(primeline_xy[1]),
+                first_z,
+            ],
+            dtype=np.float64,
+        )
+    elif first_layer_travel is not None and first_layer_travel.paths:
+        target = np.asarray(first_layer_travel.paths[0][0, :3], dtype=np.float64)
+    else:
+        target = np.asarray(first_material.paths[0][0, :3], dtype=np.float64)
+    start = np.array([0.0, 0.0, target[2]], dtype=np.float64)
+    if float(np.linalg.norm(target - start)) <= 1e-7:
+        return
+    startup = np.vstack((start, target))
+    if first_layer_travel is None:
+        first_layer_travel = TravelPaths(first_layer_index, [])
+        job.travel_paths.insert(0, first_layer_travel)
+    first_layer_travel.paths.insert(0, startup)
+    job.meta["startup_travel_count"] = 1
+    job.meta["startup_travel_source_frame"] = "normalized_prusa"
+    motion_order = job.meta.get("motion_order")
+    if isinstance(motion_order, dict):
+        records = motion_order.get(str(first_layer_index), [])
+        if isinstance(records, list):
+            shifted = []
+            for record in records:
+                if isinstance(record, dict) and record.get("kind") == "travel":
+                    shifted.append({**record, "index": int(record.get("index", 0)) + 1})
+                else:
+                    shifted.append(record)
+            motion_order[str(first_layer_index)] = [
+                {"kind": "travel", "index": 0},
+                *shifted,
+            ]
+
+
 def _parse_prusa_slice_config(
     params: dict[str, list[str]],
     shared: dict[str, Any],
@@ -320,25 +1022,53 @@ def _parse_prusa_slice_config(
 ) -> SliceConfig:
     """Build Prusa configuration without reading Legacy or PySLM fields."""
 
+    saved = _load_prusa_params()
+    saved_params = {
+        key: [
+            ""
+            if value is None
+            else str(value).lower()
+            if isinstance(value, bool)
+            else str(value)
+        ]
+        for key, value in saved.items()
+    }
+    saved_params.update(params)
+    params = saved_params
     raft_enabled = _bool_param(params, "prusa_raft_enabled", False)
+    raft_contact_auto = _bool_param(params, "prusa_raft_auto_contact", True)
     prusa_raft = (
         PrusaRaftConfig(
-            layer_count=_int_param(params, "prusa_raft_layers", 3),
-            expansion=_float_param(params, "prusa_raft_expansion", 3.0),
+            layer_count=_int_param(
+                params, "prusa_raft_layers", DEFAULT_PRUSA_RAFT_LAYER_COUNT
+            ),
+            expansion=_float_param(
+                params, "prusa_raft_expansion", DEFAULT_PRUSA_RAFT_EXPANSION_MM
+            ),
             first_layer_density=_float_param(
                 params,
                 "prusa_raft_first_layer_density",
-                80.0,
+                DEFAULT_PRUSA_RAFT_FIRST_LAYER_DENSITY_PERCENT,
             ),
             first_layer_expansion=_float_param(
                 params,
                 "prusa_raft_first_layer_expansion",
-                3.0,
+                DEFAULT_PRUSA_RAFT_FIRST_LAYER_EXPANSION_MM,
             ),
             contact_distance=_float_param(
                 params,
                 "prusa_raft_contact_distance",
-                0.25,
+                DEFAULT_PRUSA_RAFT_CONTACT_DISTANCE_MM,
+            ),
+            contact_auto=raft_contact_auto,
+            contact_layer_height=_float_param(
+                params, "prusa_raft_contact_layer_height", 0.75
+            ),
+            contact_density=_float_param(
+                params, "prusa_raft_contact_density", 100.0
+            ),
+            contact_extrusion_width=_float_param(
+                params, "prusa_raft_contact_extrusion_width", 1.5
             ),
         )
         if raft_enabled
@@ -361,8 +1091,9 @@ def _parse_prusa_slice_config(
         avoid_crossing_max_detour=_float_param(
             params, "prusa_avoid_crossing_max_detour", 0.0
         ),
-        seam_position=params.get("prusa_seam_position", ["aligned"])[0],  # type: ignore[arg-type]
+        seam_position=params.get("prusa_seam_position", ["random"])[0],  # type: ignore[arg-type]
     )
+    brim_enabled = _bool_param(params, "prusa_brim_enabled", False)
     return SliceConfig(
         **_base_slice_config_fields(shared, build_axis),
         slicing_kernel="prusa",
@@ -382,6 +1113,13 @@ def _parse_prusa_slice_config(
         print_perimeters=_bool_param(params, "prusa_print_perimeters", True),
         prusa_raft=prusa_raft,
         prusa_geometry=prusa_geometry,
+        brim_enabled=brim_enabled,
+        brim_width_mm=_float_param(params, "prusa_brim_width", 5.0),
+        brim_type=params.get("prusa_brim_type", ["outer_only"])[0],  # type: ignore[arg-type]
+        brim_separation_mm=_float_param(params, "prusa_brim_separation", 0.0),
+        brim_one_stroke=_bool_param(params, "prusa_brim_one_stroke", False),
+        start_x_mm=_float_param(params, "prusa_start_x_mm", 0.0),
+        start_y_mm=_float_param(params, "prusa_start_y_mm", 0.0),
     )
 
 
@@ -509,6 +1247,8 @@ def _resolved_slice_config(config: SliceConfig) -> dict[str, object]:
         "build_axis": config.build_axis,
         "z_min": config.z_min,
         "z_max": config.z_max,
+        "start_x_mm": config.start_x_mm,
+        "start_y_mm": config.start_y_mm,
         "tolerance": config.tolerance,
         "perimeter_count": config.perimeter_count,
         "print_perimeters": config.print_perimeters,
@@ -521,6 +1261,13 @@ def _resolved_slice_config(config: SliceConfig) -> dict[str, object]:
             path_backend="prusa_fff",
             prusa_perimeter_infill_overlap=config.contour_infill_overlap,
             prusa_raft=config.prusa_raft.to_metadata(),
+            prusa_brim={
+                "enabled": config.brim_enabled,
+                "width": config.brim_width_mm,
+                "type": config.brim_type,
+                "separation": config.brim_separation_mm,
+                "one_stroke": config.brim_one_stroke,
+            },
             prusa_geometry=config.prusa_geometry.to_metadata(),
         )
     elif config.slicing_kernel == "legacy":
@@ -650,21 +1397,35 @@ def resolve_build_axis(mesh, requested_axis: str) -> str:
 def load_fiber_template_json(json_path: Path) -> list[list[list[float]]]:
     data = json.loads(json_path.read_text(encoding="utf-8"))
     if isinstance(data, dict):
-        merged_paths: list[object] = []
-        for family_name, family_paths in data.items():
-            if not isinstance(family_paths, list):
-                raise ValueError(
-                    f"fiber JSON path family {family_name!r} must be a list"
-                )
-            merged_paths.extend(family_paths)
-        data = merged_paths
+        # Canonical fiber paths use one record per trajectory under ``paths``.
+        if "paths" in data:
+            data = data["paths"]
+        # Optimized results contain metadata and merged final paths.  They are
+        # kept compatible as geometry-only input.
+        elif "final_paths" in data:
+            data = data["final_paths"]
+        else:
+            # Keep accepting the original compact path-family format, where
+            # every top-level key is a family and its value is a path list.
+            merged_paths: list[object] = []
+            for family_name, family_paths in data.items():
+                if not isinstance(family_paths, list):
+                    raise ValueError(
+                        f"fiber JSON path family {family_name!r} must be a list"
+                    )
+                merged_paths.extend(family_paths)
+            data = merged_paths
     if not isinstance(data, list):
-        raise ValueError(
-            "fiber JSON must be a list of paths or an object containing path-family lists"
-        )
+        raise ValueError("fiber JSON paths/final_paths must be a list")
 
     paths: list[list[list[float]]] = []
     for path_index, raw_path in enumerate(data):
+        if isinstance(raw_path, dict):
+            raw_path = raw_path.get("points")
+            if raw_path is None:
+                raise ValueError(
+                    f"fiber JSON path {path_index} must contain a points list"
+                )
         if not isinstance(raw_path, list):
             raise ValueError(f"fiber JSON path {path_index} must be a list")
         path: list[list[float]] = []
@@ -705,29 +1466,64 @@ def expand_fiber_template_for_resin_layers(
                 raft_layer_count = raw_count
     part_resin_groups = resin_groups[raft_layer_count:]
 
+    # A brim is printed on the first part resin layer, but fiber should start
+    # only above the following resin layer.  Keep the normal resin/fiber
+    # schedule otherwise: skipping this one fiber layer also removes its
+    # 0.1 mm contribution from all subsequent absolute Z values.
+    first_part_has_brim = False
+    if part_resin_groups:
+        roles_by_layer = job.meta.get("path_roles", {}).get("R", {})
+        if isinstance(roles_by_layer, dict):
+            roles = roles_by_layer.get(str(part_resin_groups[0].layer_index), [])
+            first_part_has_brim = isinstance(roles, list) and "brim" in roles
+    skipped_fiber_layers = 1 if first_part_has_brim else 0
+
     # The fiber is physically printed between resin layers.  Include its
     # thickness in the exported Z schedule instead of letting every resin
-    # layer continue to use the original resin-only grid.
+    # layer continue to use the original resin-only grid.  Prusa travel paths
+    # are part of the same physical layer geometry: apply the identical shift
+    # below so their endpoints remain continuous with the deposited paths.
     fiber_layer_height = DEFAULT_FIBER_LAYER_HEIGHT_MM
+    z_offset_by_resin_layer: dict[int, float] = {}
     for layer_order, group in enumerate(part_resin_groups):
-        z_offset = layer_order * fiber_layer_height
+        z_offset = max(0, layer_order - skipped_fiber_layers) * fiber_layer_height
+        z_offset_by_resin_layer[int(group.layer_index)] = z_offset
         if z_offset == 0.0:
             continue
         group.paths = [
-            np.asarray(path, dtype=np.float32).copy()
+            np.asarray(path, dtype=np.float64).copy()
             for path in group.paths
         ]
         for path in group.paths:
-            path[:, 2] += np.float32(z_offset)
+            path[:, 2] += z_offset
+
+    # A travel group is emitted by Prusa in the motion order of its matching
+    # resin layer.  Once a fiber layer has been inserted below that resin
+    # layer, retaining Prusa's original Z would leave an artificial vertical
+    # gap immediately before the next deposited path.  Keep the native XY
+    # route intact and translate only Z by that layer's accumulated fiber
+    # thickness.
+    for group in job.travel_paths:
+        z_offset = z_offset_by_resin_layer.get(int(group.layer_index), 0.0)
+        if z_offset == 0.0:
+            continue
+        group.paths = [
+            np.asarray(path, dtype=np.float64).copy()
+            for path in group.paths
+        ]
+        for path in group.paths:
+            path[:, 2] += z_offset
 
     if isinstance(slicing_metadata, dict) and part_resin_groups:
         z_max = slicing_metadata.get("z_max")
         if isinstance(z_max, (int, float)):
-            slicing_metadata["z_max"] = float(z_max) + (len(part_resin_groups) - 1) * fiber_layer_height
+            inserted_fiber_layers = max(0, len(part_resin_groups) - 1 - skipped_fiber_layers)
+            slicing_metadata["z_max"] = float(z_max) + inserted_fiber_layers * fiber_layer_height
         slicing_metadata["fiber_layer_height_applied_mm"] = fiber_layer_height
+        slicing_metadata["fiber_layers_skipped_for_brim"] = skipped_fiber_layers
 
     # Fiber is printed between resin layers; the final resin layer is a cap.
-    for group in part_resin_groups[:-1]:
+    for group in part_resin_groups[skipped_fiber_layers:-1]:
         z = _group_layer_z(group) + fiber_layer_height
         layer_paths = []
         for template_path in template_paths:
@@ -735,7 +1531,7 @@ def expand_fiber_template_for_resin_layers(
         layer_paths = [
             path.tolist()
             for path in optimize_open_path_travel(
-                [np.asarray(path, dtype=np.float32) for path in layer_paths]
+                [np.asarray(path, dtype=np.float64) for path in layer_paths]
             )
         ]
         paths_by_layer[group.layer_index] = layer_paths
@@ -775,7 +1571,7 @@ def merge_fiber_paths_into_job(job, fiber_paths_by_layer: dict[int, list[list[li
     for layer_index in sorted(fiber_paths_by_layer):
         if (layer_index, "F") in existing:
             continue
-        paths = [np.asarray(path, dtype=np.float32) for path in fiber_paths_by_layer[layer_index]]
+        paths = [np.asarray(path, dtype=np.float64) for path in fiber_paths_by_layer[layer_index]]
         if paths:
             job.material_paths.append(MaterialPaths(layer_index, "F", paths))
     job.material_paths.sort(key=lambda group: (group.layer_index, 0 if group.material == "R" else 1))
@@ -796,7 +1592,12 @@ def _fiber_preview_paths_from_job(job) -> dict[int, list[list[list[float]]]]:
 
 
 def _preview_payload(
-    mesh, config: SliceConfig, job, fiber_paths_by_layer: dict[int, list[list[list[float]]]] | None = None
+    mesh,
+    config: SliceConfig,
+    job,
+    fiber_paths_by_layer: dict[int, list[list[list[float]]]] | None = None,
+    *,
+    hide_initial_prusa_travel: bool = False,
 ) -> dict[str, object]:
     layers_by_index: dict[int, dict[str, object]] = {}
     bounds = {
@@ -828,6 +1629,12 @@ def _preview_payload(
     layer_indices = {
         group.layer_index for group in job.material_paths
     } | set(fiber_paths_by_layer) | set(travel_groups_by_layer)
+    first_material_layer = min(layer_indices) if layer_indices else None
+    startup_travel_count = 0
+    try:
+        startup_travel_count = max(0, int(job.meta.get("startup_travel_count", 0)))
+    except (TypeError, ValueError):
+        startup_travel_count = 0
 
     for layer_index in sorted(layer_indices):
         resin_paths: list[dict[str, object]] = []
@@ -860,7 +1667,7 @@ def _preview_payload(
                     else None
                 )
                 group_resin_index += 1
-                if role in ("outer_contour", "inner_contour", "infill", "raft"):
+                if role in ("outer_contour", "inner_contour", "infill", "raft", "brim"):
                     entry: dict[str, object] = {"role": role, "points": points}
                 elif path.shape[0] > 2:
                     entry = {"role": "outer_contour", "points": points}
@@ -922,9 +1729,31 @@ def _preview_payload(
                             "extrusion": source.get("extrusion"),
                         }
                     )
+                elif kind == "fiber_deposit" and 0 <= index < len(serialized_fiber_paths):
+                    motion_paths.append(
+                        {
+                            "kind": "deposit",
+                            "role": "fiber",
+                            "points": serialized_fiber_paths[index],
+                        }
+                    )
                 elif kind == "travel" and 0 <= index < len(serialized_travel_paths):
+                    if (
+                        hide_initial_prusa_travel
+                        and layer_index == first_material_layer
+                        and index == startup_travel_count
+                    ):
+                        continue
                     motion_paths.append(
                         {"kind": "travel", "points": serialized_travel_paths[index]}
+                    )
+                elif kind == "fiber_travel" and 0 <= index < len(serialized_travel_paths):
+                    motion_paths.append(
+                        {
+                            "kind": "travel",
+                            "role": "travel",
+                            "points": serialized_travel_paths[index],
+                        }
                     )
         if not motion_paths:
             motion_paths.extend(
@@ -936,10 +1765,14 @@ def _preview_payload(
                 }
                 for path in resin_paths
             )
-            motion_paths.extend(
-                {"kind": "travel", "points": path}
-                for path in serialized_travel_paths
-            )
+            for travel_index, path in enumerate(serialized_travel_paths):
+                if (
+                    hide_initial_prusa_travel
+                    and layer_index == first_material_layer
+                    and travel_index == startup_travel_count
+                ):
+                    continue
+                motion_paths.append({"kind": "travel", "points": path})
 
         layers_by_index[layer_index] = {
             "index": layer_index,
@@ -956,6 +1789,7 @@ def _preview_payload(
     )
     return {
         "bounds": bounds,
+        "origin": [0.0, 0.0],
         "line_widths": {
             "resin": float(planning_line_width),
             "resin_nominal": float(config.line_width),
@@ -1057,7 +1891,7 @@ def _load_fiber_preview_paths(npz_path: Path) -> dict[int, list[list[list[float]
             if not match:
                 continue
             layer_index = int(match.group(1))
-            array = np.asarray(archive[key], dtype=np.float32)
+            array = np.asarray(archive[key])
             if array.ndim != 3 or array.shape[2] not in (3, 6):
                 raise ValueError(f"fiber NPZ key {key} must be a 3D array with 3 or 6 columns")
             layer_paths: list[list[list[float]]] = []
@@ -1119,6 +1953,22 @@ def _expand_bounds(bounds: dict[str, float | None], x: float, y: float, z: float
 
 
 def _index_html() -> str:
+    core_defaults = _load_core_print_params()
+    prusa_saved = _load_prusa_params()
+
+    def prusa_value(name: str, fallback: object) -> object:
+        return prusa_saved.get(name, fallback)
+
+    def prusa_num(name: str, fallback: float) -> str:
+        value = prusa_value(name, fallback)
+        return "" if value is None or value == "" else f"{float(value):g}"
+
+    def prusa_checked(name: str, fallback: bool) -> str:
+        return " checked" if bool(prusa_value(name, fallback)) else ""
+
+    def prusa_selected(name: str, fallback: str, option: str) -> str:
+        return " selected" if str(prusa_value(name, fallback)) == option else ""
+
     pyslm_defaults = PySLMConfig()
     pyslm_strategy_defaults = recommended_pyslm_strategy_defaults(
         DEFAULT_RESIN_LAYER_HEIGHT_MM,
@@ -1384,6 +2234,21 @@ def _index_html() -> str:
       gap: var(--space-2);
       align-items: start;
     }}
+    .inputBand .bandGrid {{
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 94px 94px 140px;
+    }}
+    .sectionTitleRow {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: var(--space-3);
+    }}
+    .sectionTitleRow .fiberNotice {{
+      flex: 1 1 auto;
+      min-width: 0;
+      margin: 0;
+      text-align: right;
+    }}
     .prusaSettingsGrid {{
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(148px, 1fr));
@@ -1414,7 +2279,102 @@ def _index_html() -> str:
       font-size: 13px;
       color: var(--ink);
     }}
+    input[type="number"] {{
+      appearance: auto;
+      -moz-appearance: auto;
+    }}
+    input[type="number"]::-webkit-inner-spin-button,
+    input[type="number"]::-webkit-outer-spin-button {{
+      margin: 0;
+      -webkit-appearance: auto;
+    }}
+    .magnitudeInputWrap {{
+      display: block;
+      width: 100%;
+      min-width: 0;
+    }}
+    .magnitudeInputWrap > input[type="number"] {{
+      padding-right: 8px;
+    }}
+    .magnitudeSpinButtons {{
+      display: none;
+    }}
+    .coreParameterSubgroup {{
+      margin-top: var(--space-2);
+    }}
+    .coreParameterSubgroup:first-of-type {{
+      margin-top: 0;
+    }}
+    .coreParameterSubgroup h5 {{
+      margin: 0 0 var(--space-1);
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--muted);
+    }}
+    .processCoreSettings .prusaSettingsGrid {{
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+    }}
+    .coreMaterialColumns {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: var(--space-3);
+      align-items: start;
+    }}
+    .coreMaterialColumns > .prusaAdvancedGroup + .prusaAdvancedGroup {{
+      margin-top: 0;
+      padding-top: 0;
+      padding-left: var(--space-3);
+      border-top: 0;
+      border-left: 1px solid var(--line);
+    }}
+    .coreMaterialColumns > .prusaAdvancedGroup {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      column-gap: var(--space-3);
+      align-items: start;
+    }}
+    .coreMaterialColumns > .prusaAdvancedGroup > h4 {{
+      grid-column: 1 / -1;
+    }}
+    .coreMaterialColumns > .prusaAdvancedGroup > .coreParameterSubgroup:nth-of-type(1),
+    .coreMaterialColumns > .prusaAdvancedGroup > .coreParameterSubgroup:nth-of-type(4) {{
+      grid-column: 1 / -1;
+    }}
+    .coreMaterialColumns > .prusaAdvancedGroup > .coreParameterSubgroup:nth-of-type(1) .prusaSettingsGrid,
+    .coreMaterialColumns > .prusaAdvancedGroup > .coreParameterSubgroup:nth-of-type(4) .prusaSettingsGrid {{
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }}
+    .coreMaterialColumns > .prusaAdvancedGroup > .coreParameterSubgroup:nth-of-type(2) .prusaSettingsGrid,
+    .coreMaterialColumns > .prusaAdvancedGroup > .coreParameterSubgroup:nth-of-type(3) .prusaSettingsGrid {{
+      grid-template-columns: 1fr;
+    }}
+    .coreTravelPanel {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      column-gap: var(--space-3);
+      align-items: start;
+    }}
+    .coreTravelPanel > h4 {{
+      grid-column: 1 / -1;
+    }}
+    .coreTravelPanel > .coreParameterSubgroup:nth-of-type(3) {{
+      grid-column: 1 / -1;
+    }}
+    .coreTravelPanel > .coreParameterSubgroup:nth-of-type(1) .prusaSettingsGrid,
+    .coreTravelPanel > .coreParameterSubgroup:nth-of-type(2) .prusaSettingsGrid {{
+      grid-template-columns: 1fr;
+    }}
+    .coreTravelPanel > .coreParameterSubgroup:nth-of-type(3) .prusaSettingsGrid {{
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }}
     .fieldGroup {{ min-width: 0; }}
+    .inputBand .bandGrid > .fieldGroup {{ grid-column: auto; }}
+    .inputBand .bandGrid > .layerAdvanced {{ grid-column: 1 / -1; }}
+    .compactDimensionField > label {{ white-space: nowrap; }}
+    .prusaQuickField {{ min-width: 0; }}
+    .prusaQuickField[hidden] {{ display: none; }}
+    .prusaQuickField .checkboxLabel {{ margin: 0; min-height: var(--control-height); display: flex; align-items: center; }}
+    .span-1 {{ grid-column: span 1; }}
     .span-2 {{ grid-column: span 2; }}
     .span-3 {{ grid-column: span 3; }}
     .span-4 {{ grid-column: span 4; }}
@@ -1493,19 +2453,21 @@ def _index_html() -> str:
     }}
     .processBand .actions {{
       display: flex;
-      flex-direction: column;
-      align-items: stretch;
+      flex-direction: row;
+      align-items: center;
       align-self: stretch;
       justify-content: flex-end;
       gap: var(--space-2);
       margin: 0;
       min-height: 0;
+      grid-column: 1 / -1;
     }}
     .processBand > .bandGrid {{
       align-items: stretch;
     }}
     .processBand .actions button {{
-      width: 100%;
+      width: auto;
+      flex: 0 0 auto;
     }}
     .processBand .status:empty {{
       display: none;
@@ -1516,6 +2478,15 @@ def _index_html() -> str:
       gap: var(--space-3);
       margin-top: var(--space-6);
       flex-wrap: wrap;
+    }}
+    .exportActionRow {{
+      display: flex;
+      align-items: center;
+      gap: var(--space-3);
+      width: auto;
+      flex: 1 1 auto;
+      min-width: 0;
+      flex-wrap: nowrap;
     }}
     button {{
       min-height: var(--control-height);
@@ -1535,6 +2506,7 @@ def _index_html() -> str:
       min-height: 20px;
       font-size: 13px;
       color: var(--muted);
+      white-space: nowrap;
     }}
     .status.ok {{ color: var(--ok); }}
     .status.error {{ color: var(--error); }}
@@ -1563,6 +2535,170 @@ def _index_html() -> str:
     }}
     .advancedSettings:not([open]) {{
       padding-top: var(--space-2);
+    }}
+    .advancedPopupHost {{
+      position: relative;
+    }}
+    .advancedPopupHost#coreProcessSettings {{
+      position: static;
+    }}
+    .advancedPopupTrigger {{
+      display: inline-flex;
+      align-items: center;
+      gap: var(--space-2);
+      min-height: 32px;
+      height: auto;
+      padding: 5px 9px;
+      border: 1px solid #c5d5e1;
+      border-radius: var(--radius-sm);
+      color: var(--accent-dark);
+      background: #f1f7fb;
+      font-size: 13px;
+      font-weight: 650;
+      text-align: left;
+    }}
+    .advancedPopupTrigger::after {{
+      content: '打开窗口';
+      margin-left: var(--space-1);
+      font-size: 11px;
+      font-weight: 600;
+    }}
+    .advancedPopupTrigger:hover {{
+      color: var(--accent-dark);
+      background: #e7f2fb;
+    }}
+    .advancedPopupHost > summary {{
+      display: inline-flex;
+      align-items: center;
+      gap: var(--space-2);
+      min-height: 32px;
+      padding: 5px 9px;
+      border: 1px solid #c5d5e1;
+      border-radius: var(--radius-sm);
+      color: var(--accent-dark);
+      background: #f1f7fb;
+    }}
+    .advancedPopupHost > summary::marker {{
+      content: '';
+    }}
+    .advancedPopupHost > summary::after {{
+      content: '打开设置';
+      font-size: 11px;
+      font-weight: 600;
+    }}
+    .advancedPopupHost > summary:hover {{
+      background: #e7f2fb;
+    }}
+    .advancedPopup {{
+      position: fixed;
+      z-index: 1100;
+      left: 50%;
+      top: 50%;
+      display: none;
+      flex-direction: column;
+      width: min(900px, calc(100vw - 24px));
+      min-width: min(320px, calc(100vw - 24px));
+      height: min(72vh, 680px);
+      min-height: 180px;
+      max-width: calc(100vw - 24px);
+      max-height: calc(100vh - 24px);
+      resize: both;
+      overflow: hidden;
+      transform: translate(-50%, -50%);
+      border: 1px solid #8fa0ad;
+      border-radius: var(--radius-md);
+      background: #ffffff;
+      box-shadow: 0 14px 36px rgba(23, 32, 38, 0.24);
+    }}
+    .advancedPopup.visible {{
+      display: flex;
+    }}
+    .advancedPopup.coreAdvancedPopup {{
+      position: absolute;
+      height: auto;
+      max-height: none;
+      overflow: visible;
+      transform: none;
+    }}
+    .advancedPopupHeader {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: var(--space-3);
+      flex: 0 0 auto;
+      min-height: 42px;
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--line);
+      background: #f7fafc;
+      cursor: move;
+      user-select: none;
+    }}
+    .advancedPopupTitle {{
+      min-width: 0;
+      overflow: hidden;
+      color: var(--ink);
+      font-size: 14px;
+      font-weight: 700;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }}
+    .advancedPopupClose {{
+      width: 30px;
+      min-width: 30px;
+      height: 30px;
+      min-height: 30px;
+      padding: 0;
+      border: 1px solid #bcc5cd;
+      border-radius: 5px;
+      color: var(--ink);
+      background: #ffffff;
+      font-size: 18px;
+      line-height: 1;
+    }}
+    .advancedPopupClose:hover {{
+      color: var(--ink);
+      background: #edf3f7;
+    }}
+    .advancedPopupBody {{
+      min-height: 0;
+      overflow: auto;
+      padding: var(--space-4);
+    }}
+    .coreAdvancedPopup .advancedPopupBody {{
+      overflow: visible;
+      padding: 10px 12px;
+    }}
+    .coreAdvancedPopup .coreMaterialColumns {{
+      gap: 8px;
+    }}
+    .coreAdvancedPopup .coreMaterialColumns > .prusaAdvancedGroup {{
+      column-gap: 8px;
+    }}
+    .coreAdvancedPopup .coreTravelPanel {{
+      column-gap: 8px;
+    }}
+    .coreAdvancedPopup .prusaAdvancedGroup h4 {{
+      margin-bottom: 4px;
+    }}
+    .coreAdvancedPopup .coreParameterSubgroup {{
+      margin-top: 5px;
+    }}
+    .coreAdvancedPopup .coreParameterSubgroup h5 {{
+      margin-bottom: 2px;
+    }}
+    .coreAdvancedPopup .prusaSettingsGrid {{
+      gap: 4px;
+    }}
+    .coreAdvancedPopup label {{
+      margin-top: 2px;
+      margin-bottom: 2px;
+      line-height: 1.2;
+    }}
+    .coreAdvancedPopup input:not([type="checkbox"]):not([type="range"]),
+    .coreAdvancedPopup select {{
+      height: 34px;
+      min-height: 34px;
+      padding: 5px 8px;
     }}
     .summary {{
       display: grid;
@@ -1599,6 +2735,31 @@ def _index_html() -> str:
       text-decoration: none;
     }}
     .download.visible {{ display: inline-block; }}
+    .exportProgress {{
+      display: none;
+      align-items: center;
+      gap: var(--space-2);
+      min-width: 0;
+      flex: 0 1 auto;
+      color: var(--muted);
+      font-size: 13px;
+      font-variant-numeric: tabular-nums;
+    }}
+    .exportProgress.visible {{ display: inline-flex; }}
+    .exportProgressHeader {{
+      display: flex;
+      gap: var(--space-1);
+      white-space: nowrap;
+    }}
+    .exportProgress progress {{
+      width: 120px;
+      height: 8px;
+      accent-color: var(--accent);
+    }}
+    .exportElapsed {{
+      white-space: nowrap;
+      color: var(--muted);
+    }}
     .viewerControls {{
       margin-top: var(--space-5);
       display: grid;
@@ -1660,6 +2821,18 @@ def _index_html() -> str:
     .travelSwatch {{
       height: 4px;
       background: repeating-linear-gradient(90deg, #526f8c 0 7px, transparent 7px 12px);
+    }}
+    .coreTravelSwatch {{
+      height: 4px;
+      background: repeating-linear-gradient(90deg, #c2410c 0 5px, transparent 5px 9px);
+    }}
+    .primelineSwatch {{ background: #b91c1c; }}
+    .originSwatch {{
+      width: 10px;
+      height: 10px;
+      border: 2px solid #b91c1c;
+      background: #ffffff;
+      transform: rotate(45deg);
     }}
     .viewOptions {{
       margin-top: var(--space-3);
@@ -1740,7 +2913,8 @@ def _index_html() -> str:
     @media (max-width: 820px) {{
       main {{ padding: 24px 18px 32px; }}
       .bandGrid {{ grid-template-columns: repeat(6, minmax(0, 1fr)); }}
-      .inputBand .fieldGroup {{ grid-column: span 3; }}
+      .inputBand .bandGrid {{ grid-template-columns: repeat(6, minmax(0, 1fr)); }}
+      .inputBand .bandGrid > .fieldGroup {{ grid-column: span 3; }}
       .inputBand .fiberNotice,
       .inputBand .layerAdvanced {{ grid-column: 1 / -1; }}
       .kernelBand > .bandGrid > .span-3 {{ grid-column: span 3; }}
@@ -1749,6 +2923,25 @@ def _index_html() -> str:
       .kernelBand .span-8 {{ grid-column: 1 / -1; }}
       .processBand > .bandGrid > .span-9 {{ grid-column: 1 / -1; }}
       .processBand .processGroup {{ grid-column: 1 / -1; }}
+      .processCoreSettings .prusaSettingsGrid {{
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }}
+      .coreMaterialColumns {{
+        grid-template-columns: 1fr;
+      }}
+      .coreMaterialColumns > .prusaAdvancedGroup + .prusaAdvancedGroup {{
+        margin-top: var(--space-3);
+        padding-top: var(--space-3);
+        padding-left: 0;
+        border-top: 1px solid var(--line);
+        border-left: 0;
+      }}
+      .coreMaterialColumns > .prusaAdvancedGroup {{
+        display: block;
+      }}
+      .coreTravelPanel {{
+        display: block;
+      }}
       .processGroup + .processGroup {{
         padding-top: var(--space-3);
         padding-left: 0;
@@ -1764,14 +2957,20 @@ def _index_html() -> str:
       main {{ padding: 20px 12px 28px; }}
       .panel {{ padding: var(--space-4); }}
       .bandGrid {{ grid-template-columns: 1fr; }}
+      .inputBand .bandGrid {{ grid-template-columns: 1fr; }}
       .span-2, .span-3, .span-4, .span-5, .span-6, .span-8, .span-9, .span-12,
-      .inputBand .fieldGroup,
+      .inputBand .bandGrid > .fieldGroup,
       .inputBand .fiberNotice,
       .inputBand .layerAdvanced,
       .kernelBand > .bandGrid > .span-3,
       .kernelBand > .bandGrid > .span-4 {{ grid-column: auto; }}
+      .sectionTitleRow {{ align-items: flex-start; flex-direction: column; gap: var(--space-1); }}
+      .sectionTitleRow .fiberNotice {{ text-align: left; }}
       .grid {{ grid-template-columns: 1fr; }}
       .curveFields {{ grid-template-columns: 1fr; }}
+      .processCoreSettings .prusaSettingsGrid {{
+        grid-template-columns: 1fr;
+      }}
       h1 {{ font-size: 18px; }}
       .preview {{ height: 380px; min-height: 340px; }}
     }}
@@ -1783,13 +2982,10 @@ def _index_html() -> str:
     <section class="resultsColumn">
       <div class="summary">
         <div class="metric"><span>层数</span><strong id="layers">-</strong></div>
-        <div class="metric"><span>路径数</span><strong id="paths">-</strong></div>
         <div class="metric"><span>输出</span><strong id="outputName">-</strong></div>
-        <div class="metric"><span>实际执行内核</span><strong id="executedKernel">-</strong></div>
-        <div class="metric"><span>实际规划线宽（仅轨迹规划）</span><strong id="executedPlanningLineWidth">-</strong></div>
         <div class="metric"><span>实际填充策略</span><strong id="executedInfillPattern">-</strong></div>
       </div>
-      <a id="download" class="download" href="#">下载 NPZ</a>
+      <a id="download" class="download" href="#">下载 Core NPZ</a>
       <div class="viewerControls">
         <div>
           <label for="layerSlider">层</label>
@@ -1813,11 +3009,14 @@ def _index_html() -> str:
         <label class="legendItem"><input id="showRaftPaths" type="checkbox" checked><span class="swatch raftSwatch"></span>Prusa 筏层</label>
         <label class="legendItem"><input id="showFiberPaths" type="checkbox" checked><span class="swatch fiberSwatch"></span>纤维路径</label>
         <label class="legendItem"><input id="showTravelPaths" type="checkbox" checked><span class="swatch travelSwatch"></span>空移 Travel</label>
+        <label class="legendItem"><input id="showCoreTravelPaths" type="checkbox" checked><span class="swatch coreTravelSwatch"></span>Core 转场空走</label>
+        <label class="legendItem"><input id="showPrimeline" type="checkbox" checked><span class="swatch primelineSwatch"></span>Core Primeline</label>
+        <span class="legendItem"><span class="swatch originSwatch"></span>打印平面原点 (0, 0)</span>
       </div>
       <div class="viewOptions" aria-label="显示选项">
         <label title="仅改变预览笔触宽度，不改变轨迹中心线或挤出倍率"><input id="showLineWidth" type="checkbox">按实际规划线宽显示（当前 <span id="previewLineWidthValue">2.2 mm</span>）</label>
-        <label title="仅对包含 Prusa E 数据的树脂路径按单位长度挤出量着色；关闭时保持轮廓/填充原有配色。"><input id="showExtrusion" type="checkbox">显示挤出量颜色映射（ΔE / Δs）</label>
-        <span id="extrusionColorLegend" class="extrusionColorLegend" hidden>低 <span class="extrusionColorRamp"></span> 高</span>
+        <label title="仅对包含 Prusa E 数据的树脂路径按绝对单位长度挤出量着色；关闭时保持轮廓/填充原有配色。"><input id="showExtrusion" type="checkbox">显示绝对挤出量（E/mm）</label>
+        <span id="extrusionColorLegend" class="extrusionColorLegend" hidden>0.00 E/mm <span class="extrusionColorRamp"></span> 0.50 E/mm</span>
         <label><input id="showPathPoints" type="checkbox">显示当前路径点</label>
         <label><input id="showDirection" type="checkbox" checked>显示打印方向</label>
         <span id="printSizeLabel">打印范围 -</span>
@@ -1829,7 +3028,10 @@ def _index_html() -> str:
       <h2>模型切片</h2>
       <form id="sliceForm">
         <div class="formSection inputBand" data-layout-band="input-layer">
-          <h3>输入与分层</h3>
+          <div class="sectionTitleRow">
+            <h3>输入与分层</h3>
+            <div id="fiberNotice" class="notice fiberNotice"></div>
+          </div>
           <div class="bandGrid">
             <div class="fieldGroup span-4">
               <label for="stlFile">STL 文件</label>
@@ -1839,15 +3041,15 @@ def _index_html() -> str:
               <label for="fiberJsonFile">纤维路径 JSON</label>
               <input id="fiberJsonFile" name="fiberJsonFile" type="file" accept=".json,application/json">
             </div>
-            <div class="fieldGroup span-2">
+            <div class="fieldGroup compactDimensionField">
               <label for="layerHeight">树脂层高 mm</label>
-              <input id="layerHeight" name="layerHeight" type="number" min="0.001" step="0.001" value="{DEFAULT_RESIN_LAYER_HEIGHT_MM}">
+              <input id="layerHeight" name="layerHeight" type="number" min="0.001" step="0.001" value="{prusa_num('layer_height', core_defaults.resin.layer_height_mm)}">
             </div>
-            <div class="fieldGroup span-2">
+            <div class="fieldGroup compactDimensionField">
               <label for="firstLayerHeight">首层层高 mm</label>
-              <input id="firstLayerHeight" name="firstLayerHeight" type="number" min="0.001" step="0.001" value="{DEFAULT_RESIN_LAYER_HEIGHT_MM}">
+              <input id="firstLayerHeight" name="firstLayerHeight" type="number" min="0.001" step="0.001" value="{prusa_num('first_layer_height', core_defaults.resin.layer_height_mm)}">
             </div>
-            <div class="fieldGroup span-2">
+            <div class="fieldGroup compactDimensionField">
               <label for="buildAxis">层高方向</label>
               <select id="buildAxis" name="buildAxis">
                 <option value="auto" selected>自动</option>
@@ -1856,22 +3058,6 @@ def _index_html() -> str:
                 <option value="x">X 轴</option>
               </select>
             </div>
-            <div id="fiberNotice" class="notice fiberNotice span-8"></div>
-            <details class="advancedSettings layerAdvanced span-4">
-              <summary>高级分层范围与容差设置</summary>
-              <div class="grid">
-                <div>
-                  <label for="zMin">起始 Z mm</label>
-                  <input id="zMin" name="zMin" type="number" step="0.001" placeholder="自动">
-                </div>
-                <div>
-                  <label for="zMax">结束 Z mm</label>
-                  <input id="zMax" name="zMax" type="number" step="0.001" placeholder="自动">
-                </div>
-              </div>
-              <label for="tolerance">几何容差 mm</label>
-              <input id="tolerance" name="tolerance" type="number" min="0.000001" step="0.000001" placeholder="自动">
-            </details>
           </div>
         </div>
 
@@ -1880,7 +3066,7 @@ def _index_html() -> str:
           <div class="bandGrid">
             <div class="fieldGroup span-3">
               <label for="lineWidth">名义树脂线宽 mm</label>
-              <input id="lineWidth" name="lineWidth" type="number" min="0.001" step="0.001" value="{DEFAULT_RESIN_LINE_WIDTH_MM}">
+              <input id="lineWidth" name="lineWidth" type="number" min="0.001" step="0.001" value="{prusa_num('line_width', DEFAULT_RESIN_LINE_WIDTH_MM)}">
             </div>
             <div class="fieldGroup span-3">
               <label for="slicingKernel">切片内核</label>
@@ -1890,6 +3076,21 @@ def _index_html() -> str:
                 <option value="pyslm">PySLM（实验）</option>
               </select>
             </div>
+            <div class="fieldGroup span-3 prusaQuickField">
+              <label for="prusaInfillPattern" class="tooltipLabel" data-tooltip="Prusa 内部填充的几何图案和主方向。">Prusa 填充图案</label>
+              <select id="prusaInfillPattern">
+                <option value="zigzag_horizontal" selected>横向 Zigzag</option>
+                <option value="zigzag_vertical">竖向 Zigzag</option>
+                <option value="zigzag_plus45">+45° Zigzag</option>
+                <option value="zigzag_minus45">-45° Zigzag</option>
+                <option value="isotropic">各向同性填充</option>
+                <option value="triangles">三角填充</option>
+                <option value="concentric">同心轮廓填充</option>
+              </select>
+            </div>
+            <div class="compactOptions span-3 prusaQuickField">
+              <label for="prusaPrintPerimeters" class="tooltipLabel checkboxLabel" data-tooltip="生成模型的外轮廓与内轮廓。"><input id="prusaPrintPerimeters" type="checkbox" checked> 打印内外轮廓</label>
+            </div>
           </div>
 
           <div id="prusaNativeSettings">
@@ -1897,57 +3098,108 @@ def _index_html() -> str:
             <p class="notice">由 Prusa 完整生成轮廓、填充与空移；不使用项目原生的连续路径、三角形或之字形优化。</p>
             <div class="prusaSettingsGrid">
               <div class="fieldGroup">
+                <label for="prusaStartX">零件起始 Travel X mm</label>
+                <input id="prusaStartX" name="prusaStartX" type="number" step="0.001" value="{prusa_num('prusa_start_x_mm', core_defaults.start_x_mm)}">
+              </div>
+              <div class="fieldGroup">
+                <label for="prusaStartY">零件起始 Travel Y mm</label>
+                <input id="prusaStartY" name="prusaStartY" type="number" step="0.001" value="{prusa_num('prusa_start_y_mm', core_defaults.start_y_mm)}">
+              </div>
+              <div class="fieldGroup">
                 <label for="prusaPerimeterCount" class="tooltipLabel" data-tooltip="零件外轮廓和内轮廓的总圈数。更多圈数会提升边缘强度与尺寸稳定性，但会增加打印时间。">边界圈数</label>
-                <input id="prusaPerimeterCount" type="number" min="1" step="1" value="2">
+                <input id="prusaPerimeterCount" type="number" min="1" step="1" value="{prusa_num('prusa_perimeter_count', 2)}">
               </div>
               <div class="fieldGroup">
                 <label for="prusaInfillDensity" class="tooltipLabel" data-tooltip="模型内部由填充覆盖的比例。100% 为实心；较低数值可缩短时间并降低材料用量。">填充率 %</label>
-                <input id="prusaInfillDensity" type="number" min="0" max="100" step="1" value="{DEFAULT_RESIN_INFILL_DENSITY_PERCENT:g}">
+                <input id="prusaInfillDensity" type="number" min="0" max="100" step="1" value="{prusa_num('prusa_infill_density', DEFAULT_RESIN_INFILL_DENSITY_PERCENT)}">
               </div>
               <div class="fieldGroup">
                 <label for="prusaContourInfillOverlap" class="tooltipLabel" data-tooltip="填充与最内侧轮廓的重叠比例。适当搭边能避免两者之间留缝；过大可能造成局部过挤。">轮廓与填充搭边 %</label>
-                <input id="prusaContourInfillOverlap" type="number" min="0" max="99" step="0.1" value="{DEFAULT_RESIN_CONTOUR_INFILL_OVERLAP_PERCENT:g}">
-              </div>
-              <div class="compactOptions">
-                <label for="prusaPrintPerimeters" class="tooltipLabel checkboxLabel" data-tooltip="是否生成模型的外轮廓与内轮廓。通常应开启；关闭后只保留内部填充路径。"><input id="prusaPrintPerimeters" type="checkbox" checked> 打印内外轮廓</label>
-              </div>
-              <div class="fieldGroup">
-                <label for="prusaInfillPattern" class="tooltipLabel" data-tooltip="内部填充的几何图案和主方向。不同图案会影响强度方向、路径连续性与打印耗时。">Prusa 填充图案</label>
-                <select id="prusaInfillPattern">
-                  <option value="zigzag_horizontal" selected>横向 Zigzag</option>
-                  <option value="zigzag_vertical">竖向 Zigzag</option>
-                  <option value="zigzag_plus45">+45° Zigzag</option>
-                  <option value="zigzag_minus45">-45° Zigzag</option>
-                  <option value="isotropic">各向同性填充</option>
-                  <option value="triangles">三角填充</option>
-                  <option value="concentric">同心轮廓填充</option>
-                </select>
+                <input id="prusaContourInfillOverlap" type="number" min="0" max="99" step="0.1" value="{prusa_num('prusa_contour_infill_overlap', DEFAULT_RESIN_CONTOUR_INFILL_OVERLAP_PERCENT)}">
               </div>
             </div>
             <div class="prusaFeatureToggle">
               <label for="prusaRaftEnabled" class="tooltipLabel checkboxLabel" data-tooltip="在零件底部生成可剥离的 Prusa 筏层，以改善首层附着与底面稳定性；不会额外生成悬垂支撑。"><input id="prusaRaftEnabled" type="checkbox"> 启用可剥离 Prusa 筏层</label>
             </div>
             <div id="prusaRaftSettings" class="prusaSettingsGrid prusaSubSettings" hidden>
+              <div class="fieldGroup fieldGroupWide">
+                <label for="prusaRaftAutoContact" class="tooltipLabel checkboxLabel" data-tooltip="勾选时由 Prusa 自动计算接触筏层的层高、填充和线宽；取消后使用下面的手动测试参数。"><input id="prusaRaftAutoContact" type="checkbox" checked> 自动计算接触筏层</label>
+              </div>
               <div class="fieldGroup">
                 <label for="prusaRaftLayers" class="tooltipLabel" data-tooltip="筏层的打印层数。层数越多，筏层越稳固，但材料和时间也会增加。">筏层数</label>
-                <input id="prusaRaftLayers" type="number" min="1" step="1" value="3">
+                <input id="prusaRaftLayers" type="number" min="1" step="1" value="{DEFAULT_PRUSA_RAFT_LAYER_COUNT}">
               </div>
               <div class="fieldGroup">
                 <label for="prusaRaftExpansion" class="tooltipLabel" data-tooltip="筏层相对模型轮廓向外扩展的距离，用于增加与打印平台的接触面积。">筏层外扩 mm</label>
-                <input id="prusaRaftExpansion" type="number" min="0" step="0.1" value="3">
+                <input id="prusaRaftExpansion" type="number" min="0" step="0.1" value="{DEFAULT_PRUSA_RAFT_EXPANSION_MM:g}">
               </div>
               <div class="fieldGroup">
                 <label for="prusaRaftFirstLayerDensity" class="tooltipLabel" data-tooltip="筏层第一层的填充密度。较高密度通常能提升与打印平台的附着。">首层密度 %</label>
-                <input id="prusaRaftFirstLayerDensity" type="number" min="10" max="100" step="1" value="80">
+                <input id="prusaRaftFirstLayerDensity" type="number" min="10" max="100" step="1" value="{DEFAULT_PRUSA_RAFT_FIRST_LAYER_DENSITY_PERCENT:g}">
               </div>
               <div class="fieldGroup">
                 <label for="prusaRaftFirstLayerExpansion" class="tooltipLabel" data-tooltip="仅对筏层第一层增加的额外外扩距离，可进一步提高底部附着面积。">首层额外外扩 mm</label>
-                <input id="prusaRaftFirstLayerExpansion" type="number" min="0" step="0.1" value="3">
+                <input id="prusaRaftFirstLayerExpansion" type="number" min="0" step="0.1" value="{DEFAULT_PRUSA_RAFT_FIRST_LAYER_EXPANSION_MM:g}">
               </div>
               <div class="fieldGroup">
                 <label for="prusaRaftContactDistance" class="tooltipLabel" data-tooltip="零件与筏层之间的 Z 向间隙。数值越大越易剥离，但底面支撑越弱；建议从 0.25 mm 开始实测。">可剥离间隙 mm</label>
-                <input id="prusaRaftContactDistance" type="number" min="0" step="0.01" value="0.25">
+                <input id="prusaRaftContactDistance" type="number" min="0" step="0.01" value="{DEFAULT_PRUSA_RAFT_CONTACT_DISTANCE_MM:g}">
               </div>
+              <div class="fieldGroup">
+                <label for="prusaRaftContactLayerHeight" class="tooltipLabel" data-tooltip="仅在取消自动计算时生效。接触筏层是靠近零件的一层，建议先测试 0.5、0.75 和 1.0 mm。">接触层高度 mm</label>
+                <input id="prusaRaftContactLayerHeight" type="number" min="0.1" max="2" step="0.05" value="0.75">
+              </div>
+              <div class="fieldGroup">
+                <label for="prusaRaftContactDensity" class="tooltipLabel" data-tooltip="仅在取消自动计算时生效。接触层填充密度，建议保持 100% 以优先保证与下层筏层的接触。">接触层密度 %</label>
+                <input id="prusaRaftContactDensity" type="number" min="10" max="100" step="1" value="100">
+              </div>
+              <div class="fieldGroup">
+                <label for="prusaRaftContactExtrusionWidth" class="tooltipLabel" data-tooltip="仅在取消自动计算时生效。只改变接触筏层线宽，不改变零件打印线宽；建议先测试 1.0~1.5 mm。">接触层线宽 mm</label>
+                <input id="prusaRaftContactExtrusionWidth" type="number" min="0.1" max="4" step="0.1" value="1.5">
+              </div>
+            </div>
+            <div class="prusaFeatureToggle">
+              <label for="prusaSkirtEnabled" class="tooltipLabel checkboxLabel" data-tooltip="在打印开始时生成 Prusa 裙边。开启后可直接调整裙边圈数、距离、高度和最小长度；默认关闭。"><input id="prusaSkirtEnabled" type="checkbox"> 启用 Prusa 裙边</label>
+            </div>
+            <div id="prusaSkirtSettings" class="prusaSettingsGrid prusaSubSettings" hidden>
+              <div class="fieldGroup">
+                <label for="prusaSkirtLoops">裙边圈数</label>
+                <input id="prusaSkirtLoops" type="number" min="0" step="1" value="1">
+              </div>
+              <div class="fieldGroup">
+                <label for="prusaSkirtDistance">裙边距离 mm</label>
+                <input id="prusaSkirtDistance" type="number" min="0" step="0.1" value="6">
+              </div>
+              <div class="fieldGroup">
+                <label for="prusaSkirtHeight">裙边高度 层</label>
+                <input id="prusaSkirtHeight" type="number" min="0" step="1" value="1">
+              </div>
+              <div class="fieldGroup">
+                <label for="prusaMinSkirtLength">最小裙边长度 mm</label>
+                <input id="prusaMinSkirtLength" type="number" min="0" step="1" value="10">
+              </div>
+            </div>
+            <div class="prusaFeatureToggle">
+              <label for="prusaBrimEnabled" class="tooltipLabel checkboxLabel" data-tooltip="在首层生成 Prusa Brim，用于增加底部附着面积；默认关闭。"><input id="prusaBrimEnabled" type="checkbox"> 启用 Prusa Brim</label>
+            </div>
+            <div id="prusaBrimSettings" class="prusaSettingsGrid prusaSubSettings" hidden>
+              <div class="fieldGroup">
+                <label for="prusaBrimWidth">Brim 宽度 mm</label>
+                <input id="prusaBrimWidth" type="number" min="0" step="0.1" value="5">
+              </div>
+              <div class="fieldGroup">
+                <label for="prusaBrimType">Brim 类型</label>
+                <select id="prusaBrimType">
+                  <option value="outer_only" selected>仅外侧</option>
+                  <option value="outer_and_inner">外侧和内侧</option>
+                  <option value="no_brim">不生成</option>
+                </select>
+              </div>
+              <div class="fieldGroup">
+                <label for="prusaBrimSeparation">Brim 分离间隙 mm</label>
+                <input id="prusaBrimSeparation" type="number" min="0" step="0.1" value="0">
+              </div>
+              <label for="prusaBrimOneStroke" class="tooltipLabel checkboxLabel" data-tooltip="尝试复用 Core 的安全边界连接策略，将 Prusa Brim 连接为一条连续挤出路径；无法安全连接时保留原生多路径。"><input id="prusaBrimOneStroke" type="checkbox"> Brim 一笔画</label>
             </div>
             <details id="prusaAdvancedSettings" class="advancedSettings">
               <summary>Prusa 高级几何与路径设置</summary>
@@ -2010,10 +3262,10 @@ def _index_html() -> str:
                   <div class="fieldGroup">
                   <label for="prusaSeamPosition" class="tooltipLabel" data-tooltip="每层轮廓起止点的布置策略。对齐会形成一条固定接缝；最近减少空移；后侧尝试隐藏在模型后方；随机会分散接缝。">Z 接缝位置</label>
                   <select id="prusaSeamPosition">
-                    <option value="aligned" selected>对齐</option>
+                    <option value="aligned">对齐</option>
                     <option value="nearest">最近</option>
                     <option value="rear">后侧</option>
-                    <option value="random">随机</option>
+                    <option value="random" selected>随机</option>
                   </select>
                   </div>
                 </div>
@@ -2226,6 +3478,160 @@ def _index_html() -> str:
 
         </div>
 
+        <details id="coreProcessSettings" class="advancedSettings processCoreSettings">
+          <summary>process_core 处理参数（不属于 Prusa 切片内核）</summary>
+          <p class="notice">这些参数在路径进入 process_core 后生效；Prusa 区域只负责几何、层高、打印路径和 Prusa 空走。</p>
+
+          <div class="coreMaterialColumns">
+          <section class="prusaAdvancedGroup">
+            <h4>树脂</h4>
+            <div class="coreParameterSubgroup">
+              <h5>基础参数</h5>
+              <div class="prusaSettingsGrid">
+                <div class="fieldGroup"><label for="coreResinLayerHeight">层高 mm</label><input id="coreResinLayerHeight" type="number" min="0.001" step="0.001" value="0.5"></div>
+                <div class="fieldGroup"><label for="coreResinExtrusionScale">挤出倍率</label><input id="coreResinExtrusionScale" type="number" min="0" step="0.001" value="1"></div>
+                <div class="fieldGroup"><label for="coreResinTemp">温度 °C</label><input id="coreResinTemp" type="number" min="0" max="500" step="1" value="250"></div>
+                <div class="fieldGroup"><label for="coreResinEOverride">E/mm 覆盖值</label><input id="coreResinEOverride" type="number" min="0" step="0.001" placeholder="使用默认计算"></div>
+              </div>
+            </div>
+            <div class="coreParameterSubgroup">
+              <h5>打印速度</h5>
+              <div class="prusaSettingsGrid">
+                <div class="fieldGroup"><label for="coreResinFeed">常规打印速度 mm/s</label><input id="coreResinFeed" type="number" min="0.001" step="0.001" value="10"></div>
+              </div>
+            </div>
+            <div class="coreParameterSubgroup">
+              <h5>首层参数</h5>
+              <div class="prusaSettingsGrid">
+                <div class="fieldGroup"><label for="coreResinFirstLayerFeed">首层打印速度 mm/s</label><input id="coreResinFirstLayerFeed" type="number" min="0.001" step="0.001" value="10"></div>
+              </div>
+            </div>
+            <div class="coreParameterSubgroup">
+              <h5>预挤出 / 回抽</h5>
+              <div class="prusaSettingsGrid">
+                <div class="fieldGroup"><label for="coreResinPrimeLength">预挤出长度 mm</label><input id="coreResinPrimeLength" type="number" min="0" step="0.001" value="18"></div>
+                <div class="fieldGroup"><label for="coreResinPrimeSpeed">预挤出速度 mm/s</label><input id="coreResinPrimeSpeed" type="number" min="0.001" step="0.001" value="15"></div>
+                <div class="fieldGroup"><label for="coreResinRetractLength">回抽长度 mm</label><input id="coreResinRetractLength" type="number" min="0" step="0.001" value="15"></div>
+                <div class="fieldGroup"><label for="coreResinRetractSpeed">回抽速度 mm/s</label><input id="coreResinRetractSpeed" type="number" min="0.001" step="0.001" value="30"></div>
+              </div>
+            </div>
+          </section>
+
+          <section class="prusaAdvancedGroup">
+            <h4>纤维</h4>
+            <div class="coreParameterSubgroup">
+              <h5>基础参数</h5>
+              <div class="prusaSettingsGrid">
+                <div class="fieldGroup"><label for="coreFiberLayerHeight">层高 mm</label><input id="coreFiberLayerHeight" type="number" min="0.001" step="0.001" value="0.1"></div>
+                <div class="fieldGroup"><label for="coreFiberExtrusionScale">挤出倍率</label><input id="coreFiberExtrusionScale" type="number" min="0" step="0.001" value="1"></div>
+                <div class="fieldGroup"><label for="coreFiberTemp">温度 °C</label><input id="coreFiberTemp" type="number" min="0" max="500" step="1" value="250"></div>
+                <div class="fieldGroup"><label for="coreFiberStartAccel">起步加速时间 s</label><input id="coreFiberStartAccel" type="number" min="0.001" step="0.001" value="2"></div>
+              </div>
+            </div>
+            <div class="coreParameterSubgroup">
+              <h5>打印速度</h5>
+              <div class="prusaSettingsGrid">
+                <div class="fieldGroup"><label for="coreFiberFeed">常规打印速度 mm/s</label><input id="coreFiberFeed" type="number" min="0.001" step="0.001" value="10"></div>
+              </div>
+            </div>
+            <div class="coreParameterSubgroup">
+              <h5>首层参数</h5>
+              <div class="prusaSettingsGrid">
+                <div class="fieldGroup"><label for="coreFiberFirstLayerFeed">首层打印速度 mm/s</label><input id="coreFiberFirstLayerFeed" type="number" min="0.001" step="0.001" value="10"></div>
+              </div>
+            </div>
+            <div class="coreParameterSubgroup">
+              <h5>预挤出 / 回抽</h5>
+              <div class="prusaSettingsGrid">
+                <div class="fieldGroup"><label for="coreFiberPrimeLength">预挤出长度 mm</label><input id="coreFiberPrimeLength" type="number" min="0" step="0.001" value="12"></div>
+                <div class="fieldGroup"><label for="coreFiberPrimeSpeed">预挤出速度 mm/s</label><input id="coreFiberPrimeSpeed" type="number" min="0.001" step="0.001" value="5"></div>
+                <div class="fieldGroup"><label for="coreFiberRetractLength">回抽长度 mm</label><input id="coreFiberRetractLength" type="number" min="0" step="0.001" value="10"></div>
+                <div class="fieldGroup"><label for="coreFiberRetractSpeed">回抽速度 mm/s</label><input id="coreFiberRetractSpeed" type="number" min="0.001" step="0.001" value="5"></div>
+              </div>
+            </div>
+          </section>
+          </div>
+
+          <section class="prusaAdvancedGroup coreTravelPanel">
+            <h4>空走与起始姿态</h4>
+            <div class="coreParameterSubgroup">
+              <h5>空走速度</h5>
+              <div class="prusaSettingsGrid">
+                <div class="fieldGroup"><label for="coreTravelFeed">常规空走速度 mm/s</label><input id="coreTravelFeed" type="number" min="0.001" step="0.001" value="10"></div>
+              </div>
+            </div>
+            <div class="coreParameterSubgroup">
+              <h5>首层参数（旧输入兼容）</h5>
+              <div class="prusaSettingsGrid">
+                <div class="fieldGroup"><label for="coreFirstLayerTravelFeed">首层空走速度 mm/s</label><input id="coreFirstLayerTravelFeed" type="number" min="0.001" step="0.001" value="10"></div>
+              </div>
+            </div>
+            <div class="coreParameterSubgroup">
+              <h5>起始姿态与等待</h5>
+              <div class="prusaSettingsGrid">
+                <div class="fieldGroup"><label for="corePrimeSettle">预挤出稳定等待 s</label><input id="corePrimeSettle" type="number" min="0" step="0.001" value="0.5"></div>
+                <div class="fieldGroup"><label for="coreDefaultA">默认 A °</label><input id="coreDefaultA" type="number" min="-360" max="360" step="0.001" value="0"></div>
+                <div class="fieldGroup"><label for="coreDefaultB">默认 B °</label><input id="coreDefaultB" type="number" min="-360" max="360" step="0.001" value="0"></div>
+                <div class="fieldGroup"><label for="coreDefaultC">默认 C °</label><input id="coreDefaultC" type="number" min="-360" max="360" step="0.001" value="0"></div>
+              </div>
+            </div>
+          </section>
+
+          <section class="prusaAdvancedGroup">
+            <h4>Primeline</h4>
+            <p class="notice">仅在勾选后启用下方的 Primeline 起点和长度参数；预览和导出会按命令顺序显示。</p>
+            <div class="prusaSettingsGrid">
+              <div class="fieldGroup compactOptions"><label class="checkboxLabel" for="corePrimelineEnabled"><input id="corePrimelineEnabled" type="checkbox" checked> 打印 Primeline</label></div>
+              <div class="fieldGroup"><label for="corePrimelineX">起点 X mm</label><input id="corePrimelineX" type="number" step="0.001" value="0" disabled></div>
+              <div class="fieldGroup"><label for="corePrimelineY">起点 Y mm</label><input id="corePrimelineY" type="number" step="0.001" value="-10" disabled></div>
+              <div class="fieldGroup"><label for="corePrimelineLength">长度 mm</label><input id="corePrimelineLength" type="number" min="0" step="0.001" value="100" disabled></div>
+            </div>
+          </section>
+
+          <section class="prusaAdvancedGroup">
+            <h4>路径平滑与七阶采样</h4>
+            <div class="prusaSettingsGrid">
+              <div class="fieldGroup"><label for="coreDt">采样周期 dt s</label><input id="coreDt" type="number" min="0.0001" step="0.0001" value="0.004"></div>
+              <div class="fieldGroup"><label for="coreCornerAngle">拐角角度阈值 °</label><input id="coreCornerAngle" type="number" min="0" step="0.1" value="45"></div>
+              <div class="fieldGroup"><label for="coreCornerRetreatRatio">拐角回退比例</label><input id="coreCornerRetreatRatio" type="number" min="0" max="1" step="0.001" value="0.65"></div>
+              <div class="fieldGroup"><label for="coreSplineMaxError">Spline 最大误差 mm</label><input id="coreSplineMaxError" type="number" min="0" step="0.001" value="0.1"></div>
+              <div class="fieldGroup"><label for="coreSplineMaxAngle">Spline 最大转角 °</label><input id="coreSplineMaxAngle" type="number" min="0" step="0.1" value="45"></div>
+              <div class="fieldGroup"><label for="coreSourceMergeDistance">源段合并距离 mm</label><input id="coreSourceMergeDistance" type="number" min="0" step="0.001" value="0.04"></div>
+              <div class="fieldGroup"><label for="coreCornerRetreatMax">拐角最大回退 mm</label><input id="coreCornerRetreatMax" type="number" min="0" step="0.001" value="0.4"></div>
+              <div class="fieldGroup"><label for="coreCornerBlendSegments">拐角平滑段数</label><input id="coreCornerBlendSegments" type="number" min="2" step="1" value="8"></div>
+              <div class="fieldGroup"><label for="coreDensity">Spline 密度</label><input id="coreDensity" type="number" min="0" step="1" value="0"></div>
+              <div class="fieldGroup"><label for="coreDegree">Spline 阶数</label><input id="coreDegree" type="number" min="1" step="1" value="3"></div>
+              <div class="fieldGroup"><label for="coreMaxFitPoints">单段最大拟合点数</label><input id="coreMaxFitPoints" type="number" min="2" step="1" value="20000"></div>
+            </div>
+          </section>
+
+          <section class="prusaAdvancedGroup">
+            <h4>现场材料补偿与工具偏置</h4>
+            <p class="notice">按材料区分的现场校准参数。它们在 process_core 命令层注入，随后统一经过七阶参数化。</p>
+            <div class="prusaSettingsGrid">
+              <div class="fieldGroup"><label for="coreFiberOffsetX">纤维头 X 偏置 mm</label><input id="coreFiberOffsetX" type="number" step="0.001" placeholder="读取校准文件"></div>
+              <div class="fieldGroup"><label for="coreFiberOffsetY">纤维头 Y 偏置 mm</label><input id="coreFiberOffsetY" type="number" step="0.001" placeholder="读取校准文件"></div>
+              <div class="fieldGroup"><label for="coreFiberOffsetZ">纤维头 Z 偏置 mm</label><input id="coreFiberOffsetZ" type="number" step="0.001" placeholder="读取校准文件"></div>
+              <div class="fieldGroup"><label for="coreResinZComp">树脂 Z 补偿 mm</label><input id="coreResinZComp" type="number" step="0.001" placeholder="读取校准文件"></div>
+              <div class="fieldGroup"><label for="coreFiberRetractOverride">纤维回抽覆盖 mm</label><input id="coreFiberRetractOverride" type="number" min="0" step="0.001" placeholder="使用纤维工艺参数"></div>
+            </div>
+          </section>
+
+          <section class="prusaAdvancedGroup">
+            <h4>现场动作与导出注入</h4>
+            <p class="notice">机械臂换头、CUT 和挤出等待参数保留在 process_core 中，供现场调试；导出时与轨迹统一注入。</p>
+            <div class="prusaSettingsGrid">
+              <div class="fieldGroup"><label for="coreToolSafeLift">换头安全抬升 mm</label><input id="coreToolSafeLift" type="number" min="0" step="0.001" value="20"></div>
+              <div class="fieldGroup"><label for="coreCutLift">CUT 抬升 mm</label><input id="coreCutLift" type="number" min="0" step="0.001" value="20"></div>
+              <div class="fieldGroup"><label for="coreCutWait">CUT 等待 s</label><input id="coreCutWait" type="number" min="0" step="0.001" value="15"></div>
+              <div class="fieldGroup"><label for="coreInitialTool">初始工具 ID</label><input id="coreInitialTool" type="number" min="0" step="1" value="2"></div>
+              <div class="fieldGroup compactOptions"><label class="checkboxLabel" for="coreEnableExtrudeWait"><input id="coreEnableExtrudeWait" type="checkbox" checked> 启用挤出等待</label></div>
+              <div class="fieldGroup compactOptions"><label class="checkboxLabel" for="coreTravelExtrudeOverlap"><input id="coreTravelExtrudeOverlap" type="checkbox" checked> 允许等待叠加到空走</label></div>
+              <div class="fieldGroup compactOptions"><label class="checkboxLabel" for="coreCutAbsoluteE"><input id="coreCutAbsoluteE" type="checkbox" checked> CUT 使用绝对 E</label></div>
+            </div>
+          </section>
+        </details>
+
         <div class="formSection processBand" data-layout-band="process-action">
           <div class="bandGrid">
             <div id="legacyProcessSettings" class="span-9" hidden>
@@ -2269,8 +3675,18 @@ def _index_html() -> str:
             </div>
             </div>
             <div class="actions span-3">
-              <button id="sliceButton" type="submit">生成 NPZ</button>
-              <span id="status" class="status"></span>
+              <div class="exportActionRow">
+                <button id="sliceButton" type="submit">生成并导出 Core NPZ</button>
+                <div id="exportProgress" class="exportProgress" aria-live="polite">
+                <div class="exportProgressHeader">
+                  <span id="exportProgressMessage">等待处理</span>
+                  <strong id="exportProgressValue">0%</strong>
+                </div>
+                <progress id="exportProgressBar" max="100" value="0"></progress>
+                <span id="exportElapsed" class="exportElapsed">已用时 0.0 秒</span>
+                </div>
+                <span id="status" class="status" aria-live="polite"></span>
+              </div>
             </div>
           </div>
         </div>
@@ -2283,12 +3699,14 @@ def _index_html() -> str:
     const form = document.getElementById('sliceForm');
     const button = document.getElementById('sliceButton');
     const statusEl = document.getElementById('status');
+    const exportProgressEl = document.getElementById('exportProgress');
+    const exportProgressBarEl = document.getElementById('exportProgressBar');
+    const exportProgressMessageEl = document.getElementById('exportProgressMessage');
+    const exportProgressValueEl = document.getElementById('exportProgressValue');
+    const exportElapsedEl = document.getElementById('exportElapsed');
     const downloadEl = document.getElementById('download');
     const layersEl = document.getElementById('layers');
-    const pathsEl = document.getElementById('paths');
     const outputNameEl = document.getElementById('outputName');
-    const executedKernelEl = document.getElementById('executedKernel');
-    const executedPlanningLineWidthEl = document.getElementById('executedPlanningLineWidth');
     const executedInfillPatternEl = document.getElementById('executedInfillPattern');
     const previewSurface = document.getElementById('previewSurface');
     const previewCanvas = document.getElementById('previewCanvas');
@@ -2313,6 +3731,8 @@ def _index_html() -> str:
     const showRaftPathsInput = document.getElementById('showRaftPaths');
     const showFiberPathsInput = document.getElementById('showFiberPaths');
     const showTravelPathsInput = document.getElementById('showTravelPaths');
+    const showCoreTravelPathsInput = document.getElementById('showCoreTravelPaths');
+    const showPrimelineInput = document.getElementById('showPrimeline');
     const slicingKernelInput = document.getElementById('slicingKernel');
     const layerHeightInput = document.getElementById('layerHeight');
     const firstLayerHeightInput = document.getElementById('firstLayerHeight');
@@ -2325,11 +3745,24 @@ def _index_html() -> str:
     const raftBottomOffsetInput = document.getElementById('raftBottomOffset');
     const raftSecondOffsetInput = document.getElementById('raftSecondOffset');
     const prusaNativeSettings = document.getElementById('prusaNativeSettings');
+    document.getElementById('prusaSkirtEnabled')?.closest('.prusaFeatureToggle')?.remove();
+    document.getElementById('prusaSkirtSettings')?.remove();
+    const prusaQuickFields = document.querySelectorAll('.prusaQuickField');
+    const corePrimelineEnabledInput = document.getElementById('corePrimelineEnabled');
+    const corePrimelineParameterIds = ['corePrimelineX', 'corePrimelineY', 'corePrimelineLength'];
     const prusaRaftEnabledInput = document.getElementById('prusaRaftEnabled');
+    const prusaRaftAutoContactInput = document.getElementById('prusaRaftAutoContact');
     const prusaRaftSettings = document.getElementById('prusaRaftSettings');
     const prusaRaftSettingIds = [
       'prusaRaftLayers', 'prusaRaftExpansion', 'prusaRaftFirstLayerDensity',
-      'prusaRaftFirstLayerExpansion', 'prusaRaftContactDistance'
+      'prusaRaftFirstLayerExpansion', 'prusaRaftContactDistance',
+      'prusaRaftContactLayerHeight', 'prusaRaftContactDensity',
+      'prusaRaftContactExtrusionWidth'
+    ];
+    const prusaBrimEnabledInput = document.getElementById('prusaBrimEnabled');
+    const prusaBrimSettings = document.getElementById('prusaBrimSettings');
+    const prusaBrimSettingIds = [
+      'prusaBrimWidth', 'prusaBrimType', 'prusaBrimSeparation', 'prusaBrimOneStroke'
     ];
     const legacyNativeSettings = document.getElementById('legacyNativeSettings');
     const legacyProcessSettings = document.getElementById('legacyProcessSettings');
@@ -2356,7 +3789,550 @@ def _index_html() -> str:
       'pyslmSimplificationFactor', 'pyslmSimplificationMode',
       'pyslmScanContourFirst', 'pyslmFixPolygons', 'pyslmSimplificationPreserveTopology'
     ];
+    const initialCoreParams = {json.dumps(asdict(core_defaults), ensure_ascii=False)};
+    const initialPrusaParams = {json.dumps(prusa_saved, ensure_ascii=False)};
     let previewData = null;
+    let settingsSaveTimer = null;
+    const coreNumberSettings = [
+      ['coreResinLayerHeight', 'core_resin_layer_height', 'resin', 'layer_height_mm'],
+      ['coreResinExtrusionScale', 'core_resin_extrusion_scale', 'resin', 'extrusion_scale'],
+      ['coreResinFeed', 'core_resin_feed', 'resin', 'feed_mm_s'],
+      ['coreResinFirstLayerFeed', 'core_resin_first_layer_feed', 'resin', 'first_layer_feed_mm_s'],
+      ['coreResinTemp', 'core_resin_temp', 'resin', 'temperature_c'],
+      ['coreResinPrimeLength', 'core_resin_prime_length', 'resin', 'prime_length_mm'],
+      ['coreResinPrimeSpeed', 'core_resin_prime_speed', 'resin', 'prime_speed_mm_s'],
+      ['coreResinRetractLength', 'core_resin_retract_length', 'resin', 'retract_length_mm'],
+      ['coreResinRetractSpeed', 'core_resin_retract_speed', 'resin', 'retract_speed_mm_s'],
+      ['coreResinEOverride', 'core_resin_e_override', 'resin', 'e_per_mm_override'],
+      ['coreFiberLayerHeight', 'core_fiber_layer_height', 'fiber', 'layer_height_mm'],
+      ['coreFiberExtrusionScale', 'core_fiber_extrusion_scale', 'fiber', 'extrusion_scale'],
+      ['coreFiberFeed', 'core_fiber_feed', 'fiber', 'feed_mm_s'],
+      ['coreFiberFirstLayerFeed', 'core_fiber_first_layer_feed', 'fiber', 'first_layer_feed_mm_s'],
+      ['coreFiberTemp', 'core_fiber_temp', 'fiber', 'temperature_c'],
+      ['coreFiberPrimeLength', 'core_fiber_prime_length', 'fiber', 'prime_length_mm'],
+      ['coreFiberPrimeSpeed', 'core_fiber_prime_speed', 'fiber', 'prime_speed_mm_s'],
+      ['coreFiberRetractLength', 'core_fiber_retract_length', 'fiber', 'retract_length_mm'],
+      ['coreFiberRetractSpeed', 'core_fiber_retract_speed', 'fiber', 'retract_speed_mm_s'],
+      ['coreFiberStartAccel', 'core_fiber_start_accel', 'fiber', 'start_accel_s'],
+      ['coreTravelFeed', 'core_travel_feed', 'root', 'travel_feed_mm_s'],
+      ['coreFirstLayerTravelFeed', 'core_first_layer_travel_feed', 'root', 'first_layer_travel_feed_mm_s'],
+      ['corePrimeSettle', 'core_prime_settle', 'root', 'prime_settle_s'],
+      ['coreDefaultA', 'core_default_a', 'root', 'default_a'],
+      ['coreDefaultB', 'core_default_b', 'root', 'default_b'],
+      ['coreDefaultC', 'core_default_c', 'root', 'default_c'],
+      ['corePrimelineX', 'core_primeline_x_mm', 'root', 'primeline_x_mm'],
+      ['corePrimelineY', 'core_primeline_y_mm', 'root', 'primeline_y_mm'],
+      ['corePrimelineLength', 'core_primeline_length', 'root', 'primeline_length_mm'],
+      ['coreDt', 'core_dt', 'root', 'dt'],
+      ['coreCornerAngle', 'core_corner_angle', 'root', 'corner_angle_deg'],
+      ['coreCornerRetreatRatio', 'core_corner_retreat_ratio', 'root', 'corner_retreat_ratio'],
+      ['coreSplineMaxError', 'core_spline_max_error', 'root', 'spline_max_error_mm'],
+      ['coreSplineMaxAngle', 'core_spline_max_angle', 'root', 'spline_max_angle_deg'],
+      ['coreSourceMergeDistance', 'core_source_merge_distance', 'root', 'source_merge_distance_mm'],
+      ['coreCornerRetreatMax', 'core_corner_retreat_max', 'root', 'corner_retreat_max_mm'],
+      ['coreCornerBlendSegments', 'core_corner_blend_segments', 'root', 'corner_blend_segments'],
+      ['coreDensity', 'core_density', 'root', 'density'],
+      ['coreDegree', 'core_degree', 'root', 'degree'],
+      ['coreMaxFitPoints', 'core_max_fit_points', 'root', 'max_fit_points_per_segment'],
+      ['coreFiberOffsetX', 'core_fiber_offset_x', 'export', 'fiber_x_print_compensation_mm'],
+      ['coreFiberOffsetY', 'core_fiber_offset_y', 'export', 'fiber_y_print_compensation_mm'],
+      ['coreFiberOffsetZ', 'core_fiber_offset_z', 'export', 'fiber_z_print_compensation_mm'],
+      ['coreResinZComp', 'core_resin_z_comp', 'export', 'resin_z_print_compensation_mm'],
+      ['coreToolSafeLift', 'core_tool_safe_lift', 'export', 'tool_change_safe_lift_mm'],
+      ['coreCutLift', 'core_cut_lift', 'export', 'cut_lift_mm'],
+      ['coreCutWait', 'core_cut_wait', 'export', 'cut_wait_s'],
+      ['coreFiberRetractOverride', 'core_fiber_retract_override', 'export', 'fiber_retract_length_mm'],
+      ['coreInitialTool', 'core_initial_tool', 'export', 'initial_tool_id']
+    ];
+    const coreBooleanSettings = [
+      ['corePrimelineEnabled', 'core_primeline_enabled', 'root', 'primeline_enabled'],
+      ['coreEnableExtrudeWait', 'core_enable_extrude_wait', 'export', 'enable_extrude_wait'],
+      ['coreTravelExtrudeOverlap', 'core_enable_travel_extrude_overlap', 'export', 'enable_travel_extrude_overlap'],
+      ['coreCutAbsoluteE', 'core_external_npz_cut_absolute_e', 'export', 'external_npz_cut_absolute_e']
+    ];
+    const prusaNumberSettings = [
+      ['layerHeight', 'layer_height'], ['firstLayerHeight', 'first_layer_height'],
+      ['lineWidth', 'line_width'], ['prusaStartX', 'prusa_start_x_mm'],
+      ['prusaStartY', 'prusa_start_y_mm'], ['prusaPerimeterCount', 'prusa_perimeter_count'],
+      ['prusaInfillDensity', 'prusa_infill_density'], ['prusaContourInfillOverlap', 'prusa_contour_infill_overlap'],
+      ['prusaRaftLayers', 'prusa_raft_layers'], ['prusaRaftExpansion', 'prusa_raft_expansion'],
+      ['prusaRaftFirstLayerDensity', 'prusa_raft_first_layer_density'],
+      ['prusaRaftFirstLayerExpansion', 'prusa_raft_first_layer_expansion'],
+      ['prusaRaftContactDistance', 'prusa_raft_contact_distance'],
+      ['prusaRaftContactLayerHeight', 'prusa_raft_contact_layer_height'],
+      ['prusaRaftContactDensity', 'prusa_raft_contact_density'],
+      ['prusaRaftContactExtrusionWidth', 'prusa_raft_contact_extrusion_width'],
+      ['prusaBrimWidth', 'prusa_brim_width'], ['prusaBrimSeparation', 'prusa_brim_separation'],
+      ['prusaExternalPerimeterWidth', 'prusa_external_perimeter_width'],
+      ['prusaPerimeterWidth', 'prusa_perimeter_width'], ['prusaInfillWidth', 'prusa_infill_width'],
+      ['prusaXySizeCompensation', 'prusa_xy_size_compensation'],
+      ['prusaElephantFootCompensation', 'prusa_elephant_foot_compensation'],
+      ['prusaInfillAnchor', 'prusa_infill_anchor'], ['prusaInfillAnchorMax', 'prusa_infill_anchor_max'],
+      ['prusaAvoidCrossingMaxDetour', 'prusa_avoid_crossing_max_detour']
+    ];
+    const prusaBooleanSettings = [
+      ['prusaPrintPerimeters', 'prusa_print_perimeters'], ['prusaRaftEnabled', 'prusa_raft_enabled'],
+      ['prusaRaftAutoContact', 'prusa_raft_auto_contact'],
+      ['prusaGapFillEnabled', 'prusa_gap_fill_enabled'],
+      ['prusaBrimEnabled', 'prusa_brim_enabled'], ['prusaBrimOneStroke', 'prusa_brim_one_stroke']
+    ];
+    const prusaSelectSettings = [
+      ['slicingKernel', 'slicing_kernel'], ['buildAxis', 'build_axis'],
+      ['prusaInfillPattern', 'prusa_infill_pattern'], ['prusaPerimeterGenerator', 'prusa_perimeter_generator'],
+      ['prusaSeamPosition', 'prusa_seam_position'], ['prusaBrimType', 'prusa_brim_type']
+    ];
+    function setInitialValue(id, value) {{
+      const input = document.getElementById(id);
+      if (input && value !== null && value !== undefined && value !== '') input.value = String(value);
+    }}
+    function applyInitialSavedSettings() {{
+      const core = initialCoreParams || {{}};
+      for (const [id, unused, group, key] of coreNumberSettings) {{
+        const source = group === 'root' ? core : core[group];
+        if (source) setInitialValue(id, source[key]);
+      }}
+      for (const [id, unused, group, key] of coreBooleanSettings) {{
+        const input = document.getElementById(id);
+        const source = group === 'root' ? core : core[group];
+        if (input && source && source[key] !== undefined) input.checked = Boolean(source[key]);
+      }}
+      setInitialValue('prusaStartX', initialPrusaParams.prusa_start_x_mm ?? core.start_x_mm);
+      setInitialValue('prusaStartY', initialPrusaParams.prusa_start_y_mm ?? core.start_y_mm);
+      setInitialValue('layerHeight', initialPrusaParams.layer_height ?? core.resin?.layer_height_mm);
+      setInitialValue('firstLayerHeight', initialPrusaParams.first_layer_height ?? core.resin?.layer_height_mm);
+      for (const [id, key] of prusaNumberSettings) setInitialValue(id, initialPrusaParams[key]);
+      for (const [id, key] of prusaSelectSettings) setInitialValue(id, initialPrusaParams[key]);
+      for (const [id, key] of prusaBooleanSettings) {{
+        const input = document.getElementById(id);
+        if (input && initialPrusaParams[key] !== undefined) input.checked = Boolean(initialPrusaParams[key]);
+      }}
+    }}
+    function collectPersistentSettings() {{
+      const core = {{}};
+      for (const [id, name] of coreNumberSettings) {{
+        const input = document.getElementById(id);
+        if (input) core[name] = input.value;
+      }}
+      for (const [id, name] of coreBooleanSettings) {{
+        const input = document.getElementById(id);
+        if (input) core[name] = input.checked;
+      }}
+      const prusa = {{}};
+      for (const [id, name] of prusaNumberSettings) {{
+        const input = document.getElementById(id);
+        if (input) prusa[name] = input.value;
+      }}
+      for (const [id, name] of prusaBooleanSettings) {{
+        const input = document.getElementById(id);
+        if (input) prusa[name] = input.checked;
+      }}
+      for (const [id, name] of prusaSelectSettings) {{
+        const input = document.getElementById(id);
+        if (input) prusa[name] = input.value;
+      }}
+      return {{ core, prusa }};
+    }}
+    function scheduleSettingsSave() {{
+      window.clearTimeout(settingsSaveTimer);
+      settingsSaveTimer = window.setTimeout(() => {{
+        fetch('/ui-settings', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify(collectPersistentSettings())
+        }}).catch(() => {{}});
+      }}, 120);
+    }}
+    function installSettingsPersistence() {{
+      const ids = [
+        ...coreNumberSettings.map(([id]) => id), ...coreBooleanSettings.map(([id]) => id),
+        ...prusaNumberSettings.map(([id]) => id), ...prusaBooleanSettings.map(([id]) => id),
+        ...prusaSelectSettings.map(([id]) => id)
+      ];
+      for (const id of ids) {{
+        const input = document.getElementById(id);
+        if (input) {{ input.addEventListener('input', scheduleSettingsSave); input.addEventListener('change', scheduleSettingsSave); }}
+      }}
+    }}
+    function magnitudeStepForValue(value) {{
+      const magnitude = Math.abs(Number(value));
+      if (!Number.isFinite(magnitude) || magnitude === 0) return null;
+      return magnitude < 1 ? 10 ** Math.floor(Math.log10(magnitude)) : 1;
+    }}
+    function decimalPlaces(valueText) {{
+      const text = String(valueText ?? '').trim().toLowerCase();
+      if (!text || !Number.isFinite(Number(text))) return 0;
+      const [coefficient, exponentText] = text.split('e');
+      const coefficientPlaces = (coefficient.split('.')[1] || '').length;
+      const exponent = Number(exponentText || 0);
+      return Math.max(0, coefficientPlaces - exponent);
+    }}
+    function installMagnitudeNumberStepping() {{
+      for (const input of document.querySelectorAll('input[type="number"]')) {{
+        if (input.dataset.magnitudeSpinnerInstalled === 'true') continue;
+        input.dataset.magnitudeSpinnerInstalled = 'true';
+        input.dataset.magnitudeLastValue = input.value;
+        const adjustValue = (targetInput, direction) => {{
+          const current = Number.parseFloat(targetInput.value);
+          const step = magnitudeStepForValue(current);
+          if (!Number.isFinite(current) || step === null || !Number.isFinite(direction)) return;
+          const requested = current + (direction > 0 ? step : -step);
+          let next = requested;
+          const min = targetInput.min.trim() === '' ? null : Number(targetInput.min);
+          const max = targetInput.max.trim() === '' ? null : Number(targetInput.max);
+          if (min !== null && Number.isFinite(min)) next = Math.max(min, next);
+          if (max !== null && Number.isFinite(max)) next = Math.min(max, next);
+          const clamped = next !== requested;
+          const places = Math.max(
+            decimalPlaces(String(current)),
+            decimalPlaces(String(step)),
+            clamped ? decimalPlaces(String(next)) : 0,
+          );
+          targetInput.value = String(Number(next.toFixed(places)));
+          targetInput.dataset.magnitudeLastValue = targetInput.value;
+          targetInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
+          targetInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
+        }};
+        const wrapper = document.createElement('span');
+        wrapper.className = 'magnitudeInputWrap';
+        input.parentNode.insertBefore(wrapper, input);
+        wrapper.appendChild(input);
+        const buttons = document.createElement('span');
+        buttons.className = 'magnitudeSpinButtons';
+        const makeButton = (symbol, direction, label) => {{
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.className = 'magnitudeSpinButton';
+          button.textContent = symbol;
+          button.dataset.magnitudeDirection = String(direction);
+          button.setAttribute('aria-label', label);
+          button.addEventListener('pointerdown', (event) => event.preventDefault());
+          button.addEventListener('click', (event) => {{
+            event.preventDefault();
+            event.stopPropagation();
+            const targetInput = event.currentTarget.closest('.magnitudeInputWrap')?.querySelector('input[type="number"]');
+            if (!targetInput || targetInput.disabled) return;
+            adjustValue(targetInput, Number(event.currentTarget.dataset.magnitudeDirection));
+          }});
+          buttons.appendChild(button);
+        }};
+        makeButton('▲', 1, '增加当前数量级');
+        makeButton('▼', -1, '减少当前数量级');
+        wrapper.appendChild(buttons);
+        // Keep the native spinner appearance while preserving the existing
+        // magnitude-based increment/decrement behavior.
+        input.addEventListener('pointerdown', (event) => {{
+          if (input.disabled || event.button !== 0) return;
+          const rect = input.getBoundingClientRect();
+          const localX = event.clientX - rect.left;
+          const localY = event.clientY - rect.top;
+          const spinnerWidth = Math.min(24, Math.max(16, rect.height * 0.9));
+          if (
+            !Number.isFinite(localX) || !Number.isFinite(localY)
+            || localX < rect.width - spinnerWidth
+            || localY < 0 || localY > rect.height
+          ) return;
+          event.preventDefault();
+          event.stopPropagation();
+          adjustValue(input, localY < rect.height / 2 ? 1 : -1);
+        }});
+        input.addEventListener('keydown', (event) => {{
+          if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return;
+          event.preventDefault();
+          adjustValue(input, event.key === 'ArrowUp' ? 1 : -1);
+        }});
+        input.addEventListener('input', () => {{
+          input.dataset.magnitudeLastValue = input.value;
+        }});
+        input.addEventListener('change', () => {{
+          input.dataset.magnitudeLastValue = input.value;
+        }});
+      }}
+    }}
+    function installAdvancedPopups() {{
+      const advancedIds = ['prusaAdvancedSettings', 'coreProcessSettings'];
+      let activePopup = null;
+      let activeSummary = null;
+      let dragState = null;
+
+      const clampPopup = (popup) => {{
+        const rect = popup.getBoundingClientRect();
+        const left = Math.max(12, Math.min(popup.offsetLeft, window.innerWidth - rect.width - 12));
+        const isCorePopup = popup.classList.contains('coreAdvancedPopup');
+        const top = isCorePopup
+          ? Math.max(12, popup.offsetTop)
+          : Math.max(12, Math.min(popup.offsetTop, window.innerHeight - rect.height - 12));
+        popup.style.left = left + 'px';
+        popup.style.top = top + 'px';
+      }};
+      const closePopup = (popup, trigger) => {{
+        popup.classList.remove('visible');
+        popup.setAttribute('aria-hidden', 'true');
+        trigger.setAttribute('aria-expanded', 'false');
+        if (activePopup === popup) {{
+          activePopup = null;
+          activeSummary = null;
+        }}
+      }};
+      const openPopup = (popup, trigger) => {{
+        if (activePopup && activePopup !== popup && activeSummary) closePopup(activePopup, activeSummary);
+        activePopup = popup;
+        activeSummary = trigger;
+        const isCorePopup = popup.closest('#coreProcessSettings') !== null;
+        const widthLimit = isCorePopup ? 1180 : 900;
+        const heightLimit = isCorePopup ? 960 : 680;
+        const width = Math.min(widthLimit, window.innerWidth - 24);
+        const height = Math.min(heightLimit, window.innerHeight - 24);
+        popup.classList.toggle('coreAdvancedPopup', isCorePopup);
+        popup.style.width = Math.max(320, width) + 'px';
+        popup.style.height = isCorePopup ? 'auto' : Math.max(180, height) + 'px';
+        popup.style.maxHeight = isCorePopup ? 'none' : '';
+        popup.style.left = isCorePopup
+          ? Math.max(12, window.scrollX + (window.innerWidth - width) / 2) + 'px'
+          : Math.max(12, (window.innerWidth - width) / 2) + 'px';
+        popup.style.top = isCorePopup
+          ? Math.max(12, window.scrollY + 12) + 'px'
+          : Math.max(12, (window.innerHeight - height) / 2) + 'px';
+        popup.style.transform = 'none';
+        popup.classList.add('visible');
+        popup.setAttribute('aria-hidden', 'false');
+        trigger.setAttribute('aria-expanded', 'true');
+        clampPopup(popup);
+      }};
+
+      for (const id of advancedIds) {{
+        const host = document.getElementById(id);
+        if (!host) continue;
+        const summary = host.querySelector(':scope > summary');
+        if (!summary) continue;
+        const trigger = document.createElement('button');
+        trigger.type = 'button';
+        trigger.className = 'advancedPopupTrigger';
+        trigger.textContent = summary.textContent.trim();
+        trigger.setAttribute('aria-haspopup', 'dialog');
+        trigger.setAttribute('aria-expanded', 'false');
+        summary.hidden = true;
+        host.insertBefore(trigger, summary);
+        const body = document.createElement('div');
+        body.className = 'advancedPopupBody';
+        while (summary.nextSibling) body.appendChild(summary.nextSibling);
+        const popup = document.createElement('div');
+        popup.className = 'advancedPopup';
+        popup.setAttribute('role', 'dialog');
+        popup.setAttribute('aria-modal', 'false');
+        popup.setAttribute('aria-hidden', 'true');
+        const header = document.createElement('div');
+        header.className = 'advancedPopupHeader';
+        const title = document.createElement('span');
+        title.className = 'advancedPopupTitle';
+        title.textContent = summary.textContent.trim();
+        const closeButton = document.createElement('button');
+        closeButton.type = 'button';
+        closeButton.className = 'advancedPopupClose';
+        closeButton.setAttribute('aria-label', '关闭');
+        closeButton.textContent = '×';
+        header.append(title, closeButton);
+        popup.append(header, body);
+        host.appendChild(popup);
+        host.open = true;
+        trigger.addEventListener('click', () => {{
+          if (popup.classList.contains('visible')) closePopup(popup, trigger);
+          else openPopup(popup, trigger);
+        }});
+        closeButton.addEventListener('click', () => closePopup(popup, trigger));
+        header.addEventListener('pointerdown', (event) => {{
+          if (event.target === closeButton) return;
+          dragState = {{
+            popup,
+            pointerId: event.pointerId,
+            startX: event.clientX,
+            startY: event.clientY,
+            left: popup.offsetLeft,
+            top: popup.offsetTop
+          }};
+          header.setPointerCapture(event.pointerId);
+        }});
+        header.addEventListener('pointermove', (event) => {{
+          if (!dragState || dragState.popup !== popup || dragState.pointerId !== event.pointerId) return;
+          popup.style.left = dragState.left + event.clientX - dragState.startX + 'px';
+          popup.style.top = dragState.top + event.clientY - dragState.startY + 'px';
+          clampPopup(popup);
+        }});
+        const finishDrag = (event) => {{
+          if (dragState?.popup === popup && dragState.pointerId === event.pointerId) dragState = null;
+        }};
+        header.addEventListener('pointerup', finishDrag);
+        header.addEventListener('pointercancel', finishDrag);
+      }}
+      document.addEventListener('pointerdown', (event) => {{
+        if (activePopup && !activePopup.contains(event.target) && event.target !== activeSummary) {{
+          closePopup(activePopup, activeSummary);
+        }}
+      }});
+      document.addEventListener('keydown', (event) => {{
+        if (event.key === 'Escape' && activePopup && activeSummary) {{
+          event.preventDefault();
+          closePopup(activePopup, activeSummary);
+          activeSummary.focus();
+        }}
+      }});
+      window.addEventListener('resize', () => {{
+        if (activePopup) clampPopup(activePopup);
+      }});
+    }}
+    function installPopupSelects() {{
+      const selects = Array.from(document.querySelectorAll('select'));
+      if (!selects.length) return;
+
+      const layer = document.createElement('div');
+      layer.className = 'selectPopupLayer';
+      layer.hidden = true;
+      layer.innerHTML = `
+        <div id="selectPopup" class="selectPopup" role="dialog" aria-modal="true" hidden>
+          <div class="selectPopupHeader">
+            <span class="selectPopupTitle"></span>
+            <button type="button" class="selectPopupClose" aria-label="关闭">×</button>
+          </div>
+          <div class="selectPopupOptions" role="listbox"></div>
+        </div>`;
+      document.body.appendChild(layer);
+
+      const popup = layer.querySelector('.selectPopup');
+      const title = layer.querySelector('.selectPopupTitle');
+      const closeButton = layer.querySelector('.selectPopupClose');
+      const optionsPanel = layer.querySelector('.selectPopupOptions');
+      let activeSelect = null;
+      let activeTrigger = null;
+      let dragState = null;
+
+      const close = () => {{
+        if (activeTrigger) activeTrigger.setAttribute('aria-expanded', 'false');
+        activeSelect = null;
+        activeTrigger = null;
+        popup.hidden = true;
+        layer.hidden = true;
+        layer.style.pointerEvents = 'none';
+      }};
+      const updateTrigger = (select, trigger) => {{
+        const selected = select.options[select.selectedIndex];
+        trigger.querySelector('.popupSelectLabel').textContent = selected?.textContent || '';
+        trigger.disabled = select.disabled;
+      }};
+      const clampPopup = () => {{
+        if (popup.hidden) return;
+        const width = popup.getBoundingClientRect().width;
+        const height = popup.getBoundingClientRect().height;
+        const left = Math.max(12, Math.min(Number.parseFloat(popup.style.left) || 12, window.innerWidth - width - 12));
+        const top = Math.max(12, Math.min(Number.parseFloat(popup.style.top) || 12, window.innerHeight - height - 12));
+        popup.style.left = left + 'px';
+        popup.style.top = top + 'px';
+      }};
+      const open = (select, trigger) => {{
+        if (select.disabled) return;
+        if (activeSelect === select) {{
+          close();
+          return;
+        }}
+        activeSelect = select;
+        activeTrigger = trigger;
+        title.textContent = select.dataset.popupTitle || select.id || '选择';
+        optionsPanel.innerHTML = '';
+        for (const option of select.options) {{
+          const optionButton = document.createElement('button');
+          optionButton.type = 'button';
+          optionButton.className = 'selectPopupOption';
+          optionButton.textContent = option.textContent;
+          optionButton.disabled = option.disabled;
+          optionButton.setAttribute('role', 'option');
+          optionButton.setAttribute('aria-selected', option.value === select.value ? 'true' : 'false');
+          optionButton.addEventListener('click', () => {{
+            select.value = option.value;
+            select.dispatchEvent(new Event('change', {{ bubbles: true }}));
+            updateTrigger(select, trigger);
+            close();
+            trigger.focus();
+          }});
+          optionsPanel.appendChild(optionButton);
+        }}
+        const triggerRect = trigger.getBoundingClientRect();
+        const width = Math.min(Math.max(triggerRect.width, 240), Math.max(240, window.innerWidth - 24));
+        popup.style.width = width + 'px';
+        popup.style.left = Math.max(12, Math.min(triggerRect.left, window.innerWidth - width - 12)) + 'px';
+        popup.style.top = Math.max(12, Math.min(triggerRect.bottom + 8, window.innerHeight - 220)) + 'px';
+        layer.hidden = false;
+        layer.style.pointerEvents = 'auto';
+        popup.hidden = false;
+        clampPopup();
+        optionsPanel.querySelector('[aria-selected="true"]')?.focus();
+      }};
+
+      closeButton.addEventListener('click', close);
+      layer.addEventListener('pointerdown', (event) => {{
+        if (event.target === layer) close();
+      }});
+      document.addEventListener('keydown', (event) => {{
+        if (event.key === 'Escape' && !popup.hidden) {{
+          event.preventDefault();
+          close();
+        }}
+      }});
+      window.addEventListener('resize', clampPopup);
+      const header = layer.querySelector('.selectPopupHeader');
+      header.addEventListener('pointerdown', (event) => {{
+        if (event.target === closeButton || popup.hidden) return;
+        dragState = {{
+          pointerId: event.pointerId,
+          startX: event.clientX,
+          startY: event.clientY,
+          left: popup.offsetLeft,
+          top: popup.offsetTop
+        }};
+        header.setPointerCapture(event.pointerId);
+      }});
+      header.addEventListener('pointermove', (event) => {{
+        if (!dragState || dragState.pointerId !== event.pointerId) return;
+        popup.style.left = dragState.left + event.clientX - dragState.startX + 'px';
+        popup.style.top = dragState.top + event.clientY - dragState.startY + 'px';
+        clampPopup();
+      }});
+      const finishDrag = (event) => {{
+        if (dragState?.pointerId === event.pointerId) dragState = null;
+      }};
+      header.addEventListener('pointerup', finishDrag);
+      header.addEventListener('pointercancel', finishDrag);
+
+      for (const select of selects) {{
+        const wrapper = document.createElement('div');
+        wrapper.className = 'popupSelect';
+        const trigger = document.createElement('button');
+        trigger.type = 'button';
+        trigger.className = 'popupSelectTrigger';
+        trigger.setAttribute('aria-haspopup', 'dialog');
+        trigger.setAttribute('aria-expanded', 'false');
+        trigger.setAttribute('aria-controls', 'selectPopup');
+        const label = document.createElement('span');
+        label.className = 'popupSelectLabel';
+        trigger.appendChild(label);
+        select.classList.add('popupSelectNative');
+        select.setAttribute('aria-hidden', 'true');
+        select.tabIndex = -1;
+        const labelElement = document.querySelector('label[for="' + select.id + '"]');
+        select.dataset.popupTitle = labelElement?.textContent?.trim() || select.id || '选择';
+        select.parentNode.insertBefore(wrapper, select);
+        wrapper.appendChild(select);
+        wrapper.appendChild(trigger);
+        updateTrigger(select, trigger);
+        select.addEventListener('change', () => updateTrigger(select, trigger));
+        const observer = new MutationObserver(() => updateTrigger(select, trigger));
+        observer.observe(select, {{ attributes: true, attributeFilter: ['disabled'] }});
+        trigger.addEventListener('click', () => open(select, trigger));
+        trigger.addEventListener('keydown', (event) => {{
+          if (event.key === 'Enter' || event.key === ' ' || event.key === 'ArrowDown') {{
+            event.preventDefault();
+            open(select, trigger);
+          }}
+        }});
+      }}
+    }}
     const viewerState = {{
       zoom: 1.0,
       centerX: null,
@@ -2393,6 +4369,12 @@ def _index_html() -> str:
         }}
       }};
       setPanelState(prusaNativeSettings, !isPyslm && !isLegacy);
+      for (const field of prusaQuickFields) {{
+        field.hidden = isPyslm || isLegacy;
+        for (const control of field.querySelectorAll('input, select, textarea')) {{
+          control.disabled = isPyslm || isLegacy;
+        }}
+      }}
       setPanelState(legacyNativeSettings, isLegacy);
       setPanelState(legacyProcessSettings, isLegacy);
       setPanelState(pyslmNativeSettings, isPyslm);
@@ -2402,6 +4384,20 @@ def _index_html() -> str:
       prusaRaftSettings.hidden = !prusaRaftEnabled;
       for (const id of prusaRaftSettingIds) {{
         document.getElementById(id).disabled = !prusaRaftEnabled;
+      }}
+      prusaRaftAutoContactInput.disabled = !prusaRaftEnabled;
+      const manualContactEnabled = prusaRaftEnabled && !prusaRaftAutoContactInput.checked;
+      for (const id of ['prusaRaftContactLayerHeight', 'prusaRaftContactDensity', 'prusaRaftContactExtrusionWidth']) {{
+        document.getElementById(id).disabled = !manualContactEnabled;
+      }}
+      const prusaBrimEnabled = !isPyslm && !isLegacy && prusaBrimEnabledInput.checked;
+      prusaBrimSettings.hidden = !prusaBrimEnabled;
+      for (const id of prusaBrimSettingIds) {{
+        document.getElementById(id).disabled = !prusaBrimEnabled;
+      }}
+      const primelineEnabled = corePrimelineEnabledInput.checked;
+      for (const id of corePrimelineParameterIds) {{
+        document.getElementById(id).disabled = !primelineEnabled;
       }}
       infillSafetyNote.textContent = isLegacy
         ? (strictLayeredFallbackPatterns[infillPatternInput.value] || '')
@@ -2443,8 +4439,45 @@ def _index_html() -> str:
       raftSecondOffsetInput.disabled = disabled;
     }});
     prusaRaftEnabledInput.addEventListener('change', syncKernelControls);
+    prusaRaftAutoContactInput.addEventListener('change', syncKernelControls);
+    prusaBrimEnabledInput.addEventListener('change', syncKernelControls);
+    corePrimelineEnabledInput.addEventListener('change', syncKernelControls);
+    applyInitialSavedSettings();
+    installAdvancedPopups();
     syncKernelControls();
+    installMagnitudeNumberStepping();
+    installSettingsPersistence();
     fiberNotice.textContent = 'JSON 中的单层纤维路径会复制到每个树脂层，纤维层高 0.1 mm 会计入后续树脂层 Z 位置，最后一层树脂封顶不打印纤维。';
+
+    function updateExportProgress(job) {{
+      const progress = Math.max(0, Math.min(100, Number(job.progress) || 0));
+      exportProgressEl.classList.add('visible');
+      exportProgressBarEl.value = progress;
+      exportProgressValueEl.textContent = progress + '%';
+      exportProgressMessageEl.textContent = job.state === 'complete'
+        ? '完成'
+        : job.state === 'error'
+          ? '失败'
+          : progress > 0
+            ? '处理中'
+            : '准备中';
+      const elapsed = Number(job.elapsed_s);
+      exportElapsedEl.textContent = '已用时 ' + (Number.isFinite(elapsed) ? elapsed.toFixed(1) : '0.0') + ' 秒';
+    }}
+
+    async function waitForSliceJob(jobId) {{
+      while (true) {{
+        const response = await fetch('/slice-status?job_id=' + encodeURIComponent(jobId), {{
+          cache: 'no-store'
+        }});
+        const job = await response.json();
+        if (!response.ok || !job.ok) throw new Error(job.error || '无法读取导出进度');
+        updateExportProgress(job);
+        if (job.state === 'complete') return job.result;
+        if (job.state === 'error') throw new Error(job.error || '导出失败');
+        await new Promise(resolve => setTimeout(resolve, 250));
+      }}
+    }}
 
     form.addEventListener('submit', async (event) => {{
       event.preventDefault();
@@ -2453,10 +4486,11 @@ def _index_html() -> str:
       if (!file) return;
 
       button.disabled = true;
-      button.textContent = '处理中';
+      button.textContent = '处理中…';
       statusEl.textContent = '处理中';
       statusEl.className = 'status';
       downloadEl.className = 'download';
+      updateExportProgress({{ progress: 0, message: '正在提交任务', elapsed_s: 0 }});
 
       const formData = new FormData();
       formData.append('stl_file', file, file.name);
@@ -2466,9 +4500,39 @@ def _index_html() -> str:
       formData.append('first_layer_height', document.getElementById('firstLayerHeight').value);
       formData.append('line_width', document.getElementById('lineWidth').value);
       formData.append('build_axis', document.getElementById('buildAxis').value);
-      formData.append('z_min', document.getElementById('zMin').value);
-      formData.append('z_max', document.getElementById('zMax').value);
-      formData.append('tolerance', document.getElementById('tolerance').value);
+       formData.append('prusa_start_x_mm', document.getElementById('prusaStartX').value);
+       formData.append('prusa_start_y_mm', document.getElementById('prusaStartY').value);
+       const coreFieldIds = [
+         'coreResinLayerHeight', 'coreResinExtrusionScale', 'coreResinFeed',
+         'coreResinFirstLayerFeed', 'coreResinTemp', 'coreResinPrimeLength',
+         'coreResinPrimeSpeed', 'coreResinRetractLength', 'coreResinRetractSpeed',
+         'coreResinEOverride', 'coreFiberLayerHeight', 'coreFiberExtrusionScale',
+         'coreFiberFeed', 'coreFiberFirstLayerFeed', 'coreFiberTemp',
+         'coreFiberPrimeLength', 'coreFiberPrimeSpeed', 'coreFiberRetractLength',
+         'coreFiberRetractSpeed', 'coreFiberStartAccel', 'coreTravelFeed',
+         'coreFirstLayerTravelFeed', 'corePrimeSettle', 'coreDefaultA',
+         'coreDefaultB', 'coreDefaultC', 'corePrimelineX', 'corePrimelineY',
+         'corePrimelineLength', 'coreDt', 'coreCornerAngle',
+         'coreCornerRetreatRatio', 'coreSplineMaxError', 'coreSplineMaxAngle',
+         'coreSourceMergeDistance', 'coreCornerRetreatMax', 'coreCornerBlendSegments',
+         'coreDensity', 'coreDegree', 'coreMaxFitPoints', 'coreFiberOffsetX',
+         'coreFiberOffsetY', 'coreFiberOffsetZ', 'coreResinZComp',
+         'coreToolSafeLift', 'coreCutLift', 'coreCutWait', 'coreFiberRetractOverride',
+         'coreInitialTool'
+       ];
+       for (const id of coreFieldIds) {{
+         const input = document.getElementById(id);
+         const name = 'core_' + id.slice(4).replace(/[A-Z]/g, m => '_' + m.toLowerCase());
+         formData.append(name, input.value);
+       }}
+       formData.append('core_primeline_enabled', corePrimelineEnabledInput.checked ? 'true' : 'false');
+       for (const [id, name] of [
+         ['coreEnableExtrudeWait', 'core_enable_extrude_wait'],
+         ['coreTravelExtrudeOverlap', 'core_enable_travel_extrude_overlap'],
+         ['coreCutAbsoluteE', 'core_external_npz_cut_absolute_e']
+       ]) {{
+         formData.append(name, document.getElementById(id).checked ? 'true' : 'false');
+       }}
       formData.append('slicing_kernel', slicingKernelInput.value);
       if (slicingKernelInput.value === 'prusa') {{
         formData.append('prusa_perimeter_count', document.getElementById('prusaPerimeterCount').value);
@@ -2482,6 +4546,15 @@ def _index_html() -> str:
         formData.append('prusa_raft_first_layer_density', document.getElementById('prusaRaftFirstLayerDensity').value);
         formData.append('prusa_raft_first_layer_expansion', document.getElementById('prusaRaftFirstLayerExpansion').value);
         formData.append('prusa_raft_contact_distance', document.getElementById('prusaRaftContactDistance').value);
+        formData.append('prusa_raft_auto_contact', prusaRaftAutoContactInput.checked ? 'true' : 'false');
+        formData.append('prusa_raft_contact_layer_height', document.getElementById('prusaRaftContactLayerHeight').value);
+        formData.append('prusa_raft_contact_density', document.getElementById('prusaRaftContactDensity').value);
+        formData.append('prusa_raft_contact_extrusion_width', document.getElementById('prusaRaftContactExtrusionWidth').value);
+        formData.append('prusa_brim_enabled', prusaBrimEnabledInput.checked ? 'true' : 'false');
+        formData.append('prusa_brim_width', document.getElementById('prusaBrimWidth').value);
+        formData.append('prusa_brim_type', document.getElementById('prusaBrimType').value);
+        formData.append('prusa_brim_separation', document.getElementById('prusaBrimSeparation').value);
+        formData.append('prusa_brim_one_stroke', document.getElementById('prusaBrimOneStroke').checked ? 'true' : 'false');
         formData.append('prusa_perimeter_generator', document.getElementById('prusaPerimeterGenerator').value);
         formData.append('prusa_gap_fill_enabled', document.getElementById('prusaGapFillEnabled').checked ? 'true' : 'false');
         formData.append('prusa_infill_anchor', document.getElementById('prusaInfillAnchor').value);
@@ -2543,27 +4616,12 @@ def _index_html() -> str:
           method: 'POST',
           body: formData
         }});
-        const result = await response.json();
-        if (!response.ok || !result.ok) throw new Error(result.error || '切片失败');
+        const queued = await response.json();
+        if (!response.ok || !queued.ok) throw new Error(queued.error || 'export job submission failed');
+        const result = await waitForSliceJob(queued.job_id);
 
         layersEl.textContent = result.layers;
-        pathsEl.textContent = result.paths;
         outputNameEl.textContent = result.filename;
-        executedKernelEl.textContent = result.slicing_kernel === 'legacy'
-          ? '项目原生（Legacy）'
-          : result.slicing_kernel === 'prusa'
-            ? 'Prusa 完整路径内核'
-          : result.slicing_kernel === 'pyslm'
-            ? 'PySLM'
-            : String(result.slicing_kernel || '-');
-        const executedPlanningLineWidth = Number(result.planning_line_width);
-        executedPlanningLineWidthEl.textContent = result.slicing_kernel === 'pyslm'
-          ? '不适用（PySLM 后端自行控制）'
-          : result.slicing_kernel === 'prusa'
-            ? '不适用（Prusa 使用名义线宽）'
-          : Number.isFinite(executedPlanningLineWidth)
-            ? String(Number(executedPlanningLineWidth.toFixed(3))) + ' mm'
-            : '-';
         const patternExecution = result.infill_pattern_execution;
         if (patternExecution?.applied) {{
           const angles = (patternExecution.angle_schedule_degrees || []).join('° / ');
@@ -2583,12 +4641,16 @@ def _index_html() -> str:
           ? '完成。' + result.recommendation.message
           : '完成';
         statusEl.className = 'status ok';
+        const coreSeconds = Number(result.core_export_seconds);
+        if (Number.isFinite(coreSeconds)) {{
+          exportElapsedEl.textContent = 'core 最终 NPZ 处理耗时 ' + coreSeconds.toFixed(1) + ' 秒';
+        }}
       }} catch (error) {{
         statusEl.textContent = error.message;
         statusEl.className = 'status error';
       }} finally {{
         button.disabled = false;
-        button.textContent = '生成 NPZ';
+        button.textContent = '生成并导出 Core NPZ';
       }}
     }});
 
@@ -2619,6 +4681,8 @@ def _index_html() -> str:
       if (role === 'raft') return showRaftPathsInput.checked;
       if (role === 'fiber') return showFiberPathsInput.checked;
       if (role === 'travel') return showTravelPathsInput.checked;
+      if (role === 'core_travel' || role === 'layer_lift') return showCoreTravelPathsInput.checked;
+      if (role === 'primeline') return showPrimelineInput.checked;
       return showResinInfillInput.checked;
     }}
 
@@ -2636,16 +4700,48 @@ def _index_html() -> str:
         const kind = rawEntry.kind === 'travel' ? 'travel' : 'deposit';
         const role = kind === 'travel' ? 'travel' : (rawEntry.role || 'infill');
         const points = rawEntry.points || rawEntry;
-        if (roleIsSelected(role) && points && points.length >= 2) {{
+        if (points && points.length >= 2) {{
           entries.push({{ kind, role, points, extrusion: rawEntry.extrusion || null }});
         }}
       }}
-      if (showFiberPathsInput.checked) {{
-        for (const points of layer.fiber_paths || []) {{
-          if (points && points.length >= 2) entries.push({{ kind: 'deposit', role: 'fiber', points }});
+      for (const points of layer.fiber_paths || []) {{
+        if (points && points.length >= 2) entries.push({{ kind: 'deposit', role: 'fiber', points }});
+      }}
+      const additions = (previewData?.core_overlay?.sequence || [])
+        .filter((entry) => Number(entry.layer) === Number(layer.index))
+        // A layer lift is a Z-only move.  In this top-view preview its two
+        // endpoints have the same XY and therefore collapse to a misleading
+        // one-point "path".  Keep it in the Core NPZ/overlay metadata, but do
+        // not put it into the selectable 2D path sequence.
+        .filter((entry) => entry.role !== 'layer_lift')
+        .sort((left, right) => Number(left.order) - Number(right.order));
+      if (!additions.length) {{
+        return entries.filter((entry) => roleIsSelected(entry.role));
+      }}
+      const orderedEntries = [];
+      let baseIndex = 0;
+      for (const addition of additions) {{
+        const anchor = Math.max(
+          0,
+          Math.min(entries.length, Number.isFinite(Number(addition.anchor))
+            ? Number(addition.anchor)
+            : entries.length)
+        );
+        while (baseIndex < anchor && baseIndex < entries.length) {{
+          orderedEntries.push(entries[baseIndex++]);
+        }}
+        const points = addition.points;
+        if (points && points.length >= 2) {{
+          orderedEntries.push({{
+            kind: addition.kind === 'travel' ? 'travel' : 'deposit',
+            role: addition.role || 'travel',
+            points,
+            extrusion: null,
+          }});
         }}
       }}
-      return entries;
+      while (baseIndex < entries.length) orderedEntries.push(entries[baseIndex++]);
+      return orderedEntries.filter((entry) => roleIsSelected(entry.role));
     }}
 
     function updatePathSlider(resetToEnd = false) {{
@@ -2838,7 +4934,56 @@ def _index_html() -> str:
       if (role === 'raft') return '#7f5539';
       if (role === 'fiber') return '#e66f00';
       if (role === 'travel') return '#526f8c';
+      if (role === 'primeline') return '#b91c1c';
       return '#0b6bcb';
+    }}
+
+    function coreOverlayPaths(key, layer) {{
+      const layerIndex = Number(layer?.index);
+      return (previewData?.core_overlay?.[key] || [])
+        .filter((entry) => Number(entry.layer) === layerIndex)
+        .map((entry) => entry.points)
+        .filter((points) => Array.isArray(points) && points.length >= 2);
+    }}
+
+    function drawOverlayPath(ctx, path, project) {{
+      const first = project(path[0]);
+      ctx.beginPath();
+      ctx.moveTo(first[0], first[1]);
+      for (let index = 1; index < path.length; index++) {{
+        const point = project(path[index]);
+        ctx.lineTo(point[0], point[1]);
+      }}
+      ctx.stroke();
+    }}
+
+    function drawOriginMarker(ctx, viewport) {{
+      const origin = previewData?.origin || [0, 0];
+      const point = viewport.project(origin);
+      const {{ plot }} = viewport;
+      if (
+        point[0] < plot.left - 10 || point[0] > plot.right + 10
+        || point[1] < plot.top - 10 || point[1] > plot.bottom + 10
+      ) return;
+      ctx.save();
+      ctx.strokeStyle = '#b91c1c';
+      ctx.fillStyle = '#b91c1c';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.moveTo(point[0] - 7, point[1]);
+      ctx.lineTo(point[0] + 7, point[1]);
+      ctx.moveTo(point[0], point[1] - 7);
+      ctx.lineTo(point[0], point[1] + 7);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(point[0], point[1], 3, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.font = '600 11px Segoe UI, Arial, sans-serif';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'bottom';
+      ctx.fillText('(0, 0)', point[0] + 9, point[1] - 8);
+      ctx.restore();
     }}
 
     function extrusionDensity(path, extrusion, segmentIndex) {{
@@ -2852,21 +4997,19 @@ def _index_html() -> str:
       return Math.max(0, deltaE) / distance;
     }}
 
+    // Use one physical E/mm domain for every layer and path.  A percentile
+    // range derived from the current layer makes a tiny difference between
+    // Brim/contour/infill look like a large flow change.
+    const ABSOLUTE_EXTRUSION_COLOR_RANGE = Object.freeze({{ low: 0.0, high: 0.5 }});
+
     function extrusionDensityRange(entries) {{
-      const densities = [];
       for (const entry of entries) {{
         for (let index = 0; index < entry.points.length - 1; index++) {{
           const density = extrusionDensity(entry.points, entry.extrusion, index);
-          if (density !== null && density > 0) densities.push(density);
+          if (density !== null && density >= 0) return ABSOLUTE_EXTRUSION_COLOR_RANGE;
         }}
       }}
-      if (!densities.length) return null;
-      densities.sort((a, b) => a - b);
-      const low = densities[Math.floor((densities.length - 1) * 0.05)];
-      const high = densities[Math.ceil((densities.length - 1) * 0.95)];
-      return high > low + 1e-12
-        ? {{ low, high }}
-        : {{ low: low * 0.9, high: low * 1.1 + 1e-12 }};
+      return null;
     }}
 
     function extrusionColorForSegment(density, range) {{
@@ -2913,9 +5056,12 @@ def _index_html() -> str:
       const currentEntry = visibleCount > 0 ? entries[visibleCount - 1] : null;
       const lineWidths = previewData.line_widths || {{ resin: 2.0, fiber: 1.0 }};
       const usePhysicalWidth = showLineWidthInput.checked;
-      const extrusionRange = showExtrusionInput.checked
-        ? extrusionDensityRange(entries.slice(0, visibleCount))
-        : null;
+    // Keep the color scale stable while the path-progress slider reveals more
+    // paths.  Deriving it from only the visible prefix would recolor every
+    // previously drawn path whenever a new path changes the min/max range.
+    const extrusionRange = showExtrusionInput.checked && visibleCount > 0
+      ? extrusionDensityRange(entries)
+      : null;
       extrusionColorLegend.hidden = extrusionRange === null;
 
       function drawPath(path) {{
@@ -2966,10 +5112,18 @@ def _index_html() -> str:
       for (let index = 0; index < visibleCount; index++) {{
         const entry = entries[index];
         if (entry.kind === 'travel') {{
-          ctx.strokeStyle = '#526f8c';
+          ctx.strokeStyle = entry.role === 'core_travel'
+            ? '#c2410c'
+            : entry.role === 'layer_lift'
+              ? '#f59e0b'
+              : '#526f8c';
           ctx.globalAlpha = 0.95;
-          ctx.lineWidth = 1.5;
-          ctx.setLineDash([7, 5]);
+          ctx.lineWidth = entry.role === 'layer_lift' ? 2.2 : entry.role === 'core_travel' ? 2.0 : 1.5;
+          ctx.setLineDash(
+            entry.role === 'layer_lift' ? [2, 3]
+              : entry.role === 'core_travel' ? [5, 4]
+              : [7, 5]
+          );
           drawPath(entry.points);
           ctx.setLineDash([]);
           ctx.globalAlpha = 1;
@@ -3000,6 +5154,7 @@ def _index_html() -> str:
         drawDirection(ctx, currentEntry.points, pathColor(currentEntry.role), viewport.project);
       }}
       ctx.restore();
+      drawOriginMarker(ctx, viewport);
       updateViewerLabels();
     }}
 
@@ -3184,6 +5339,8 @@ def _index_html() -> str:
         drawPreview();
       }});
     }}
+    showCoreTravelPathsInput.addEventListener('change', drawPreview);
+    showPrimelineInput.addEventListener('change', drawPreview);
     showLineWidthInput.addEventListener('change', drawPreview);
     showExtrusionInput.addEventListener('change', drawPreview);
     showPathPointsInput.addEventListener('change', drawPreview);
