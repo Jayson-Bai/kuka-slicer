@@ -168,6 +168,35 @@ def test_converts_ordered_resin_and_fiber_paths_to_planner_commands_without_over
     assert travel_moves[-1].pos.z == pytest.approx(3.1)
 
 
+def test_curved_logical_layers_keep_source_order_when_converted_for_core():
+    semantics = {
+        "format": "logical_layer_v1",
+        "layer_key": "logical_deposition_layer",
+        "z_coordinate": "per_point_trajectory",
+        "ordering": "ascending_layer_key_then_source_path_order",
+        "reconstruct_layers_from_z": False,
+    }
+    job = SourceJob(
+        meta={"layer_semantics": semantics},
+        layers=[
+            LayerPaths(
+                index=0,
+                resin_paths=[_straight_path("R", 0, 0.0, 5.0, z=1.4)],
+            ),
+            LayerPaths(
+                index=1,
+                resin_paths=[_straight_path("R", 0, 5.0, 10.0, z=0.6)],
+            ),
+        ],
+    )
+
+    commands = source_job_to_parsed_commands(job, _params())
+    curves = _source_curves(commands)
+
+    assert [curve.layer for curve in curves] == [0, 1]
+    assert [curve.start_pos.z for curve in curves] == pytest.approx([1.4, 0.6])
+
+
 def test_uses_source_resin_travel_and_core_layer_lift_without_synthetic_layer_end_travel():
     job = SourceJob(
         meta={

@@ -79,6 +79,52 @@ def test_convert_uses_shared_head_calibration_offsets(tmp_path, monkeypatch):
     assert captured["kwargs"]["external_npz_cut_absolute_e"] is True
 
 
+def test_convert_passes_curved_source_in_logical_layer_order_to_core(tmp_path, monkeypatch):
+    import json
+    import numpy as np
+
+    import external_npz_preprocessor.export_runner as runner
+    from external_npz_preprocessor.process_params import ProcessParams
+    from path_processing_core.types import GlobalCurveCommand
+
+    source = tmp_path / "curved_layers.npz"
+    semantics = {
+        "format": "logical_layer_v1",
+        "layer_key": "logical_deposition_layer",
+        "z_coordinate": "per_point_trajectory",
+        "ordering": "ascending_layer_key_then_source_path_order",
+        "reconstruct_layers_from_z": False,
+    }
+    np.savez(
+        source,
+        meta=np.array(json.dumps({"format": "external_layer_paths_v1", "layer_semantics": semantics})),
+        layer_0000_R=np.asarray([[[0.0, 0.0, 1.4], [2.0, 0.0, 0.9]]], dtype=np.float64),
+        layer_0001_R=np.asarray([[[2.0, 1.0, 0.6], [4.0, 1.0, 1.8]]], dtype=np.float64),
+    )
+    calibration_path = tmp_path / "head_offsets.json"
+    calibration_path.write_text(
+        json.dumps({"resin": {}, "fiber": {}}), encoding="utf-8"
+    )
+    captured = {}
+
+    def fake_export_npz(commands, output_path, **kwargs):
+        captured["commands"] = commands
+        return {"rows": 0, "parts": 0, "total_s": 0.0}
+
+    monkeypatch.setattr(runner, "export_npz", fake_export_npz)
+
+    runner.convert_external_npz(
+        source,
+        tmp_path / "out.npz",
+        ProcessParams(primeline_enabled=False),
+        calibration_path=calibration_path,
+    )
+
+    curves = [command for command in captured["commands"] if isinstance(command, GlobalCurveCommand)]
+    assert [curve.layer for curve in curves] == [0, 1]
+    assert [curve.start_pos.z for curve in curves] == [1.4, 0.6]
+
+
 def test_exporter_uses_curve_start_acceleration_without_changing_default(tmp_path, monkeypatch):
     import path_processing_core.npz_exporter as exporter
     from path_processing_core.polynomial_interpolator import InterpolatedPoint

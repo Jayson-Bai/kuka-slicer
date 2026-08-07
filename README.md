@@ -324,6 +324,25 @@ Open:
 http://127.0.0.1:8765
 ```
 
+## Standalone surface preview
+
+The initial surface-preview package is intentionally separate from the slicer.
+It previews the documented `graded_surface_v1` double-sine height field,
+reports its sampled Z range and maximum slope, and can import an STL to clip
+the preview to its printable XY projection.  After an STL is imported, it can
+download a `graded_surface_v1.json` sidecar containing the surface parameters,
+printability constraints and an STL fingerprint.  It does not alter a slice
+job or write an NPZ file.
+
+```powershell
+python -m kuka_slicer surface-preview
+```
+
+Open `http://127.0.0.1:8766` and adjust amplitude, wavelengths, phases, and
+the preview domain.  The implementation lives in `kuka_slicer.surface_preview`
+so a later slicer-UI integration can reuse its API without coupling the preview
+to the slicing core.
+
 The UI groups adjustable inputs into:
 
 | Group | Parameters |

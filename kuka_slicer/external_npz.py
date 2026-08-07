@@ -10,6 +10,13 @@ import numpy as np
 Material = Literal["R", "F"]
 DEFAULT_EXPORT_CHORD_TOLERANCE_MM = 0.05
 SOURCE_NPZ_CONTRACT_ID = "external_layer_paths_v1"
+LOGICAL_LAYER_SEMANTICS_V1 = {
+    "format": "logical_layer_v1",
+    "layer_key": "logical_deposition_layer",
+    "z_coordinate": "per_point_trajectory",
+    "ordering": "ascending_layer_key_then_source_path_order",
+    "reconstruct_layers_from_z": False,
+}
 
 
 @dataclass
@@ -291,6 +298,10 @@ def _defaulted_meta(meta: dict[str, object]) -> dict[str, object]:
             "preserves_path_count_and_order": True,
             "preserves_point_count_and_order": True,
         },
+        # ``layer_xxxx_R/F/T`` is a logical deposition grouping. Z remains
+        # per-point trajectory geometry and may vary within one logical layer
+        # after a future surface-map stage.
+        "layer_semantics": dict(LOGICAL_LAYER_SEMANTICS_V1),
     }
     base.update(meta)
     return base

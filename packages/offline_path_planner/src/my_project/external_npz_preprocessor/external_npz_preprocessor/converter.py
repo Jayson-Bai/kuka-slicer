@@ -25,7 +25,13 @@ from path_processing_core.types import (
 )
 
 from .process_params import ProcessParams
-from .source_npz import LayerPaths, MaterialPath, SourceJob, TravelPath
+from .source_npz import (
+    LayerPaths,
+    MaterialPath,
+    SourceJob,
+    TravelPath,
+    validate_layer_semantics,
+)
 
 
 _RESIN_GCODE_TOOL = 1
@@ -40,6 +46,7 @@ def source_job_to_parsed_commands(job: SourceJob, params: ProcessParams) -> Pars
     travel_feed_mm_s = float(params.travel_feed_mm_s)
     if not math.isfinite(travel_feed_mm_s) or travel_feed_mm_s <= 0.0:
         raise ValueError("travel_feed_mm_s must be finite and > 0")
+    _validate_logical_layer_sequence(job)
 
     # Brim continuity is decided before the source job reaches Core.  When the
     # optional Prusa adapter pass cannot form one safe deposited chain, retain
@@ -90,6 +97,8 @@ def source_job_to_parsed_commands(job: SourceJob, params: ProcessParams) -> Pars
                 )
             initial_travel_added = True
 
+    # Layer iteration is intentionally driven only by the source logical key;
+    # curved per-point Z is geometry, not a basis for regrouping or sorting.
     for layer in job.layers:
         resin_path_count = len(layer.resin_paths)
         resin_path_number = 0
@@ -1817,6 +1826,19 @@ def _feed_mm_s_for_material(
     if first_layer:
         return float(process.first_layer_feed_mm_s)
     return float(process.feed_mm_s)
+
+
+def _validate_logical_layer_sequence(job: SourceJob) -> None:
+    """Keep curved jobs in explicit source-layer order before entering Core."""
+
+    if job.meta.get("layer_semantics") is None:
+        return
+    validate_layer_semantics(job.meta)
+    indexes = [layer.logical_layer_index for layer in job.layers]
+    if indexes != sorted(indexes) or len(indexes) != len(set(indexes)):
+        raise ValueError(
+            "logical-layer source jobs must contain unique layer indexes in ascending order"
+        )
 
 
 def _travel_feed_mm_s_for_destination(

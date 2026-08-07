@@ -25,6 +25,7 @@ from .slicer import (
     slice_mesh_to_job,
 )
 from .stl_io import load_stl
+from .surface_preview import run_surface_preview_server
 from .ui_server import run_ui_server
 
 
@@ -195,6 +196,13 @@ def main(argv: list[str] | None = None) -> int:
     ui_parser.add_argument("--port", type=int, default=8765)
     ui_parser.add_argument("--output-dir", type=Path, default=Path("outputs"))
 
+    surface_preview_parser = subparsers.add_parser(
+        "surface-preview",
+        help="start the independent parameterised-surface preview UI",
+    )
+    surface_preview_parser.add_argument("--host", default="127.0.0.1")
+    surface_preview_parser.add_argument("--port", type=int, default=8766)
+
     args = parser.parse_args(argv)
     if args.command == "slice":
         return _slice_command(args)
@@ -202,6 +210,9 @@ def main(argv: list[str] | None = None) -> int:
         return _template_command(args)
     if args.command == "ui":
         run_ui_server(args.host, args.port, args.output_dir)
+        return 0
+    if args.command == "surface-preview":
+        run_surface_preview_server(args.host, args.port)
         return 0
     parser.error(f"unknown command: {args.command}")
     return 2

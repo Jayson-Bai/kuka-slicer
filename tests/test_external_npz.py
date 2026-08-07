@@ -60,6 +60,13 @@ def test_write_external_source_npz(tmp_path):
         assert meta["format"] == "external_layer_paths_v1"
         assert meta["precision"] == "float64"
         assert meta["path_sampling"]["simplification"] == "none"
+        assert meta["layer_semantics"] == {
+            "format": "logical_layer_v1",
+            "layer_key": "logical_deposition_layer",
+            "z_coordinate": "per_point_trajectory",
+            "ordering": "ascending_layer_key_then_source_path_order",
+            "reconstruct_layers_from_z": False,
+        }
         assert archive["layer_0000_R"].shape == (1, 2, 3)
         assert archive["layer_0000_R"].dtype == np.float64
         assert np.allclose(archive["layer_0000_R_E"], [[0.0, 1.25]])

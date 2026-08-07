@@ -1170,6 +1170,37 @@ def _raft_footprint_geometry(mesh: Mesh, config: SliceConfig):
     return _part_projection_geometry(mesh, config)
 
 
+def mesh_xy_projection(
+    mesh: Mesh,
+    *,
+    build_axis: BuildAxis = "z",
+    layer_height: float = DEFAULT_RESIN_LAYER_HEIGHT_MM,
+    tolerance: float = 1e-5,
+):
+    """Return the union of printable XY cross-sections for an STL mesh.
+
+    This is a geometry-domain operation, not path planning.  It is shared by
+    surface-preview tooling so an exported surface configuration and the
+    eventual slicer use the same projection semantics.
+    """
+
+    if build_axis not in ("x", "y", "z"):
+        raise ValueError("build_axis must be x, y, or z")
+    if not math.isfinite(layer_height) or layer_height <= 0.0:
+        raise ValueError("layer_height must be positive")
+    if not math.isfinite(tolerance) or tolerance <= 0.0:
+        raise ValueError("tolerance must be positive")
+    oriented_mesh = orient_mesh_for_build_axis(mesh, build_axis)
+    return _part_projection_geometry(
+        oriented_mesh,
+        SliceConfig(
+            layer_height=layer_height,
+            tolerance=tolerance,
+            build_axis="z",
+        ),
+    )
+
+
 def _part_projection_geometry(mesh: Mesh, config: SliceConfig):
     z_values = _layer_z_values(mesh, config)
     if len(z_values) == 0:
