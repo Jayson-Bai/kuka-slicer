@@ -43,7 +43,7 @@ class ExternalSourceJob:
     travel_paths: list[TravelPaths] = field(default_factory=list)
     # Kept outside ``meta`` so legacy external-NPZ serialization never embeds
     # the large native Prusa G-code payload.
-    native_gcode: str | None = field(default=None, repr=False)
+    native_gcode: bytes | str | None = field(default=None, repr=False)
     native_gcode_translation_mm: tuple[float, float, float] | None = field(
         default=None,
         repr=False,

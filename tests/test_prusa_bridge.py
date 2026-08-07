@@ -108,8 +108,8 @@ def test_native_bridge_emits_print_and_travel_paths_with_extrusion() -> None:
     assert result["layers"][0]["extrusion"]
     assert result["layers"][0]["travel"]
     assert result["layers"][0]["motions"]
-    assert isinstance(result["gcode"], str)
-    assert "G1" in result["gcode"]
+    assert isinstance(result["gcode"], bytes)
+    assert b"G1" in result["gcode"]
     assert {motion["kind"] for motion in result["layers"][0]["motions"]} >= {
         "deposit",
         "travel",

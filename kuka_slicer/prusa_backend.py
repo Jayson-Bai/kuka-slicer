@@ -204,7 +204,7 @@ def slice_mesh_to_job_with_prusa(mesh: Mesh, config: SliceConfig) -> ExternalSou
             motion_order,
         ),
         native_gcode=(
-            result["gcode"] if isinstance(result.get("gcode"), str) else None
+            result["gcode"] if isinstance(result.get("gcode"), (bytes, str)) else None
         ),
         native_gcode_translation_mm=tuple(float(value) for value in -placement),
     )

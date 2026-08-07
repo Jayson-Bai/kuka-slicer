@@ -188,6 +188,15 @@ def test_prusa_gcode_adapter_matches_native_source_path_grouping_and_e(tmp_path)
     }
 
 
+def test_prusa_gcode_adapter_accepts_non_utf8_native_comments(tmp_path):
+    gcode = tmp_path / "native-localized-comment.gcode"
+    gcode.write_bytes(b";\xc1\xbf\xbf\xaa\n" + _PRUSA_GCODE.encode("ascii"))
+
+    job = load_source_gcode(gcode)
+
+    assert [len(layer.resin_paths) for layer in job.layers] == [2, 1]
+
+
 def test_prusa_startup_travel_maps_raw_gcode_coordinates_to_existing_core_frame(tmp_path):
     gcode = tmp_path / "native.gcode"
     gcode.write_text(_PRUSA_GCODE, encoding="utf-8")

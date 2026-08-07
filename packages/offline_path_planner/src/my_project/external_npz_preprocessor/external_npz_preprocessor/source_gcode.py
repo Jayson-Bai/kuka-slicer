@@ -48,8 +48,11 @@ def load_source_gcode(
     source = Path(path).expanduser()
     if not source.is_file():
         raise FileNotFoundError(str(source))
+    # Native Prusa output can contain localized non-UTF-8 comments. G-code
+    # commands are ASCII, so Latin-1 provides a byte-for-byte reversible view
+    # while keeping the parser independent from the local code page.
     return source_job_from_gcode_lines(
-        source.read_text(encoding="utf-8", errors="strict").splitlines(),
+        source.read_bytes().decode("latin-1").splitlines(),
         default_abc=default_abc,
     )
 

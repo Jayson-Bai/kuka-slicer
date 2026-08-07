@@ -583,13 +583,17 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         core_source_job = None
         native_gcode_path = None
         source_gcode_module = None
-        if slicing_kernel == "prusa" and isinstance(job.native_gcode, str):
+        if slicing_kernel == "prusa" and isinstance(job.native_gcode, (bytes, str)):
             _ensure_offline_planner_import_paths()
             source_gcode_module = importlib.import_module(
                 "external_npz_preprocessor.source_gcode"
             )
             native_gcode_path = job_dir / f"{Path(filename).stem}_prusa.gcode"
-            native_gcode_path.write_text(job.native_gcode, encoding="utf-8")
+            native_gcode_path.write_bytes(
+                job.native_gcode
+                if isinstance(job.native_gcode, bytes)
+                else job.native_gcode.encode("utf-8")
+            )
             core_source_job = source_gcode_module.translate_source_job(
                 source_gcode_module.load_source_gcode(native_gcode_path),
                 job.native_gcode_translation_mm or (0.0, 0.0, 0.0),

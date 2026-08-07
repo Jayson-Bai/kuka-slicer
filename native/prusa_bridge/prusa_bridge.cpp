@@ -584,9 +584,10 @@ py::dict slice_print_paths(
         std::ifstream gcode_input(gcode_path, std::ios::binary);
         if (!gcode_input)
             throw std::runtime_error("PrusaSlicer did not produce readable G-code");
-        result["gcode"] = std::string(
+        result["gcode"] = py::bytes(std::string(
             std::istreambuf_iterator<char>(gcode_input),
-            std::istreambuf_iterator<char>());
+            std::istreambuf_iterator<char>()));
+        gcode_input.close();
         std::filesystem::remove(gcode_path);
         return result;
     } catch (...) {
