@@ -129,6 +129,104 @@ def test_convert_passes_curved_source_in_logical_layer_order_to_core(tmp_path, m
     assert [move.start_pos.z for move in moves] == [1.4, 0.6]
 
 
+def test_surface_mapped_job_uses_density_four_when_the_saved_value_is_zero(tmp_path, monkeypatch):
+    import external_npz_preprocessor.export_runner as runner
+    import numpy as np
+
+    from external_npz_preprocessor.process_params import ProcessParams
+    from external_npz_preprocessor.source_npz import LayerPaths, MaterialPath, SourceJob
+
+    captured = {}
+
+    def fake_export_npz(commands, output_path, **kwargs):
+        captured["density"] = kwargs["density"]
+        return {"rows": 0, "parts": 0, "total_s": 0.0}
+
+    calibration = tmp_path / "head_offsets.json"
+    calibration.write_text('{"resin": {}, "fiber": {}}', encoding="utf-8")
+    job = SourceJob(
+        meta={"surface_mapping": {"format": "surface_mapping_v1"}},
+        layers=[
+            LayerPaths(
+                index=0,
+                resin_paths=[
+                    MaterialPath(
+                        "R",
+                        0,
+                        np.asarray(
+                            [
+                                [0.0, 0.0, 0.5, 0.0, 0.0, 0.0],
+                                [1.0, 0.0, 0.6, 0.0, 0.0, 0.0],
+                            ],
+                            dtype=np.float64,
+                        ),
+                    )
+                ],
+            )
+        ],
+    )
+    monkeypatch.setattr(runner, "export_npz", fake_export_npz)
+
+    runner.convert_source_job(
+        job,
+        source_path=tmp_path / "mapped.npz",
+        output_path=tmp_path / "core.npz",
+        params=ProcessParams(density=0),
+        calibration_path=calibration,
+    )
+
+    assert captured["density"] == 4
+
+
+def test_surface_mapped_job_preserves_nonzero_density(tmp_path, monkeypatch):
+    import external_npz_preprocessor.export_runner as runner
+    import numpy as np
+
+    from external_npz_preprocessor.process_params import ProcessParams
+    from external_npz_preprocessor.source_npz import LayerPaths, MaterialPath, SourceJob
+
+    captured = {}
+
+    def fake_export_npz(commands, output_path, **kwargs):
+        captured["density"] = kwargs["density"]
+        return {"rows": 0, "parts": 0, "total_s": 0.0}
+
+    calibration = tmp_path / "head_offsets.json"
+    calibration.write_text('{"resin": {}, "fiber": {}}', encoding="utf-8")
+    job = SourceJob(
+        meta={"surface_mapping": {"format": "surface_mapping_v1"}},
+        layers=[
+            LayerPaths(
+                index=0,
+                resin_paths=[
+                    MaterialPath(
+                        "R",
+                        0,
+                        np.asarray(
+                            [
+                                [0.0, 0.0, 0.5, 0.0, 0.0, 0.0],
+                                [1.0, 0.0, 0.6, 0.0, 0.0, 0.0],
+                            ],
+                            dtype=np.float64,
+                        ),
+                    )
+                ],
+            )
+        ],
+    )
+    monkeypatch.setattr(runner, "export_npz", fake_export_npz)
+
+    runner.convert_source_job(
+        job,
+        source_path=tmp_path / "mapped.npz",
+        output_path=tmp_path / "core.npz",
+        params=ProcessParams(density=3),
+        calibration_path=calibration,
+    )
+
+    assert captured["density"] == 3
+
+
 def test_exporter_uses_curve_start_acceleration_without_changing_default(tmp_path, monkeypatch):
     import path_processing_core.npz_exporter as exporter
     from path_processing_core.polynomial_interpolator import InterpolatedPoint
