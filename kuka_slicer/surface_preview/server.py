@@ -107,23 +107,9 @@ def surface_payload(
 def graded_surface_config_payload(
     params: dict[str, list[str]], domain: STLProjectionDomain
 ) -> dict[str, object]:
-    """Build the portable sidecar consumed by the later post-Prusa mapper."""
+    """Build the portable geometry-only sidecar consumed by the mapper."""
 
     surface = surface_payload(params, domain)["surface"]
-    flat_fraction = _query_float(params, "flat_fraction", 0.20)
-    if not 0.0 <= flat_fraction < 1.0:
-        raise ValueError("flat_fraction must be in the range [0, 1)")
-    max_slope = _query_float(params, "max_slope", 0.25, positive=True)
-    max_layer_delta_mm = _query_float(
-        params, "max_layer_delta_mm", 0.20, positive=True
-    )
-    min_support_overlap_mm = _query_float(
-        params, "min_support_overlap_mm", 0.10, positive=True
-    )
-    max_volumetric_flow_mm3_s = _query_float(
-        params, "max_volumetric_flow_mm3_s", 8.0, positive=True
-    )
-    min_opening_mm = _query_float(params, "min_opening_mm", 2.0, positive=True)
     projection = domain.preview_payload()
     return {
         "format": "graded_surface_v1",
@@ -147,25 +133,6 @@ def graded_surface_config_payload(
             },
         },
         "surface": surface,
-        "progression": {
-            "mode": "height",
-            "transition": "smoothstep",
-            "flat_fraction": flat_fraction,
-            "stage_marks": [
-                {"name": "flat", "alpha": 0.00},
-                {"name": "slight", "alpha": 0.20},
-                {"name": "medium", "alpha": 0.45},
-                {"name": "near_final", "alpha": 0.75},
-                {"name": "final", "alpha": 1.00},
-            ],
-        },
-        "printability": {
-            "max_slope": max_slope,
-            "max_layer_delta_mm": max_layer_delta_mm,
-            "min_support_overlap_mm": min_support_overlap_mm,
-            "max_volumetric_flow_mm3_s": max_volumetric_flow_mm3_s,
-            "min_opening_mm": min_opening_mm,
-        },
     }
 
 
@@ -366,14 +333,6 @@ def surface_preview_html() -> str:
         <div class="field"><label for="width_mm">X 宽度（mm）</label><input id="width_mm" type="number" min="0.001" step="1" value="120"></div>
         <div class="field"><label for="height_mm">Y 高度（mm）</label><input id="height_mm" type="number" min="0.001" step="1" value="100"></div>
         <div class="field"><label for="samples">网格密度</label><input id="samples" type="number" min="8" max="120" step="1" value="48"></div>
-        <div class="divider"></div>
-        <h2>渐变与工艺约束</h2>
-        <div class="field"><label for="flat_fraction">底部平面比例</label><input id="flat_fraction" type="number" min="0" max="0.99" step="0.01" value="0.20"></div>
-        <div class="field"><label for="max_slope">最大坡度</label><input id="max_slope" type="number" min="0.001" step="0.01" value="0.25"></div>
-        <div class="field"><label for="max_layer_delta_mm">最大层间 ΔZ（mm）</label><input id="max_layer_delta_mm" type="number" min="0.001" step="0.01" value="0.20"></div>
-        <div class="field"><label for="min_support_overlap_mm">最小支撑搭接（mm）</label><input id="min_support_overlap_mm" type="number" min="0.001" step="0.01" value="0.10"></div>
-        <div class="field"><label for="max_volumetric_flow_mm3_s">最大体积流量（mm³/s）</label><input id="max_volumetric_flow_mm3_s" type="number" min="0.001" step="0.1" value="8.0"></div>
-        <div class="field"><label for="min_opening_mm">最小开口（mm）</label><input id="min_opening_mm" type="number" min="0.001" step="0.1" value="2.0"></div>
         <button type="button" id="exportConfig" disabled>导出曲面指导 JSON</button>
         <button type="button" class="secondary" id="reset">恢复示例参数</button>
         <p class="hint">方程：H(x,y)=A·sin(2πx/λx+φx)·sin(2πy/λy+φy)+Zref</p>
@@ -388,7 +347,6 @@ def surface_preview_html() -> str:
   </main>
   <script>
     const surfaceIds = ['amplitude_mm', 'wavelength_x_mm', 'wavelength_y_mm', 'phase_x_rad', 'phase_y_rad', 'z_reference_mm', 'width_mm', 'height_mm', 'samples'];
-    const configIds = ['flat_fraction', 'max_slope', 'max_layer_delta_mm', 'min_support_overlap_mm', 'max_volumetric_flow_mm3_s', 'min_opening_mm'];
     const canvas = document.getElementById('canvas');
     const statusEl = document.getElementById('status');
     const statsEl = document.getElementById('stats');
@@ -404,7 +362,7 @@ def surface_preview_html() -> str:
 
     function parameters() {
       const query = new URLSearchParams();
-      [...surfaceIds, ...configIds].forEach((id) => query.set(id, document.getElementById(id).value));
+      surfaceIds.forEach((id) => query.set(id, document.getElementById(id).value));
       if (domainId) {
         query.set('domain_id', domainId);
         query.set('compact', '1');
@@ -672,7 +630,7 @@ def surface_preview_html() -> str:
       render();
     });
     document.getElementById('reset').addEventListener('click', () => {
-      const defaults = { amplitude_mm: 0.8, wavelength_x_mm: 40, wavelength_y_mm: 50, phase_x_rad: 0, phase_y_rad: 0, z_reference_mm: 0, width_mm: 120, height_mm: 100, samples: 48, flat_fraction: 0.20, max_slope: 0.25, max_layer_delta_mm: 0.20, min_support_overlap_mm: 0.10, max_volumetric_flow_mm3_s: 8.0, min_opening_mm: 2.0 };
+      const defaults = { amplitude_mm: 0.8, wavelength_x_mm: 40, wavelength_y_mm: 50, phase_x_rad: 0, phase_y_rad: 0, z_reference_mm: 0, width_mm: 120, height_mm: 100, samples: 48 };
       Object.entries(defaults).forEach(([id, value]) => {
         if (domainId && (id === 'width_mm' || id === 'height_mm')) return;
         document.getElementById(id).value = value;

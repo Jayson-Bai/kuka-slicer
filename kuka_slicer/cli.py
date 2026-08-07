@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +27,7 @@ from .slicer import (
 )
 from .stl_io import load_stl
 from .surface_preview import run_surface_preview_server
+from .surface_mapper import run_surface_mapper_server
 from .ui_server import run_ui_server
 
 
@@ -203,6 +205,13 @@ def main(argv: list[str] | None = None) -> int:
     surface_preview_parser.add_argument("--host", default="127.0.0.1")
     surface_preview_parser.add_argument("--port", type=int, default=8766)
 
+    surface_mapper_parser = subparsers.add_parser(
+        "surface-map",
+        help="start the independent planar-to-surface mapping UI",
+    )
+    surface_mapper_parser.add_argument("--host", default="127.0.0.1")
+    surface_mapper_parser.add_argument("--port", type=int, default=8767)
+
     args = parser.parse_args(argv)
     if args.command == "slice":
         return _slice_command(args)
@@ -213,6 +222,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "surface-preview":
         run_surface_preview_server(args.host, args.port)
+        return 0
+    if args.command == "surface-map":
+        run_surface_mapper_server(args.host, args.port)
         return 0
     parser.error(f"unknown command: {args.command}")
     return 2
@@ -306,6 +318,10 @@ def _slice_command(args: argparse.Namespace) -> int:
     )
     job = slice_mesh_to_job(mesh, config)
     normalize_job_xy_origin(job)
+    job.meta["source_model"] = {
+        "file_name": args.input_stl.name,
+        "sha256": hashlib.sha256(args.input_stl.read_bytes()).hexdigest(),
+    }
     write_external_source_npz(job, args.output_npz)
     path_count = sum(len(group.paths) for group in job.material_paths)
     print(f"wrote {args.output_npz} with {len(job.material_paths)} layer/material groups and {path_count} paths")

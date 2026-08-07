@@ -140,13 +140,12 @@ def test_stl_projection_domain_uses_stl_xy_min_as_the_local_origin():
 
 def test_exported_surface_config_binds_the_surface_to_the_imported_stl_domain():
     domain = stl_projection_domain_from_bytes(_box_stl_bytes(), file_name="part.stl")
-    config = graded_surface_config_payload(
-        {"amplitude_mm": ["1.5"], "flat_fraction": ["0.3"]}, domain
-    )
+    config = graded_surface_config_payload({"amplitude_mm": ["1.5"]}, domain)
 
     assert config["format"] == "graded_surface_v1"
     assert config["coordinate_system"]["origin"] == "stl_xy_min"
     assert config["domain"]["source"]["file_name"] == "part.stl"
     assert config["domain"]["source"]["sha256"] == domain.sha256
     assert config["surface"]["amplitude_mm"] == pytest.approx(1.5)
-    assert config["progression"]["flat_fraction"] == pytest.approx(0.3)
+    assert "progression" not in config
+    assert "printability" not in config

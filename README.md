@@ -331,8 +331,8 @@ It previews the documented `graded_surface_v1` double-sine height field,
 reports its sampled Z range and maximum slope, and can import an STL to clip
 the preview to its printable XY projection.  After an STL is imported, it can
 download a `graded_surface_v1.json` sidecar containing the surface parameters,
-printability constraints and an STL fingerprint.  It does not alter a slice
-job or write an NPZ file.
+STL projection domain and an STL fingerprint. It does not define layer
+progression, alter a slice job, or write an NPZ file.
 
 ```powershell
 python -m kuka_slicer surface-preview
@@ -342,6 +342,23 @@ Open `http://127.0.0.1:8766` and adjust amplitude, wavelengths, phases, and
 the preview domain.  The implementation lives in `kuka_slicer.surface_preview`
 so a later slicer-UI integration can reuse its API without coupling the preview
 to the slicing core.
+
+## Standalone surface mapper
+
+`kuka_slicer.surface_mapper` is a second, independent package. It imports a
+planar `external_layer_paths_v1` NPZ and the geometry-only
+`graded_surface_v1.json` export, then applies a mapper-owned logical-layer
+progression to Z only. It preserves XY, `layer_XXXX_R/F/T` grouping, path and
+point order, and existing E values. The resulting `curved.npz` remains a valid
+input for the existing Core preprocessor.
+
+```powershell
+python -m kuka_slicer surface-map
+```
+
+Open `http://127.0.0.1:8767`. The page configures the start/end logical layer,
+linear or smoothstep progression, and automatic or manual Z safety offset. E
+recalculation and ABC orientation generation are intentionally deferred.
 
 The UI groups adjustable inputs into:
 
