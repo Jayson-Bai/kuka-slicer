@@ -15,6 +15,7 @@ from typing import Any, Literal
 import numpy as np
 
 from ..surface_mapper.contracts import SourceNPZ, SurfaceTarget
+from ..surface_mapper.sampling import SurfaceSamplingConfig, resample_material_paths
 
 
 Status = Literal["pass", "warning", "fail"]
@@ -105,16 +106,17 @@ def validate_surface_job(
     """Validate the mapped job without mutating either source object."""
 
     active_limits = limits or ValidatorLimits()
+    paired_flat_source = _flat_reference_for_mapped_job(flat_source, curved_source)
     checks = (
-        _check_path_contract(flat_source, curved_source, active_limits),
+        _check_path_contract(paired_flat_source, curved_source, active_limits),
         _check_surface_identity(flat_source, curved_source, target, active_limits),
         _check_mapping_metadata(curved_source),
-        _check_mapped_geometry(flat_source, curved_source, target, active_limits),
-        _check_layer_geometry(flat_source, curved_source, active_limits),
+        _check_mapped_geometry(paired_flat_source, curved_source, target, active_limits),
+        _check_layer_geometry(paired_flat_source, curved_source, active_limits),
         _check_sampling_density(curved_source, target, active_limits),
-        _check_extrusion(flat_source, curved_source, active_limits),
+        _check_extrusion(paired_flat_source, curved_source, active_limits),
         _check_travel_risk(curved_source, active_limits),
-        _check_topology_evidence(flat_source, curved_source, active_limits),
+        _check_topology_evidence(paired_flat_source, curved_source, active_limits),
     )
     return SurfaceValidationReport(
         checks=checks,
@@ -122,6 +124,32 @@ def validate_surface_job(
         flat_z_bounds_mm=flat_source.z_bounds_mm,
         curved_z_bounds_mm=curved_source.z_bounds_mm,
     )
+
+
+def _flat_reference_for_mapped_job(
+    flat_source: SourceNPZ, curved_source: SourceNPZ
+) -> SourceNPZ:
+    """Recreate the mapper's planar R/F grid before pairwise validation.
+
+    The validator remains read-only: it only derives an in-memory reference
+    when the curved job explicitly records surface-material resampling.  Older
+    mapped files retain their original flat grid unchanged.
+    """
+
+    mapping = curved_source.meta.get("surface_mapping")
+    sampling = mapping.get("sampling") if isinstance(mapping, dict) else None
+    if not isinstance(sampling, dict):
+        return flat_source
+    if sampling.get("format") != "surface_material_resampling_v1":
+        return flat_source
+    max_segment = sampling.get("max_segment_length_mm")
+    if max_segment is None:
+        return flat_source
+    try:
+        config = SurfaceSamplingConfig(max_segment_length_mm=float(max_segment))
+    except (TypeError, ValueError):
+        return flat_source
+    return resample_material_paths(flat_source, config).source
 
 
 def _check_path_contract(

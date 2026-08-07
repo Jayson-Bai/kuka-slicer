@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 
@@ -11,6 +11,11 @@ import numpy as np
 from .contracts import SourceNPZ, SurfaceTarget, _PATH_KEY
 from .orientation import kuka_abc_for_surface
 from .progression import LayerProgression
+from .sampling import (
+    SurfaceSamplingConfig,
+    SurfaceSamplingResult,
+    resample_material_paths,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,6 +23,7 @@ class SurfaceMappingPlan:
     """Mapper-owned process choices, separate from the target geometry JSON."""
 
     progression: LayerProgression
+    sampling: SurfaceSamplingConfig = field(default_factory=SurfaceSamplingConfig)
 
     @classmethod
     def default_for(cls, source: SourceNPZ) -> "SurfaceMappingPlan":
@@ -28,19 +34,23 @@ class SurfaceMappingPlan:
 @dataclass(frozen=True, slots=True)
 class MappingResult:
     source: SourceNPZ
+    flat_source: SourceNPZ
     alpha_by_layer: dict[int, float]
     source_z_bounds_mm: tuple[float, float]
     mapped_z_bounds_mm: tuple[float, float]
     xy_bounds_mm: tuple[float, float, float, float]
+    sampling: SurfaceSamplingResult
 
 
 def map_source_job(source: SourceNPZ, target: SurfaceTarget, plan: SurfaceMappingPlan) -> MappingResult:
-    """Map all R/F/T paths in Z and write the matching KUKA relative ABC."""
+    """Resample deposited paths, then map all R/F/T paths to XYZABC."""
 
     _validate_domain(source, target)
+    sampling = resample_material_paths(source, plan.sampling)
+    flat_source = sampling.source
     alpha_by_layer = {layer: plan.progression.alpha(layer) for layer in source.layer_indices}
     source_z_bounds = source.z_bounds_mm
-    arrays = {key: value.copy() for key, value in source.arrays.items()}
+    arrays = {key: value.copy() for key, value in flat_source.arrays.items()}
     for key, original in tuple(arrays.items()):
         match = _PATH_KEY.match(key)
         if not match:
@@ -84,7 +94,16 @@ def map_source_job(source: SourceNPZ, target: SurfaceTarget, plan: SurfaceMappin
             "alpha_by_layer": {str(key): value for key, value in alpha_by_layer.items()},
         },
         "z_validation": "all mapped points must be greater than or equal to 0 mm",
-        "xy": "preserved",
+        "xy": "R/F paths resampled in planar XY before analytical surface mapping; T paths preserved",
+        "sampling": {
+            "format": "surface_material_resampling_v1",
+            "scope": "R/F only; T paths are preserved",
+            "max_segment_length_mm": plan.sampling.max_segment_length_mm,
+            "material_point_count_before": sampling.material_point_count_before,
+            "material_point_count_after": sampling.material_point_count_after,
+            "resampled_path_count": sampling.resampled_path_count,
+            "new_points": "XYZ is sampled on the planar source segment; Z and ABC are recomputed from the analytical surface",
+        },
         "extrusion": "preserved_unrecalculated",
         "orientation": {
             "mode": "surface_normal_kuka_zyx",
@@ -99,10 +118,12 @@ def map_source_job(source: SourceNPZ, target: SurfaceTarget, plan: SurfaceMappin
     mapped = SourceNPZ(arrays=arrays, meta=meta, source_name=source.source_name)
     return MappingResult(
         source=mapped,
+        flat_source=flat_source,
         alpha_by_layer=alpha_by_layer,
         source_z_bounds_mm=source_z_bounds,
         mapped_z_bounds_mm=mapped_z_bounds,
         xy_bounds_mm=mapped.xy_bounds_mm,
+        sampling=sampling,
     )
 
 

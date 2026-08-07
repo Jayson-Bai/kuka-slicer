@@ -12,6 +12,7 @@ import pytest
 from kuka_slicer.external_npz import ExternalSourceJob, MaterialPaths, write_external_source_npz
 from kuka_slicer.surface_mapper import (
     LayerProgression,
+    SurfaceSamplingConfig,
     SurfaceMappingPlan,
     load_surface_target,
     map_source_job,
@@ -22,6 +23,7 @@ from kuka_slicer.surface_mapper.server import (
     mapping_preview_payload,
     surface_mapper_html,
 )
+from kuka_slicer.surface_mapper.orientation import kuka_abc_for_surface
 
 
 def _target(*, amplitude_mm: float = 1.0, phase_x_rad: float = 0.0, sha256: str = "same-model"):
@@ -167,7 +169,52 @@ def test_mapped_npz_is_re_readable_and_records_mapping_metadata(tmp_path):
     reloaded = read_source_npz(mapped.to_bytes())
 
     assert reloaded.meta["surface_mapping"]["format"] == "surface_mapping_v1"
-    assert reloaded.meta["surface_mapping"]["xy"] == "preserved"
+    assert reloaded.meta["surface_mapping"]["sampling"]["format"] == "surface_material_resampling_v1"
+
+
+def test_mapper_resamples_material_xyzabc_and_e_on_one_shared_parameter_grid(tmp_path):
+    source = _source(tmp_path)
+    source.arrays["layer_0001_R"][0, :, :3] = [[0.0, 5.0, 1.0], [4.0, 5.0, 1.0]]
+    source.arrays["layer_0001_R_E"][0, :] = [2.0, 10.0]
+    plan = SurfaceMappingPlan(
+        LayerProgression(0, 3),
+        sampling=SurfaceSamplingConfig(max_segment_length_mm=1.0),
+    )
+
+    result = map_source_job(source, _target(), plan)
+    flat = result.flat_source.arrays["layer_0001_R"][0, :5]
+    mapped = result.source.arrays["layer_0001_R"][0, :5]
+    e = result.flat_source.arrays["layer_0001_R_E"][0, :5]
+
+    assert source.arrays["layer_0001_R"].shape[1] == 2
+    assert flat[:, 0] == pytest.approx([0, 1, 2, 3, 4])
+    assert flat[:, 1] == pytest.approx([5, 5, 5, 5, 5])
+    assert e == pytest.approx([2, 4, 6, 8, 10])
+    assert mapped[:, 2] == pytest.approx(
+        1.0 + _target().surface.height(flat[:, 0], flat[:, 1])
+    )
+    dz_dx = (np.pi / 10.0) * np.cos(np.pi * flat[:, 0] / 10.0)
+    dz_dy = np.zeros_like(dz_dx)
+    expected_abc = np.stack(kuka_abc_for_surface(dz_dx, dz_dy), axis=1)
+    assert mapped[:, 3:] == pytest.approx(expected_abc)
+    sampling = result.source.meta["surface_mapping"]["sampling"]
+    assert sampling["material_point_count_before"] < sampling["material_point_count_after"]
+    assert sampling["resampled_path_count"] == 1
+
+
+def test_mapper_can_disable_material_resampling_for_compatibility_checks(tmp_path):
+    source = _source(tmp_path)
+    result = map_source_job(
+        source,
+        _target(),
+        SurfaceMappingPlan(
+            LayerProgression(0, 3),
+            sampling=SurfaceSamplingConfig(max_segment_length_mm=None),
+        ),
+    )
+
+    assert result.flat_source.arrays["layer_0001_R"].shape == source.arrays["layer_0001_R"].shape
+    assert result.sampling.material_point_count_before == result.sampling.material_point_count_after
 
 
 def test_mapper_http_api_imports_previews_and_exports_without_writing_server_files(tmp_path):

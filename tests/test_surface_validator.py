@@ -59,8 +59,8 @@ def _flat_source(tmp_path, *, include_travel: bool = False):
 
 
 def _curved_source(flat):
-    mapped = map_source_job(flat, _target(), SurfaceMappingPlan(LayerProgression(0, 3))).source
-    return compensate_extrusion(flat, mapped).source
+    result = map_source_job(flat, _target(), SurfaceMappingPlan(LayerProgression(0, 3)))
+    return compensate_extrusion(result.flat_source, result.source).source
 
 
 def _check(report, name):
@@ -91,6 +91,20 @@ def test_validator_rejects_changed_xy_and_reports_t_risk(tmp_path):
     assert _check(report, "坡度、dz 与采样密度").status == "pass"
     assert _check(report, "T 空走风险").status == "warning"
     assert report.status == "fail"
+
+
+def test_validator_recreates_mapper_resampling_grid_without_mutating_flat_input(tmp_path):
+    flat = _flat_source(tmp_path)
+    for layer in range(4):
+        flat.arrays[f"layer_{layer:04d}_R"][0, :, 0] = [5.0, 10.0, 5.0]
+    curved = _curved_source(flat)
+
+    report = validate_surface_job(flat, curved, _target())
+
+    assert curved.arrays["layer_0001_R"].shape[1] > flat.arrays["layer_0001_R"].shape[1]
+    assert report.checks[0].status == "pass"  # path contract and Z safety
+    assert report.checks[3].status == "pass"  # mapped geometry
+    assert report.checks[6].status == "pass"  # arc-length E compensation
 
 
 def test_surface_validate_cli_writes_json_and_html_without_mutating_npz(tmp_path):

@@ -31,7 +31,7 @@ def mapping_preview_payload(
     """Return lightweight mapping diagnostics for the independent UI."""
 
     mapped_result = map_source_job(source, target, plan)
-    compensation = compensate_extrusion(source, mapped_result.source)
+    compensation = compensate_extrusion(mapped_result.flat_source, mapped_result.source)
     return {
         "source": _source_summary(source),
         "target": {
@@ -45,6 +45,7 @@ def mapping_preview_payload(
             "surface_return_layer": plan.progression.surface_return_layer,
             "peak_layers": plan.progression.peak_layers,
             "alpha_by_layer": mapped_result.alpha_by_layer,
+            "max_segment_length_mm": plan.sampling.max_segment_length_mm,
         },
         "result": {
             "source_z_bounds_mm": mapped_result.source_z_bounds_mm,
@@ -58,6 +59,7 @@ def mapping_preview_payload(
                 "max_length_ratio": compensation.max_length_ratio,
             },
             "orientation": mapped_result.source.meta["surface_mapping"]["orientation"],
+            "sampling": mapped_result.source.meta["surface_mapping"]["sampling"],
         },
         "cross_section": _cross_section_payload(
             source, target, mapped_result.alpha_by_layer, section_y_mm=section_y_mm
@@ -139,8 +141,10 @@ class SurfaceMapperHandler(BaseHTTPRequestHandler):
                 params = parse_qs(parsed.query)
                 source, target = self._session_values(params)
                 plan = _plan_from_params(params, source)
-                mapped = map_source_job(source, target, plan).source
-                content = compensate_extrusion(source, mapped).source.to_bytes()
+                mapped_result = map_source_job(source, target, plan)
+                content = compensate_extrusion(
+                    mapped_result.flat_source, mapped_result.source
+                ).source.to_bytes()
                 self._send_bytes(content, "application/octet-stream", "curved.npz")
                 return
             self._send_json({"ok": False, "error": "not found"}, status=HTTPStatus.NOT_FOUND)

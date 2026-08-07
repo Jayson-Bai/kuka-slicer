@@ -9,6 +9,7 @@ unchanged.
 from .contracts import SurfaceTarget, SourceNPZ, load_surface_target, read_source_npz
 from .mapper import MappingResult, SurfaceMappingPlan, map_source_job
 from .progression import LayerProgression
+from .sampling import SurfaceSamplingConfig
 from .server import run_surface_mapper_server
 
 __all__ = [
@@ -16,6 +17,7 @@ __all__ = [
     "MappingResult",
     "SourceNPZ",
     "SurfaceMappingPlan",
+    "SurfaceSamplingConfig",
     "SurfaceTarget",
     "load_surface_target",
     "map_source_job",
