@@ -17,9 +17,16 @@ from .progression import LayerProgression
 
 MAX_SOURCE_NPZ_BYTES = 256 * 1024 * 1024
 MAX_SURFACE_CONFIG_BYTES = 2 * 1024 * 1024
+DEFAULT_CROSS_SECTION_SAMPLES = 181
 
 
-def mapping_preview_payload(source: SourceNPZ, target: SurfaceTarget, plan: SurfaceMappingPlan) -> dict[str, object]:
+def mapping_preview_payload(
+    source: SourceNPZ,
+    target: SurfaceTarget,
+    plan: SurfaceMappingPlan,
+    *,
+    section_y_mm: float | None = None,
+) -> dict[str, object]:
     """Return lightweight mapping diagnostics for the independent UI."""
 
     result = map_source_job(source, target, plan)
@@ -44,6 +51,9 @@ def mapping_preview_payload(source: SourceNPZ, target: SurfaceTarget, plan: Surf
             "extrusion": "preserved_unrecalculated",
             "orientation": "preserved_unrecalculated",
         },
+        "cross_section": _cross_section_payload(
+            source, target, result.alpha_by_layer, section_y_mm=section_y_mm
+        ),
     }
 
 
@@ -72,7 +82,17 @@ class SurfaceMapperHandler(BaseHTTPRequestHandler):
                 params = parse_qs(parsed.query)
                 source, target = self._session_values(params)
                 plan = _plan_from_params(params, source)
-                self._send_json({"ok": True, **mapping_preview_payload(source, target, plan)})
+                self._send_json(
+                    {
+                        "ok": True,
+                        **mapping_preview_payload(
+                            source,
+                            target,
+                            plan,
+                            section_y_mm=_optional_section_y(params, target),
+                        ),
+                    }
+                )
             except ValueError as exc:
                 self._send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
@@ -200,6 +220,84 @@ def _integer(params: dict[str, list[str]], name: str, default: int) -> int:
         raise ValueError(f"{name} must be an integer") from exc
 
 
+def _optional_section_y(
+    params: dict[str, list[str]], target: SurfaceTarget
+) -> float | None:
+    raw = params.get("section_y_mm", [""])[0]
+    if raw == "":
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("section_y_mm must be a number") from exc
+    if not np.isfinite(value) or not 0.0 <= value <= target.height_mm:
+        raise ValueError(f"section_y_mm must be within [0, {target.height_mm:g}]")
+    return value
+
+
+def _cross_section_payload(
+    source: SourceNPZ,
+    target: SurfaceTarget,
+    alpha_by_layer: dict[int, float],
+    *,
+    section_y_mm: float | None,
+) -> dict[str, object]:
+    """Sample mapped logical layers on one XZ cut through the STL XY domain."""
+
+    y_mm = _default_section_y(target) if section_y_mm is None else section_y_mm
+    x_mm = np.linspace(0.0, target.width_mm, DEFAULT_CROSS_SECTION_SAMPLES)
+    layers: list[dict[str, object]] = []
+    z_min = float("inf")
+    z_max = float("-inf")
+    for logical_layer in source.layer_indices:
+        base_z_mm = _logical_layer_reference_z(source, logical_layer)
+        alpha = alpha_by_layer[logical_layer]
+        z_mm = base_z_mm + alpha * target.surface.height(x_mm, y_mm)
+        z_min = min(z_min, float(np.min(z_mm)))
+        z_max = max(z_max, float(np.max(z_mm)))
+        layers.append(
+            {
+                "logical_layer": logical_layer,
+                "alpha": alpha,
+                "base_z_mm": base_z_mm,
+                "z_mm": z_mm.tolist(),
+            }
+        )
+    return {
+        "section_y_mm": y_mm,
+        "x_mm": x_mm.tolist(),
+        "layers": layers,
+        "z_bounds_mm": [z_min, z_max],
+    }
+
+
+def _default_section_y(target: SurfaceTarget) -> float:
+    """Choose a valid Y cut where the double-sine profile is most visible."""
+
+    candidates = np.linspace(0.0, target.height_mm, 1001)
+    factor = np.abs(
+        np.sin((2.0 * np.pi * candidates) / target.surface.wavelength_y_mm + target.surface.phase_y_rad)
+    )
+    return float(candidates[int(np.argmax(factor))])
+
+
+def _logical_layer_reference_z(source: SourceNPZ, logical_layer: int) -> float:
+    """Use the median material-path height rather than deriving a layer from Z."""
+
+    values: list[np.ndarray] = []
+    for material in ("R", "F", "T"):
+        key = f"layer_{logical_layer:04d}_{material}"
+        array = source.arrays.get(key)
+        if array is None:
+            continue
+        valid = np.isfinite(array[..., 2])
+        if np.any(valid):
+            values.append(array[..., 2][valid])
+    if not values:
+        raise ValueError(f"logical layer {logical_layer} has no path points for XZ preview")
+    return float(np.median(np.concatenate(values)))
+
+
 def surface_mapper_html() -> str:
     """Return a small accessible browser shell around the mapper's public API."""
 
@@ -229,6 +327,8 @@ def surface_mapper_html() -> str:
     .card { border: 1px solid #dce6f0; border-radius: 8px; padding: 11px; } .card span { display: block; color: #66778e; font-size: 12px; } .card strong { display: block; margin-top: 4px; color: #1e3858; font-size: 15px; }
     .layerReadout { margin: 10px 0 0; padding: 11px; background: #f4f8fc; border-radius: 8px; color: #304661; line-height: 1.6; font-size: 13px; }
     .bar { height: 8px; border-radius: 8px; overflow: hidden; background: #dce6f1; margin-top: 8px; } .bar > i { display: block; height: 100%; width: 0; background: #0b8f6f; transition: width .15s ease; }
+    .crossSection { display: block; width: 100%; height: 310px; margin-top: 9px; border: 1px solid #dce6f0; border-radius: 8px; background: #fbfdff; }
+    .sectionMeta { margin: 7px 0 0; color: #5a6d85; font-size: 12px; line-height: 1.5; }
     .notice { border-left: 3px solid #0b8f6f; padding: 9px 11px; background: #f0faf6; color: #215b4a; font-size: 13px; line-height: 1.55; }
     .status { min-height: 22px; margin: 15px 0 0; color: #56677d; font-size: 13px; } .status.error { color: #b42318; }
     @media (max-width: 820px) { main { padding: 15px; } .workspace { grid-template-columns: 1fr; } }
@@ -255,6 +355,7 @@ def surface_mapper_html() -> str:
           <div class="field"><label for="startLayer">曲面起始层</label><input id="startLayer" type="number" step="1"></div>
           <div class="field"><label for="endLayer">曲面完成层</label><input id="endLayer" type="number" step="1"></div>
           <div class="field"><label for="curve">渐变曲线</label><select id="curve"><option value="smoothstep">平滑渐变（推荐）</option><option value="linear">线性渐变</option></select></div>
+          <div class="field"><label for="sectionY">XZ 截面 Y 位置（mm）</label><input id="sectionY" type="number" min="0" step="0.1" placeholder="自动选择曲率最明显的位置"></div>
           <div class="field"><label for="layerFocus">检查逻辑层</label><input id="layerFocus" type="range" step="1"></div>
         </fieldset>
         <button type="button" id="exportMapped" disabled>映射并导出 curved.npz</button>
@@ -271,6 +372,9 @@ def surface_mapper_html() -> str:
         </div>
         <h3>当前层的曲面完成度</h3>
         <div class="layerReadout"><span id="layerText">导入路径后可检查每一逻辑层。</span><div class="bar" aria-hidden="true"><i id="alphaBar"></i></div></div>
+        <h3>XZ 截面：各逻辑层的映射后形貌</h3>
+        <canvas class="crossSection" id="sectionCanvas" aria-label="映射后零件的 XZ 截面，各逻辑层以单独曲线显示"></canvas>
+        <p class="sectionMeta" id="sectionMeta">导入文件后显示截面。</p>
         <h3>保持不变的内容</h3>
         <p class="meta">X/Y、R/F/T 分组、逻辑层号、路径与点的顺序、已有 E 数值均被保留。本版本不重算 E，也不生成 ABC 姿态。</p>
       </section>
@@ -285,17 +389,31 @@ def surface_mapper_html() -> str:
     const planFields = document.getElementById('planFields');
     const exportButton = document.getElementById('exportMapped');
     const sourceId = { value: null }; const targetId = { value: null }; let preview = null;
-    const ids = { start: document.getElementById('startLayer'), end: document.getElementById('endLayer'), curve: document.getElementById('curve'), layer: document.getElementById('layerFocus') };
+    const ids = { start: document.getElementById('startLayer'), end: document.getElementById('endLayer'), curve: document.getElementById('curve'), sectionY: document.getElementById('sectionY'), layer: document.getElementById('layerFocus') };
     function setStatus(message, error = false) { statusEl.className = error ? 'status error' : 'status'; statusEl.textContent = message; }
     function fmtRange(values) { return `${values[0].toFixed(3)} ～ ${values[1].toFixed(3)} mm`; }
-    function params() { const query = new URLSearchParams({ source_id: sourceId.value || '', target_id: targetId.value || '', start_logical_layer: ids.start.value, end_logical_layer: ids.end.value, curve: ids.curve.value }); return query; }
+    function params() { const query = new URLSearchParams({ source_id: sourceId.value || '', target_id: targetId.value || '', start_logical_layer: ids.start.value, end_logical_layer: ids.end.value, curve: ids.curve.value }); if (ids.sectionY.value !== '') query.set('section_y_mm', ids.sectionY.value); return query; }
     function ready() { const enabled = Boolean(sourceId.value && targetId.value); planFields.disabled = !enabled; exportButton.disabled = !enabled; return enabled; }
     function updateLayerReadout() { if (!preview) return; const layer = Number(ids.layer.value); const alpha = preview.plan.alpha_by_layer[String(layer)]; document.getElementById('layerText').textContent = `逻辑层 ${layer}：sₖ = ${(alpha * 100).toFixed(1)}%，仅该比例的目标曲面 H(X,Y) 会加到本层路径 Z。`; document.getElementById('alphaBar').style.width = `${alpha * 100}%`; }
-    async function refreshPreview() { if (!ready()) return; setStatus('正在计算映射预览…'); try { const response = await fetch(`/api/preview?${params().toString()}`); const result = await response.json(); if (!response.ok || !result.ok) throw new Error(result.error || '无法预览映射'); preview = result; document.getElementById('flatZ').textContent = fmtRange(result.result.source_z_bounds_mm); document.getElementById('mappedZ').textContent = fmtRange(result.result.mapped_z_bounds_mm); document.getElementById('zSafety').textContent = `通过（最低 ${result.result.mapped_z_bounds_mm[0].toFixed(3)} mm）`; document.getElementById('pointCount').textContent = result.source.point_count.toLocaleString(); updateLayerReadout(); setStatus('预览已更新：所有映射 Z 均不小于 0 mm。'); } catch (error) { setStatus(error.message, true); } }
+    function drawCrossSection(section) {
+      const canvas = document.getElementById('sectionCanvas'); const rect = canvas.getBoundingClientRect(); const ratio = window.devicePixelRatio || 1;
+      canvas.width = Math.max(1, Math.round(rect.width * ratio)); canvas.height = Math.max(1, Math.round(rect.height * ratio));
+      const ctx = canvas.getContext('2d'); ctx.scale(ratio, ratio); const width = rect.width; const height = rect.height;
+      ctx.clearRect(0, 0, width, height); const pad = { left: 48, right: 56, top: 18, bottom: 32 };
+      const xValues = section.x_mm; let zMin = section.z_bounds_mm[0]; let zMax = section.z_bounds_mm[1]; const span = Math.max(zMax - zMin, 0.2); zMin -= span * .08; zMax += span * .08;
+      const sx = (x) => pad.left + (x - xValues[0]) / (xValues[xValues.length - 1] - xValues[0]) * (width - pad.left - pad.right);
+      const sy = (z) => height - pad.bottom - (z - zMin) / (zMax - zMin) * (height - pad.top - pad.bottom);
+      ctx.strokeStyle = '#e1e9f2'; ctx.lineWidth = 1; ctx.fillStyle = '#64758b'; ctx.font = '11px Segoe UI, Microsoft YaHei, sans-serif';
+      for (let i = 0; i <= 4; i += 1) { const z = zMin + (zMax - zMin) * i / 4; const y = sy(z); ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(width - pad.right, y); ctx.stroke(); ctx.fillText(`${z.toFixed(2)}`, 5, y + 4); }
+      ctx.strokeStyle = '#93a6bb'; ctx.beginPath(); ctx.moveTo(pad.left, pad.top); ctx.lineTo(pad.left, height - pad.bottom); ctx.lineTo(width - pad.right, height - pad.bottom); ctx.stroke();
+      ctx.fillStyle = '#53677f'; ctx.fillText('Z (mm)', 5, 13); ctx.fillText('X (mm)', width - pad.right - 32, height - 10);
+      section.layers.forEach((layer, index) => { const hue = 202 - (index / Math.max(section.layers.length - 1, 1)) * 112; ctx.strokeStyle = `hsl(${hue}, 72%, 42%)`; ctx.lineWidth = 1.65; ctx.beginPath(); layer.z_mm.forEach((z, pointIndex) => { const x = sx(xValues[pointIndex]); const y = sy(z); if (pointIndex === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y); }); ctx.stroke(); const endZ = layer.z_mm[layer.z_mm.length - 1]; ctx.fillStyle = `hsl(${hue}, 72%, 34%)`; ctx.fillText(`L${layer.logical_layer} · ${(layer.alpha * 100).toFixed(0)}%`, width - pad.right + 5, sy(endZ) + 3); });
+    }
+    async function refreshPreview() { if (!ready()) return; setStatus('正在计算映射预览…'); try { const response = await fetch(`/api/preview?${params().toString()}`); const result = await response.json(); if (!response.ok || !result.ok) throw new Error(result.error || '无法预览映射'); preview = result; if (ids.sectionY.value === '') ids.sectionY.value = result.cross_section.section_y_mm.toFixed(3); document.getElementById('flatZ').textContent = fmtRange(result.result.source_z_bounds_mm); document.getElementById('mappedZ').textContent = fmtRange(result.result.mapped_z_bounds_mm); document.getElementById('zSafety').textContent = `通过（最低 ${result.result.mapped_z_bounds_mm[0].toFixed(3)} mm）`; document.getElementById('pointCount').textContent = result.source.point_count.toLocaleString(); document.getElementById('sectionMeta').textContent = `截面平面：Y = ${result.cross_section.section_y_mm.toFixed(3)} mm。每条曲线代表一个逻辑层的映射后沉积面。`; updateLayerReadout(); drawCrossSection(result.cross_section); setStatus('预览已更新：所有映射 Z 均不小于 0 mm。'); } catch (error) { setStatus(error.message, true); } }
     async function upload(file, endpoint, name) { const response = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', 'X-Source-File-Name': encodeURIComponent(file.name) }, body: file }); const result = await response.json(); if (!response.ok || !result.ok) throw new Error(result.error || '导入失败'); return result; }
     document.getElementById('importSource').addEventListener('click', async () => { const file = sourceFile.files[0]; if (!file) return setStatus('请选择 flat.npz。', true); setStatus('正在读取平面路径…'); try { const result = await upload(file, '/api/source-npz'); sourceId.value = result.source_id; const layers = result.source.layer_indices; ids.start.value = layers[0]; ids.end.value = layers[layers.length - 1]; ids.layer.min = layers[0]; ids.layer.max = layers[layers.length - 1]; ids.layer.value = layers[0]; sourceMeta.textContent = `${result.source.file_name}：${result.source.layer_count} 个逻辑层，${result.source.path_count.toLocaleString()} 条路径，${result.source.point_count.toLocaleString()} 个点。`; ready(); await refreshPreview(); } catch (error) { setStatus(error.message, true); } });
-    document.getElementById('importTarget').addEventListener('click', async () => { const file = targetFile.files[0]; if (!file) return setStatus('请选择 graded_surface_v1.json。', true); setStatus('正在读取目标曲面…'); try { const result = await upload(file, '/api/surface-config'); targetId.value = result.target_id; targetMeta.textContent = `${result.target.file_name}：XY ${result.target.width_mm.toFixed(3)} × ${result.target.height_mm.toFixed(3)} mm。`; ready(); await refreshPreview(); } catch (error) { setStatus(error.message, true); } });
-    [ids.start, ids.end, ids.curve].forEach((input) => input.addEventListener('input', refreshPreview)); ids.layer.addEventListener('input', updateLayerReadout);
+    document.getElementById('importTarget').addEventListener('click', async () => { const file = targetFile.files[0]; if (!file) return setStatus('请选择 graded_surface_v1.json。', true); setStatus('正在读取目标曲面…'); try { const result = await upload(file, '/api/surface-config'); targetId.value = result.target_id; ids.sectionY.max = result.target.height_mm; targetMeta.textContent = `${result.target.file_name}：XY ${result.target.width_mm.toFixed(3)} × ${result.target.height_mm.toFixed(3)} mm。`; ready(); await refreshPreview(); } catch (error) { setStatus(error.message, true); } });
+    [ids.start, ids.end, ids.curve, ids.sectionY].forEach((input) => input.addEventListener('input', refreshPreview)); ids.layer.addEventListener('input', updateLayerReadout); window.addEventListener('resize', () => { if (preview) drawCrossSection(preview.cross_section); });
     exportButton.addEventListener('click', async () => { if (!ready()) return; setStatus('正在生成 curved.npz…'); try { const response = await fetch(`/api/map?${params().toString()}`, { method: 'POST' }); if (!response.ok) { const result = await response.json(); throw new Error(result.error || '导出失败'); } const blob = await response.blob(); const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = 'curved.npz'; link.click(); URL.revokeObjectURL(link.href); setStatus('已导出 curved.npz，可作为 Core 前的外部源路径输入。'); } catch (error) { setStatus(error.message, true); } });
   </script>
 </body>

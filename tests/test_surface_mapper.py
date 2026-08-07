@@ -122,7 +122,25 @@ def test_mapper_preview_and_web_shell_expose_the_separate_mapping_controls(tmp_p
     assert "曲面起始层" in html
     assert "曲面完成层" in html
     assert "Z 安全抬升" not in html
+    assert 'id="sectionY"' in html
+    assert 'id="sectionCanvas"' in html
     assert "/api/map?${params().toString()}" in html
+
+
+def test_mapper_preview_samples_each_logical_layer_on_an_xz_section(tmp_path):
+    source = _source(tmp_path)
+    payload = mapping_preview_payload(
+        source,
+        _target(),
+        SurfaceMappingPlan(LayerProgression(0, 1, curve="linear")),
+    )
+
+    section = payload["cross_section"]
+    assert section["section_y_mm"] == pytest.approx(5.0)
+    assert len(section["x_mm"]) == 181
+    assert [layer["logical_layer"] for layer in section["layers"]] == [0, 1]
+    assert section["layers"][0]["z_mm"][90] == pytest.approx(0.5)
+    assert section["layers"][1]["z_mm"][90] == pytest.approx(2.0)
 
 
 def test_mapped_npz_is_re_readable_and_records_mapping_metadata(tmp_path):
