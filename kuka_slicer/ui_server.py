@@ -11,6 +11,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -372,6 +373,8 @@ def run_ui_server(host: str, port: int, output_dir: Path) -> None:
         server_output_dir = output_dir.resolve()
         slice_jobs: dict[str, dict[str, object]] = {}
         slice_jobs_lock = threading.Lock()
+        tool_launchers: dict[str, subprocess.Popen[bytes]] = {}
+        tool_launchers_lock = threading.Lock()
 
     server = ThreadingHTTPServer((host, port), SlicerUiHandler)
     print(f"KUKA slicer UI running at http://{host}:{port}")
@@ -387,6 +390,8 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
     server_output_dir: Path
     slice_jobs: dict[str, dict[str, object]] = {}
     slice_jobs_lock = threading.Lock()
+    tool_launchers: dict[str, subprocess.Popen[bytes]] = {}
+    tool_launchers_lock = threading.Lock()
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -403,6 +408,9 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/launch-tool":
+            self._launch_tool(parse_qs(parsed.query))
+            return
         if parsed.path == "/ui-settings":
             try:
                 self._save_ui_settings()
@@ -430,6 +438,35 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                 "message": "已接收任务，等待处理",
             }
         )
+
+    def _launch_tool(self, params: dict[str, list[str]]) -> None:
+        tool = params.get("tool", [""])[0]
+        if tool not in {"surface-preview", "surface-map"}:
+            self._send_json({"ok": False, "error": "unknown local tool"}, HTTPStatus.BAD_REQUEST)
+            return
+        with self.tool_launchers_lock:
+            existing = self.tool_launchers.get(tool)
+            if existing is not None and existing.poll() is None:
+                self._send_json({"ok": True, "already_running": True})
+                return
+            from .app_session import spawn_app_session
+
+            process = spawn_app_session(tool)
+            self.tool_launchers[tool] = process
+        watcher = threading.Thread(
+            target=self._clear_finished_tool,
+            args=(tool, process),
+            daemon=True,
+            name=f"slicer-tool-{tool}",
+        )
+        watcher.start()
+        self._send_json({"ok": True, "already_running": False})
+
+    def _clear_finished_tool(self, tool: str, process: subprocess.Popen[bytes]) -> None:
+        process.wait()
+        with self.tool_launchers_lock:
+            if self.tool_launchers.get(tool) is process:
+                self.tool_launchers.pop(tool, None)
 
     def log_message(self, format: str, *args: object) -> None:
         print(f"{self.address_string()} - {format % args}")
@@ -2059,6 +2096,8 @@ def _index_html() -> str:
       min-height: 68px;
       display: flex;
       align-items: center;
+      justify-content: space-between;
+      gap: var(--space-4);
       padding: 14px max(20px, calc((100vw - 960px) / 2));
       border-bottom: 1px solid var(--line);
       background: #ffffff;
@@ -2251,6 +2290,25 @@ def _index_html() -> str:
       outline-offset: 2px;
       border-color: var(--accent);
     }}
+    .surfaceTools {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--space-2);
+      justify-content: flex-end;
+    }}
+    .surfaceToolButton {{
+      min-height: 34px;
+      padding: 6px 10px;
+      border: 1px solid #8aa0b8;
+      border-radius: var(--radius-sm);
+      color: #084f96;
+      background: #ffffff;
+      font: inherit;
+      font-size: 13px;
+      cursor: pointer;
+    }}
+    .surfaceToolButton:hover {{ background: #eef6ff; }}
+    .surfaceToolButton:disabled {{ cursor: wait; opacity: 0.7; }}
     .inputBand input[type="file"] {{
       padding: 0;
       line-height: calc(var(--control-height) - 2px);
@@ -3017,12 +3075,20 @@ def _index_html() -> str:
         grid-template-columns: 1fr;
       }}
       h1 {{ font-size: 18px; }}
+      header {{ align-items: flex-start; flex-direction: column; }}
+      .surfaceTools {{ justify-content: flex-start; }}
       .preview {{ height: 380px; min-height: 340px; }}
     }}
   </style>
 </head>
 <body>
-  <header><h1>机械臂空间复合材料增材制造系统切片器</h1></header>
+  <header>
+    <h1>机械臂空间复合材料增材制造系统切片器</h1>
+    <div class="surfaceTools" aria-label="曲面工具">
+      <button id="surfacePreviewButton" class="surfaceToolButton" type="button">启动曲面预览器</button>
+      <button id="surfaceMapperButton" class="surfaceToolButton" type="button">启动曲面映射器</button>
+    </div>
+  </header>
   <main>
     <section class="resultsColumn">
       <div class="summary">
@@ -3743,7 +3809,34 @@ def _index_html() -> str:
   <script>
     const form = document.getElementById('sliceForm');
     const button = document.getElementById('sliceButton');
+    const surfaceToolButtons = {{
+      'surface-preview': document.getElementById('surfacePreviewButton'),
+      'surface-map': document.getElementById('surfaceMapperButton')
+    }};
     const statusEl = document.getElementById('status');
+    async function launchSurfaceTool(tool) {{
+      const toolButton = surfaceToolButtons[tool];
+      const originalLabel = toolButton.textContent;
+      toolButton.disabled = true;
+      toolButton.textContent = '正在启动…';
+      try {{
+        const response = await fetch('/launch-tool?tool=' + encodeURIComponent(tool), {{ method: 'POST' }});
+        const result = await response.json();
+        if (!response.ok || !result.ok) throw new Error(result.error || '启动失败');
+        statusEl.className = 'status ok';
+        statusEl.textContent = result.already_running
+          ? '该曲面工具窗口已打开。'
+          : '曲面工具已在独立窗口打开；关闭该窗口后服务会自动停止。';
+      }} catch (error) {{
+        statusEl.className = 'status error';
+        statusEl.textContent = '无法启动曲面工具：' + error.message;
+      }} finally {{
+        toolButton.disabled = false;
+        toolButton.textContent = originalLabel;
+      }}
+    }}
+    surfaceToolButtons['surface-preview'].addEventListener('click', () => launchSurfaceTool('surface-preview'));
+    surfaceToolButtons['surface-map'].addEventListener('click', () => launchSurfaceTool('surface-map'));
     const exportProgressEl = document.getElementById('exportProgress');
     const exportProgressBarEl = document.getElementById('exportProgressBar');
     const exportProgressMessageEl = document.getElementById('exportProgressMessage');
