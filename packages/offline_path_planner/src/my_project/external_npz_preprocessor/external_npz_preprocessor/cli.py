@@ -5,14 +5,14 @@ from __future__ import annotations
 import argparse
 import sys
 
-from .export_runner import convert_external_npz, resolve_output_path
+from .export_runner import convert_external_npz, convert_gcode, resolve_output_path
 from .process_params import FiberProcessParams, ProcessParams, ResinProcessParams
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="External path NPZ -> my_project system NPZ")
-    parser.add_argument("--source", required=True, help="External source NPZ location")
-    parser.add_argument("--out", default="", help="Output system NPZ location; defaults next to source NPZ")
+    parser = argparse.ArgumentParser(description="External source NPZ / native Prusa G-code -> my_project system NPZ")
+    parser.add_argument("--source", required=True, help="External source NPZ or native Prusa G-code location")
+    parser.add_argument("--out", default="", help="Output system NPZ location; defaults next to source")
     parser.add_argument("--resin-layer-height-mm", type=float, default=0.5)
     parser.add_argument("--resin-extrusion-scale", type=float, default=1.0)
     parser.add_argument("--resin-feed-mm-s", type=float, default=10.0)
@@ -89,7 +89,12 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     try:
         output = resolve_output_path(args.source, args.out)
-        stats = convert_external_npz(
+        converter = (
+            convert_gcode
+            if args.source.lower().endswith((".gcode", ".gc", ".g"))
+            else convert_external_npz
+        )
+        stats = converter(
             args.source,
             args.out,
             params_from_args(args),

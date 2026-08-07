@@ -13,7 +13,8 @@ from path_processing_core.npz_exporter import export_npz
 
 from .converter import source_job_to_parsed_commands
 from .process_params import ProcessParams
-from .source_npz import load_source_npz
+from .source_gcode import load_source_gcode, with_fiber_paths
+from .source_npz import SourceJob, load_source_npz
 
 
 def default_source_npz_template_dir(data_root: str | Path | None = None) -> Path:
@@ -70,9 +71,73 @@ def convert_external_npz(
     chunk_size: int = 100000,
     commands_callback=None,
 ) -> dict:
+    job = load_source_npz(source_path, default_abc=params.default_abc)
+    return convert_source_job(
+        job,
+        source_path=source_path,
+        output_path=output_path,
+        params=params,
+        progress_callback=progress_callback,
+        calibration_path=calibration_path,
+        cut_lift_mm=cut_lift_mm,
+        cut_wait_s=cut_wait_s,
+        chunk_size=chunk_size,
+        commands_callback=commands_callback,
+    )
+
+
+def convert_gcode(
+    source_path: str | Path,
+    output_path: str | Path | None,
+    params: ProcessParams,
+    progress_callback=None,
+    calibration_path: str | Path = DEFAULT_HEAD_CALIBRATION_PATH,
+    cut_lift_mm: float | None = None,
+    cut_wait_s: float | None = None,
+    chunk_size: int = 100000,
+    commands_callback=None,
+    fiber_paths_by_layer=None,
+) -> dict:
+    """Convert native Prusa G-code through the external-NPZ Core pipeline."""
+
+    job = load_source_gcode(source_path, default_abc=params.default_abc)
+    if fiber_paths_by_layer:
+        job = with_fiber_paths(
+            job,
+            fiber_paths_by_layer,
+            default_abc=params.default_abc,
+        )
+    return convert_source_job(
+        job,
+        source_path=source_path,
+        output_path=output_path,
+        params=params,
+        progress_callback=progress_callback,
+        calibration_path=calibration_path,
+        cut_lift_mm=cut_lift_mm,
+        cut_wait_s=cut_wait_s,
+        chunk_size=chunk_size,
+        commands_callback=commands_callback,
+    )
+
+
+def convert_source_job(
+    job: SourceJob,
+    *,
+    source_path: str | Path,
+    output_path: str | Path | None,
+    params: ProcessParams,
+    progress_callback=None,
+    calibration_path: str | Path = DEFAULT_HEAD_CALIBRATION_PATH,
+    cut_lift_mm: float | None = None,
+    cut_wait_s: float | None = None,
+    chunk_size: int = 100000,
+    commands_callback=None,
+) -> dict:
+    """Export one normalized source job through the sole Core consumer path."""
+
     resolved_output = resolve_output_path(source_path, output_path)
     resolved_output.parent.mkdir(parents=True, exist_ok=True)
-    job = load_source_npz(source_path, default_abc=params.default_abc)
     commands = source_job_to_parsed_commands(job, params)
     if commands_callback is not None:
         commands_callback(commands)
