@@ -50,6 +50,8 @@ def _source(tmp_path, *, source_sha256: str = "same-model"):
         material_paths=[
             MaterialPaths(0, "R", [np.asarray([[5, 5, 0.5], [6, 5, 0.5]], dtype=np.float64)]),
             MaterialPaths(1, "R", [np.asarray([[5, 5, 1.0], [6, 5, 1.0]], dtype=np.float64)], extrusion=[np.asarray([0.0, 1.0])]),
+            MaterialPaths(2, "R", [np.asarray([[5, 5, 1.5], [6, 5, 1.5]], dtype=np.float64)]),
+            MaterialPaths(3, "R", [np.asarray([[5, 5, 2.0], [6, 5, 2.0]], dtype=np.float64)]),
         ],
         meta={"source_model": {"file_name": "honeycomb.stl", "sha256": source_sha256}},
     )
@@ -59,7 +61,7 @@ def _source(tmp_path, *, source_sha256: str = "same-model"):
 
 def test_mapper_changes_only_z_by_logical_layer_and_preserves_extrusion(tmp_path):
     source = _source(tmp_path)
-    result = map_source_job(source, _target(), SurfaceMappingPlan(LayerProgression(0, 1, curve="linear")))
+    result = map_source_job(source, _target(), SurfaceMappingPlan(LayerProgression(0, 3)))
 
     mapped = result.source
     assert np.array_equal(mapped.arrays["layer_0000_R"][..., :2], source.arrays["layer_0000_R"][..., :2], equal_nan=True)
@@ -76,7 +78,7 @@ def test_mapper_rejects_negative_z_instead_of_silently_raising_the_path(tmp_path
         map_source_job(
             source,
             _target(amplitude_mm=2.0, phase_x_rad=np.pi),
-            SurfaceMappingPlan(LayerProgression(0, 1, curve="linear")),
+            SurfaceMappingPlan(LayerProgression(0, 3)),
         )
 
 
@@ -95,32 +97,33 @@ def test_mapper_accepts_verified_prusa_setup_paths_outside_the_part_domain(tmp_p
         [[[-8.0, -8.0, 0.5], [-7.0, -8.0, 0.5]]], dtype=np.float64
     )
 
-    result = map_source_job(source, _target(), SurfaceMappingPlan(LayerProgression(0, 1)))
+    result = map_source_job(source, _target(), SurfaceMappingPlan(LayerProgression(0, 3)))
 
     assert result.source.arrays["layer_0000_T"][0, 0, 2] == pytest.approx(0.5)
 
 
-def test_smoothstep_progression_uses_logical_layer_index_not_z():
-    progression = LayerProgression(4, 6, curve="smoothstep")
+def test_symmetric_progression_uses_logical_layer_index_not_z():
+    progression = LayerProgression(2, 9)
 
-    assert progression.alpha(3) == 0.0
-    assert progression.alpha(4) == 0.0
-    assert progression.alpha(5) == pytest.approx(0.5)
-    assert progression.alpha(6) == 1.0
+    assert progression.surface_return_layer == 7
+    assert progression.peak_layers == (4, 5)
+    assert [progression.alpha(index) for index in range(10)] == pytest.approx(
+        [0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 0.5, 0.0, 0.0, 0.0]
+    )
 
 
 def test_mapper_preview_and_web_shell_expose_the_separate_mapping_controls(tmp_path):
     source = _source(tmp_path)
-    payload = mapping_preview_payload(source, _target(), SurfaceMappingPlan(LayerProgression(0, 1)))
+    payload = mapping_preview_payload(source, _target(), SurfaceMappingPlan(LayerProgression(0, 3)))
 
-    assert payload["plan"]["alpha_by_layer"] == {0: 0.0, 1: 1.0}
+    assert payload["plan"]["alpha_by_layer"] == {0: 0.0, 1: 1.0, 2: 1.0, 3: 0.0}
     assert payload["result"]["extrusion"] == "preserved_unrecalculated"
     html = surface_mapper_html()
     assert 'id="sourceFile"' in html
     assert 'id="targetFile"' in html
     assert 'id="startLayer"' in html
     assert "曲面起始层" in html
-    assert "曲面完成层" in html
+    assert "曲面完成层" not in html
     assert "Z 安全抬升" not in html
     assert 'id="sectionY"' in html
     assert 'id="sectionCanvas"' in html
@@ -132,20 +135,20 @@ def test_mapper_preview_samples_each_logical_layer_on_an_xz_section(tmp_path):
     payload = mapping_preview_payload(
         source,
         _target(),
-        SurfaceMappingPlan(LayerProgression(0, 1, curve="linear")),
+        SurfaceMappingPlan(LayerProgression(0, 3)),
     )
 
     section = payload["cross_section"]
     assert section["section_y_mm"] == pytest.approx(5.0)
     assert len(section["x_mm"]) == 181
-    assert [layer["logical_layer"] for layer in section["layers"]] == [0, 1]
+    assert [layer["logical_layer"] for layer in section["layers"]] == [0, 1, 2, 3]
     assert section["layers"][0]["z_mm"][90] == pytest.approx(0.5)
     assert section["layers"][1]["z_mm"][90] == pytest.approx(2.0)
 
 
 def test_mapped_npz_is_re_readable_and_records_mapping_metadata(tmp_path):
     source = _source(tmp_path)
-    mapped = map_source_job(source, _target(), SurfaceMappingPlan(LayerProgression(0, 1))).source
+    mapped = map_source_job(source, _target(), SurfaceMappingPlan(LayerProgression(0, 3))).source
 
     reloaded = read_source_npz(mapped.to_bytes())
 
@@ -172,9 +175,7 @@ def test_mapper_http_api_imports_previews_and_exports_without_writing_server_fil
             {
                 "source_id": source_response["source_id"],
                 "target_id": target_response["target_id"],
-                "start_logical_layer": 0,
-                "end_logical_layer": 1,
-                "curve": "smoothstep",
+                "surface_start_layer": 0,
             }
         )
         with urlopen(base + "/api/preview?" + params) as response:
@@ -186,7 +187,7 @@ def test_mapper_http_api_imports_previews_and_exports_without_writing_server_fil
         server.server_close()
 
     assert preview["ok"] is True
-    assert preview["plan"]["alpha_by_layer"] == {"0": 0.0, "1": 1.0}
+    assert preview["plan"]["alpha_by_layer"] == {"0": 0.0, "1": 1.0, "2": 1.0, "3": 0.0}
     assert read_source_npz(exported).meta["surface_mapping"]["format"] == "surface_mapping_v1"
 
 

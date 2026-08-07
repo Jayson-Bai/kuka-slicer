@@ -9,7 +9,7 @@ import json
 import numpy as np
 
 from .contracts import SourceNPZ, SurfaceTarget, _PATH_KEY
-from .progression import LayerProgression, ProgressionCurve
+from .progression import LayerProgression
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,9 +19,9 @@ class SurfaceMappingPlan:
     progression: LayerProgression
 
     @classmethod
-    def default_for(cls, source: SourceNPZ, *, curve: ProgressionCurve = "smoothstep") -> "SurfaceMappingPlan":
+    def default_for(cls, source: SourceNPZ) -> "SurfaceMappingPlan":
         layers = source.layer_indices
-        return cls(LayerProgression(layers[0], layers[-1], curve=curve))
+        return cls(LayerProgression(layers[0], layers[-1]))
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,7 +55,7 @@ def map_source_job(source: SourceNPZ, target: SurfaceTarget, plan: SurfaceMappin
     if mapped_z_bounds[0] < 0.0:
         raise ValueError(
             "surface mapping would produce negative Z "
-            f"(minimum {mapped_z_bounds[0]:.3f} mm); adjust the curve or its start/completion layers"
+            f"(minimum {mapped_z_bounds[0]:.3f} mm); adjust the curve or its surface start layer"
         )
     meta = dict(source.meta)
     meta["surface_mapping"] = {
@@ -67,9 +67,10 @@ def map_source_job(source: SourceNPZ, target: SurfaceTarget, plan: SurfaceMappin
         "target_source_sha256": target.source_sha256,
         "progression": {
             "basis": "logical_layer_index",
-            "curve": plan.progression.curve,
-            "start_logical_layer": plan.progression.start_logical_layer,
-            "end_logical_layer": plan.progression.end_logical_layer,
+            "mode": "symmetric_flat_curved_flat",
+            "surface_start_layer": plan.progression.surface_start_layer,
+            "surface_return_layer": plan.progression.surface_return_layer,
+            "peak_layers": list(plan.progression.peak_layers),
             "alpha_by_layer": {str(key): value for key, value in alpha_by_layer.items()},
         },
         "z_validation": "all mapped points must be greater than or equal to 0 mm",
