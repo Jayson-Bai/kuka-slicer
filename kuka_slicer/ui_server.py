@@ -580,6 +580,20 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             config = _parse_pyslm_slice_config(params, shared, build_axis)
             raft_layers = []
         job = slice_mesh_to_job(mesh, config)
+        core_source_job = None
+        native_gcode_path = None
+        source_gcode_module = None
+        if slicing_kernel == "prusa" and isinstance(job.native_gcode, str):
+            _ensure_offline_planner_import_paths()
+            source_gcode_module = importlib.import_module(
+                "external_npz_preprocessor.source_gcode"
+            )
+            native_gcode_path = job_dir / f"{Path(filename).stem}_prusa.gcode"
+            native_gcode_path.write_text(job.native_gcode, encoding="utf-8")
+            core_source_job = source_gcode_module.translate_source_job(
+                source_gcode_module.load_source_gcode(native_gcode_path),
+                job.native_gcode_translation_mm or (0.0, 0.0, 0.0),
+            )
         progress(35, "Prusa 路径生成完成，正在保留原始预览")
         resolved_config = _resolved_slice_config(config)
         slicing_meta = job.meta.get("slicing")
@@ -591,6 +605,11 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                 job, fiber_template_paths
             )
             merge_fiber_paths_into_job(job, fiber_preview_paths)
+            if core_source_job is not None and source_gcode_module is not None:
+                core_source_job = source_gcode_module.with_fiber_paths(
+                    core_source_job,
+                    fiber_preview_paths,
+                )
         if raft_layers:
             z_shift = add_raft_to_job(job, mesh, config, raft_layers, DEFAULT_RAFT_TOP_GAP_MM)
             fiber_preview_paths = _shift_fiber_preview_paths(
@@ -613,8 +632,19 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                     _float_param(params, "core_primeline_y_mm", -10.0),
                 ),
             )
+            if core_source_job is not None and source_gcode_module is not None:
+                core_source_job = source_gcode_module.prepend_prusa_startup_travel(
+                    core_source_job,
+                    start_xy=(float(config.start_x_mm), float(config.start_y_mm)),
+                    primeline_enabled=primeline_enabled,
+                    primeline_xy=(
+                        _float_param(params, "core_primeline_x_mm", 0.0),
+                        _float_param(params, "core_primeline_y_mm", -10.0),
+                    ),
+                )
         fiber_preview_paths = _fiber_preview_paths_from_job(job)
-        write_external_source_npz(job, npz_path)
+        if core_source_job is None:
+            write_external_source_npz(job, npz_path)
         progress(45, "Prusa 预览数据已保留，正在交给 path_processing_core")
 
         path_count = sum(len(group.paths) for group in job.material_paths)
@@ -655,14 +685,25 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                 xy_offset=core_preview_xy_offset,
             )
 
-        core_stats = export_runner.convert_external_npz(
-            npz_path,
-            core_npz_path,
-            core_params,
-            progress_callback=core_progress,
-            chunk_size=5_000_000,
-            commands_callback=capture_core_preview,
-        )
+        if core_source_job is None:
+            core_stats = export_runner.convert_external_npz(
+                npz_path,
+                core_npz_path,
+                core_params,
+                progress_callback=core_progress,
+                chunk_size=5_000_000,
+                commands_callback=capture_core_preview,
+            )
+        else:
+            core_stats = export_runner.convert_source_job(
+                core_source_job,
+                source_path=native_gcode_path,
+                output_path=core_npz_path,
+                params=core_params,
+                progress_callback=core_progress,
+                chunk_size=5_000_000,
+                commands_callback=capture_core_preview,
+            )
         progress(98, "正在完成系统 NPZ 和时间元数据写入")
         download_path = _core_output_download_path(core_npz_path)
         return {

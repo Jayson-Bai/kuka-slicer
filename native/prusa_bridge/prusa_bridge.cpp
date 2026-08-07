@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <optional>
 #include <sstream>
@@ -580,6 +581,12 @@ py::dict slice_print_paths(
             print.export_gcode(gcode_path.string(), nullptr);
         }
         py::dict result = parse_print_gcode(gcode_path);
+        std::ifstream gcode_input(gcode_path, std::ios::binary);
+        if (!gcode_input)
+            throw std::runtime_error("PrusaSlicer did not produce readable G-code");
+        result["gcode"] = std::string(
+            std::istreambuf_iterator<char>(gcode_input),
+            std::istreambuf_iterator<char>());
         std::filesystem::remove(gcode_path);
         return result;
     } catch (...) {

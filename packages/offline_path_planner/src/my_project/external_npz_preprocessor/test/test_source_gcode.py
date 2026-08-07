@@ -3,11 +3,17 @@ import json
 import numpy as np
 
 from external_npz_preprocessor.export_runner import (
+    convert_source_job,
     convert_external_npz,
     convert_gcode,
 )
 from external_npz_preprocessor.process_params import ProcessParams, ResinProcessParams
-from external_npz_preprocessor.source_gcode import load_source_gcode
+from external_npz_preprocessor.source_gcode import (
+    load_source_gcode,
+    prepend_prusa_startup_travel,
+    translate_source_job,
+    with_fiber_paths,
+)
 
 
 _PRUSA_GCODE = """\
@@ -79,6 +85,64 @@ def _write_equivalent_npz(path, *, include_fiber=False):
     )
 
 
+def _write_ui_equivalent_npz(path):
+    np.savez(
+        path,
+        meta=np.array(
+            json.dumps(
+                {
+                    "format": "external_layer_paths_v1",
+                    "path_roles": {
+                        "R": {"0": ["outer_contour", "infill"], "1": ["infill"]}
+                    },
+                    "motion_order": {
+                        "0": [
+                            {"kind": "travel", "index": 0},
+                            {"kind": "deposit", "index": 0},
+                            {"kind": "travel", "index": 1},
+                            {"kind": "deposit", "index": 1},
+                        ],
+                        "1": [
+                            {"kind": "travel", "index": 0},
+                            {"kind": "deposit", "index": 0},
+                        ],
+                    },
+                    "startup_travel_count": 1,
+                    "startup_travel_source_frame": "normalized_prusa",
+                }
+            )
+        ),
+        layer_0000_R=np.array(
+            [
+                [[10.0, 10.0, 0.5], [11.0, 10.0, 0.5], [12.0, 10.0, 0.5]],
+                [[13.0, 10.0, 0.5], [14.0, 10.0, 0.5], [15.0, 10.0, 0.5]],
+            ],
+            dtype=np.float64,
+        ),
+        layer_0000_R_E=np.array([[0.0, 0.1, 0.2], [0.2, 0.3, 0.4]], dtype=np.float64),
+        layer_0000_F=np.array(
+            [[[10.0, 12.0, 0.6], [11.0, 12.0, 0.6]]], dtype=np.float64
+        ),
+        layer_0000_T=np.array(
+            [
+                [[0.0, 0.0, 0.5], [10.0, 0.0, 0.5]],
+                [[12.0, 10.0, 0.5], [13.0, 10.0, 0.5]],
+            ],
+            dtype=np.float64,
+        ),
+        layer_0001_R=np.array(
+            [[[10.0, 11.0, 1.0], [11.0, 11.0, 1.0]]], dtype=np.float64
+        ),
+        layer_0001_R_E=np.array([[0.4, 0.6]], dtype=np.float64),
+        layer_0001_F=np.array(
+            [[[10.0, 13.0, 1.1], [11.0, 13.0, 1.1]]], dtype=np.float64
+        ),
+        layer_0001_T=np.array(
+            [[[15.0, 10.0, 1.0], [10.0, 11.0, 1.0]]], dtype=np.float64
+        ),
+    )
+
+
 def _calibration(path):
     path.write_text(
         json.dumps({"resin": {"z_print_compensation_mm": 0.0}, "fiber": {}}),
@@ -124,6 +188,25 @@ def test_prusa_gcode_adapter_matches_native_source_path_grouping_and_e(tmp_path)
     }
 
 
+def test_prusa_startup_travel_maps_raw_gcode_coordinates_to_existing_core_frame(tmp_path):
+    gcode = tmp_path / "native.gcode"
+    gcode.write_text(_PRUSA_GCODE, encoding="utf-8")
+
+    job = translate_source_job(load_source_gcode(gcode), (5.0, 7.0, 2.0))
+    prepared = prepend_prusa_startup_travel(
+        job,
+        start_xy=(10.0, 10.0),
+        primeline_enabled=True,
+        primeline_xy=(0.0, -10.0),
+    )
+
+    startup = prepared.layers[0].travel_paths[0].points
+    np.testing.assert_allclose(startup[0, :3], [-5.0, -3.0, 2.5])
+    np.testing.assert_allclose(startup[1, :3], [5.0, -3.0, 2.5])
+    assert prepared.meta["startup_travel_count"] == 1
+    assert prepared.meta["startup_travel_source_frame"] == "normalized_prusa"
+
+
 def test_gcode_and_equivalent_external_npz_produce_byte_identical_core_npz(tmp_path):
     gcode = tmp_path / "native.gcode"
     source_npz = tmp_path / "source.npz"
@@ -165,5 +248,46 @@ def test_gcode_with_expanded_fiber_paths_matches_external_npz_byte_for_byte(tmp_
         fiber_paths_by_layer=fiber_paths_by_layer,
     )
     convert_external_npz(source_npz, output_npz, _params(), calibration_path=calibration)
+
+    assert output_gcode.read_bytes() == output_npz.read_bytes()
+
+
+def test_prusa_ui_gcode_route_matches_legacy_normalized_npz_byte_for_byte(tmp_path):
+    gcode = tmp_path / "native.gcode"
+    source_npz = tmp_path / "legacy_ui_source.npz"
+    output_gcode = tmp_path / "gcode_core.npz"
+    output_npz = tmp_path / "legacy_core.npz"
+    calibration = tmp_path / "calibration.json"
+    gcode.write_text(_PRUSA_GCODE, encoding="utf-8")
+    _write_ui_equivalent_npz(source_npz)
+    _calibration(calibration)
+    fiber_paths = {
+        0: [np.array([[0.0, 2.0, 0.6], [1.0, 2.0, 0.6]])],
+        1: [np.array([[0.0, 3.0, 1.1], [1.0, 3.0, 1.1]])],
+    }
+    direct_job = prepend_prusa_startup_travel(
+        with_fiber_paths(load_source_gcode(gcode), fiber_paths),
+        start_xy=(10.0, 10.0),
+        primeline_enabled=True,
+        primeline_xy=(0.0, -10.0),
+    )
+    params = ProcessParams(
+        dt=0.05,
+        resin=ResinProcessParams(
+            feed_mm_s=10.0,
+            first_layer_feed_mm_s=10.0,
+            prime_length_mm=0.0,
+            retract_length_mm=0.0,
+        ),
+    )
+
+    convert_source_job(
+        direct_job,
+        source_path=gcode,
+        output_path=output_gcode,
+        params=params,
+        calibration_path=calibration,
+    )
+    convert_external_npz(source_npz, output_npz, params, calibration_path=calibration)
 
     assert output_gcode.read_bytes() == output_npz.read_bytes()

@@ -222,6 +222,126 @@ def with_fiber_paths(
     return SourceJob(meta=meta, layers=layers)
 
 
+def translate_source_job(
+    job: SourceJob,
+    translation_xyz: tuple[float, float, float],
+) -> SourceJob:
+    """Translate parsed native G-code into the slicer's source coordinate frame."""
+
+    translation = np.asarray(translation_xyz, dtype=np.float64)
+    if translation.shape != (3,) or not np.isfinite(translation).all():
+        raise ValueError("G-code source translation must contain three finite values")
+
+    def translated(points: np.ndarray) -> np.ndarray:
+        result = np.asarray(points, dtype=np.float64).copy()
+        result[:, :3] += translation
+        return result
+
+    layers = [
+        LayerPaths(
+            index=layer.index,
+            resin_paths=[
+                MaterialPath(path.material, path.order, translated(path.points), path.extrusion)
+                for path in layer.resin_paths
+            ],
+            fiber_paths=[
+                MaterialPath(path.material, path.order, translated(path.points), path.extrusion)
+                for path in layer.fiber_paths
+            ],
+            travel_paths=[
+                TravelPath(path.order, translated(path.points))
+                for path in layer.travel_paths
+            ],
+        )
+        for layer in job.layers
+    ]
+    meta = dict(job.meta)
+    meta["native_gcode_source_translation_mm"] = translation.tolist()
+    return SourceJob(meta=meta, layers=layers)
+
+
+def prepend_prusa_startup_travel(
+    job: SourceJob,
+    *,
+    start_xy: tuple[float, float],
+    primeline_enabled: bool,
+    primeline_xy: tuple[float, float],
+) -> SourceJob:
+    """Add the same origin-to-first-motion travel used by the Prusa UI path.
+
+    The source points are expressed so ``source_job_to_parsed_commands()``
+    maps them to the existing final-machine coordinates without first writing
+    a normalized source NPZ.
+    """
+
+    first_layer = next(
+        (layer for layer in job.layers if layer.resin_paths or layer.fiber_paths),
+        None,
+    )
+    if first_layer is None:
+        return job
+    source_min = _source_xy_min(job)
+    first_material = (first_layer.resin_paths or first_layer.fiber_paths)[0]
+    first_z = float(first_material.points[0, 2])
+    if primeline_enabled:
+        target_xy = (
+            source_min[0] + float(primeline_xy[0]),
+            source_min[1] + float(primeline_xy[1]),
+        )
+    elif first_layer.travel_paths:
+        target_xy = tuple(float(value) for value in first_layer.travel_paths[0].points[0, :2])
+    else:
+        target_xy = tuple(float(value) for value in first_material.points[0, :2])
+    start = np.asarray(
+        [
+            source_min[0] - float(start_xy[0]),
+            source_min[1] - float(start_xy[1]),
+            first_z,
+            0.0,
+            0.0,
+            0.0,
+        ],
+        dtype=np.float64,
+    )
+    target = np.asarray([target_xy[0], target_xy[1], first_z, 0.0, 0.0, 0.0], dtype=np.float64)
+    if np.linalg.norm(target[:3] - start[:3]) <= 1e-7:
+        return job
+
+    layers: list[LayerPaths] = []
+    for layer in job.layers:
+        if layer.index != first_layer.index:
+            layers.append(layer)
+            continue
+        travel_paths = [TravelPath(0, np.vstack((start, target)))]
+        travel_paths.extend(
+            TravelPath(index, path.points)
+            for index, path in enumerate(layer.travel_paths, start=1)
+        )
+        layers.append(
+            LayerPaths(
+                index=layer.index,
+                resin_paths=list(layer.resin_paths),
+                fiber_paths=list(layer.fiber_paths),
+                travel_paths=travel_paths,
+            )
+        )
+    meta = dict(job.meta)
+    motion_order = dict(meta.get("motion_order", {}))
+    records = motion_order.get(str(first_layer.index), [])
+    if isinstance(records, list):
+        shifted = [
+            {**record, "index": int(record.get("index", 0)) + 1}
+            if isinstance(record, dict) and record.get("kind") == "travel"
+            else record
+            for record in records
+        ]
+        motion_order[str(first_layer.index)] = [{"kind": "travel", "index": 0}, *shifted]
+    meta["motion_order"] = motion_order
+    meta["startup_travel_count"] = 1
+    meta["startup_travel_source_frame"] = "normalized_prusa"
+    return SourceJob(meta=meta, layers=layers)
+
+
 def _parse_command(line: str) -> tuple[str, int] | None:
     match = _COMMAND_RE.match(line)
     if match is None:
@@ -295,6 +415,19 @@ def _normalize_fiber_path(
     if points.shape[1] == 6:
         return points.copy()
     return _with_abc([tuple(row) for row in points], default_abc)
+
+
+def _source_xy_min(job: SourceJob) -> tuple[float, float]:
+    points = [
+        path.points[:, :2]
+        for layer in job.layers
+        for path in [*layer.resin_paths, *layer.fiber_paths]
+        if path.points.size
+    ]
+    if not points:
+        return (0.0, 0.0)
+    merged = np.vstack(points)
+    return (float(np.min(merged[:, 0])), float(np.min(merged[:, 1])))
 
 
 def _path_role_from_gcode_type(value: str) -> str:
