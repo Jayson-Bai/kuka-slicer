@@ -132,7 +132,7 @@ def _paired_path_array(
     curved_path = curved_source.arrays.get(key)
     if flat_path is None or curved_path is None:
         raise ValueError(f"flat and curved NPZ must both contain path array {key}")
-    if flat_path.shape != curved_path.shape:
+    if flat_path.shape[:2] != curved_path.shape[:2]:
         raise ValueError(f"flat and curved path array shapes differ for {key}")
     flat_valid = np.isfinite(flat_path[..., 0])
     curved_valid = np.isfinite(curved_path[..., 0])

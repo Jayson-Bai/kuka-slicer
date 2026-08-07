@@ -14,6 +14,12 @@ from .bspline import parameter_selection as ps
 from .bspline import bspline_curve as bc
 
 from .types import MoveCommand, Position, GlobalCurveCommand
+from .kuka_orientation import (
+    kuka_abc_to_quaternion,
+    quaternion_inverse,
+    quaternion_multiply,
+    rotation_vector_from_quaternion,
+)
 
 
 def compute_angle_deg(v1: tuple, v2: tuple) -> float:
@@ -156,6 +162,28 @@ def _subdivide_points(points: List[Position]) -> List[Position]:
     return new_points
 
 
+def _fit_kuka_orientation_curve(
+    points: List[Position], param, knot, n_ctrl: int, degree: int
+) -> Optional[Tuple[Tuple[float, float, float, float], List[Tuple[float, float, float]]]]:
+    """Fit KUKA orientations in the tangent space of the first quaternion."""
+
+    reference = kuka_abc_to_quaternion(points[0].a, points[0].b, points[0].c)
+    reference_inverse = quaternion_inverse(reference)
+    vectors: List[Tuple[float, float, float]] = []
+    for point in points:
+        q = kuka_abc_to_quaternion(point.a, point.b, point.c)
+        vectors.append(rotation_vector_from_quaternion(quaternion_multiply(reference_inverse, q)))
+    if all(math.sqrt(x * x + y * y + z * z) < 1e-10 for x, y, z in vectors):
+        return None
+    controls = bc.curve_approximation(
+        [[value[index] for value in vectors] for index in range(3)],
+        len(points), n_ctrl, degree, param, knot,
+    )
+    if not controls or len(controls[0]) != n_ctrl:
+        raise ValueError("KUKA orientation B-spline fitting returned no controls")
+    return reference, [tuple(controls[axis][index] for axis in range(3)) for index in range(n_ctrl)]
+
+
 class GlobalSplinePlanner:
     def __init__(self):
         self.last_fit_profile = self._new_fit_profile()
@@ -175,6 +203,7 @@ class GlobalSplinePlanner:
             "fit_lsq_normal_mat_s": 0.0,
             "fit_lsq_solve_s": 0.0,
             "fit_lsq_total_s": 0.0,
+            "fit_orientation_s": 0.0,
         }
 
     def fit_global_curve(
@@ -238,10 +267,9 @@ class GlobalSplinePlanner:
         D_X = [p.x for p in fit_points]
         D_Y = [p.y for p in fit_points]
         D_Z = [p.z for p in fit_points]
-        D_A = [p.a for p in fit_points]
-        D_B = [p.b for p in fit_points]
-        D_C = [p.c for p in fit_points]
-        D = [D_X, D_Y, D_Z, D_A, D_B, D_C]
+        # The spatial B-spline must be parameterised by XYZ only.  KUKA ABC
+        # is fitted separately as a quaternion curve on the same parameter u.
+        D = [D_X, D_Y, D_Z]
         D_N = n_points
         profile["fit_prepare_data_s"] += time.perf_counter() - t0
 
@@ -284,6 +312,12 @@ class GlobalSplinePlanner:
             if not ctrl_raw or len(ctrl_raw[0]) == 0:
                 return None
 
+            t_orientation = time.perf_counter()
+            orientation_curve = _fit_kuka_orientation_curve(
+                fit_points, param, knot, calc_n_ctrl, degree
+            )
+            profile["fit_orientation_s"] += time.perf_counter() - t_orientation
+
             # 6. 转换回 Position 列表
             t0 = time.perf_counter()
             res_ctrl_points = []
@@ -293,9 +327,9 @@ class GlobalSplinePlanner:
                     x=ctrl_raw[0][i],
                     y=ctrl_raw[1][i],
                     z=ctrl_raw[2][i],
-                    a=ctrl_raw[3][i],
-                    b=ctrl_raw[4][i],
-                    c=ctrl_raw[5][i]
+                    a=fit_points[0].a,
+                    b=fit_points[0].b,
+                    c=fit_points[0].c
                 ))
             profile["fit_post_ctrl_s"] += time.perf_counter() - t0
 
@@ -321,5 +355,7 @@ class GlobalSplinePlanner:
             line=moves[0].line,
             raw="GLOBAL_BSPLINE_LIB",
             constraints=constraints,
-            original_moves=moves
+            original_moves=moves,
+            orientation_reference_quaternion=(orientation_curve[0] if orientation_curve else None),
+            orientation_control_vectors=(orientation_curve[1] if orientation_curve else None),
         )

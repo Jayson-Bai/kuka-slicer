@@ -136,7 +136,7 @@ def _check_path_contract(
         if flat is None or curved is None:
             errors.append(f"{key} 缺失")
             continue
-        if flat.shape != curved.shape:
+        if flat.shape[:2] != curved.shape[:2]:
             errors.append(f"{key} 形状不同")
             continue
         if not np.array_equal(np.isfinite(flat[..., 0]), np.isfinite(curved[..., 0])):

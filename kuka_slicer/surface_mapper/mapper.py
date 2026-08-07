@@ -1,4 +1,4 @@
-"""Pure Z-only mapping from a planar source NPZ to a graded surface."""
+"""Map planar source paths onto a graded surface with KUKA tool orientation."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import json
 import numpy as np
 
 from .contracts import SourceNPZ, SurfaceTarget, _PATH_KEY
+from .orientation import kuka_abc_for_surface
 from .progression import LayerProgression
 
 
@@ -34,22 +35,31 @@ class MappingResult:
 
 
 def map_source_job(source: SourceNPZ, target: SurfaceTarget, plan: SurfaceMappingPlan) -> MappingResult:
-    """Map all R/F/T path points in Z while preserving their logical key and order."""
+    """Map all R/F/T paths in Z and write the matching KUKA relative ABC."""
 
     _validate_domain(source, target)
     alpha_by_layer = {layer: plan.progression.alpha(layer) for layer in source.layer_indices}
     source_z_bounds = source.z_bounds_mm
     arrays = {key: value.copy() for key, value in source.arrays.items()}
-    for key, array in arrays.items():
+    for key, original in tuple(arrays.items()):
         match = _PATH_KEY.match(key)
         if not match:
             continue
+        array = _with_kuka_orientation_columns(original)
+        arrays[key] = array
         alpha = alpha_by_layer[int(match.group(1))]
         valid = np.isfinite(array[..., 0])
         if not np.any(valid):
             continue
-        mapped_height = target.surface.height(array[..., 0][valid], array[..., 1][valid])
+        x = array[..., 0][valid]
+        y = array[..., 1][valid]
+        mapped_height = target.surface.height(x, y)
         array[..., 2][valid] += alpha * mapped_height
+        dz_dx, dz_dy = _surface_gradient(target, x, y, alpha)
+        a, b, c = kuka_abc_for_surface(dz_dx, dz_dy)
+        array[..., 3][valid] = a
+        array[..., 4][valid] = b
+        array[..., 5][valid] = c
     mapped = SourceNPZ(arrays=arrays, meta=dict(source.meta), source_name=source.source_name)
     mapped_z_bounds = mapped.z_bounds_mm
     if mapped_z_bounds[0] < 0.0:
@@ -76,7 +86,15 @@ def map_source_job(source: SourceNPZ, target: SurfaceTarget, plan: SurfaceMappin
         "z_validation": "all mapped points must be greater than or equal to 0 mm",
         "xy": "preserved",
         "extrusion": "preserved_unrecalculated",
-        "orientation": "preserved_unrecalculated",
+        "orientation": {
+            "mode": "surface_normal_kuka_zyx",
+            "kuka_abc_order": "A=Z,B=Y,C=X",
+            "frame": "relative_to_calibrated_flat_printing_pose",
+            "tool_work_axis": "+X_TOOL",
+            "tool_work_axis_direction": "opposite_upward_surface_normal",
+            "roll_reference": "projected_workpiece_+Y_minimum_twist",
+            "flat_reference": "+X_TOOL=-Z_BASE,+Y_TOOL=+Y_BASE,+Z_TOOL=+X_BASE",
+        },
     }
     mapped = SourceNPZ(arrays=arrays, meta=meta, source_name=source.source_name)
     return MappingResult(
@@ -86,6 +104,27 @@ def map_source_job(source: SourceNPZ, target: SurfaceTarget, plan: SurfaceMappin
         mapped_z_bounds_mm=mapped_z_bounds,
         xy_bounds_mm=mapped.xy_bounds_mm,
     )
+
+
+def _with_kuka_orientation_columns(array: np.ndarray) -> np.ndarray:
+    """Preserve padding and XYZ while normalising mapped path arrays to XYZABC."""
+
+    if array.shape[-1] == 6:
+        return np.asarray(array, dtype=np.float64).copy()
+    expanded = np.full((*array.shape[:2], 6), np.nan, dtype=np.float64)
+    expanded[..., :3] = array
+    return expanded
+
+
+def _surface_gradient(
+    target: SurfaceTarget, x: np.ndarray, y: np.ndarray, alpha: float
+) -> tuple[np.ndarray, np.ndarray]:
+    surface = target.surface
+    x_phase = (2.0 * np.pi / surface.wavelength_x_mm) * x + surface.phase_x_rad
+    y_phase = (2.0 * np.pi / surface.wavelength_y_mm) * y + surface.phase_y_rad
+    dz_dx = alpha * surface.amplitude_mm * (2.0 * np.pi / surface.wavelength_x_mm) * np.cos(x_phase) * np.sin(y_phase)
+    dz_dy = alpha * surface.amplitude_mm * (2.0 * np.pi / surface.wavelength_y_mm) * np.sin(x_phase) * np.cos(y_phase)
+    return dz_dx, dz_dy
 
 
 def _validate_domain(source: SourceNPZ, target: SurfaceTarget) -> None:

@@ -57,7 +57,7 @@ def mapping_preview_payload(
                 "mean_length_ratio": compensation.mean_length_ratio,
                 "max_length_ratio": compensation.max_length_ratio,
             },
-            "orientation": "preserved_unrecalculated",
+            "orientation": mapped_result.source.meta["surface_mapping"]["orientation"],
         },
         "cross_section": _cross_section_payload(
             source, target, mapped_result.alpha_by_layer, section_y_mm=section_y_mm

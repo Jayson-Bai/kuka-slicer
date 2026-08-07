@@ -72,6 +72,18 @@ def test_mapper_changes_only_z_by_logical_layer_and_preserves_extrusion(tmp_path
     assert mapped.meta["surface_mapping"]["extrusion"] == "preserved_unrecalculated"
 
 
+def test_mapper_adds_relative_kuka_surface_normal_orientation(tmp_path):
+    source = _source(tmp_path)
+    source.arrays["layer_0001_R"][0, 0, :2] = [2.5, 5.0]
+
+    mapped = map_source_job(source, _target(), SurfaceMappingPlan(LayerProgression(0, 3))).source
+
+    assert mapped.arrays["layer_0001_R"].shape[-1] == 6
+    assert mapped.arrays["layer_0000_R"][0, 0, 3:] == pytest.approx([0.0, 0.0, 0.0])
+    assert np.linalg.norm(mapped.arrays["layer_0001_R"][0, 0, 3:]) > 1e-3
+    assert mapped.meta["surface_mapping"]["orientation"]["kuka_abc_order"] == "A=Z,B=Y,C=X"
+
+
 def test_mapper_rejects_negative_z_instead_of_silently_raising_the_path(tmp_path):
     source = _source(tmp_path)
     with pytest.raises(ValueError, match="negative Z"):
