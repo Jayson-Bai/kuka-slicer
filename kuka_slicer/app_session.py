@@ -12,10 +12,10 @@ import tempfile
 import time
 
 
-_TOOLS: dict[str, tuple[str, int, tuple[str, ...]]] = {
-    "ui": ("ui", 8765, ("--output-dir", "outputs")),
-    "surface-preview": ("surface-preview", 8766, ()),
-    "surface-map": ("surface-map", 8767, ()),
+_TOOLS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "ui": ("ui", ("--output-dir", "outputs")),
+    "surface-preview": ("surface-preview", ()),
+    "surface-map": ("surface-map", ()),
 }
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -36,7 +36,8 @@ def spawn_app_session(tool: str) -> subprocess.Popen[bytes]:
 def run_app_session(tool: str) -> int:
     """Run the server only while its dedicated browser app window is open."""
 
-    command, port, extra_args = _tool_spec(tool)
+    command, extra_args = _tool_spec(tool)
+    port = _find_available_port()
     server = subprocess.Popen(
         [sys.executable, "-m", "kuka_slicer", command, "--host", "127.0.0.1", "--port", str(port), *extra_args],
         cwd=_PROJECT_ROOT,
@@ -53,11 +54,19 @@ def run_app_session(tool: str) -> int:
             shutil.rmtree(profile_dir, ignore_errors=True)
 
 
-def _tool_spec(tool: str) -> tuple[str, int, tuple[str, ...]]:
+def _tool_spec(tool: str) -> tuple[str, tuple[str, ...]]:
     try:
         return _TOOLS[tool]
     except KeyError as exc:
         raise ValueError(f"unsupported local tool: {tool}") from exc
+
+
+def _find_available_port() -> int:
+    """Allocate a fresh loopback port for one browser-bound local session."""
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
 
 
 def _wait_for_port(port: int, server: subprocess.Popen[bytes], timeout_s: float = 15.0) -> None:
@@ -102,8 +111,8 @@ def _find_browser() -> Path:
         for root in (os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles"))
         if root
         for relative in (
-            Path("Microsoft/Edge/Application/msedge.exe"),
             Path("Google/Chrome/Application/chrome.exe"),
+            Path("Microsoft/Edge/Application/msedge.exe"),
         )
     )
     for candidate in candidates:

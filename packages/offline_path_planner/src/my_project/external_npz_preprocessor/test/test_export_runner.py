@@ -85,7 +85,7 @@ def test_convert_passes_curved_source_in_logical_layer_order_to_core(tmp_path, m
 
     import external_npz_preprocessor.export_runner as runner
     from external_npz_preprocessor.process_params import ProcessParams
-    from path_processing_core.types import GlobalCurveCommand
+    from path_processing_core.types import MoveCommand
 
     source = tmp_path / "curved_layers.npz"
     semantics = {
@@ -120,9 +120,13 @@ def test_convert_passes_curved_source_in_logical_layer_order_to_core(tmp_path, m
         calibration_path=calibration_path,
     )
 
-    curves = [command for command in captured["commands"] if isinstance(command, GlobalCurveCommand)]
-    assert [curve.layer for curve in curves] == [0, 1]
-    assert [curve.start_pos.z for curve in curves] == [1.4, 0.6]
+    moves = [
+        command
+        for command in captured["commands"]
+        if isinstance(command, MoveCommand) and command.type == "PRINT"
+    ]
+    assert [move.layer for move in moves] == [0, 1]
+    assert [move.start_pos.z for move in moves] == [1.4, 0.6]
 
 
 def test_exporter_uses_curve_start_acceleration_without_changing_default(tmp_path, monkeypatch):
@@ -278,8 +282,8 @@ def test_final_resin_layer_end_travel_is_last_runtime_trajectory_before_auto_abo
 
         assert travel_rows
         assert travel_rows[-1] == len(data["seq"]) - 1
-        assert np.isclose(data["x"][travel_rows[-1]], 30.0)
-        assert np.isclose(data["y"][travel_rows[-1]], 0.0)
+        assert np.isclose(data["x"][travel_rows[-1]], layer_end_travel.pos.x)
+        assert np.isclose(data["y"][travel_rows[-1]], layer_end_travel.pos.y)
         assert np.allclose(data["z"][travel_rows], 0.5)
         assert np.allclose(data["e"][travel_rows], 0.0)
 
@@ -364,8 +368,8 @@ def test_resin_layer_end_travel_is_exported_before_tool_change_safe_lift(tmp_pat
         assert travel_rows
         assert tool_change_rows
         assert max(travel_rows) < min(tool_change_rows)
-        assert np.isclose(data["x"][travel_rows[-1]], 30.0)
-        assert np.isclose(data["y"][travel_rows[-1]], 0.0)
+        assert np.isclose(data["x"][travel_rows[-1]], layer_end_travel.pos.x)
+        assert np.isclose(data["y"][travel_rows[-1]], layer_end_travel.pos.y)
         assert np.allclose(data["z"][travel_rows], 0.5)
         assert np.allclose(data["e"][travel_rows], 0.0)
         assert np.isclose(np.max(data["z"][tool_change_rows]), 20.5)
@@ -745,9 +749,9 @@ def test_fiber_cut_and_ui_actions_use_independent_absolute_e_boundaries(tmp_path
     assert np.allclose(data["e"][travel_idx], 0.0)
     assert np.isclose(data["z"][travel_idx[0]], cut_z + 20.0)
     assert np.isclose(data["z"][travel_idx[-1]], cut_z)
-    assert np.isclose(data["x"][travel_idx[0]], 10.0)
-    assert np.isclose(data["x"][travel_idx[-1]], 30.0)
-    assert np.allclose(data["y"][travel_idx], 0.0)
+    assert np.isclose(data["x"][travel_idx[0]], 20.0)
+    assert np.isclose(data["x"][travel_idx[-1]], 40.0)
+    assert np.allclose(data["y"][travel_idx], 10.0)
 
     second_cut_idx = event_types.index("cut", cut_idx + 1)
     second_pre_cut_reset_idx = second_cut_idx - 2
