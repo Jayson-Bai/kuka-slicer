@@ -91,6 +91,17 @@ def test_mapper_rejects_a_surface_exported_from_another_stl(tmp_path):
         )
 
 
+def test_mapper_accepts_verified_prusa_setup_paths_outside_the_part_domain(tmp_path):
+    source = _source(tmp_path)
+    source.arrays["layer_0000_T"] = np.asarray(
+        [[[-8.0, -8.0, 0.5], [-7.0, -8.0, 0.5]]], dtype=np.float64
+    )
+
+    result = map_source_job(source, _target(), SurfaceMappingPlan(LayerProgression(0, 1)))
+
+    assert result.source.arrays["layer_0000_T"][0, 0, 2] == pytest.approx(0.5)
+
+
 def test_smoothstep_progression_uses_logical_layer_index_not_z():
     progression = LayerProgression(4, 6, curve="smoothstep")
 

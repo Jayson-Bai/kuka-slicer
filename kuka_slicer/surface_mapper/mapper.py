@@ -120,15 +120,22 @@ def _resolve_offset(
 def _validate_domain(source: SourceNPZ, target: SurfaceTarget) -> None:
     x_min, y_min, x_max, y_max = source.xy_bounds_mm
     tolerance = 1e-6
+    source_model = source.meta.get("source_model")
+    source_hash = source_model.get("sha256") if isinstance(source_model, dict) else None
+    target_hash = target.source_sha256 or None
+    if source_hash and target_hash and source_hash != target_hash:
+        raise ValueError("source NPZ was sliced from a different STL than the target surface config")
+    # Native Prusa output can intentionally include a skirt, brim, or startup
+    # path outside the part projection.  A matching source-model hash is a
+    # stronger identity check than those process-path bounds, so keep those
+    # paths valid and map them with the same analytical H(x, y) field.
+    if source_hash and target_hash and source_hash == target_hash:
+        return
     if x_min < -tolerance or y_min < -tolerance or x_max > target.width_mm + tolerance or y_max > target.height_mm + tolerance:
         raise ValueError(
             "source NPZ XY bounds do not fit inside the target surface STL projection "
             f"(source={source.xy_bounds_mm}, target=(0, 0, {target.width_mm}, {target.height_mm}))"
         )
-    source_model = source.meta.get("source_model")
-    if isinstance(source_model, dict) and source_model.get("sha256") and target.source_sha256:
-        if source_model["sha256"] != target.source_sha256:
-            raise ValueError("source NPZ was sliced from a different STL than the target surface config")
 
 
 def _target_digest(target: SurfaceTarget) -> str:
