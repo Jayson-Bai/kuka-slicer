@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import numpy as np
 
+from ..extrusion_compensator import compensate_extrusion
 from .contracts import SourceNPZ, SurfaceTarget, load_surface_target, read_source_npz
 from .mapper import SurfaceMappingPlan, map_source_job
 from .progression import LayerProgression
@@ -29,7 +30,8 @@ def mapping_preview_payload(
 ) -> dict[str, object]:
     """Return lightweight mapping diagnostics for the independent UI."""
 
-    result = map_source_job(source, target, plan)
+    mapped_result = map_source_job(source, target, plan)
+    compensation = compensate_extrusion(source, mapped_result.source)
     return {
         "source": _source_summary(source),
         "target": {
@@ -42,17 +44,23 @@ def mapping_preview_payload(
             "surface_start_layer": plan.progression.surface_start_layer,
             "surface_return_layer": plan.progression.surface_return_layer,
             "peak_layers": plan.progression.peak_layers,
-            "alpha_by_layer": result.alpha_by_layer,
+            "alpha_by_layer": mapped_result.alpha_by_layer,
         },
         "result": {
-            "source_z_bounds_mm": result.source_z_bounds_mm,
-            "mapped_z_bounds_mm": result.mapped_z_bounds_mm,
-            "xy_bounds_mm": result.xy_bounds_mm,
-            "extrusion": "preserved_unrecalculated",
+            "source_z_bounds_mm": mapped_result.source_z_bounds_mm,
+            "mapped_z_bounds_mm": mapped_result.mapped_z_bounds_mm,
+            "xy_bounds_mm": mapped_result.xy_bounds_mm,
+            "extrusion": {
+                "status": "arc_length_ratio_compensated",
+                "replaced_arrays": list(compensation.replaced_arrays),
+                "positive_segment_count": compensation.positive_segment_count,
+                "mean_length_ratio": compensation.mean_length_ratio,
+                "max_length_ratio": compensation.max_length_ratio,
+            },
             "orientation": "preserved_unrecalculated",
         },
         "cross_section": _cross_section_payload(
-            source, target, result.alpha_by_layer, section_y_mm=section_y_mm
+            source, target, mapped_result.alpha_by_layer, section_y_mm=section_y_mm
         ),
     }
 
@@ -131,7 +139,8 @@ class SurfaceMapperHandler(BaseHTTPRequestHandler):
                 params = parse_qs(parsed.query)
                 source, target = self._session_values(params)
                 plan = _plan_from_params(params, source)
-                content = map_source_job(source, target, plan).source.to_bytes()
+                mapped = map_source_job(source, target, plan).source
+                content = compensate_extrusion(source, mapped).source.to_bytes()
                 self._send_bytes(content, "application/octet-stream", "curved.npz")
                 return
             self._send_json({"ok": False, "error": "not found"}, status=HTTPStatus.NOT_FOUND)
@@ -366,6 +375,7 @@ def surface_mapper_html() -> str:
           <div class="card"><span>映射后 Z 范围</span><strong id="mappedZ">—</strong></div>
           <div class="card"><span>Z 安全检查</span><strong id="zSafety">—</strong></div>
           <div class="card"><span>路径点数量</span><strong id="pointCount">—</strong></div>
+          <div class="card"><span>E 弧长补偿</span><strong id="extrusionInfo">—</strong></div>
         </div>
         <h3>当前层的曲面完成度</h3>
         <div class="layerReadout"><span id="layerText">导入路径后可检查每一逻辑层。</span><div class="bar" aria-hidden="true"><i id="alphaBar"></i></div></div>
@@ -373,7 +383,7 @@ def surface_mapper_html() -> str:
         <canvas class="crossSection" id="sectionCanvas" aria-label="映射后零件的 XZ 截面，各逻辑层以单独曲线显示"></canvas>
         <p class="sectionMeta" id="sectionMeta">导入文件后显示截面。</p>
         <h3>保持不变的内容</h3>
-        <p class="meta">X/Y、R/F/T 分组、逻辑层号、路径与点的顺序、已有 E 数值均被保留。本版本不重算 E，也不生成 ABC 姿态。</p>
+        <p class="meta">X/Y、R/F/T 分组、逻辑层号、路径与点的顺序均保持不变。已有 E 会按每段曲面三维弧长直接替换为新累计值；没有 E 的路径仍不生成 E。暂不生成 ABC 姿态。</p>
       </section>
     </section>
   </main>
@@ -406,12 +416,12 @@ def surface_mapper_html() -> str:
       ctx.fillStyle = '#53677f'; ctx.fillText('Z (mm)', 5, 13); ctx.fillText('X (mm)', width - pad.right - 32, height - 10);
       section.layers.forEach((layer, index) => { const hue = 202 - (index / Math.max(section.layers.length - 1, 1)) * 112; ctx.strokeStyle = `hsl(${hue}, 72%, 42%)`; ctx.lineWidth = 1.65; ctx.beginPath(); layer.z_mm.forEach((z, pointIndex) => { const x = sx(xValues[pointIndex]); const y = sy(z); if (pointIndex === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y); }); ctx.stroke(); const endZ = layer.z_mm[layer.z_mm.length - 1]; ctx.fillStyle = `hsl(${hue}, 72%, 34%)`; ctx.fillText(`L${layer.logical_layer} · ${(layer.alpha * 100).toFixed(0)}%`, width - pad.right + 5, sy(endZ) + 3); });
     }
-    async function refreshPreview() { if (!ready()) return; setStatus('正在计算映射预览…'); try { const response = await fetch(`/api/preview?${params().toString()}`); const result = await response.json(); if (!response.ok || !result.ok) throw new Error(result.error || '无法预览映射'); preview = result; if (ids.sectionY.value === '') ids.sectionY.value = result.cross_section.section_y_mm.toFixed(3); document.getElementById('flatZ').textContent = fmtRange(result.result.source_z_bounds_mm); document.getElementById('mappedZ').textContent = fmtRange(result.result.mapped_z_bounds_mm); document.getElementById('zSafety').textContent = `通过（最低 ${result.result.mapped_z_bounds_mm[0].toFixed(3)} mm）`; document.getElementById('pointCount').textContent = result.source.point_count.toLocaleString(); document.getElementById('sectionMeta').textContent = `截面平面：Y = ${result.cross_section.section_y_mm.toFixed(3)} mm。每条曲线代表一个逻辑层的映射后沉积面。`; updateLayerReadout(); drawCrossSection(result.cross_section); setStatus('预览已更新：所有映射 Z 均不小于 0 mm。'); } catch (error) { setStatus(error.message, true); } }
+    async function refreshPreview() { if (!ready()) return; setStatus('正在计算映射预览…'); try { const response = await fetch(`/api/preview?${params().toString()}`); const result = await response.json(); if (!response.ok || !result.ok) throw new Error(result.error || '无法预览映射'); preview = result; if (ids.sectionY.value === '') ids.sectionY.value = result.cross_section.section_y_mm.toFixed(3); document.getElementById('flatZ').textContent = fmtRange(result.result.source_z_bounds_mm); document.getElementById('mappedZ').textContent = fmtRange(result.result.mapped_z_bounds_mm); document.getElementById('zSafety').textContent = `通过（最低 ${result.result.mapped_z_bounds_mm[0].toFixed(3)} mm）`; document.getElementById('pointCount').textContent = result.source.point_count.toLocaleString(); const extrusion = result.result.extrusion; document.getElementById('extrusionInfo').textContent = extrusion.replaced_arrays.length ? `将重算 ${extrusion.replaced_arrays.length} 个 E 数组` : '没有可重算的 E 数组'; document.getElementById('sectionMeta').textContent = `截面平面：Y = ${result.cross_section.section_y_mm.toFixed(3)} mm。每条曲线代表一个逻辑层的映射后沉积面。`; updateLayerReadout(); drawCrossSection(result.cross_section); setStatus('预览已更新：所有映射 Z 均不小于 0 mm；导出时将替换已有 E 数组。'); } catch (error) { setStatus(error.message, true); } }
     async function upload(file, endpoint, name) { const response = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', 'X-Source-File-Name': encodeURIComponent(file.name) }, body: file }); const result = await response.json(); if (!response.ok || !result.ok) throw new Error(result.error || '导入失败'); return result; }
     document.getElementById('importSource').addEventListener('click', async () => { const file = sourceFile.files[0]; if (!file) return setStatus('请选择 flat.npz。', true); setStatus('正在读取平面路径…'); try { const result = await upload(file, '/api/source-npz'); sourceId.value = result.source_id; const layers = result.source.layer_indices; ids.start.value = layers[0]; ids.start.min = layers[0]; ids.start.max = Math.floor(layers[layers.length - 1] / 2); ids.layer.min = layers[0]; ids.layer.max = layers[layers.length - 1]; ids.layer.value = layers[0]; sourceMeta.textContent = `${result.source.file_name}：${result.source.layer_count} 个逻辑层，${result.source.path_count.toLocaleString()} 条路径，${result.source.point_count.toLocaleString()} 个点。`; ready(); await refreshPreview(); } catch (error) { setStatus(error.message, true); } });
     document.getElementById('importTarget').addEventListener('click', async () => { const file = targetFile.files[0]; if (!file) return setStatus('请选择 graded_surface_v1.json。', true); setStatus('正在读取目标曲面…'); try { const result = await upload(file, '/api/surface-config'); targetId.value = result.target_id; ids.sectionY.max = result.target.height_mm; targetMeta.textContent = `${result.target.file_name}：XY ${result.target.width_mm.toFixed(3)} × ${result.target.height_mm.toFixed(3)} mm。`; ready(); await refreshPreview(); } catch (error) { setStatus(error.message, true); } });
     [ids.start, ids.sectionY].forEach((input) => input.addEventListener('input', refreshPreview)); ids.layer.addEventListener('input', updateLayerReadout); window.addEventListener('resize', () => { if (preview) drawCrossSection(preview.cross_section); });
-    exportButton.addEventListener('click', async () => { if (!ready()) return; setStatus('正在生成 curved.npz…'); try { const response = await fetch(`/api/map?${params().toString()}`, { method: 'POST' }); if (!response.ok) { const result = await response.json(); throw new Error(result.error || '导出失败'); } const blob = await response.blob(); const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = 'curved.npz'; link.click(); URL.revokeObjectURL(link.href); setStatus('已导出 curved.npz，可作为 Core 前的外部源路径输入。'); } catch (error) { setStatus(error.message, true); } });
+    exportButton.addEventListener('click', async () => { if (!ready()) return; setStatus('正在生成 curved.npz 并重算已有 E…'); try { const response = await fetch(`/api/map?${params().toString()}`, { method: 'POST' }); if (!response.ok) { const result = await response.json(); throw new Error(result.error || '导出失败'); } const blob = await response.blob(); const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = 'curved.npz'; link.click(); URL.revokeObjectURL(link.href); setStatus('已导出 curved.npz：已有 E 数组已按曲面弧长重算，可作为 Core 前的外部源路径输入。'); } catch (error) { setStatus(error.message, true); } });
   </script>
 </body>
 </html>'''

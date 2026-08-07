@@ -117,7 +117,7 @@ def test_mapper_preview_and_web_shell_expose_the_separate_mapping_controls(tmp_p
     payload = mapping_preview_payload(source, _target(), SurfaceMappingPlan(LayerProgression(0, 3)))
 
     assert payload["plan"]["alpha_by_layer"] == {0: 0.0, 1: 1.0, 2: 1.0, 3: 0.0}
-    assert payload["result"]["extrusion"] == "preserved_unrecalculated"
+    assert payload["result"]["extrusion"]["status"] == "arc_length_ratio_compensated"
     html = surface_mapper_html()
     assert 'id="sourceFile"' in html
     assert 'id="targetFile"' in html
@@ -127,6 +127,8 @@ def test_mapper_preview_and_web_shell_expose_the_separate_mapping_controls(tmp_p
     assert "Z 安全抬升" not in html
     assert 'id="sectionY"' in html
     assert 'id="sectionCanvas"' in html
+    assert 'id="extrusionInfo"' in html
+    assert "本版本不重算 E" not in html
     assert "/api/map?${params().toString()}" in html
 
 
@@ -188,7 +190,11 @@ def test_mapper_http_api_imports_previews_and_exports_without_writing_server_fil
 
     assert preview["ok"] is True
     assert preview["plan"]["alpha_by_layer"] == {"0": 0.0, "1": 1.0, "2": 1.0, "3": 0.0}
-    assert read_source_npz(exported).meta["surface_mapping"]["format"] == "surface_mapping_v1"
+    exported_source = read_source_npz(exported)
+    assert exported_source.meta["surface_mapping"]["format"] == "surface_mapping_v1"
+    assert exported_source.meta["surface_mapping"]["extrusion"] == "arc_length_ratio_compensated"
+    assert exported_source.meta["extrusion_compensation"]["replaced_arrays"] == ["layer_0001_R_E"]
+    assert exported_source.arrays["layer_0001_R_E"][0, 1] > source.arrays["layer_0001_R_E"][0, 1]
 
 
 def _post(url: str, data: bytes) -> dict[str, object]:

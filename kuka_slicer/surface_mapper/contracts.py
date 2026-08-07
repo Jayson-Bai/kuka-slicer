@@ -146,6 +146,7 @@ def read_source_npz(data: bytes | str, *, source_name: str = "flat.npz") -> Sour
             _validate_extrusion_array(key, array)
         else:
             raise ValueError(f"source NPZ contains unsupported array {key}")
+    _validate_extrusion_ownership(arrays)
     return source
 
 
@@ -184,3 +185,20 @@ def _validate_extrusion_array(key: str, array: np.ndarray) -> None:
         raise ValueError(f"{key} must have shape (path, point) and numeric dtype")
     if not np.all(np.isnan(array) | np.isfinite(array)):
         raise ValueError(f"{key} contains invalid extrusion values")
+
+
+def _validate_extrusion_ownership(arrays: Mapping[str, np.ndarray]) -> None:
+    """Ensure every optional E grid exactly follows its material-path grid."""
+
+    for key, extrusion in arrays.items():
+        match = _E_KEY.match(key)
+        if not match:
+            continue
+        path_key = f"layer_{match.group(1)}_{match.group(2)}"
+        path = arrays.get(path_key)
+        if path is None:
+            raise ValueError(f"{key} requires matching path array {path_key}")
+        if extrusion.shape != path.shape[:2]:
+            raise ValueError(f"{key} shape must match {path_key} path and point dimensions")
+        if not np.array_equal(np.isfinite(extrusion), np.isfinite(path[..., 0])):
+            raise ValueError(f"{key} finite values must match {path_key} NaN padding")
