@@ -332,6 +332,10 @@ def _check_sampling_density(
     max_dz = 0.0
     segment_count = 0
     for key in curved_source.path_keys:
+        match = _PATH_KEY.match(key)
+        assert match is not None
+        if match.group(2) == "T":
+            continue
         array = curved_source.arrays[key]
         for path in array:
             count = int(np.isfinite(path[:, 0]).sum())

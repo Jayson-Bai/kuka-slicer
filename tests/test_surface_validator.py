@@ -45,7 +45,7 @@ def _flat_source(tmp_path, *, include_travel: bool = False):
             )
         )
     travel_paths = [
-        TravelPaths(1, [np.asarray([[5.0, 5.0, 1.0], [6.0, 5.0, 1.0]], dtype=np.float64)])
+        TravelPaths(1, [np.asarray([[5.0, 5.0, 1.0], [120.0, 5.0, 1.0]], dtype=np.float64)])
     ] if include_travel else []
     write_external_source_npz(
         ExternalSourceJob(
@@ -88,6 +88,7 @@ def test_validator_rejects_changed_xy_and_reports_t_risk(tmp_path):
     report = validate_surface_job(flat, curved, _target())
 
     assert _check(report, "路径契约与 Z 安全").status == "fail"
+    assert _check(report, "坡度、dz 与采样密度").status == "pass"
     assert _check(report, "T 空走风险").status == "warning"
     assert report.status == "fail"
 
