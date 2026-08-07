@@ -356,9 +356,10 @@ input for the existing Core preprocessor.
 python -m kuka_slicer surface-map
 ```
 
-Open `http://127.0.0.1:8767`. The page configures the start/end logical layer,
-linear or smoothstep progression, and automatic or manual Z safety offset. E
-recalculation and ABC orientation generation are intentionally deferred.
+Open `http://127.0.0.1:8767`. The page configures the surface start/completion
+layers and linear or smoothstep progression, then rejects any mapped result
+containing negative Z. E recalculation and ABC orientation generation are
+intentionally deferred.
 
 The UI groups adjustable inputs into:
 

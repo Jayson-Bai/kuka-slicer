@@ -24,7 +24,7 @@ from kuka_slicer.surface_mapper.server import (
 )
 
 
-def _target(*, phase_x_rad: float = 0.0, sha256: str = "same-model"):
+def _target(*, amplitude_mm: float = 1.0, phase_x_rad: float = 0.0, sha256: str = "same-model"):
     return load_surface_target(
         {
             "format": "graded_surface_v1",
@@ -33,7 +33,7 @@ def _target(*, phase_x_rad: float = 0.0, sha256: str = "same-model"):
             "domain": {"source": {"file_name": "honeycomb.stl", "sha256": sha256, "xy_bounds_mm": [0, 0, 10, 10]}},
             "surface": {
                 "type": "double_sine_product",
-                "amplitude_mm": 1.0,
+                "amplitude_mm": amplitude_mm,
                 "wavelength_x_mm": 20.0,
                 "wavelength_y_mm": 20.0,
                 "phase_x_rad": phase_x_rad,
@@ -70,16 +70,14 @@ def test_mapper_changes_only_z_by_logical_layer_and_preserves_extrusion(tmp_path
     assert mapped.meta["surface_mapping"]["extrusion"] == "preserved_unrecalculated"
 
 
-def test_mapper_auto_offset_keeps_mapped_path_above_source_lowest_z(tmp_path):
+def test_mapper_rejects_negative_z_instead_of_silently_raising_the_path(tmp_path):
     source = _source(tmp_path)
-    result = map_source_job(
-        source,
-        _target(phase_x_rad=np.pi),
-        SurfaceMappingPlan(LayerProgression(0, 1, curve="linear")),
-    )
-
-    assert result.applied_z_offset_mm == pytest.approx(0.5)
-    assert result.mapped_z_bounds_mm[0] == pytest.approx(source.z_bounds_mm[0])
+    with pytest.raises(ValueError, match="negative Z"):
+        map_source_job(
+            source,
+            _target(amplitude_mm=2.0, phase_x_rad=np.pi),
+            SurfaceMappingPlan(LayerProgression(0, 1, curve="linear")),
+        )
 
 
 def test_mapper_rejects_a_surface_exported_from_another_stl(tmp_path):
@@ -121,6 +119,9 @@ def test_mapper_preview_and_web_shell_expose_the_separate_mapping_controls(tmp_p
     assert 'id="sourceFile"' in html
     assert 'id="targetFile"' in html
     assert 'id="startLayer"' in html
+    assert "曲面起始层" in html
+    assert "曲面完成层" in html
+    assert "Z 安全抬升" not in html
     assert "/api/map?${params().toString()}" in html
 
 
@@ -156,7 +157,6 @@ def test_mapper_http_api_imports_previews_and_exports_without_writing_server_fil
                 "start_logical_layer": 0,
                 "end_logical_layer": 1,
                 "curve": "smoothstep",
-                "offset_mode": "auto",
             }
         )
         with urlopen(base + "/api/preview?" + params) as response:

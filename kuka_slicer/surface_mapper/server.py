@@ -35,8 +35,6 @@ def mapping_preview_payload(source: SourceNPZ, target: SurfaceTarget, plan: Surf
             "start_logical_layer": plan.progression.start_logical_layer,
             "end_logical_layer": plan.progression.end_logical_layer,
             "curve": plan.progression.curve,
-            "offset_mode": plan.offset_mode,
-            "applied_z_offset_mm": result.applied_z_offset_mm,
             "alpha_by_layer": result.alpha_by_layer,
         },
         "result": {
@@ -190,12 +188,8 @@ def _plan_from_params(params: dict[str, list[str]], source: SourceNPZ) -> Surfac
     start = _integer(params, "start_logical_layer", layers[0])
     end = _integer(params, "end_logical_layer", layers[-1])
     curve = params.get("curve", ["smoothstep"])[0]
-    offset_mode = params.get("offset_mode", ["auto"])[0]
-    z_offset = _number(params, "z_offset_mm", 0.0)
     return SurfaceMappingPlan(
         progression=LayerProgression(start, end, curve=curve),  # type: ignore[arg-type]
-        offset_mode=offset_mode,  # type: ignore[arg-type]
-        z_offset_mm=z_offset,
     )
 
 
@@ -204,16 +198,6 @@ def _integer(params: dict[str, list[str]], name: str, default: int) -> int:
         return int(params.get(name, [str(default)])[0])
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{name} must be an integer") from exc
-
-
-def _number(params: dict[str, list[str]], name: str, default: float) -> float:
-    try:
-        value = float(params.get(name, [str(default)])[0])
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} must be a number") from exc
-    if not np.isfinite(value):
-        raise ValueError(f"{name} must be finite")
-    return value
 
 
 def surface_mapper_html() -> str:
@@ -268,11 +252,9 @@ def surface_mapper_html() -> str:
         <div class="divider"></div>
         <fieldset id="planFields" disabled>
           <h2>映射策略</h2>
-          <div class="field"><label for="startLayer">起始逻辑层</label><input id="startLayer" type="number" step="1"></div>
-          <div class="field"><label for="endLayer">完成逻辑层</label><input id="endLayer" type="number" step="1"></div>
+          <div class="field"><label for="startLayer">曲面起始层</label><input id="startLayer" type="number" step="1"></div>
+          <div class="field"><label for="endLayer">曲面完成层</label><input id="endLayer" type="number" step="1"></div>
           <div class="field"><label for="curve">渐变曲线</label><select id="curve"><option value="smoothstep">平滑渐变（推荐）</option><option value="linear">线性渐变</option></select></div>
-          <div class="field"><label for="offsetMode">Z 安全抬升</label><select id="offsetMode"><option value="auto">自动：不低于平面路径最低 Z</option><option value="manual">手动指定</option></select></div>
-          <div class="field"><label for="zOffset">手动抬升量（mm）</label><input id="zOffset" type="number" step="0.01" value="0" disabled></div>
           <div class="field"><label for="layerFocus">检查逻辑层</label><input id="layerFocus" type="range" step="1"></div>
         </fieldset>
         <button type="button" id="exportMapped" disabled>映射并导出 curved.npz</button>
@@ -284,7 +266,7 @@ def surface_mapper_html() -> str:
         <div class="cards" style="margin-top: 12px">
           <div class="card"><span>平面路径 Z 范围</span><strong id="flatZ">—</strong></div>
           <div class="card"><span>映射后 Z 范围</span><strong id="mappedZ">—</strong></div>
-          <div class="card"><span>自动／实际 Z 抬升</span><strong id="zOffsetReadout">—</strong></div>
+          <div class="card"><span>Z 安全检查</span><strong id="zSafety">—</strong></div>
           <div class="card"><span>路径点数量</span><strong id="pointCount">—</strong></div>
         </div>
         <h3>当前层的曲面完成度</h3>
@@ -303,18 +285,17 @@ def surface_mapper_html() -> str:
     const planFields = document.getElementById('planFields');
     const exportButton = document.getElementById('exportMapped');
     const sourceId = { value: null }; const targetId = { value: null }; let preview = null;
-    const ids = { start: document.getElementById('startLayer'), end: document.getElementById('endLayer'), curve: document.getElementById('curve'), offsetMode: document.getElementById('offsetMode'), zOffset: document.getElementById('zOffset'), layer: document.getElementById('layerFocus') };
+    const ids = { start: document.getElementById('startLayer'), end: document.getElementById('endLayer'), curve: document.getElementById('curve'), layer: document.getElementById('layerFocus') };
     function setStatus(message, error = false) { statusEl.className = error ? 'status error' : 'status'; statusEl.textContent = message; }
     function fmtRange(values) { return `${values[0].toFixed(3)} ～ ${values[1].toFixed(3)} mm`; }
-    function params() { const query = new URLSearchParams({ source_id: sourceId.value || '', target_id: targetId.value || '', start_logical_layer: ids.start.value, end_logical_layer: ids.end.value, curve: ids.curve.value, offset_mode: ids.offsetMode.value, z_offset_mm: ids.zOffset.value }); return query; }
+    function params() { const query = new URLSearchParams({ source_id: sourceId.value || '', target_id: targetId.value || '', start_logical_layer: ids.start.value, end_logical_layer: ids.end.value, curve: ids.curve.value }); return query; }
     function ready() { const enabled = Boolean(sourceId.value && targetId.value); planFields.disabled = !enabled; exportButton.disabled = !enabled; return enabled; }
     function updateLayerReadout() { if (!preview) return; const layer = Number(ids.layer.value); const alpha = preview.plan.alpha_by_layer[String(layer)]; document.getElementById('layerText').textContent = `逻辑层 ${layer}：sₖ = ${(alpha * 100).toFixed(1)}%，仅该比例的目标曲面 H(X,Y) 会加到本层路径 Z。`; document.getElementById('alphaBar').style.width = `${alpha * 100}%`; }
-    async function refreshPreview() { if (!ready()) return; setStatus('正在计算映射预览…'); try { const response = await fetch(`/api/preview?${params().toString()}`); const result = await response.json(); if (!response.ok || !result.ok) throw new Error(result.error || '无法预览映射'); preview = result; document.getElementById('flatZ').textContent = fmtRange(result.result.source_z_bounds_mm); document.getElementById('mappedZ').textContent = fmtRange(result.result.mapped_z_bounds_mm); document.getElementById('zOffsetReadout').textContent = `${result.plan.applied_z_offset_mm.toFixed(3)} mm`; document.getElementById('pointCount').textContent = result.source.point_count.toLocaleString(); updateLayerReadout(); setStatus('预览已更新：逻辑层号和路径顺序将保持不变。'); } catch (error) { setStatus(error.message, true); } }
+    async function refreshPreview() { if (!ready()) return; setStatus('正在计算映射预览…'); try { const response = await fetch(`/api/preview?${params().toString()}`); const result = await response.json(); if (!response.ok || !result.ok) throw new Error(result.error || '无法预览映射'); preview = result; document.getElementById('flatZ').textContent = fmtRange(result.result.source_z_bounds_mm); document.getElementById('mappedZ').textContent = fmtRange(result.result.mapped_z_bounds_mm); document.getElementById('zSafety').textContent = `通过（最低 ${result.result.mapped_z_bounds_mm[0].toFixed(3)} mm）`; document.getElementById('pointCount').textContent = result.source.point_count.toLocaleString(); updateLayerReadout(); setStatus('预览已更新：所有映射 Z 均不小于 0 mm。'); } catch (error) { setStatus(error.message, true); } }
     async function upload(file, endpoint, name) { const response = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', 'X-Source-File-Name': encodeURIComponent(file.name) }, body: file }); const result = await response.json(); if (!response.ok || !result.ok) throw new Error(result.error || '导入失败'); return result; }
     document.getElementById('importSource').addEventListener('click', async () => { const file = sourceFile.files[0]; if (!file) return setStatus('请选择 flat.npz。', true); setStatus('正在读取平面路径…'); try { const result = await upload(file, '/api/source-npz'); sourceId.value = result.source_id; const layers = result.source.layer_indices; ids.start.value = layers[0]; ids.end.value = layers[layers.length - 1]; ids.layer.min = layers[0]; ids.layer.max = layers[layers.length - 1]; ids.layer.value = layers[0]; sourceMeta.textContent = `${result.source.file_name}：${result.source.layer_count} 个逻辑层，${result.source.path_count.toLocaleString()} 条路径，${result.source.point_count.toLocaleString()} 个点。`; ready(); await refreshPreview(); } catch (error) { setStatus(error.message, true); } });
     document.getElementById('importTarget').addEventListener('click', async () => { const file = targetFile.files[0]; if (!file) return setStatus('请选择 graded_surface_v1.json。', true); setStatus('正在读取目标曲面…'); try { const result = await upload(file, '/api/surface-config'); targetId.value = result.target_id; targetMeta.textContent = `${result.target.file_name}：XY ${result.target.width_mm.toFixed(3)} × ${result.target.height_mm.toFixed(3)} mm。`; ready(); await refreshPreview(); } catch (error) { setStatus(error.message, true); } });
-    ids.offsetMode.addEventListener('change', () => { ids.zOffset.disabled = ids.offsetMode.value !== 'manual'; refreshPreview(); });
-    [ids.start, ids.end, ids.curve, ids.zOffset].forEach((input) => input.addEventListener('input', refreshPreview)); ids.layer.addEventListener('input', updateLayerReadout);
+    [ids.start, ids.end, ids.curve].forEach((input) => input.addEventListener('input', refreshPreview)); ids.layer.addEventListener('input', updateLayerReadout);
     exportButton.addEventListener('click', async () => { if (!ready()) return; setStatus('正在生成 curved.npz…'); try { const response = await fetch(`/api/map?${params().toString()}`, { method: 'POST' }); if (!response.ok) { const result = await response.json(); throw new Error(result.error || '导出失败'); } const blob = await response.blob(); const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = 'curved.npz'; link.click(); URL.revokeObjectURL(link.href); setStatus('已导出 curved.npz，可作为 Core 前的外部源路径输入。'); } catch (error) { setStatus(error.message, true); } });
   </script>
 </body>

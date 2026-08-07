@@ -12,7 +12,7 @@
 只有逐点 Z 会按照映射器配置的逻辑层完成度改变：
 
 ```text
-z_mapped = z_flat + alpha(logical_layer) * H(x, y) + z_offset
+z_mapped = z_flat + alpha(logical_layer) * H(x, y)
 ```
 
 启动本地界面：
@@ -21,7 +21,7 @@ z_mapped = z_flat + alpha(logical_layer) * H(x, y) + z_offset
 python -m kuka_slicer surface-map
 ```
 
-默认地址为 <http://127.0.0.1:8767>。映射策略（起止逻辑层、线性/平滑渐变、
-自动或手动 Z 抬升）只在本包中配置，不会写入目标曲面 JSON。
+默认地址为 <http://127.0.0.1:8767>。映射策略（曲面起始/完成层、线性/平滑渐变）
+只在本包中配置，不会写入目标曲面 JSON。预览与导出前均会拒绝包含负 Z 的结果。
 
 本版本刻意不做 E 重算、姿态 ABC 生成或 Core 内部轨迹修改。
