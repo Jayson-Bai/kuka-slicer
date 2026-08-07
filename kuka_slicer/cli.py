@@ -28,6 +28,8 @@ from .slicer import (
 from .stl_io import load_stl
 from .surface_preview import run_surface_preview_server
 from .surface_mapper import run_surface_mapper_server
+from .surface_mapper.contracts import load_surface_target, read_source_npz
+from .surface_validator import ValidatorLimits, validate_surface_job, write_validation_reports
 from .ui_server import run_ui_server
 
 
@@ -212,6 +214,19 @@ def main(argv: list[str] | None = None) -> int:
     surface_mapper_parser.add_argument("--host", default="127.0.0.1")
     surface_mapper_parser.add_argument("--port", type=int, default=8767)
 
+    surface_validator_parser = subparsers.add_parser(
+        "surface-validate",
+        help="validate flat/curved surface paths without changing either NPZ",
+    )
+    surface_validator_parser.add_argument("flat_npz", type=Path)
+    surface_validator_parser.add_argument("curved_npz", type=Path)
+    surface_validator_parser.add_argument("surface_json", type=Path)
+    surface_validator_parser.add_argument("report_json", type=Path)
+    surface_validator_parser.add_argument("--html", type=Path, help="optional self-contained HTML report")
+    surface_validator_parser.add_argument("--max-slope", type=float, default=0.5)
+    surface_validator_parser.add_argument("--max-layer-gap-ratio", type=float, default=1.5)
+    surface_validator_parser.add_argument("--max-segment-fraction", type=float, default=0.125)
+
     args = parser.parse_args(argv)
     if args.command == "slice":
         return _slice_command(args)
@@ -226,6 +241,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "surface-map":
         run_surface_mapper_server(args.host, args.port)
         return 0
+    if args.command == "surface-validate":
+        return _surface_validate_command(args)
     parser.error(f"unknown command: {args.command}")
     return 2
 
@@ -346,6 +363,27 @@ def _template_command(args: argparse.Namespace) -> int:
     write_external_source_npz(job, args.output_npz)
     print(f"wrote template {args.output_npz}")
     return 0
+
+
+def _surface_validate_command(args: argparse.Namespace) -> int:
+    flat_source = read_source_npz(args.flat_npz.read_bytes(), source_name=args.flat_npz.name)
+    curved_source = read_source_npz(args.curved_npz.read_bytes(), source_name=args.curved_npz.name)
+    target = load_surface_target(args.surface_json.read_bytes())
+    report = validate_surface_job(
+        flat_source,
+        curved_source,
+        target,
+        ValidatorLimits(
+            max_slope=args.max_slope,
+            max_layer_gap_ratio=args.max_layer_gap_ratio,
+            max_segment_fraction_of_wavelength=args.max_segment_fraction,
+        ),
+    )
+    write_validation_reports(report, args.report_json, args.html)
+    print(f"wrote {args.report_json}: {report.status}")
+    if args.html is not None:
+        print(f"wrote {args.html}")
+    return 1 if report.status == "fail" else 0
 
 
 def _path(points: list[list[float]]) -> np.ndarray:
