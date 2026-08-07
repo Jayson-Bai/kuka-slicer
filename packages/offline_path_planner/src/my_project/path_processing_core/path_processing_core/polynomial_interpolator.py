@@ -16,11 +16,12 @@ import time
 from .types import Position, GlobalCurveCommand
 from .kuka_orientation import (
     kuka_abc_to_quaternion,
-    quaternion_from_rotation_vector,
-    quaternion_multiply,
     quaternion_slerp,
     quaternion_to_kuka_abc,
 )
+
+
+_MAX_ORIENTATION_STEP_DEG = 0.1
 
 
 # -------------------------- 基础工具 --------------------------
@@ -138,15 +139,21 @@ def _eval_bspline_point(
     return Position(x=x, y=y, z=z, a=a, b=b, c=c), span
 
 
-def _eval_bspline_vector(
-    u: float, degree: int, knots: List[float], controls, span: int
-) -> tuple[float, float, float]:
-    coeffs = _basis_funs(span, u, degree, knots)
-    start = span - degree
-    return tuple(
-        sum(coeff * controls[start + offset][axis] for offset, coeff in enumerate(coeffs))
-        for axis in range(3)
-    )
+def _sample_kuka_orientation(
+    normalized_u: float, parameters, quaternions
+):
+    """Evaluate local KUKA quaternion SLERP on the shared position parameter."""
+
+    if normalized_u <= parameters[0]:
+        return quaternions[0]
+    if normalized_u >= parameters[-1]:
+        return quaternions[-1]
+    right = bisect.bisect_right(parameters, normalized_u)
+    left = max(0, right - 1)
+    right = min(len(parameters) - 1, right)
+    span = parameters[right] - parameters[left]
+    local = 0.0 if span <= 1e-12 else (normalized_u - parameters[left]) / span
+    return quaternion_slerp(quaternions[left], quaternions[right], local)
 
 
 def _build_arc_length_map(ctrl: List[Position], degree: int = 3, samples: int = 400):
@@ -315,6 +322,55 @@ def _compute_time_profile(length: float, target_v: float, t_acc: float, t_dec: f
     return total_time, t_flat
 
 
+def _orientation_only_samples(
+    curve: GlobalCurveCommand, ctrl: List[Position], dt: float
+):
+    """Sample an in-place KUKA rotation with the seventh-order S curve.
+
+    Core previously collapsed a zero-XYZ move to a single row even when its
+    ABC changed.  That makes a layer-dependent surface normal an RSI jump.
+    """
+
+    start = curve.start_pos
+    end = ctrl[-1]
+    start_q = kuka_abc_to_quaternion(start.a, start.b, start.c)
+    end_q = kuka_abc_to_quaternion(end.a, end.b, end.c)
+    dot = min(1.0, max(-1.0, abs(sum(a * b for a, b in zip(start_q, end_q)))))
+    angle_deg = math.degrees(2.0 * math.acos(dot))
+    if angle_deg <= 1e-9:
+        yield InterpolatedPoint(
+            t=0.0, pos=start, e=curve.e_val, extrude_speed=0.0,
+            feedrate_mm_min=curve.feedrate, cmd_type=curve.type,
+            line=curve.line, raw=curve.raw,
+        )
+        return
+
+    # The largest derivative of the seventh-order base curve is 2.1875.
+    # Account for it so every emitted RSI frame remains below the angle step.
+    steps = max(1, int(math.ceil(angle_deg * 2.1875 / _MAX_ORIENTATION_STEP_DEG)))
+    start_e = curve.e_val - curve.delta_e
+    previous_e = start_e
+    previous_abc = (start.a, start.b, start.c)
+    for index in range(steps + 1):
+        ratio = _sept_poly_base(index / steps)
+        q = quaternion_slerp(start_q, end_q, ratio)
+        a, b, c = quaternion_to_kuka_abc(q, near_deg=previous_abc)
+        current_e = start_e + curve.delta_e * ratio
+        delta_e = current_e - previous_e
+        yield InterpolatedPoint(
+            t=index * dt,
+            pos=Position(start.x, start.y, start.z, a, b, c),
+            e=current_e,
+            extrude_speed=delta_e / dt if dt > 0.0 else 0.0,
+            feedrate_mm_min=0.0,
+            cmd_type=curve.type,
+            line=curve.line,
+            raw=curve.raw,
+        )
+        previous_e = current_e
+        previous_abc = (a, b, c)
+
+
 # -------------------------- 采样主逻辑 --------------------------
 
 def sample_global_curve_iter(
@@ -346,6 +402,15 @@ def sample_global_curve_iter(
         profile.setdefault("sample_deboor_s", 0.0)
         profile.setdefault("sample_pose_s", 0.0)
         profile.setdefault("sample_extrude_s", 0.0)
+
+    if all(
+        abs(point.x - curve.start_pos.x) <= 1e-9
+        and abs(point.y - curve.start_pos.y) <= 1e-9
+        and abs(point.z - curve.start_pos.z) <= 1e-9
+        for point in ctrl[1:]
+    ):
+        yield from _orientation_only_samples(curve, ctrl, dt)
+        return
 
     if (curve.cmd or "").upper() == "POLYLINE":
         points = [curve.start_pos] + list(curve.control_points)
@@ -567,8 +632,8 @@ def sample_global_curve_iter(
     current_e = start_e
 
     # 姿态：仅用起点/终点做 slerp
-    # Planner-generated curves carry KUKA quaternion-log controls.  Curves
-    # created by older callers retain a KUKA quaternion endpoint fallback.
+    # Planner-generated curves carry KUKA samples on the position parameter.
+    # Curves created by older callers retain a KUKA quaternion endpoint fallback.
     end_pos = ctrl[-1]
     start_q = kuka_abc_to_quaternion(
         curve.start_pos.a, curve.start_pos.b, curve.start_pos.c,
@@ -582,8 +647,8 @@ def sample_global_curve_iter(
     fixed_a = curve.start_pos.a
     fixed_b = curve.start_pos.b
     fixed_c = curve.start_pos.c
-    orientation_controls = curve.orientation_control_vectors
-    orientation_reference = curve.orientation_reference_quaternion
+    orientation_parameters = curve.orientation_parameters
+    orientation_quaternions = curve.orientation_quaternions
     previous_abc = (fixed_a, fixed_b, fixed_c)
 
     prev_s = 0.0
@@ -611,9 +676,9 @@ def sample_global_curve_iter(
 
         # 姿态插值
         t_pose0 = time.perf_counter()
-        if orientation_reference is not None and orientation_controls:
-            vector = _eval_bspline_vector(u, degree, knots, orientation_controls, span)
-            q = quaternion_multiply(orientation_reference, quaternion_from_rotation_vector(vector))
+        if orientation_parameters and orientation_quaternions:
+            normalized_u = u / knots[n_ctrl] if knots[n_ctrl] > 1e-12 else 0.0
+            q = _sample_kuka_orientation(normalized_u, orientation_parameters, orientation_quaternions)
             p.a, p.b, p.c = quaternion_to_kuka_abc(q, near_deg=previous_abc)
         elif constant_orientation:
             p.a = fixed_a

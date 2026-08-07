@@ -110,10 +110,11 @@ class GlobalCurveCommand(CurveCommand):
     # present, the sampler follows this profile segment-by-segment instead of
     # distributing only the total delta_e by geometric arc length.
     e_profile: Optional[List[float]] = None
-    # Quaternion-log B-spline data for KUKA A(Z)-B(Y)-C(X) orientation.
-    # The vectors share the position B-spline's degree, knots and parameter u.
-    orientation_reference_quaternion: Optional[Tuple[float, float, float, float]] = None
-    orientation_control_vectors: Optional[List[Tuple[float, float, float]]] = None
+    # KUKA A(Z)-B(Y)-C(X) quaternion samples on the position B-spline's
+    # normalized parameter axis.  Sampling uses local SLERP to prevent a
+    # global least-squares attitude fit from overshooting surface normals.
+    orientation_parameters: Optional[List[float]] = None
+    orientation_quaternions: Optional[List[Tuple[float, float, float, float]]] = None
 
 
 ParsedCommand = Union[MoveCommand, CurveCommand, GlobalCurveCommand,

@@ -1993,6 +1993,21 @@ def export_npz(
         if isinstance(cmd, MoveCommand):
             if cmd.is_pure_state_change:
                 continue
+            if buffer:
+                previous = buffer[-1].pos
+                if (
+                    abs(cmd.start_pos.x - previous.x) > 1e-9
+                    or abs(cmd.start_pos.y - previous.y) > 1e-9
+                    or abs(cmd.start_pos.z - previous.z) > 1e-9
+                    or abs(cmd.start_pos.a - previous.a) > 1e-9
+                    or abs(cmd.start_pos.b - previous.b) > 1e-9
+                    or abs(cmd.start_pos.c - previous.c) > 1e-9
+                ):
+                    from .types import Position as _Pos
+                    cmd.start_pos = _Pos(
+                        previous.x, previous.y, previous.z,
+                        previous.a, previous.b, previous.c,
+                    )
             if current_type is None and last_pose is not None:
                 from .types import Position as _Pos
                 if (
