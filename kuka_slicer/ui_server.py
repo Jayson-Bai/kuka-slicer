@@ -23,10 +23,12 @@ import zipfile
 import numpy as np
 
 from .external_npz import (
+    ExternalSourceJob,
     MaterialPaths,
     TravelPaths,
     write_external_source_npz,
 )
+
 from .slicer import (
     DEFAULT_FIBER_LINE_WIDTH_MM,
     DEFAULT_FIBER_LAYER_HEIGHT_MM,
@@ -60,6 +62,9 @@ from .slicer import (
     slice_mesh_to_job,
 )
 from .stl_io import load_stl
+
+
+MAX_SURFACE_PREVIEW_NPZ_BYTES = 256 * 1024 * 1024
 
 
 DEFAULT_UI_RESIN_INFILL_OVERLAP_PERCENT = 0.0
@@ -418,6 +423,27 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
                 return
             self._send_json({"ok": True})
+            return
+        if parsed.path == "/preview-source-npz":
+            try:
+                _, files = self._read_slice_request(parsed.query)
+                source_upload = files.get("source_npz")
+                if source_upload is None:
+                    raise ValueError("missing mapped source NPZ payload")
+                source_name, source_bytes = source_upload
+                if len(source_bytes) > MAX_SURFACE_PREVIEW_NPZ_BYTES:
+                    raise ValueError("mapped source NPZ exceeds the 256 MB preview limit")
+                self._send_json(
+                    {
+                        "ok": True,
+                        "preview": _preview_payload_from_source_npz(
+                            source_bytes,
+                            _safe_filename(source_name or "curved.npz"),
+                        ),
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
         if parsed.path != "/slice":
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
@@ -1691,6 +1717,8 @@ def _preview_payload(
         "max_z": None,
     }
     fiber_paths_by_layer = fiber_paths_by_layer or {}
+    has_curved_deposition = False
+    has_tool_orientation = False
     resin_roles_by_layer = (
         job.meta.get("path_roles", {}).get("R", {})
         if isinstance(job.meta.get("path_roles", {}), dict)
@@ -1724,10 +1752,9 @@ def _preview_payload(
         for group in groups_by_layer.get(layer_index, {}).get("R", []):
             layer_roles = resin_roles_by_layer.get(str(layer_index), [])
             for path_index, path in enumerate(group.paths):
-                raw_points = [
-                    [float(point[0]), float(point[1]), float(point[2])]
-                    for point in path
-                ]
+                raw_points = [_serialize_preview_point(point) for point in path]
+                has_curved_deposition = has_curved_deposition or _preview_path_varies_in_z(raw_points)
+                has_tool_orientation = has_tool_orientation or _preview_path_has_orientation(raw_points)
                 raw_extrusion = (
                     group.extrusion[path_index]
                     if group.extrusion is not None and path_index < len(group.extrusion)
@@ -1758,8 +1785,8 @@ def _preview_payload(
                 if extrusion is not None:
                     entry["extrusion"] = extrusion
                 resin_paths.append(entry)
-                for x, y, z in points:
-                    _expand_bounds(bounds, x, y, z)
+                for point in points:
+                    _expand_bounds(bounds, point[0], point[1], point[2])
 
         serialized_fiber_paths = [
             _simplify_preview_path(path, max_points=2000)
@@ -1769,27 +1796,29 @@ def _preview_payload(
             for group in groups_by_layer.get(layer_index, {}).get("F", []):
                 serialized_fiber_paths.extend(
                     _simplify_preview_path(
-                        [[float(point[0]), float(point[1]), float(point[2])] for point in path],
+                        [_serialize_preview_point(point) for point in path],
                         max_points=2000,
                     )
                     for path in group.paths
                 )
         for fiber_path in serialized_fiber_paths:
-            for x, y, z in fiber_path:
-                _expand_bounds(bounds, x, y, z)
+            has_curved_deposition = has_curved_deposition or _preview_path_varies_in_z(fiber_path)
+            has_tool_orientation = has_tool_orientation or _preview_path_has_orientation(fiber_path)
+            for point in fiber_path:
+                _expand_bounds(bounds, point[0], point[1], point[2])
 
         serialized_travel_paths: list[list[list[float]]] = []
         for group in travel_groups_by_layer.get(layer_index, []):
             serialized_travel_paths.extend(
                 _simplify_preview_path(
-                    [[float(point[0]), float(point[1]), float(point[2])] for point in path],
+                    [_serialize_preview_point(point) for point in path],
                     max_points=2000,
                 )
                 for path in group.paths
             )
         for travel_path in serialized_travel_paths:
-            for x, y, z in travel_path:
-                _expand_bounds(bounds, x, y, z)
+            for point in travel_path:
+                _expand_bounds(bounds, point[0], point[1], point[2])
 
         motion_paths: list[dict[str, object]] = []
         motion_order = motion_order_by_layer.get(str(layer_index), [])
@@ -1872,6 +1901,14 @@ def _preview_payload(
     return {
         "bounds": bounds,
         "origin": [0.0, 0.0],
+        # A flat job may span many layers in Z.  The view changes only when a
+        # depositing path itself varies in Z, which is the signature of a
+        # mapped surface rather than ordinary planar slicing.
+        "geometry_mode": "surface_3d" if has_curved_deposition else "planar_2d",
+        "tool_orientation": {
+            "available": has_tool_orientation,
+            "fallback": "calibrated_flat_downward",
+        },
         "line_widths": {
             "resin": float(planning_line_width),
             "resin_nominal": float(config.line_width),
@@ -1879,6 +1916,62 @@ def _preview_payload(
         },
         "layers": list(layers_by_index.values()),
     }
+
+
+def _preview_payload_from_source_npz(source_bytes: bytes, source_name: str) -> dict[str, object]:
+    """Adapt a mapped external NPZ to the existing main-UI preview schema."""
+
+    # The mapper contract remains the authority for validation.  This adapter
+    # only removes NaN padding and forwards XYZABC to the shared Canvas view;
+    # it does not perform mapping, interpolation, or any Core processing.
+    from .surface_mapper.contracts import read_source_npz
+
+    source = read_source_npz(source_bytes, source_name=source_name)
+    material_paths: list[MaterialPaths] = []
+    travel_paths: list[TravelPaths] = []
+    key_pattern = re.compile(r"^layer_(\d{4,})_([RFT])$")
+    for key in source.path_keys:
+        match = key_pattern.match(key)
+        if match is None:
+            continue
+        layer_index = int(match.group(1))
+        material = match.group(2)
+        paths = [
+            np.asarray(path[np.isfinite(path[:, 0])], dtype=np.float64)
+            for path in np.asarray(source.arrays[key])
+            if np.isfinite(path[:, 0]).any()
+        ]
+        if material == "T":
+            if paths:
+                travel_paths.append(TravelPaths(layer_index, paths))
+            continue
+        extrusion_key = f"{key}_E"
+        extrusion = None
+        if extrusion_key in source.arrays:
+            extrusion = [
+                np.asarray(values[np.isfinite(values)], dtype=np.float64)
+                for values in np.asarray(source.arrays[extrusion_key])
+                if np.isfinite(values).any()
+            ]
+        if paths:
+            material_paths.append(MaterialPaths(layer_index, material, paths, extrusion))
+
+    slicing_meta = source.meta.get("slicing")
+    resolved_config = slicing_meta.get("resolved_config", {}) if isinstance(slicing_meta, dict) else {}
+    line_width = resolved_config.get("line_width", DEFAULT_RESIN_LINE_WIDTH_MM)
+    try:
+        config = SliceConfig(line_width=float(line_width))
+    except (TypeError, ValueError):
+        config = SliceConfig(line_width=DEFAULT_RESIN_LINE_WIDTH_MM)
+    return _preview_payload(
+        None,
+        config,
+        ExternalSourceJob(
+            material_paths=material_paths,
+            travel_paths=travel_paths,
+            meta=source.meta,
+        ),
+    )
 
 
 def _triangle_infill_recommendation(mesh, config: SliceConfig, current_job) -> dict[str, object] | None:
@@ -1962,6 +2055,30 @@ def _simplify_preview_path(
     simplified = [points[round(index * step)] for index in range(max_points)]
     simplified[-1] = points[-1]
     return simplified
+
+
+def _serialize_preview_point(point: object) -> list[float]:
+    """Keep XYZABC when a mapped source path supplies a KUKA orientation."""
+
+    values = [float(point[index]) for index in range(3)]
+    try:
+        orientation = [float(point[index]) for index in range(3, 6)]
+    except (IndexError, TypeError):
+        return values
+    if all(np.isfinite(value) for value in orientation):
+        values.extend(orientation)
+    return values
+
+
+def _preview_path_varies_in_z(points: list[list[float]]) -> bool:
+    if len(points) < 2:
+        return False
+    z_values = [point[2] for point in points]
+    return max(z_values) - min(z_values) > 1e-5
+
+
+def _preview_path_has_orientation(points: list[list[float]]) -> bool:
+    return any(len(point) >= 6 for point in points)
 
 
 def _load_fiber_preview_paths(npz_path: Path) -> dict[int, list[list[list[float]]]]:
@@ -3087,6 +3204,8 @@ def _index_html() -> str:
     <div class="surfaceTools" aria-label="曲面工具">
       <button id="surfacePreviewButton" class="surfaceToolButton" type="button">启动曲面预览器</button>
       <button id="surfaceMapperButton" class="surfaceToolButton" type="button">启动曲面映射器</button>
+      <button id="surfaceNpzPreviewButton" class="surfaceToolButton" type="button">导入映射 NPZ 预览</button>
+      <input id="surfaceNpzInput" type="file" accept=".npz,application/octet-stream" hidden>
     </div>
   </header>
   <main>
@@ -3129,7 +3248,7 @@ def _index_html() -> str:
         <label title="仅对包含 Prusa E 数据的树脂路径按绝对单位长度挤出量着色；关闭时保持轮廓/填充原有配色。"><input id="showExtrusion" type="checkbox">显示绝对挤出量（E/mm）</label>
         <span id="extrusionColorLegend" class="extrusionColorLegend" hidden>0.00 E/mm <span class="extrusionColorRamp"></span> 0.50 E/mm</span>
         <label><input id="showPathPoints" type="checkbox">显示当前路径点</label>
-        <label><input id="showDirection" type="checkbox" checked>显示打印方向</label>
+        <label><input id="showDirection" type="checkbox" checked><span id="showDirectionLabel">显示打印方向</span></label>
         <span id="printSizeLabel">打印范围 -</span>
       </div>
       <div id="previewSurface" class="preview"><canvas id="previewCanvas" title="滚轮缩放；鼠标左键、右键或中键拖动视图"></canvas></div>
@@ -3813,6 +3932,8 @@ def _index_html() -> str:
       'surface-preview': document.getElementById('surfacePreviewButton'),
       'surface-map': document.getElementById('surfaceMapperButton')
     }};
+    const surfaceNpzPreviewButton = document.getElementById('surfaceNpzPreviewButton');
+    const surfaceNpzInput = document.getElementById('surfaceNpzInput');
     const statusEl = document.getElementById('status');
     async function launchSurfaceTool(tool) {{
       const toolButton = surfaceToolButtons[tool];
@@ -3837,6 +3958,37 @@ def _index_html() -> str:
     }}
     surfaceToolButtons['surface-preview'].addEventListener('click', () => launchSurfaceTool('surface-preview'));
     surfaceToolButtons['surface-map'].addEventListener('click', () => launchSurfaceTool('surface-map'));
+    surfaceNpzPreviewButton.addEventListener('click', () => surfaceNpzInput.click());
+    surfaceNpzInput.addEventListener('change', async () => {{
+      const file = surfaceNpzInput.files?.[0];
+      if (!file) return;
+      const originalLabel = surfaceNpzPreviewButton.textContent;
+      surfaceNpzPreviewButton.disabled = true;
+      surfaceNpzPreviewButton.textContent = '正在载入预览…';
+      try {{
+        const payload = new FormData();
+        payload.append('source_npz', file, file.name);
+        const response = await fetch('/preview-source-npz', {{ method: 'POST', body: payload }});
+        const result = await response.json();
+        if (!response.ok || !result.ok) throw new Error(result.error || '曲面 NPZ 预览载入失败');
+        previewData = result.preview;
+        configureViewer();
+        layersEl.textContent = String(previewData.layers?.length || 0);
+        outputNameEl.textContent = file.name;
+        downloadEl.removeAttribute('href');
+        downloadEl.textContent = '已载入曲面预览（未导出）';
+        statusEl.className = 'status ok';
+        statusEl.textContent = '已载入映射曲面 NPZ：左键旋转，箭头尖端为当前打印点。';
+        drawPreview();
+      }} catch (error) {{
+        statusEl.className = 'status error';
+        statusEl.textContent = '无法载入曲面 NPZ：' + error.message;
+      }} finally {{
+        surfaceNpzPreviewButton.disabled = false;
+        surfaceNpzPreviewButton.textContent = originalLabel;
+        surfaceNpzInput.value = '';
+      }}
+    }});
     const exportProgressEl = document.getElementById('exportProgress');
     const exportProgressBarEl = document.getElementById('exportProgressBar');
     const exportProgressMessageEl = document.getElementById('exportProgressMessage');
@@ -3863,6 +4015,7 @@ def _index_html() -> str:
     const previewLineWidthValueEl = document.getElementById('previewLineWidthValue');
     const showPathPointsInput = document.getElementById('showPathPoints');
     const showDirectionInput = document.getElementById('showDirection');
+    const showDirectionLabel = document.getElementById('showDirectionLabel');
     const showOuterContourInput = document.getElementById('showOuterContour');
     const showInnerContourInput = document.getElementById('showInnerContour');
     const showResinInfillInput = document.getElementById('showResinInfill');
@@ -4475,7 +4628,13 @@ def _index_html() -> str:
       zoom: 1.0,
       centerX: null,
       centerY: null,
+      centerZ: null,
+      surfaceYaw: -0.72,
+      surfacePitch: -0.58,
+      surfacePanX: 0,
+      surfacePanY: 0,
       dragging: false,
+      dragMode: null,
       pointerId: null,
       lastX: 0,
       lastY: 0
@@ -4798,6 +4957,11 @@ def _index_html() -> str:
       layerSlider.max = Math.max(0, layers.length - 1);
       layerSlider.value = 0;
       resetPreviewView();
+      const isSurface = isSurfacePreview();
+      showDirectionLabel.textContent = isSurface ? '显示打印头方向' : '显示打印方向';
+      previewCanvas.title = isSurface
+        ? '滚轮缩放；左键旋转；右键或中键平移；双击复位'
+        : '滚轮缩放；鼠标左键、右键或中键拖动视图；双击复位';
       updatePrintSizeLabel();
       updatePathSlider(true);
     }}
@@ -4806,11 +4970,20 @@ def _index_html() -> str:
       viewerState.zoom = 1.0;
       viewerState.centerX = null;
       viewerState.centerY = null;
+      viewerState.centerZ = null;
+      viewerState.surfaceYaw = -0.72;
+      viewerState.surfacePitch = -0.58;
+      viewerState.surfacePanX = 0;
+      viewerState.surfacePanY = 0;
     }}
 
     function currentLayer() {{
       const layers = previewData?.layers || [];
       return layers[Number(layerSlider.value)] || null;
+    }}
+
+    function isSurfacePreview() {{
+      return previewData?.geometry_mode === 'surface_3d';
     }}
 
     function roleIsSelected(role) {{
@@ -4957,6 +5130,127 @@ def _index_html() -> str:
         viewerState.centerY - (y - plotCenterY) / pixelsPerMm
       ];
       return {{ plot, baseScale, pixelsPerMm, plotCenterX, plotCenterY, project, unproject }};
+    }}
+
+    function buildSurfaceViewport(rect, bounds) {{
+      const plot = {{
+        left: 40,
+        top: 18,
+        right: Math.max(80, rect.width - 18),
+        bottom: Math.max(80, rect.height - 28)
+      }};
+      plot.width = Math.max(1, plot.right - plot.left);
+      plot.height = Math.max(1, plot.bottom - plot.top);
+      const minimum = [Number(bounds.min_x), Number(bounds.min_y), Number(bounds.min_z)];
+      const maximum = [Number(bounds.max_x), Number(bounds.max_y), Number(bounds.max_z)];
+      if (viewerState.centerX === null || viewerState.centerY === null || viewerState.centerZ === null) {{
+        viewerState.centerX = (minimum[0] + maximum[0]) * 0.5;
+        viewerState.centerY = (minimum[1] + maximum[1]) * 0.5;
+        viewerState.centerZ = (minimum[2] + maximum[2]) * 0.5;
+      }}
+      const yaw = viewerState.surfaceYaw;
+      const pitch = viewerState.surfacePitch;
+      const cosYaw = Math.cos(yaw);
+      const sinYaw = Math.sin(yaw);
+      const cosPitch = Math.cos(pitch);
+      const sinPitch = Math.sin(pitch);
+      const rotate = (point) => {{
+        const x = Number(point[0]) - viewerState.centerX;
+        const y = Number(point[1]) - viewerState.centerY;
+        const z = Number(point[2]) - viewerState.centerZ;
+        const yawX = cosYaw * x - sinYaw * y;
+        const yawY = sinYaw * x + cosYaw * y;
+        return [
+          yawX,
+          cosPitch * yawY - sinPitch * z,
+          sinPitch * yawY + cosPitch * z,
+        ];
+      }};
+      const corners = [];
+      for (const x of [minimum[0], maximum[0]]) {{
+        for (const y of [minimum[1], maximum[1]]) {{
+          for (const z of [minimum[2], maximum[2]]) corners.push(rotate([x, y, z]));
+        }}
+      }}
+      const projectedX = corners.map((point) => point[0]);
+      const projectedY = corners.map((point) => point[1]);
+      const spanX = Math.max(0.001, Math.max(...projectedX) - Math.min(...projectedX));
+      const spanY = Math.max(0.001, Math.max(...projectedY) - Math.min(...projectedY));
+      const baseScale = Math.max(
+        1e-6,
+        Math.min(
+          Math.max(1, plot.width - 36) / spanX,
+          Math.max(1, plot.height - 36) / spanY
+        )
+      );
+      const pixelsPerMm = baseScale * viewerState.zoom;
+      const plotCenterX = (plot.left + plot.right) * 0.5;
+      const plotCenterY = (plot.top + plot.bottom) * 0.5;
+      const project = (point) => {{
+        const rotated = rotate(point);
+        return [
+          plotCenterX + rotated[0] * pixelsPerMm + viewerState.surfacePanX,
+          plotCenterY - rotated[1] * pixelsPerMm + viewerState.surfacePanY,
+          rotated[2],
+        ];
+      }};
+      return {{ plot, baseScale, pixelsPerMm, plotCenterX, plotCenterY, project, minimum, maximum, isSurface: true }};
+    }}
+
+    function drawSurfaceReference(ctx, viewport) {{
+      const {{ plot, minimum, maximum, project }} = viewport;
+      const z = minimum[2];
+      const corners = [
+        [minimum[0], minimum[1], z],
+        [maximum[0], minimum[1], z],
+        [maximum[0], maximum[1], z],
+        [minimum[0], maximum[1], z],
+      ].map(project);
+      ctx.fillStyle = 'rgba(232, 239, 244, 0.64)';
+      ctx.beginPath();
+      ctx.moveTo(corners[0][0], corners[0][1]);
+      for (let index = 1; index < corners.length; index++) ctx.lineTo(corners[index][0], corners[index][1]);
+      ctx.closePath();
+      ctx.fill();
+      ctx.strokeStyle = '#d5dbe0';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      const axisOrigin = [minimum[0], minimum[1], z];
+      const axisLength = Math.max(8, Math.min(30, Math.max(
+        maximum[0] - minimum[0],
+        maximum[1] - minimum[1],
+        maximum[2] - minimum[2]
+      ) * 0.18));
+      const axes = [
+        {{ end: [axisOrigin[0] + axisLength, axisOrigin[1], axisOrigin[2]], color: '#b91c1c', label: 'X' }},
+        {{ end: [axisOrigin[0], axisOrigin[1] + axisLength, axisOrigin[2]], color: '#0f766e', label: 'Y' }},
+        {{ end: [axisOrigin[0], axisOrigin[1], axisOrigin[2] + axisLength], color: '#1d4ed8', label: 'Z' }},
+      ];
+      const start = project(axisOrigin);
+      ctx.font = '600 11px Segoe UI, Arial, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      for (const axis of axes) {{
+        const end = project(axis.end);
+        ctx.strokeStyle = axis.color;
+        ctx.fillStyle = axis.color;
+        ctx.lineWidth = 2.4;
+        ctx.beginPath();
+        ctx.moveTo(start[0], start[1]);
+        ctx.lineTo(end[0], end[1]);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(end[0], end[1], 2.8, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillText(axis.label, end[0] + 9, end[1] - 6);
+      }}
+      ctx.strokeStyle = '#aeb8c0';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(plot.left + 0.5, plot.top + 0.5, plot.width - 1, plot.height - 1);
+      ctx.fillStyle = '#5c6972';
+      ctx.textAlign = 'right';
+      ctx.textBaseline = 'top';
+      ctx.fillText('三维曲面预览 · 左键旋转', plot.right - 7, plot.top + 7);
     }}
 
     function niceGridStep(pixelsPerMm) {{
@@ -5170,7 +5464,7 @@ def _index_html() -> str:
     function drawPreview() {{
       const canvas = previewCanvas;
       const rect = canvas.getBoundingClientRect();
-      const deviceScale = window.devicePixelRatio || 1;
+      const deviceScale = Math.min(window.devicePixelRatio || 1, 2);
       canvas.width = Math.max(1, Math.floor(rect.width * deviceScale));
       canvas.height = Math.max(1, Math.floor(rect.height * deviceScale));
       const ctx = canvas.getContext('2d');
@@ -5187,8 +5481,15 @@ def _index_html() -> str:
         return;
       }}
 
-      const viewport = buildViewport(rect, bounds);
-      drawMeasurementGrid(ctx, viewport, rect);
+      const surfacePreview = isSurfacePreview();
+      const viewport = surfacePreview
+        ? buildSurfaceViewport(rect, bounds)
+        : buildViewport(rect, bounds);
+      if (surfacePreview) {{
+        drawSurfaceReference(ctx, viewport);
+      }} else {{
+        drawMeasurementGrid(ctx, viewport, rect);
+      }}
       const entries = selectedPrintEntries(layer);
       const visibleCount = Math.min(Number(pathProgressSlider.value), entries.length);
       const currentEntry = visibleCount > 0 ? entries[visibleCount - 1] : null;
@@ -5288,11 +5589,23 @@ def _index_html() -> str:
       if (currentEntry && showPathPointsInput.checked) {{
         drawPathPoints(ctx, currentEntry.points, pathColor(currentEntry.role), viewport.project);
       }}
-      if (currentEntry && showDirectionInput.checked) {{
+      if (surfacePreview && showDirectionInput.checked) {{
+        const currentDeposit = entries
+          .slice(0, visibleCount)
+          .reverse()
+          .find((entry) => entry.kind === 'deposit' && entry.points?.length);
+        if (currentDeposit) {{
+          drawPrintHeadArrow(
+            ctx,
+            currentDeposit.points[currentDeposit.points.length - 1],
+            viewport
+          );
+        }}
+      }} else if (currentEntry && showDirectionInput.checked) {{
         drawDirection(ctx, currentEntry.points, pathColor(currentEntry.role), viewport.project);
       }}
       ctx.restore();
-      drawOriginMarker(ctx, viewport);
+      if (!surfacePreview) drawOriginMarker(ctx, viewport);
       updateViewerLabels();
     }}
 
@@ -5380,6 +5693,121 @@ def _index_html() -> str:
       ctx.restore();
     }}
 
+    function normalizeVector(vector) {{
+      const length = Math.hypot(vector[0], vector[1], vector[2]);
+      return length > 1e-9 ? vector.map((value) => value / length) : [0, 0, -1];
+    }}
+
+    function crossVector(left, right) {{
+      return [
+        left[1] * right[2] - left[2] * right[1],
+        left[2] * right[0] - left[0] * right[2],
+        left[0] * right[1] - left[1] * right[0],
+      ];
+    }}
+
+    function kukaToolDirection(point) {{
+      if (!Array.isArray(point) || point.length < 6) {{
+        return {{ direction: [0, 0, -1], exact: false }};
+      }}
+      const [a, b, c] = point.slice(3, 6).map(Number);
+      if (![a, b, c].every(Number.isFinite)) {{
+        return {{ direction: [0, 0, -1], exact: false }};
+      }}
+      // Surface mapping defines ABC as Rz(A) * Ry(B) * Rx(C), relative to
+      // the calibrated flat pose whose +X_TOOL work axis is -Z_BASE.
+      const radians = Math.PI / 180;
+      const cosA = Math.cos(a * radians);
+      const sinA = Math.sin(a * radians);
+      const cosB = Math.cos(b * radians);
+      const sinB = Math.sin(b * radians);
+      const cosC = Math.cos(c * radians);
+      const sinC = Math.sin(c * radians);
+      const afterX = [0, sinC, -cosC];
+      const afterY = [
+        cosB * afterX[0] + sinB * afterX[2],
+        afterX[1],
+        -sinB * afterX[0] + cosB * afterX[2],
+      ];
+      return {{
+        direction: normalizeVector([
+          cosA * afterY[0] - sinA * afterY[1],
+          sinA * afterY[0] + cosA * afterY[1],
+          afterY[2],
+        ]),
+        exact: true,
+      }};
+    }}
+
+    function drawPrintHeadArrow(ctx, point, viewport) {{
+      if (!point || !viewport?.isSurface) return;
+      const {{ direction, exact }} = kukaToolDirection(point);
+      const sceneSpan = Math.max(
+        viewport.maximum[0] - viewport.minimum[0],
+        viewport.maximum[1] - viewport.minimum[1],
+        viewport.maximum[2] - viewport.minimum[2]
+      );
+      const length = Math.max(8, Math.min(28, sceneSpan * 0.16));
+      const coneLength = length * 0.30;
+      const shaftBase = point.slice(0, 3).map((value, index) => value - direction[index] * length);
+      const coneBase = point.slice(0, 3).map((value, index) => value - direction[index] * coneLength);
+      const side = normalizeVector(crossVector(
+        direction,
+        Math.abs(direction[2]) < 0.85 ? [0, 0, 1] : [0, 1, 0]
+      ));
+      const up = normalizeVector(crossVector(side, direction));
+      const radius = Math.max(1.5, length * 0.12);
+      const coneRing = Array.from({{ length: 6 }}, (_, index) => {{
+        const angle = index * Math.PI * 2 / 6;
+        return coneBase.map((value, axis) => value + radius * (
+          side[axis] * Math.cos(angle) + up[axis] * Math.sin(angle)
+        ));
+      }});
+      const faces = coneRing.map((vertex, index) => {{
+        const next = coneRing[(index + 1) % coneRing.length];
+        const projected = [viewport.project(point), viewport.project(vertex), viewport.project(next)];
+        return {{ projected, depth: (projected[0][2] + projected[1][2] + projected[2][2]) / 3 }};
+      }}).sort((left, right) => left.depth - right.depth);
+      const projectedBase = viewport.project(shaftBase);
+      const projectedConeBase = viewport.project(coneBase);
+      const projectedTip = viewport.project(point);
+      const color = exact ? '#0f4c81' : '#4b6475';
+      ctx.save();
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 5;
+      ctx.beginPath();
+      ctx.moveTo(projectedBase[0], projectedBase[1]);
+      ctx.lineTo(projectedConeBase[0], projectedConeBase[1]);
+      ctx.stroke();
+      for (const face of faces) {{
+        ctx.fillStyle = exact ? 'rgba(15, 76, 129, 0.86)' : 'rgba(75, 100, 117, 0.82)';
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 0.8;
+        ctx.beginPath();
+        ctx.moveTo(face.projected[0][0], face.projected[0][1]);
+        ctx.lineTo(face.projected[1][0], face.projected[1][1]);
+        ctx.lineTo(face.projected[2][0], face.projected[2][1]);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+      }}
+      ctx.fillStyle = '#ffffff';
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(projectedTip[0], projectedTip[1], 3.8, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      ctx.font = '600 11px Segoe UI, Arial, sans-serif';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'bottom';
+      ctx.fillStyle = color;
+      ctx.fillText(exact ? '打印头 +X_TOOL' : '打印头（默认朝下）', projectedBase[0] + 7, projectedBase[1] - 6);
+      ctx.restore();
+    }}
+
     function drawEmptyPreview(ctx, width, height) {{
       ctx.fillStyle = '#ffffff';
       ctx.fillRect(0, 0, width, height);
@@ -5393,7 +5821,12 @@ def _index_html() -> str:
         return null;
       }}
       const rect = previewCanvas.getBoundingClientRect();
-      return {{ rect, viewport: buildViewport(rect, bounds) }};
+      return {{
+        rect,
+        viewport: isSurfacePreview()
+          ? buildSurfaceViewport(rect, bounds)
+          : buildViewport(rect, bounds),
+      }};
     }}
 
     previewCanvas.addEventListener('wheel', (event) => {{
@@ -5404,10 +5837,15 @@ def _index_html() -> str:
       const y = event.clientY - current.rect.top;
       const {{ plot }} = current.viewport;
       if (x < plot.left || x > plot.right || y < plot.top || y > plot.bottom) return;
-      const worldPoint = current.viewport.unproject(x, y);
       const zoomFactor = Math.exp(-event.deltaY * 0.0015);
       const nextZoom = Math.min(40.0, Math.max(0.2, viewerState.zoom * zoomFactor));
       if (Math.abs(nextZoom - viewerState.zoom) < 1e-9) return;
+      if (isSurfacePreview()) {{
+        viewerState.zoom = nextZoom;
+        drawPreview();
+        return;
+      }}
+      const worldPoint = current.viewport.unproject(x, y);
       viewerState.zoom = nextZoom;
       const nextScale = current.viewport.baseScale * nextZoom;
       viewerState.centerX = worldPoint[0]
@@ -5421,6 +5859,7 @@ def _index_html() -> str:
       if (![0, 1, 2].includes(event.button) || !currentViewportForInteraction()) return;
       event.preventDefault();
       viewerState.dragging = true;
+      viewerState.dragMode = isSurfacePreview() && event.button === 0 ? 'rotate' : 'pan';
       viewerState.pointerId = event.pointerId;
       viewerState.lastX = event.clientX;
       viewerState.lastY = event.clientY;
@@ -5436,14 +5875,27 @@ def _index_html() -> str:
       const deltaY = event.clientY - viewerState.lastY;
       viewerState.lastX = event.clientX;
       viewerState.lastY = event.clientY;
-      viewerState.centerX -= deltaX / current.viewport.pixelsPerMm;
-      viewerState.centerY += deltaY / current.viewport.pixelsPerMm;
+      if (isSurfacePreview()) {{
+        if (viewerState.dragMode === 'rotate') {{
+          viewerState.surfaceYaw += deltaX * 0.009;
+          viewerState.surfacePitch = Math.max(-1.35, Math.min(1.35,
+            viewerState.surfacePitch + deltaY * 0.009
+          ));
+        }} else {{
+          viewerState.surfacePanX += deltaX;
+          viewerState.surfacePanY += deltaY;
+        }}
+      }} else {{
+        viewerState.centerX -= deltaX / current.viewport.pixelsPerMm;
+        viewerState.centerY += deltaY / current.viewport.pixelsPerMm;
+      }}
       drawPreview();
     }});
 
     function finishPreviewDrag(event) {{
       if (!viewerState.dragging || viewerState.pointerId !== event.pointerId) return;
       viewerState.dragging = false;
+      viewerState.dragMode = null;
       viewerState.pointerId = null;
       previewSurface.classList.remove('dragging');
       if (previewCanvas.hasPointerCapture(event.pointerId)) {{

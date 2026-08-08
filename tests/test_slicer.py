@@ -7,7 +7,12 @@ from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import unary_union
 
 import kuka_slicer.slicer as slicer_module
-from kuka_slicer.external_npz import ExternalSourceJob, MaterialPaths, TravelPaths
+from kuka_slicer.external_npz import (
+    ExternalSourceJob,
+    MaterialPaths,
+    TravelPaths,
+    write_external_source_npz,
+)
 from kuka_slicer.slicer import (
     DEFAULT_FIBER_LAYER_HEIGHT_MM,
     DEFAULT_FIBER_LINE_WIDTH_MM,
@@ -59,6 +64,7 @@ from kuka_slicer.ui_server import (
     _parse_prusa_slice_config,
     _resolved_slice_config,
     _preview_payload,
+    _preview_payload_from_source_npz,
     _raft_layers_from_params,
     _simplify_preview_path,
     expand_fiber_template_for_resin_layers,
@@ -869,7 +875,19 @@ def test_preview_payload_uses_slim_role_aware_layer_schema_and_complete_bounds()
         job,
     )
 
-    assert set(preview) == {"bounds", "line_widths", "layers"}
+    assert set(preview) == {
+        "bounds",
+        "geometry_mode",
+        "line_widths",
+        "layers",
+        "origin",
+        "tool_orientation",
+    }
+    assert preview["geometry_mode"] == "planar_2d"
+    assert preview["tool_orientation"] == {
+        "available": False,
+        "fallback": "calibrated_flat_downward",
+    }
     assert preview["line_widths"] == {
         "resin": 2.2,
         "resin_nominal": 2.0,
@@ -928,6 +946,46 @@ def test_preview_keeps_prusa_extrusion_values_aligned_with_resin_paths():
     entry = preview["layers"][0]["resin_paths"][0]
     assert entry["points"] == resin_path.tolist()
     assert entry["extrusion"] == [10.0, 11.0, 12.5]
+
+
+def test_preview_marks_mapped_xyzabc_paths_as_a_surface_and_preserves_orientation():
+    mapped_path = np.asarray(
+        [
+            [0.0, 0.0, 0.5, 0.0, 0.0, 0.0],
+            [4.0, 0.0, 1.0, 10.0, -5.0, 2.0],
+            [4.0, 3.0, 1.4, 12.0, -7.0, 3.0],
+        ],
+        dtype=np.float64,
+    )
+    job = ExternalSourceJob(material_paths=[MaterialPaths(0, "R", [mapped_path])])
+
+    preview = _preview_payload(
+        Mesh(_cube_triangles(size=10.0)),
+        SliceConfig(line_width=2.0),
+        job,
+    )
+
+    assert preview["geometry_mode"] == "surface_3d"
+    assert preview["tool_orientation"]["available"] is True
+    assert preview["layers"][0]["resin_paths"][0]["points"] == mapped_path.tolist()
+
+
+def test_preview_import_adapter_reads_mapped_external_npz(tmp_path):
+    mapped_path = np.asarray(
+        [[0.0, 0.0, 0.5, 0.0, 0.0, 0.0], [3.0, 1.0, 1.2, 8.0, -4.0, 2.0]],
+        dtype=np.float64,
+    )
+    source_path = tmp_path / "curved.npz"
+    write_external_source_npz(
+        ExternalSourceJob(material_paths=[MaterialPaths(0, "R", [mapped_path])]),
+        source_path,
+    )
+
+    preview = _preview_payload_from_source_npz(source_path.read_bytes(), source_path.name)
+
+    assert preview["geometry_mode"] == "surface_3d"
+    assert preview["tool_orientation"]["available"] is True
+    assert preview["layers"][0]["resin_paths"][0]["points"] == mapped_path.tolist()
 
 
 def test_isotropic_infill_explicit_z_bounds_keep_four_direction_schedule():
@@ -4439,6 +4497,22 @@ def test_ui_preview_supports_filtered_ordered_progress_pan_zoom_and_rulers():
         assert interaction in html
     assert "const isContour" not in html
     assert "pathIndex >= visiblePaths" not in html
+
+
+def test_ui_preview_reuses_canvas_for_surface_3d_tool_direction():
+    html = _index_html()
+
+    for feature in (
+        "geometry_mode === 'surface_3d'",
+        "buildSurfaceViewport",
+        "drawSurfaceReference",
+        "drawPrintHeadArrow",
+        "kukaToolDirection",
+        "showDirectionLabel",
+        "Math.min(window.devicePixelRatio || 1, 2)",
+        "左键旋转；右键或中键平移",
+    ):
+        assert feature in html
 
 
 def test_preview_simplification_keeps_contour_corners():
