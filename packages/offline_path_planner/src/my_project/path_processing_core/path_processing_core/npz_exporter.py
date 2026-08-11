@@ -31,7 +31,7 @@ from .polynomial_interpolator import sample_global_curve_iter
 from .rsi_timing import RsiTimingAccumulator
 
 
-@dataclass
+@dataclass(slots=True)
 class CsvRow:
     seq: int
     x: float
@@ -95,6 +95,7 @@ def export_npz(
     cut_wait_s: float = 15.0,
     fiber_retract_length_mm: float | None = None,
     external_npz_cut_absolute_e: bool = False,
+    collect_detailed_timing: bool = False,
 ) -> dict:
     """
     导出 npz（分片）.
@@ -132,6 +133,7 @@ def export_npz(
         "plot_s": 0.0,
         "rows": 0,
         "parts": 0,
+        "detailed_sampling_timing": bool(collect_detailed_timing),
     }
 
     last_pose_map = {}
@@ -345,13 +347,27 @@ def export_npz(
             self.part = 0
             self.wrote_any = False
             self.rows: List[CsvRow] = []
+            # The previous implementation found a path end by scanning every
+            # buffered row.  A UI export may keep millions of rows in one
+            # chunk, making that work quadratic in the number of paths.  This
+            # index preserves the same last-row marker in O(1).
+            self.last_row_index_by_path: dict[int, int] = {}
             self.last_seq: Optional[int] = None
 
         def add(self, row: CsvRow):
+            previous_index = self.last_row_index_by_path.get(row.path_id)
+            if previous_index is not None:
+                self.rows[previous_index].path_end_flag = 0
             self.rows.append(row)
+            self.last_row_index_by_path[row.path_id] = len(self.rows) - 1
             self.last_seq = row.seq
             if len(self.rows) >= chunk_size:
                 self.flush()
+
+        def mark_path_end(self, path_id: int):
+            last_index = self.last_row_index_by_path.get(path_id)
+            if last_index is not None:
+                self.rows[last_index].path_end_flag = 1
 
         def flush(self):
             if not self.rows:
@@ -363,6 +379,7 @@ def export_npz(
             out_path = f"{self.base_path}_part{self.part:04d}.npz"
             chunk = self.rows
             self.rows = []
+            self.last_row_index_by_path.clear()
             seq_arr = np.array([r.seq for r in chunk], dtype=np.uint32)
             x = np.array([r.x for r in chunk], dtype=np.float32)
             y = np.array([r.y for r in chunk], dtype=np.float32)
@@ -502,13 +519,7 @@ def export_npz(
         if path_id <= 0:
             return
         writer = _writer_for(layer, subtype, occ)
-        last_index = None
-        for idx, row in enumerate(writer.rows):
-            if row.path_id == path_id:
-                row.path_end_flag = 0
-                last_index = idx
-        if last_index is not None:
-            writer.rows[last_index].path_end_flag = 1
+        writer.mark_path_end(path_id)
 
     processed_rows = 0
     active_injection_block_id = -1
@@ -622,13 +633,17 @@ def export_npz(
         nonlocal seq, last_feedrate_mm_min, processed_rows, last_pose_map, last_pose
         nonlocal pending_injection_block_id, pending_injection_role
         t0 = time.perf_counter()
-        sample_profile = {
-            "sample_arc_map_s": 0.0,
-            "sample_lookup_s": 0.0,
-            "sample_deboor_s": 0.0,
-            "sample_pose_s": 0.0,
-            "sample_extrude_s": 0.0,
-        }
+        sample_profile = (
+            {
+                "sample_arc_map_s": 0.0,
+                "sample_lookup_s": 0.0,
+                "sample_deboor_s": 0.0,
+                "sample_pose_s": 0.0,
+                "sample_extrude_s": 0.0,
+            }
+            if collect_detailed_timing
+            else None
+        )
         feed_mm_min = gc.feedrate if (
             gc.feedrate is not None and gc.feedrate > 0) else last_feedrate_mm_min
         if feed_mm_min is None or feed_mm_min <= 0:
@@ -650,8 +665,9 @@ def export_npz(
         sample_kwargs = {
             "dt": dt,
             "target_velocity": target_velocity,
-            "profile": sample_profile,
         }
+        if sample_profile is not None:
+            sample_kwargs["profile"] = sample_profile
         time_acc_s = getattr(gc, "time_acc_s", None)
         if time_acc_s is not None and float(time_acc_s) > 0.0:
             sample_kwargs["t_acc"] = float(time_acc_s)
@@ -723,11 +739,12 @@ def export_npz(
             if mark_path_end:
                 _mark_path_end(layer, subtype, occ)
         timings["sample_s"] += time.perf_counter() - t0
-        timings["sample_arc_map_s"] += sample_profile["sample_arc_map_s"]
-        timings["sample_lookup_s"] += sample_profile["sample_lookup_s"]
-        timings["sample_deboor_s"] += sample_profile["sample_deboor_s"]
-        timings["sample_pose_s"] += sample_profile["sample_pose_s"]
-        timings["sample_extrude_s"] += sample_profile["sample_extrude_s"]
+        if sample_profile is not None:
+            timings["sample_arc_map_s"] += sample_profile["sample_arc_map_s"]
+            timings["sample_lookup_s"] += sample_profile["sample_lookup_s"]
+            timings["sample_deboor_s"] += sample_profile["sample_deboor_s"]
+            timings["sample_pose_s"] += sample_profile["sample_pose_s"]
+            timings["sample_extrude_s"] += sample_profile["sample_extrude_s"]
         if not has_any:
             return
 
