@@ -19,6 +19,8 @@ from shapely.ops import linemerge, nearest_points, unary_union
 from shapely.strtree import STRtree
 
 from .external_npz import ExternalSourceJob, Material, MaterialPaths, TravelPaths
+from .cpu_limiter import limit_slicer_task
+from .honeycomb_pathing.config import HoneycombPathingConfig
 from .stl_io import Mesh
 
 CurveMode = Literal["flat", "sinusoidal"]
@@ -362,6 +364,9 @@ class SliceConfig:
     pyslm: PySLMConfig = field(default_factory=PySLMConfig)
     prusa_raft: PrusaRaftConfig = field(default_factory=PrusaRaftConfig)
     prusa_geometry: PrusaGeometryConfig = field(default_factory=PrusaGeometryConfig)
+    # Optional post-Prusa planner for regular honeycomb wall networks. The
+    # native backend remains untouched; this transforms its completed job.
+    honeycomb_pathing: HoneycombPathingConfig = field(default_factory=HoneycombPathingConfig)
     # Native Prusa brim controls.  The checkbox is kept separate from the
     # width so a saved test value does not re-enable the brim by accident.
     brim_enabled: bool = False
@@ -452,6 +457,10 @@ class SliceConfig:
             raise ValueError("build_axis must be x, y, or z")
         if self.slicing_kernel not in ("legacy", "pyslm", "prusa"):
             raise ValueError("slicing_kernel must be legacy, pyslm, or prusa")
+        if self.honeycomb_pathing.enabled and (
+            self.slicing_kernel != "prusa" or self.material != "R"
+        ):
+            raise ValueError("honeycomb centreline planning currently requires Prusa resin slicing")
         if self.perimeter_count < 1:
             raise ValueError("perimeter_count must be at least 1")
         if self.brim_type not in ("outer_only", "outer_and_inner", "no_brim"):
@@ -525,6 +534,13 @@ class RaftLayerConfig:
 
 
 def slice_mesh_to_job(mesh: Mesh, config: SliceConfig) -> ExternalSourceJob:
+    # Covers direct Python and command-line slicing.  The UI adds an outer
+    # guard so its Core export phase is limited too; the limiter is re-entrant.
+    with limit_slicer_task():
+        return _slice_mesh_to_job_limited(mesh, config)
+
+
+def _slice_mesh_to_job_limited(mesh: Mesh, config: SliceConfig) -> ExternalSourceJob:
     if config.infill_pattern == "isotropic":
         _validate_isotropic_infill_schedule(mesh, config)
     if config.slicing_kernel == "pyslm":
@@ -539,8 +555,20 @@ def slice_mesh_to_job(mesh: Mesh, config: SliceConfig) -> ExternalSourceJob:
         return job
     if config.slicing_kernel == "prusa":
         from .prusa_backend import slice_mesh_to_job_with_prusa
+        from .honeycomb_pathing import apply_honeycomb_centerline_pathing
 
-        return slice_mesh_to_job_with_prusa(mesh, config)
+        job = slice_mesh_to_job_with_prusa(mesh, config)
+        if config.honeycomb_pathing.enabled:
+            # This stays after the native boundary: the add-on consumes a
+            # completed Prusa job but never changes the native bridge itself.
+            return apply_honeycomb_centerline_pathing(
+                job,
+                orient_mesh_for_build_axis(mesh, config.build_axis),
+                line_width_mm=float(config.line_width),
+                tolerance_mm=float(config.tolerance),
+                topology=config.honeycomb_pathing.topology,
+            )
+        return job
     job = _slice_mesh_to_job_legacy(mesh, config)
     _record_line_width_contract(job, config, planning_applied=True)
     return job

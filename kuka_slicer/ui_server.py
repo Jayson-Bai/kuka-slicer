@@ -28,6 +28,8 @@ from .external_npz import (
     TravelPaths,
     write_external_source_npz,
 )
+from .cpu_limiter import limit_slicer_task
+from .honeycomb_pathing import HoneycombPathingConfig
 
 from .slicer import (
     DEFAULT_FIBER_LINE_WIDTH_MM,
@@ -107,7 +109,10 @@ def _core_output_download_path(core_npz_path: Path) -> Path:
         core_npz_path.with_name(f"{core_npz_path.stem}.offset.json"),
         core_npz_path.with_name(f"{core_npz_path.stem}.timing.json"),
     ]
-    with zipfile.ZipFile(package_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+    # Core parts are already ``np.savez_compressed`` archives.  Deflating them
+    # a second time burns CPU for negligible size reduction, so the outer ZIP
+    # only bundles the exact same files for browser download.
+    with zipfile.ZipFile(package_path, "w", compression=zipfile.ZIP_STORED) as archive:
         for candidate in [*parts, *sidecars]:
             if candidate.is_file():
                 archive.write(candidate, arcname=candidate.name)
@@ -346,6 +351,7 @@ _PRUSA_INT_KEYS = {
 _PRUSA_BOOL_KEYS = {
     "prusa_print_perimeters", "prusa_raft_enabled", "prusa_raft_auto_contact",
     "prusa_gap_fill_enabled", "prusa_brim_enabled", "prusa_brim_one_stroke",
+    "honeycomb_centerline_enabled",
 }
 _PRUSA_NULLABLE_FLOAT_KEYS = {
     "prusa_external_perimeter_width", "prusa_perimeter_width", "prusa_infill_width",
@@ -538,11 +544,16 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             )
 
         try:
-            result = self._handle_slice(
-                query,
-                request_data=request_data,
-                progress_callback=update_progress,
-            )
+            # Limit the whole UI task, including native slicing and the Core
+            # trajectory export.  Nested slice_mesh_to_job calls reuse this
+            # re-entrant guard.
+            with limit_slicer_task() as cpu_limit:
+                result = self._handle_slice(
+                    query,
+                    request_data=request_data,
+                    progress_callback=update_progress,
+                )
+            result["cpu_limit"] = cpu_limit.to_metadata()
             elapsed_s = time.perf_counter() - started_at
             self._update_slice_job(
                 job_id,
@@ -646,7 +657,11 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         core_source_job = None
         native_gcode_path = None
         source_gcode_module = None
-        if slicing_kernel == "prusa" and isinstance(job.native_gcode, (bytes, str)):
+        if (
+            slicing_kernel == "prusa"
+            and not config.honeycomb_pathing.enabled
+            and isinstance(job.native_gcode, (bytes, str))
+        ):
             _ensure_offline_planner_import_paths()
             source_gcode_module = importlib.import_module(
                 "external_npz_preprocessor.source_gcode"
@@ -1221,6 +1236,10 @@ def _parse_prusa_slice_config(
         print_perimeters=_bool_param(params, "prusa_print_perimeters", True),
         prusa_raft=prusa_raft,
         prusa_geometry=prusa_geometry,
+        honeycomb_pathing=HoneycombPathingConfig(
+            enabled=_bool_param(params, "honeycomb_centerline_enabled", False),
+            topology=params.get("honeycomb_topology", ["closed_minimum_trails"])[0],  # type: ignore[arg-type]
+        ),
         brim_enabled=brim_enabled,
         brim_width_mm=_float_param(params, "prusa_brim_width", 5.0),
         brim_type=params.get("prusa_brim_type", ["outer_only"])[0],  # type: ignore[arg-type]
@@ -1748,6 +1767,7 @@ def _preview_payload(
 
     for layer_index in sorted(layer_indices):
         resin_paths: list[dict[str, object]] = []
+        preview_resin_indices: dict[int, list[int]] = {}
         group_resin_index = 0
         for group in groups_by_layer.get(layer_index, {}).get("R", []):
             layer_roles = resin_roles_by_layer.get(str(layer_index), [])
@@ -1760,33 +1780,30 @@ def _preview_payload(
                     if group.extrusion is not None and path_index < len(group.extrusion)
                     else None
                 )
-                if raw_extrusion is not None and len(raw_extrusion) == len(raw_points):
-                    sample_count = min(len(raw_points), 2000)
-                    step = (len(raw_points) - 1) / max(sample_count - 1, 1)
-                    sample_indices = [round(index * step) for index in range(sample_count)]
-                    sample_indices[-1] = len(raw_points) - 1
-                    points = [raw_points[index] for index in sample_indices]
-                    extrusion = [float(raw_extrusion[index]) for index in sample_indices]
-                else:
-                    points = _simplify_preview_path(raw_points, max_points=2000)
-                    extrusion = None
+                source_resin_index = group_resin_index
                 role = (
-                    layer_roles[group_resin_index]
-                    if isinstance(layer_roles, list) and group_resin_index < len(layer_roles)
+                    layer_roles[source_resin_index]
+                    if isinstance(layer_roles, list) and source_resin_index < len(layer_roles)
                     else None
                 )
                 group_resin_index += 1
-                if role in ("outer_contour", "inner_contour", "infill", "raft", "brim"):
-                    entry: dict[str, object] = {"role": role, "points": points}
-                elif path.shape[0] > 2:
-                    entry = {"role": "outer_contour", "points": points}
-                else:
-                    entry = {"role": "infill", "points": points}
-                if extrusion is not None:
-                    entry["extrusion"] = extrusion
-                resin_paths.append(entry)
-                for point in points:
-                    _expand_bounds(bounds, point[0], point[1], point[2])
+                preview_role = role if role in ("outer_contour", "inner_contour", "infill", "raft", "brim") else (
+                    "outer_contour" if path.shape[0] > 2 else "infill"
+                )
+                # Rendering must never uniformly decimate a long polyline:
+                # that joins unrelated honeycomb nodes with false chords.
+                # Keep every source point and split only the *preview payload*
+                # into contiguous overlapping chunks.
+                chunk_indices: list[int] = []
+                for points, extrusion in _preview_path_chunks(raw_points, raw_extrusion, max_points=2000):
+                    entry: dict[str, object] = {"role": preview_role, "points": points}
+                    if extrusion is not None:
+                        entry["extrusion"] = extrusion
+                    chunk_indices.append(len(resin_paths))
+                    resin_paths.append(entry)
+                    for point in points:
+                        _expand_bounds(bounds, point[0], point[1], point[2])
+                preview_resin_indices[source_resin_index] = chunk_indices
 
         serialized_fiber_paths = [
             _simplify_preview_path(path, max_points=2000)
@@ -1830,16 +1847,17 @@ def _preview_payload(
                 index = motion.get("index")
                 if not isinstance(index, int):
                     continue
-                if kind == "deposit" and 0 <= index < len(resin_paths):
-                    source = resin_paths[index]
-                    motion_paths.append(
-                        {
-                            "kind": "deposit",
-                            "role": source["role"],
-                            "points": source["points"],
-                            "extrusion": source.get("extrusion"),
-                        }
-                    )
+                if kind == "deposit" and index in preview_resin_indices:
+                    for preview_index in preview_resin_indices[index]:
+                        source = resin_paths[preview_index]
+                        motion_paths.append(
+                            {
+                                "kind": "deposit",
+                                "role": source["role"],
+                                "points": source["points"],
+                                "extrusion": source.get("extrusion"),
+                            }
+                        )
                 elif kind == "fiber_deposit" and 0 <= index < len(serialized_fiber_paths):
                     motion_paths.append(
                         {
@@ -2055,6 +2073,32 @@ def _simplify_preview_path(
     simplified = [points[round(index * step)] for index in range(max_points)]
     simplified[-1] = points[-1]
     return simplified
+
+
+def _preview_path_chunks(
+    points: list[list[float]],
+    extrusion_values,
+    *,
+    max_points: int,
+) -> list[tuple[list[list[float]], list[float] | None]]:
+    """Split a display-only path without dropping or reordering source points."""
+
+    if max_points < 2:
+        raise ValueError("preview chunk size must be at least two")
+    values = (
+        [float(value) for value in extrusion_values]
+        if extrusion_values is not None and len(extrusion_values) == len(points)
+        else None
+    )
+    chunks = []
+    start = 0
+    while start < len(points):
+        end = min(start + max_points, len(points))
+        chunks.append((points[start:end], None if values is None else values[start:end]))
+        if end == len(points):
+            break
+        start = end - 1
+    return chunks
 
 
 def _serialize_preview_point(point: object) -> list[float]:
@@ -3247,6 +3291,7 @@ def _index_html() -> str:
         <label title="仅改变预览笔触宽度，不改变轨迹中心线或挤出倍率"><input id="showLineWidth" type="checkbox">按实际规划线宽显示（当前 <span id="previewLineWidthValue">2.2 mm</span>）</label>
         <label title="仅对包含 Prusa E 数据的树脂路径按绝对单位长度挤出量着色；关闭时保持轮廓/填充原有配色。"><input id="showExtrusion" type="checkbox">显示绝对挤出量（E/mm）</label>
         <span id="extrusionColorLegend" class="extrusionColorLegend" hidden>0.00 E/mm <span class="extrusionColorRamp"></span> 0.50 E/mm</span>
+        <span title="连续蜂窝路径中，灰蓝虚线只移动喷头，不增加 E。">灰蓝虚线：零挤出安全连接</span>
         <label><input id="showPathPoints" type="checkbox">显示当前路径点</label>
         <label><input id="showDirection" type="checkbox" checked><span id="showDirectionLabel">显示打印方向</span></label>
         <span id="printSizeLabel">打印范围 -</span>
@@ -3430,6 +3475,17 @@ def _index_html() -> str:
                 <input id="prusaBrimSeparation" type="number" min="0" step="0.1" value="0">
               </div>
               <label for="prusaBrimOneStroke" class="tooltipLabel checkboxLabel" data-tooltip="尝试复用 Core 的安全边界连接策略，将 Prusa Brim 连接为一条连续挤出路径；无法安全连接时保留原生多路径。"><input id="prusaBrimOneStroke" type="checkbox"> Brim 一笔画</label>
+            </div>
+            <div class="prusaFeatureToggle">
+              <label for="honeycombCenterlineEnabled" class="tooltipLabel checkboxLabel" data-tooltip="附加于完整 Prusa 切片之后：每层先打印正式 150×100 外框，再保留 Prusa 切出的原始蜂窝壁。路径合并为一条连续运动，连接段为零挤出并避开孔洞；虚线表示这些无材料连接。重复端点最多允许三次，并在一个线宽内渐降/渐升挤出，减少节点堆料。启用后 Core 使用该附加路径，不使用原生 Prusa G-code。"><input id="honeycombCenterlineEnabled" type="checkbox"{prusa_checked('honeycomb_centerline_enabled', False)}> 蜂窝连续路径（每层外框）</label>
+              <div class="fieldGroup">
+                <label for="honeycombTopology" class="tooltipLabel" data-tooltip="默认模式从原始 STL 的蜂窝孔壁生成最少不重走分区轨迹；三岔节点以 1/3 挤出量平滑过渡，分区间用不跨孔的独立 Travel。Prusa 原始路径模式保留原始沉积段，仅用于对比。">蜂窝拓扑</label>
+                <select id="honeycombTopology">
+                  <option value="closed_minimum_trails"{prusa_selected('honeycomb_topology', 'closed_minimum_trails', 'closed_minimum_trails')}>原始 STL 孔壁（分区连续沉积 + 节点渐变）</option>
+                  <option value="native_single_motion"{prusa_selected('honeycomb_topology', 'closed_minimum_trails', 'native_single_motion')}>Prusa 原始沉积段（严格保形对比）</option>
+                  <option value="closed_hexagon_double_wall"{prusa_selected('honeycomb_topology', 'closed_minimum_trails', 'closed_hexagon_double_wall')}>严格闭合六边形（双线壁，改变拓扑）</option>
+                </select>
+              </div>
             </div>
             <details id="prusaAdvancedSettings" class="advancedSettings">
               <summary>Prusa 高级几何与路径设置</summary>
@@ -4165,12 +4221,14 @@ def _index_html() -> str:
       ['prusaPrintPerimeters', 'prusa_print_perimeters'], ['prusaRaftEnabled', 'prusa_raft_enabled'],
       ['prusaRaftAutoContact', 'prusa_raft_auto_contact'],
       ['prusaGapFillEnabled', 'prusa_gap_fill_enabled'],
-      ['prusaBrimEnabled', 'prusa_brim_enabled'], ['prusaBrimOneStroke', 'prusa_brim_one_stroke']
+      ['prusaBrimEnabled', 'prusa_brim_enabled'], ['prusaBrimOneStroke', 'prusa_brim_one_stroke'],
+      ['honeycombCenterlineEnabled', 'honeycomb_centerline_enabled']
     ];
     const prusaSelectSettings = [
       ['slicingKernel', 'slicing_kernel'], ['buildAxis', 'build_axis'],
       ['prusaInfillPattern', 'prusa_infill_pattern'], ['prusaPerimeterGenerator', 'prusa_perimeter_generator'],
-      ['prusaSeamPosition', 'prusa_seam_position'], ['prusaBrimType', 'prusa_brim_type']
+      ['prusaSeamPosition', 'prusa_seam_position'], ['prusaBrimType', 'prusa_brim_type'],
+      ['honeycombTopology', 'honeycomb_topology']
     ];
     function setInitialValue(id, value) {{
       const input = document.getElementById(id);
@@ -4834,6 +4892,8 @@ def _index_html() -> str:
       if (slicingKernelInput.value === 'prusa') {{
         formData.append('prusa_perimeter_count', document.getElementById('prusaPerimeterCount').value);
         formData.append('prusa_print_perimeters', document.getElementById('prusaPrintPerimeters').checked ? 'true' : 'false');
+        formData.append('honeycomb_centerline_enabled', document.getElementById('honeycombCenterlineEnabled').checked ? 'true' : 'false');
+        formData.append('honeycomb_topology', document.getElementById('honeycombTopology').value);
         formData.append('prusa_infill_pattern', document.getElementById('prusaInfillPattern').value);
         formData.append('prusa_infill_density', document.getElementById('prusaInfillDensity').value);
         formData.append('prusa_contour_infill_overlap', document.getElementById('prusaContourInfillOverlap').value);
@@ -5166,21 +5226,24 @@ def _index_html() -> str:
           sinPitch * yawY + cosPitch * z,
         ];
       }};
-      const corners = [];
-      for (const x of [minimum[0], maximum[0]]) {{
-        for (const y of [minimum[1], maximum[1]]) {{
-          for (const z of [minimum[2], maximum[2]]) corners.push(rotate([x, y, z]));
-        }}
-      }}
-      const projectedX = corners.map((point) => point[0]);
-      const projectedY = corners.map((point) => point[1]);
-      const spanX = Math.max(0.001, Math.max(...projectedX) - Math.min(...projectedX));
-      const spanY = Math.max(0.001, Math.max(...projectedY) - Math.min(...projectedY));
+      // Keep the camera distance independent of yaw and pitch.  Fitting the
+      // rotated bounding box here made the preview appear to zoom in or out
+      // whenever the user turned the model.  The unrotated 3D bounding-sphere
+      // diameter safely contains every orientation while leaving zoom solely
+      // under explicit user control.
+      const modelSpan = Math.max(
+        0.001,
+        Math.hypot(
+          maximum[0] - minimum[0],
+          maximum[1] - minimum[1],
+          maximum[2] - minimum[2]
+        )
+      );
       const baseScale = Math.max(
         1e-6,
         Math.min(
-          Math.max(1, plot.width - 36) / spanX,
-          Math.max(1, plot.height - 36) / spanY
+          Math.max(1, plot.width - 36) / modelSpan,
+          Math.max(1, plot.height - 36) / modelSpan
         )
       );
       const pixelsPerMm = baseScale * viewerState.zoom;
@@ -5522,8 +5585,20 @@ def _index_html() -> str:
 
       function drawExtrusionPath(path, extrusion, fallbackColor) {{
         for (let pointIndex = 0; pointIndex < path.length - 1; pointIndex++) {{
+          const deltaE = Number(extrusion[pointIndex + 1]) - Number(extrusion[pointIndex]);
+          const zeroExtrusion = Number.isFinite(deltaE) && Math.abs(deltaE) <= 1e-9;
           const density = extrusionDensity(path, extrusion, pointIndex);
-          if (density === null || extrusionRange === null) {{
+          const activeLineWidth = ctx.lineWidth;
+          if (zeroExtrusion) {{
+            // A continuous honeycomb motion has connector segments with
+            // exactly constant E.  Draw them distinctly even when the
+            // extrusion heat map is disabled, so they cannot be mistaken for
+            // deposited walls in the preview.
+            ctx.strokeStyle = '#526f8c';
+            ctx.globalAlpha = 0.95;
+            ctx.lineWidth = Math.min(activeLineWidth, 1.5);
+            ctx.setLineDash([7, 5]);
+          }} else if (density === null || extrusionRange === null) {{
             ctx.strokeStyle = fallbackColor;
           }} else {{
             ctx.strokeStyle = extrusionColorForSegment(density, extrusionRange);
@@ -5534,6 +5609,11 @@ def _index_html() -> str:
           ctx.moveTo(first[0], first[1]);
           ctx.lineTo(last[0], last[1]);
           ctx.stroke();
+          if (zeroExtrusion) {{
+            ctx.setLineDash([]);
+            ctx.lineWidth = activeLineWidth;
+            ctx.globalAlpha = 1;
+          }}
         }}
       }}
 
@@ -5575,8 +5655,7 @@ def _index_html() -> str:
           ? Math.max(1.0, physicalWidth * viewport.pixelsPerMm)
           : entry.role === 'fiber' ? 2.0 : 1.7;
         if (
-          extrusionRange !== null
-          && entry.role !== 'fiber'
+          entry.role !== 'fiber'
           && Array.isArray(entry.extrusion)
           && entry.extrusion.length === entry.points.length
         ) {{
