@@ -6,7 +6,7 @@
       "layer_height_mm": 0.5,
       "extrusion_scale": 0.95,
       "feed_mm_s": 20.0,
-      "first_layer_feed_mm_s": 10.0,
+      "first_layer_feed_mm_s": 15.0,
       "temperature_c": 240.0,
       "fan_enabled": true,
       "prime_length_mm": 21.0,

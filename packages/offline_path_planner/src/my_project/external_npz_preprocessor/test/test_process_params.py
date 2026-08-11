@@ -60,7 +60,7 @@ def test_default_process_params_match_current_material_setup():
     assert params.fiber.temperature_c == 260.0
     assert params.fiber.fan_enabled is True
     assert params.fiber.e_per_mm() == 1.0
-    assert params.resin.prime_length_mm == 22.0
+    assert params.resin.prime_length_mm == 21.0
     assert params.resin.prime_speed_mm_s == 12.0
     assert params.resin.retract_length_mm == 19.0
     assert params.resin.retract_speed_mm_s == 12.0

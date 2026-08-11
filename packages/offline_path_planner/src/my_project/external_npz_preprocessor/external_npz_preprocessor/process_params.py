@@ -21,7 +21,7 @@ class ResinProcessParams:
     first_layer_feed_mm_s: float = field(default=10.0, kw_only=True)
     temperature_c: float = 240.0
     fan_enabled: bool = True
-    prime_length_mm: float = 22.0
+    prime_length_mm: float = 21.0
     prime_speed_mm_s: float = 12.0
     retract_length_mm: float = 19.0
     retract_speed_mm_s: float = 12.0
