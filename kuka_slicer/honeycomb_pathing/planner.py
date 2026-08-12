@@ -1,9 +1,10 @@
 """STL-preserving honeycomb path planning.
 
 This is an *adapter* around a completed Prusa slice, not a replacement for
-PrusaSlicer. Deposited honeycomb walls are retained verbatim. Every move
-between two non-incident wall regions remains an explicit, hole-safe travel
-path instead of a zero-E gap hidden inside a material path.
+PrusaSlicer. Honeycomb walls are reconstructed from the source STL section.
+The wall graph is split into non-repeating deposition trails, then packed into
+the smallest tested set of macro partitions with verified hole-safe, zero-E
+connector segments.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 import heapq
 import math
+import random
 from typing import Iterable
 
 import numpy as np
@@ -21,7 +23,6 @@ from shapely.ops import unary_union, voronoi_diagram
 from ..external_npz import ExternalSourceJob, MaterialPaths, TravelPaths
 from ..stl_io import Mesh
 from .config import HoneycombTopology
-from .closed_hexagon import build_closed_hexagon_double_wall_honeycomb
 from .travel_router import HoleSafeTravelRouter, route_length
 
 
@@ -36,30 +37,22 @@ class _Edge:
     length: float
 
 
-@dataclass(frozen=True, slots=True)
-class _EulerRegion:
-    """One closed, wall-only traversal of a native STL graph component."""
-
-    traversals: tuple[tuple[tuple[float, float], tuple[float, float], int], ...]
-    edge_visits: dict[int, int]
-    repeated_length_mm: float
-
-
 def apply_honeycomb_centerline_pathing(
     job: ExternalSourceJob,
     mesh: Mesh,
     *,
     line_width_mm: float,
     tolerance_mm: float,
-    topology: HoneycombTopology = "native_single_motion",
+    topology: HoneycombTopology = "macro_partition_zero_e",
 ) -> ExternalSourceJob:
-    """Preserve native honeycomb walls and emit a partitioned path plan.
+    """Emit compact safe honeycomb macro partitions for every logical layer.
 
-    The outer frame is regenerated from the STL section, while every internal
-    deposited path remains the native Prusa geometry. True shared endpoints
-    receive a smooth three-way flow taper. Non-incident regions are never
-    joined by a material or zero-E pseudo-material segment: their shortest
-    hole-safe connector is emitted as ``T`` travel.
+    The outer STL frame remains a separate deposited path.  All internal wall
+    edges are deposited once; the necessary transitions between edge-disjoint
+    trails stay in the same ``R`` path with an unchanged cumulative E value.
+    They are therefore print-context, non-extruding moves rather than ``T``
+    travel paths in the source contract.  A boundary between two macro
+    partitions remains an explicit ``T`` travel.
     """
 
     if line_width_mm <= 0 or tolerance_mm <= 0:
@@ -70,6 +63,8 @@ def apply_honeycomb_centerline_pathing(
     )
     if not resin_groups:
         raise ValueError("honeycomb path planning requires native resin paths")
+    if topology != "macro_partition_zero_e":
+        raise ValueError("unsupported honeycomb topology")
 
     reference_z = _layer_z(resin_groups[0])
     solid = _solid_geometry_at_z(mesh, reference_z, tolerance_mm)
@@ -77,291 +72,130 @@ def apply_honeycomb_centerline_pathing(
     # contour.  Derive the frame from the STL section instead of selecting the
     # largest native ring, which can otherwise be only one honeycomb cell.
     frame = _outer_frame_from_solid(solid, reference_z)
-    native_travel_groups = {group.layer_index: group for group in job.travel_paths}
-    if topology == "closed_hexagon_double_wall":
-        pattern = build_closed_hexagon_double_wall_honeycomb(
-            tuple(float(value) for value in solid.bounds),
-            cell_side_mm=_estimate_honeycomb_cell_side(solid, line_width_mm),
-            line_width_mm=line_width_mm,
-        )
-        # Each generated loop is the exact boundary of one closed hexagonal
-        # void.  The router uses this *replacement* void geometry, rather than
-        # the source STL holes, so every non-deposition move is also checked
-        # against the new topology.
-        generated_solid = _solid_from_closed_hexagons(frame, pattern.loops)
-        routing = _closed_loop_routing_graph(frame, pattern.loops)
-        travel_router = HoleSafeTravelRouter(
-            generated_solid,
-            routing,
-            spacing_mm=min(1.0, line_width_mm * 0.5),
-        )
-        ordered_template, travel_template = _order_closed_loops(
-            frame,
-            pattern.loops,
-            travel_router,
-        )
-        topology_meta = {
-            "topology": topology,
-            "source": "post_prusa_outer_envelope",
-            "topology_change": "closed honeycomb regenerated as strict regular hexagons",
-            "original_holes": "replaced by regular closed hexagonal voids",
-            "wall_edge_count": pattern.cell_count * 6,
-            "minimum_trail_count": pattern.cell_count,
-            "layer_path_count": pattern.cell_count + 1,
-            "closed_hexagon_cell_count": pattern.cell_count,
-            "closed_hexagon_row_count": pattern.row_count,
-            "closed_hexagon_nominal_cell_side_mm": pattern.nominal_cell_side_mm,
-            "closed_hexagon_centreline_side_mm": pattern.centreline_hex_side_mm,
-            "wall_tracks_per_internal_rib": 2,
-            "wall_track_spacing_mm": round(pattern.wall_track_spacing_mm, 6),
-            "wall_track_controlled_overlap_mm": round(pattern.wall_track_overlap_mm, 6),
-            "travel_count": len(travel_template),
-            "travel_length_mm_per_layer": round(
-                sum(route_length(route) for route in travel_template), 6
-            ),
-        }
-    elif topology == "closed_minimum_trails":
-        # The wall graph comes directly from the source STL section: the
-        # actual honeycomb-hole centroids define its Voronoi centreline and
-        # the graph is clipped to the STL solid.  Prusa is used only for the
-        # nominal extrusion rate, never for wall XY geometry or connectivity.
-        wall_edges = _stl_honeycomb_wall_edges(solid, tolerance_mm)
-        # The rectangle is a standalone first deposition path.  It must not
-        # be noded into, repeated by, or reoriented with the honeycomb graph.
-        edges = wall_edges
-        euler_regions, euler_meta = _eulerize_native_wall_components(edges)
-        # Routing edges are deliberately separate from material edges.  Each
-        # clipped boundary wall component is attached to the outer frame with
-        # a verified-solid connector, so travel can use the perimeter instead
-        # of falling back to a dense grid or cutting across a honeycomb void.
-        routing, routing_meta = _stl_wall_routing_graph(edges, frame, solid)
-        travel_router = HoleSafeTravelRouter(
-            solid,
-            routing,
-            spacing_mm=min(1.0, line_width_mm * 0.5),
-        )
-        ordered_euler_regions, euler_travel_template = _order_euler_regions(
-            frame,
-            euler_regions,
-            travel_router,
-        )
-        junctions = _junction_nodes(edges)
-        topology_meta = {
-            "topology": "stl_honeycomb_eulerized_regions",
-            "source": "source_stl_hole_topology",
-            "topology_change": "none; wall graph is derived from and clipped to the source STL section",
-            "wall_edge_count": len(wall_edges),
-            "outer_frame_policy": "one closed standalone first deposition path",
-            "native_deposition_stroke_count": 0,
-            **euler_meta,
-            "junction_count": len(junctions),
-            "junction_flow_scale": round(1.0 / 3.0, 6),
-            "connector_extrusion": "none; inter-region moves are explicit T travel",
-            **routing_meta,
-        }
-    else:
-        # Do not reconstruct the honeycomb from centroids or Voronoi cells.
-        # The native Prusa job is the authority for both the source topology
-        # and its pre-optimised sequence of individual wall strokes.
-        reference_frame = frame.copy()
-        reference_frame[:, 2] = reference_z
-        reference_native_paths = _native_paths_without_outer_frame(
-            resin_groups[0],
-            reference_frame,
-            tolerance_mm=tolerance_mm,
-        )
-        travel_router = HoleSafeTravelRouter(
-            solid,
-            _native_routing_graph(
-                reference_frame,
-                reference_native_paths,
-                native_travel_groups.get(resin_groups[0].layer_index),
-                solid,
-                tolerance_mm=tolerance_mm,
-            ),
-            spacing_mm=min(1.0, line_width_mm * 0.5),
-        )
-        ordered_template = None
-        travel_template = None
-        topology_meta = {
-            "topology": "native_partitioned_trails",
-            "source": "completed_prusa_honeycomb_paths",
-            "topology_change": "none; native Prusa honeycomb paths retained verbatim",
-            "connector_extrusion": "none; inter-region moves are explicit T travel",
-        }
+    # The wall graph comes directly from the source STL section.  Degree-three
+    # honeycomb junctions prevent a one-stroke Euler walk without retracing,
+    # so first derive the exact non-repeating trail cover.  The trails are
+    # then joined with shortest verified-safe zero-E connectors *inside* the
+    # single macro partition.
+    wall_edges = _stl_honeycomb_wall_edges(solid, tolerance_mm)
+    trail_template = _minimum_trail_cover(wall_edges)
+    trail_meta = _non_repeating_trail_cover_meta(wall_edges, trail_template)
+    routing, routing_meta = _stl_wall_routing_graph(wall_edges, frame, solid)
+    travel_router = HoleSafeTravelRouter(
+        solid,
+        routing,
+        spacing_mm=min(1.0, line_width_mm * 0.5),
+    )
+    ordered_trail_template, connector_template, partition_starts, connector_meta = _order_trails(
+        frame,
+        trail_template,
+        travel_router,
+    )
+    # The first route starts at the separate outer-frame endpoint.  Every
+    # later partition start is an explicit T travel; only routes between two
+    # trails in the same partition are encoded as zero-E material motion.
+    partition_ends = [*partition_starts[1:], len(ordered_trail_template)]
+    intra_partition_connector_template = [
+        connector_template[index]
+        for start, end in zip(partition_starts, partition_ends)
+        for index in range(start + 1, end)
+    ]
+    junctions = _junction_nodes(wall_edges)
     material_paths: list[MaterialPaths] = []
     travel_paths: list[TravelPaths] = []
     roles: dict[str, list[str]] = {}
     motions: dict[str, list[dict[str, object]]] = {}
-    endpoint_compensation: dict[str, object] | None = None
     for group in resin_groups:
         z = _layer_z(group)
         frame_at_z = frame.copy()
         frame_at_z[:, 2] = z
-        if topology == "closed_hexagon_double_wall":
-            ordered = ordered_template
-            connecting_travel = travel_template
-            paths = [frame_at_z, *[_trail_to_path(trail, z) for trail in ordered]]
-        elif topology == "closed_minimum_trails":
-            native_junctions = junctions
-            # The vertical STL extrusion has the same XY section at every
-            # resin layer, so reuse the already-validated direct-STL Euler
-            # graph rather than recomputing its shortest wall retraces 20
-            # times.
-            layer_regions, layer_meta = ordered_euler_regions, euler_meta
-            ordered_regions, connecting_travel = layer_regions, euler_travel_template
-            paths, extrusion = _eulerized_region_profiles(
-                frame_at_z,
-                ordered_regions,
-                z=float(frame_at_z[0, 2]),
-                rate=_native_e_per_mm(group, tolerance_mm),
-                junctions=native_junctions,
-                tolerance_mm=tolerance_mm,
-                taper_length_mm=line_width_mm,
-            )
-            ordered = [path[:, :2].tolist() for path in paths[1:]]
-        else:
-            native_paths = _native_paths_without_outer_frame(
-                group,
-                frame_at_z,
-                tolerance_mm=tolerance_mm,
-            )
-            native_paths, connecting_travel = _order_native_paths_for_continuous_motion(
-                frame_at_z,
-                native_paths,
-                router=travel_router,
-            )
-            paths = [frame_at_z, *[path for _index, path in native_paths]]
-            ordered = [path[:, :2].tolist() for _index, path in native_paths]
-        if topology == "closed_minimum_trails":
-            taper_meta = _junction_taper_meta(native_junctions, line_width_mm)
-        else:
-            taper_plan, taper_meta = _endpoint_taper_plan(
-                paths,
-                tolerance_mm=tolerance_mm,
-                line_width_mm=line_width_mm,
-            )
-            paths = _insert_endpoint_taper_points(paths, taper_plan)
-            extrusion = _extrusion_profiles(
-                paths,
-                _native_e_per_mm(group, tolerance_mm),
-                taper_plan=taper_plan,
-            )
-        if endpoint_compensation is None:
-            endpoint_compensation = taper_meta
-        if topology == "closed_hexagon_double_wall":
-            material_paths.append(MaterialPaths(group.layer_index, "R", paths, extrusion))
-            travel_paths.append(
-                TravelPaths(group.layer_index, [_travel_to_path(path, z) for path in connecting_travel])
-            )
-            roles[str(group.layer_index)] = ["outer_contour", *("honeycomb_wall" for _ in ordered)]
-            records: list[dict[str, object]] = [{"kind": "deposit", "index": 0}]
-            for index, _trail in enumerate(ordered, start=1):
-                records.append({"kind": "travel", "index": index - 1})
-                records.append({"kind": "deposit", "index": index})
-            motions[str(group.layer_index)] = records
-            continue
-
-        if topology == "closed_minimum_trails":
-            # A physical honeycomb edge must never be reclassified as a
-            # zero-extrusion connector merely to reduce the NPZ path count.
-            # Keep every Euler trail as an explicit deposited path and every
-            # transition as a separately visible, hole-safe travel.  This
-            # preserves the STL wall topology in both the preview and the
-            # manufactured bead; callers may batch these paths for Core
-            # export, but must not merge them into pseudo-one-stroke motion.
-            material_paths.append(MaterialPaths(group.layer_index, "R", paths, extrusion))
-            if connecting_travel:
-                travel_paths.append(
-                    TravelPaths(group.layer_index, [_travel_to_path(path, z) for path in connecting_travel])
-                )
-            roles[str(group.layer_index)] = ["outer_contour", *("honeycomb_wall" for _ in ordered)]
-            records = [{"kind": "deposit", "index": 0}]
-            for index in range(1, len(paths)):
-                records.append({"kind": "travel", "index": index - 1})
-                records.append({"kind": "deposit", "index": index})
-            motions[str(group.layer_index)] = records
-            if group is resin_groups[0]:
-                topology_meta.update(
-                    {
-                        "layer_path_count": len(paths),
-                        "motion_path_count": len(paths),
-                        "travel_count": len(connecting_travel),
-                        "travel_length_mm_per_layer": round(
-                            sum(route_length(path) for path in connecting_travel), 6
-                        ),
-                        **layer_meta,
-                        "intra_region_zero_e_connector_count": 0,
-                        "intra_region_zero_e_connector_length_mm_per_layer": 0.0,
-                    }
-                )
-            continue
-
-        material_paths.append(MaterialPaths(group.layer_index, "R", paths, extrusion))
-        travel_paths.append(
-            TravelPaths(group.layer_index, [_travel_to_path(path, z) for path in connecting_travel])
+        trail_paths = [_trail_to_path(trail, z) for trail in ordered_trail_template]
+        trail_paths = _insert_junction_taper_points(
+            trail_paths,
+            junctions,
+            tolerance_mm=tolerance_mm,
+            taper_length_mm=line_width_mm,
         )
-        roles[str(group.layer_index)] = ["outer_contour", *("honeycomb_wall" for _ in ordered)]
-        records = [{"kind": "deposit", "index": 0}]
-        for index, _trail in enumerate(ordered, start=1):
-            records.append({"kind": "travel", "index": index - 1})
-            records.append({"kind": "deposit", "index": index})
-        motions[str(group.layer_index)] = records
-        if group is resin_groups[0] and topology == "native_single_motion":
-            topology_meta.update(
-                {
-                    "native_deposition_stroke_count": len(native_paths),
-                    "layer_path_count": len(paths),
-                    "motion_path_count": len(paths),
-                    "travel_count": len(connecting_travel),
-                    "connector_length_mm_per_layer": round(
-                        sum(route_length(route) for route in connecting_travel), 6
-                    ),
-                }
+        trail_extrusion = _junction_extrusion_profiles(
+            trail_paths,
+            _native_e_per_mm(group, tolerance_mm),
+            junctions=junctions,
+            tolerance_mm=tolerance_mm,
+            taper_length_mm=line_width_mm,
+        )
+        macro_paths: list[np.ndarray] = []
+        macro_extrusion: list[np.ndarray] = []
+        for start, end in zip(partition_starts, partition_ends):
+            path, profile = _combine_with_zero_extrusion_connectors(
+                trail_paths[start:end],
+                trail_extrusion[start:end],
+                connector_template[start + 1:end],
             )
+            macro_paths.append(path)
+            macro_extrusion.append(profile)
+        paths = [frame_at_z, *macro_paths]
+        extrusion = [
+            _extrusion_profiles([frame_at_z], _native_e_per_mm(group, tolerance_mm))[0],
+            *macro_extrusion,
+        ]
+        material_paths.append(MaterialPaths(group.layer_index, "R", paths, extrusion))
+        roles[str(group.layer_index)] = ["outer_contour", *("honeycomb_wall" for _ in macro_paths)]
+        records: list[dict[str, object]] = [{"kind": "deposit", "index": 0}]
+        travel_index = 0
+        for macro_index in range(len(macro_paths)):
+            if macro_index:
+                records.append({"kind": "travel", "index": travel_index})
+                travel_index += 1
+            records.append({"kind": "deposit", "index": macro_index + 1})
+        motions[str(group.layer_index)] = records
+        inter_partition_routes = [
+            connector_template[start]
+            for start in partition_starts[1:]
+        ]
+        if inter_partition_routes:
+            travel_paths.append(TravelPaths(
+                group.layer_index,
+                [_travel_to_path(route, z) for route in inter_partition_routes],
+            ))
 
     job.material_paths = material_paths
+    # Only inter-partition transitions are T paths. Macro-internal connectors
+    # intentionally live in R/E and therefore remain PRINT/G1 delta-E-zero.
     job.travel_paths = travel_paths
     job.native_gcode = None
     job.native_gcode_translation_mm = None
     job.meta["path_roles"] = {"R": roles}
     job.meta["motion_order"] = motions
     job.meta["honeycomb_centerline_pathing"] = {
-        "format": "honeycomb_partitioned_trails_v1",
+        "format": "honeycomb_macro_partition_zero_e_v1",
         "outer_frame": "stl_cross_section_outer_boundary_copied_first_to_every_layer",
-        "wall_representation": (
-            "strict closed regular hexagon loops; adjacent loops form each two-track wall"
-            if topology == "closed_hexagon_double_wall"
-            else "STL-section honeycomb-wall centreline reconstructed from the source void topology; Prusa supplies only the nominal extrusion rate"
-            if topology == "closed_minimum_trails"
-            else "native deposited paths from the completed Prusa slice; no wall geometry is reconstructed"
+        "wall_representation": "STL-section honeycomb-wall centreline reconstructed from the source void topology; Prusa supplies only the nominal extrusion rate",
+        "edge_policy": "each original STL wall is deposited exactly once; shared junctions may be revisited",
+        "trail_policy": "minimum non-repeating STL wall trails packed by bounded multi-start search into the fewest tested macro partitions",
+        "connector_policy": "within a macro partition, a shortest hole-safe connector is stored in R with unchanged cumulative E; between macro partitions it is emitted as T",
+        "connector_turn_policy": "every intra-partition connector heading change is at most 90 degrees; partition count is minimised before zero-E connector length",
+        "connector_execution_contract": "converter emits PRINT/G1 with delta_e == 0 for every macro connector",
+        "travel_optimizer": "actual-route nearest neighbour over verified hole-safe connector routes",
+        "junction_flow_compensation": _junction_taper_meta(junctions, line_width_mm),
+        "topology": "stl_honeycomb_macro_partition_zero_e",
+        "source": "source_stl_hole_topology",
+        "topology_change": "none; wall graph is derived from and clipped to the source STL section",
+        "wall_edge_count": len(wall_edges),
+        "outer_frame_policy": "one closed standalone first deposition path",
+        "macro_partition_count": len(partition_starts),
+        "layer_path_count": 1 + len(partition_starts),
+        "motion_path_count": 1 + len(partition_starts),
+        "deposit_subtrail_count": len(ordered_trail_template),
+        "intra_partition_zero_e_connector_count": len(intra_partition_connector_template),
+        "intra_partition_zero_e_connector_length_mm_per_layer": round(
+            sum(route_length(path) for path in intra_partition_connector_template), 6
         ),
-        "edge_policy": (
-            "each original STL wall receives its nominal total material; an Euler retrace divides that wall budget across its visits"
-            if topology == "closed_minimum_trails"
-            else "each generated wall segment deposited exactly once"
-        ),
-        "trail_policy": (
-            "one non-retracing closed loop per strict hexagonal void"
-            if topology == "closed_hexagon_double_wall"
-            else "Eulerized STL wall regions; only original STL-derived wall edges may be repeated"
-            if topology == "closed_minimum_trails"
-            else "native wall regions remain partitioned; only genuine shared endpoints may be continuous"
-        ),
-        "travel_policy": (
-            "shortest direct no-hole connector; solid-grid fallback only when blocked; emitted as T travel"
-            if topology != "closed_hexagon_double_wall"
-            else "shortest hole-safe connector: direct solid, wall graph, then solid grid fallback"
-        ),
-        "travel_optimizer": (
-            "actual-route nearest neighbour with the best loop entry side"
-            if topology == "closed_hexagon_double_wall"
-            else "STL wall regions are greedily ordered by the shortest hole-safe travel route"
-            if topology == "closed_minimum_trails"
-            else "native wall regions are greedily reoriented by shortest no-hole travel"
-        ),
-        "junction_flow_compensation": endpoint_compensation or {},
-        **topology_meta,
+        "travel_count": len(partition_starts) - 1,
+        "junction_count": len(junctions),
+        "junction_flow_scale": round(1.0 / 3.0, 6),
+        **trail_meta,
+        **routing_meta,
+        **connector_meta,
     }
     slicing = job.meta.get("slicing")
     if isinstance(slicing, dict):
@@ -1282,6 +1116,35 @@ def _minimum_trail_cover(edges: list[_Edge]) -> list[list[tuple[float, float]]]:
     return trails
 
 
+def _non_repeating_trail_cover_meta(
+    edges: list[_Edge],
+    trails: list[list[tuple[float, float]]],
+) -> dict[str, object]:
+    """Verify and describe an exact, edge-once cover of the wall graph."""
+
+    expected: dict[tuple[tuple[float, float], tuple[float, float]], int] = defaultdict(int)
+    actual: dict[tuple[tuple[float, float], tuple[float, float]], int] = defaultdict(int)
+    for edge in edges:
+        expected[tuple(sorted((edge.a, edge.b)))] += 1
+    for trail in trails:
+        for start, end in zip(trail, trail[1:]):
+            actual[tuple(sorted((start, end)))] += 1
+    if actual != expected:
+        missing = sum(max(0, count - actual.get(edge, 0)) for edge, count in expected.items())
+        repeated = sum(max(0, count - expected.get(edge, 0)) for edge, count in actual.items())
+        raise ValueError(
+            "minimum honeycomb trail cover must use every wall edge exactly once "
+            f"(missing={missing}, repeated={repeated})"
+        )
+    return {
+        "minimum_trail_count": len(trails),
+        "repeated_wall_edge_count": 0,
+        "repeated_wall_length_mm_per_layer": 0.0,
+        "wall_edge_coverage": "every original STL wall edge is deposited exactly once",
+        "repeat_material_policy": "not applicable; wall retracing is disabled",
+    }
+
+
 def _junction_nodes(edges: list[_Edge]) -> set[tuple[float, float]]:
     """Return only genuine three-way vertices of the STL wall graph."""
 
@@ -1476,207 +1339,376 @@ def _shortest_visible_connector(source, target, solid):
     return None if best is None else (best[1], best[2])
 
 
+# A true reversal is 180°. The regular honeycomb's valid wall turns are 60°
+# and the outer frame admits 90° corners. When this hard cap is infeasible at
+# a clipped boundary, the path starts a new macro partition instead of making
+# a blue zero-E U-turn.
+_MAX_CONNECTOR_TURN_DEGREES = 90.0
+# Packing the edge-once trails is a path-cover problem: choosing the nearest
+# valid continuation at a single dead end can prematurely create a new
+# partition.  A bounded deterministic multi-start search avoids that local
+# optimum without introducing an unbounded delay into slicing.
+_TRAIL_ORDER_SEARCH_ATTEMPTS = 640
+_TRAIL_ORDER_LOCAL_CANDIDATES = 12
+_TRAIL_ORDER_SEED = 20260812
+
+
 def _order_trails(frame: np.ndarray, trails, travel_router: HoleSafeTravelRouter):
+    """Order non-repeating wall trails with direction-safe zero-E links.
+
+    A connector is not merely required to avoid a hole: it must continue the
+    incoming and outgoing wall headings without a U-turn.  The same rule is
+    applied to every bend inside a routed connector, and an already-used
+    connector edge is never reused in either direction.
+    """
+
+    if not trails:
+        return [], [], [], {
+            "intra_partition_zero_e_max_turn_degrees": 0.0,
+            "intra_partition_zero_e_reused_edge_count": 0,
+            "partition_search_strategy": "bounded_deterministic_multistart_shortest_safe_link",
+            "partition_search_attempt_count": 0,
+        }
+
+    attempts = min(
+        _TRAIL_ORDER_SEARCH_ATTEMPTS,
+        max(32, len(trails) * 2),
+    )
+    best = None
+    # Each candidate preserves the exact same feasible-link rule.  Only the
+    # start order and distance ties change.  Prefer fewer macro partitions;
+    # at equal count prefer less zero-E motion, then less connector reuse.
+    for attempt in range(attempts):
+        candidate = _order_trails_once(
+            frame,
+            trails,
+            travel_router,
+            random.Random(_TRAIL_ORDER_SEED + attempt),
+        )
+        ordered, connectors, starts, meta = candidate
+        partition_ends = [*starts[1:], len(ordered)]
+        intra_connectors = [
+            connectors[index]
+            for start, end in zip(starts, partition_ends)
+            for index in range(start + 1, end)
+        ]
+        score = (
+            len(starts),
+            round(sum(route_length(route) for route in intra_connectors), 8),
+            int(meta["intra_partition_zero_e_reused_edge_count"]),
+            attempt,
+        )
+        if best is None or score < best[0]:
+            best = (score, candidate)
+
+    assert best is not None
+    ordered, connectors, starts, meta = best[1]
+    return ordered, connectors, starts, {
+        **meta,
+        "partition_search_strategy": "bounded_deterministic_multistart_shortest_safe_link",
+        "partition_search_attempt_count": attempts,
+        "partition_search_selected_attempt": best[0][-1],
+    }
+
+
+def _order_trails_once(
+    frame: np.ndarray,
+    trails,
+    travel_router: HoleSafeTravelRouter,
+    rng: random.Random,
+):
+    """Build one feasible trail cover candidate for the bounded search."""
+
     remaining = [list(trail) for trail in trails]
     ordered: list[list[tuple[float, float]]] = []
     travels: list[list[tuple[float, float]]] = []
+    partition_starts = [0]
     current = (float(frame[-1, 0]), float(frame[-1, 1]))
+    incoming_heading = _last_heading([(float(point[0]), float(point[1])) for point in frame])
+    used_connector_edges: set[tuple[tuple[float, float], tuple[float, float]]] = set()
+    accepted_turns: list[float] = []
+    reused_edge_count = 0
     while remaining:
-        # The old planner accepted the first endpoint that happened to be
-        # closest in straight-line distance.  A straight line can be a poor
-        # proxy near honeycomb holes, so evaluate real constrained lengths.
-        # Euclidean distance is nevertheless a strict lower bound on any
-        # connector, allowing us to stop as soon as later candidates cannot
-        # beat the best safe route already found.
-        best = None
-        candidates = []
-        for index, trail in enumerate(remaining):
-            for reverse in (False, True):
-                candidate = list(reversed(trail)) if reverse else trail
-                candidates.append((math.dist(current, candidate[0]), index, reverse, candidate))
-        for lower_bound, index, reverse, candidate in sorted(candidates, key=lambda item: item[:3]):
-            if best is not None and lower_bound >= best[0] - 1e-8:
-                break
-            route = travel_router.route(current, candidate[0])
+        if not ordered or len(ordered) in partition_starts:
+            # A partition may start at any trail orientation because its
+            # preceding transition is explicit T travel.  Sampling that
+            # freedom is what exposes much larger valid partitions than a
+            # single nearest-neighbour run can see.
+            start_candidates = [
+                (index, list(reversed(source_trail)) if reverse else source_trail)
+                for index, source_trail in enumerate(remaining)
+                for reverse in (False, True)
+            ]
+            index, trail = rng.choice(start_candidates)
+            route = travel_router.route(current, trail[0])
             if route is None:
-                continue
-            proposal = (route_length(route), index, reverse, candidate, route)
-            if best is None or proposal[:3] < best[:3]:
-                best = proposal
-        if best is None:
-            raise ValueError("cannot route honeycomb travel without crossing a hole")
-        _cost, index, _reverse, trail, route = best
+                raise ValueError("cannot route honeycomb partition transition without crossing a hole")
+            ordered.append(trail)
+            travels.append(route)
+            current = trail[-1]
+            incoming_heading = _last_heading(trail)
+            remaining.pop(index)
+            continue
+        choices = []
+        geometric_candidates = []
+        for index, source_trail in enumerate(remaining):
+            for reverse in (False, True):
+                trail = list(reversed(source_trail)) if reverse else source_trail
+                geometric_candidates.append(
+                    (math.dist(current, trail[0]), index, reverse, trail)
+                )
+        # The regular honeycomb is locally connected: evaluating the nearest
+        # endpoints first avoids a quadratic number of Dijkstra calls on a
+        # 150×100 layer.  If none of the local options satisfies the heading
+        # rule, expand once to all remaining endpoints for correctness.
+        ordered_candidates = sorted(geometric_candidates, key=lambda item: item[:3])
+        local_count = min(_TRAIL_ORDER_LOCAL_CANDIDATES, len(ordered_candidates))
+        for candidate_group in (ordered_candidates[:local_count], ordered_candidates[local_count:]):
+            for _distance, index, _reverse, trail in candidate_group:
+                route = travel_router.route(current, trail[0])
+                if route is None:
+                    continue
+                turns = [] if not ordered else _connector_turns_degrees(
+                    incoming_heading,
+                    route,
+                    _first_heading(trail),
+                )
+                if any(turn > _MAX_CONNECTOR_TURN_DEGREES + 1e-6 for turn in turns):
+                    continue
+                connector_edges = _route_edge_keys(route)
+                repeated = len(connector_edges & used_connector_edges)
+                choices.append((
+                    route_length(route),
+                    max(turns, default=0.0),
+                    repeated,
+                    sum(turns),
+                    index,
+                    trail,
+                    route,
+                    turns,
+                    connector_edges,
+                ))
+            if choices:
+                break
+        if not choices:
+            # The remaining trails cannot be joined without a zero-E U-turn.
+            # Begin the next partition on the next loop.  Its independent
+            # lead-in is emitted as T travel, not a blue zero-E connector.
+            partition_starts.append(len(ordered))
+            continue
+        else:
+            (
+                _length,
+                _max_turn,
+                repeated,
+                _turn_sum,
+                index,
+                trail,
+                route,
+                turns,
+                connector_edges,
+            ) = min(
+                choices,
+                key=lambda item: (round(item[0], 8), rng.random()),
+            )
         ordered.append(trail)
         travels.append(route)
+        reused_edge_count += repeated
+        used_connector_edges.update(connector_edges)
+        accepted_turns.extend(turns)
         current = trail[-1]
+        incoming_heading = _last_heading(trail)
         remaining.pop(index)
-    _two_opt_improve(frame, ordered, travels, travel_router)
-    return ordered, travels
+    return ordered, travels, partition_starts, {
+        "intra_partition_zero_e_max_turn_degrees": round(max(accepted_turns, default=0.0), 6),
+        "intra_partition_zero_e_reused_edge_count": reused_edge_count,
+    }
 
 
-def _solid_from_closed_hexagons(frame: np.ndarray, loops: Iterable[np.ndarray]):
-    """Build the replacement solid whose voids are the generated hexagons."""
+def _first_heading(path: list[tuple[float, float]]) -> tuple[float, float] | None:
+    for first, second in zip(path, path[1:]):
+        heading = _unit_heading(first, second)
+        if heading is not None:
+            return heading
+    return None
 
-    outer = Polygon([(float(x), float(y)) for x, y in frame[:, :2]])
-    if outer.is_empty or not outer.is_valid:
-        outer = outer.buffer(0)
-    holes = []
-    for loop in loops:
-        hexagon = Polygon([(float(x), float(y)) for x, y in loop[:, :2]])
-        if hexagon.is_empty or not hexagon.is_valid or not outer.contains(hexagon):
-            raise ValueError("generated closed hexagon lies outside the outer frame")
-        holes.append(list(hexagon.exterior.coords))
-    result = Polygon(outer.exterior.coords, holes)
-    if result.is_empty or not result.is_valid:
-        raise ValueError("generated closed-hexagon honeycomb is invalid")
+
+def _last_heading(path: list[tuple[float, float]]) -> tuple[float, float] | None:
+    for first, second in zip(reversed(path[:-1]), reversed(path[1:])):
+        heading = _unit_heading(first, second)
+        if heading is not None:
+            return heading
+    return None
+
+
+def _unit_heading(
+    first: tuple[float, float], second: tuple[float, float]
+) -> tuple[float, float] | None:
+    dx = float(second[0]) - float(first[0])
+    dy = float(second[1]) - float(first[1])
+    length = math.hypot(dx, dy)
+    if length <= 1e-8:
+        return None
+    return (dx / length, dy / length)
+
+
+def _connector_turns_degrees(
+    incoming: tuple[float, float] | None,
+    route: list[tuple[float, float]],
+    outgoing: tuple[float, float] | None,
+) -> list[float] | None:
+    headings = [
+        heading
+        for heading in [
+            incoming,
+            *[_unit_heading(first, second) for first, second in zip(route, route[1:])],
+            outgoing,
+        ]
+        if heading is not None
+    ]
+    if len(headings) < 2:
+        return []
+    result = []
+    for first, second in zip(headings, headings[1:]):
+        dot = max(-1.0, min(1.0, first[0] * second[0] + first[1] * second[1]))
+        result.append(math.degrees(math.acos(dot)))
     return result
 
 
-def _closed_loop_routing_graph(frame: np.ndarray, loops: Iterable[np.ndarray]):
-    """Use every printed boundary as an exact, no-hole travel graph."""
-
-    graph: dict[tuple[float, float], list[tuple[tuple[float, float], float]]] = defaultdict(list)
-    for path in (frame[:, :2], *loops):
-        for first, second in zip(path, path[1:]):
-            _add_route_edge(
-                graph,
-                (float(first[0]), float(first[1])),
-                (float(second[0]), float(second[1])),
-            )
-    return graph
+def _route_edge_keys(
+    route: list[tuple[float, float]]
+) -> set[tuple[tuple[float, float], tuple[float, float]]]:
+    return {
+        tuple(sorted((_node(first), _node(second))))
+        for first, second in zip(route, route[1:])
+        if math.dist(first, second) > 1e-8
+    }
 
 
-def _order_closed_loops(
-    frame: np.ndarray,
-    loops: Iterable[np.ndarray],
-    travel_router: HoleSafeTravelRouter,
-):
-    """Greedily order closed hexagons using their nearest valid entry side.
+def _heading_safe_connector_route(
+    router: HoleSafeTravelRouter,
+    start: tuple[float, float],
+    end: tuple[float, float],
+    incoming: tuple[float, float] | None,
+    outgoing: tuple[float, float] | None,
+) -> list[tuple[float, float]] | None:
+    """Return a no-hole connector whose joins never form a U-turn.
 
-    A closed loop can start from any of its six side midpoints without changing
-    the printed hexagon.  Choosing that point per move removes the avoidable
-    lead-in distance that would result from fixing all loops to one vertex.
-    This remains linear in the number of emitted paths after candidate
-    evaluation; unlike generic 2-opt it is intentionally bounded for large
-    honeycomb arrays.
+    A shortest direct route is preferred.  If it faces back along an adjacent
+    wall trail, build a short perpendicular dogleg at both ends.  That turns
+    the otherwise 180° reversal into ordinary 90° cornering, while each leg
+    is still checked by the same hole-safe router.
     """
 
-    remaining = [np.asarray(loop, dtype=np.float64) for loop in loops]
-    ordered: list[list[tuple[float, float]]] = []
-    travels: list[list[tuple[float, float]]] = []
-    current = (float(frame[-1, 0]), float(frame[-1, 1]))
-    while remaining:
-        candidates = []
-        for index, loop in enumerate(remaining):
-            for variant_index, candidate in enumerate(_closed_loop_entry_variants(loop)):
-                candidates.append(
-                    (math.dist(current, candidate[0]), index, variant_index, candidate)
-                )
-        best = None
-        for lower_bound, index, variant_index, candidate in sorted(
-            candidates,
-            key=lambda item: item[:3],
-        ):
-            if best is not None and lower_bound >= best[0] - 1e-8:
-                break
-            route = travel_router.route(current, candidate[0])
-            if route is None:
+    direct = router.route(start, end)
+    if incoming is None or outgoing is None:
+        return direct
+    if direct is not None:
+        turns = _connector_turns_degrees(incoming, direct, outgoing)
+        if all(turn <= _MAX_CONNECTOR_TURN_DEGREES + 1e-6 for turn in turns):
+            return direct
+
+    constrained = _heading_constrained_wall_route(router, start, end, incoming, outgoing)
+    if constrained is not None:
+        return constrained
+
+    candidates: list[list[tuple[float, float]]] = []
+    for distance in (0.5, 1.0, 2.0):
+        for start_sign in (-1.0, 1.0):
+            start_normal = (-incoming[1] * start_sign, incoming[0] * start_sign)
+            first = (start[0] + start_normal[0] * distance, start[1] + start_normal[1] * distance)
+            first_leg = router.route(start, first)
+            if first_leg is None:
                 continue
-            proposal = (route_length(route), index, variant_index, candidate, route)
-            if best is None or proposal[:3] < best[:3]:
-                best = proposal
-        if best is None:
-            raise ValueError("cannot route closed-hexagon travel without crossing a hole")
-        _cost, index, _variant_index, loop, route = best
-        ordered.append(loop)
-        travels.append(route)
-        current = loop[-1]
-        remaining.pop(index)
-    return ordered, travels
+            for end_sign in (-1.0, 1.0):
+                # The final dogleg reaches end in the same direction as the
+                # following deposited wall segment.
+                last = (end[0] - outgoing[0] * distance + (-outgoing[1]) * end_sign * distance,
+                        end[1] - outgoing[1] * distance + outgoing[0] * end_sign * distance)
+                middle = router.route(first, last)
+                last_leg = router.route(last, end)
+                if middle is None or last_leg is None:
+                    continue
+                route = _dedupe_route([*first_leg, *middle[1:], *last_leg[1:]])
+                # Hole-safe alone is insufficient at the outer rim: the
+                # dogleg must also remain inside the printable STL section.
+                if not router._solid.covers(LineString(route)):
+                    continue
+                turns = _connector_turns_degrees(incoming, route, outgoing)
+                if all(turn <= _MAX_CONNECTOR_TURN_DEGREES + 1e-6 for turn in turns):
+                    candidates.append(route)
+    return min(candidates, key=route_length) if candidates else None
 
 
-def _closed_loop_entry_variants(loop: np.ndarray) -> list[list[tuple[float, float]]]:
-    """Return the twelve geometrically identical start/direction variants."""
-
-    vertices = [tuple(map(float, point)) for point in loop[:-1, :2]]
-    if len(vertices) != 6:
-        raise ValueError("closed-hexagon loop must have exactly six vertices")
-    variants: list[list[tuple[float, float]]] = []
-    for index in range(6):
-        first = vertices[index]
-        second = vertices[(index + 1) % 6]
-        start = ((first[0] + second[0]) * 0.5, (first[1] + second[1]) * 0.5)
-        forward = [start, *[vertices[(index + 1 + step) % 6] for step in range(6)], start]
-        backward = [start, *[vertices[(index - step) % 6] for step in range(6)], start]
-        variants.extend((forward, backward))
-    return variants
+def _dedupe_route(route: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    result = [route[0]]
+    for point in route[1:]:
+        if math.dist(result[-1], point) > 1e-8:
+            result.append(point)
+    return result
 
 
-def _two_opt_improve(frame, ordered, travels, travel_router: HoleSafeTravelRouter) -> None:
-    """Improve a route order without changing a wall edge or using a void.
+def _heading_constrained_wall_route(
+    router: HoleSafeTravelRouter,
+    start: tuple[float, float],
+    end: tuple[float, float],
+    incoming: tuple[float, float],
+    outgoing: tuple[float, float],
+) -> list[tuple[float, float]] | None:
+    """Find a wall-graph connector that never reverses its heading.
 
-    Reversing a contiguous block and reversing every trail in that block keeps
-    all its internal safe links valid.  The two boundary links are rerouted and
-    accepted only when the total travel length strictly falls.  Two passes
-    give a useful improvement on large honeycomb graphs without an expensive
-    global travelling-salesperson solve.
+    The shortest unconstrained router can legally leave a honeycomb endpoint
+    along the same segment it just arrived on.  Search the existing safe wall
+    graph with heading as part of the state, so every graph bend and both
+    joins to deposited trails stay at or below 90°.
     """
 
-    tolerance = 1e-8
-    for _pass in range(2):
-        improved = False
-        for first_index in range(len(ordered) - 1):
-            before = (
-                (float(frame[-1, 0]), float(frame[-1, 1]))
-                if first_index == 0
-                else ordered[first_index - 1][-1]
-            )
-            for last_index in range(first_index + 1, len(ordered)):
-                reversed_block = [
-                    list(reversed(trail))
-                    for trail in reversed(ordered[first_index:last_index + 1])
-                ]
-                after_index = last_index + 1
-                old_length = route_length(travels[first_index])
-                lower_bound = math.dist(before, reversed_block[0][0])
-                if after_index < len(ordered):
-                    old_length += route_length(travels[after_index])
-                    lower_bound += math.dist(reversed_block[-1][-1], ordered[after_index][0])
-                # The interior links simply reverse, so only the two boundary
-                # links can change.  Their Euclidean lengths are lower bounds
-                # for their new safe routes; skip the expensive GEOS/Dijkstra
-                # checks when they cannot improve the existing boundaries.
-                if lower_bound >= old_length - tolerance:
-                    continue
-                new_before = travel_router.route(before, reversed_block[0][0])
-                if new_before is None:
-                    continue
-                new_after = None
-                if after_index < len(ordered):
-                    new_after = travel_router.route(
-                        reversed_block[-1][-1], ordered[after_index][0]
-                    )
-                    if new_after is None:
-                        continue
-                new_length = route_length(new_before)
-                if new_after is not None:
-                    new_length += route_length(new_after)
-                if new_length + tolerance >= old_length:
-                    continue
-                ordered[first_index:last_index + 1] = reversed_block
-                travels[first_index] = new_before
-                travels[first_index + 1:last_index + 1] = [
-                    list(reversed(route))
-                    for route in reversed(travels[first_index + 1:last_index + 1])
-                ]
-                if new_after is not None:
-                    travels[after_index] = new_after
-                improved = True
-                break
-            if improved:
-                break
-        if not improved:
-            return
+    start = _node(start)
+    end = _node(end)
+    graph = router._wall_graph
+    if start not in graph or end not in graph or start == end:
+        return None
+    queue: list[tuple[float, tuple[tuple[float, float] | None, tuple[float, float]]]] = []
+    parent: dict[tuple[tuple[float, float] | None, tuple[float, float]], tuple[tuple[float, float] | None, tuple[float, float]] | None] = {}
+    distance: dict[tuple[tuple[float, float] | None, tuple[float, float]], float] = {}
+    initial = (None, start)
+    distance[initial] = 0.0
+    parent[initial] = None
+    heapq.heappush(queue, (0.0, initial))
+    while queue:
+        cost, state = heapq.heappop(queue)
+        if cost != distance.get(state):
+            continue
+        previous, node = state
+        heading_before = incoming if previous is None else _unit_heading(previous, node)
+        if node == end and previous is not None:
+            final_heading = _unit_heading(previous, node)
+            if final_heading is not None and _turn_degrees(final_heading, outgoing) <= _MAX_CONNECTOR_TURN_DEGREES + 1e-6:
+                nodes = [node]
+                current = state
+                while parent[current] is not None:
+                    current = parent[current]
+                    nodes.append(current[1])
+                return list(reversed(nodes))
+        for next_node, edge_cost in graph[node]:
+            heading = _unit_heading(node, next_node)
+            if heading is None or heading_before is None:
+                continue
+            if _turn_degrees(heading_before, heading) > _MAX_CONNECTOR_TURN_DEGREES + 1e-6:
+                continue
+            next_state = (node, next_node)
+            proposal = cost + edge_cost
+            if proposal + 1e-9 >= distance.get(next_state, math.inf):
+                continue
+            distance[next_state] = proposal
+            parent[next_state] = state
+            heapq.heappush(queue, (proposal, next_state))
+    return None
+
+
+def _turn_degrees(first: tuple[float, float], second: tuple[float, float]) -> float:
+    dot = max(-1.0, min(1.0, first[0] * second[0] + first[1] * second[1]))
+    return math.degrees(math.acos(dot))
 
 
 def _add_route_edge(graph, first, second):

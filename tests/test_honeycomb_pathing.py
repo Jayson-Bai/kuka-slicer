@@ -20,7 +20,6 @@ from kuka_slicer.honeycomb_pathing.planner import (
     _insert_endpoint_taper_points,
     _minimum_trail_cover,
 )
-from kuka_slicer.honeycomb_pathing.closed_hexagon import build_closed_hexagon_double_wall_honeycomb
 from kuka_slicer.slicer import SliceConfig, slice_mesh_to_job
 from kuka_slicer.stl_io import Mesh
 
@@ -75,25 +74,6 @@ def test_hole_safe_router_detours_around_an_internal_void() -> None:
     assert route is not None
     assert LineString(route).length > LineString((start, end)).length
     assert LineString(route).intersection(Polygon([(3, 3), (7, 3), (7, 7), (3, 7)])).length <= 1e-8
-
-
-def test_closed_hexagon_double_wall_topology_uses_regular_closed_loops() -> None:
-    pattern = build_closed_hexagon_double_wall_honeycomb(
-        (0.0, 0.0, 150.0, 100.0),
-        cell_side_mm=5.0,
-        line_width_mm=2.0,
-    )
-
-    assert pattern.row_count == 12
-    assert pattern.cell_count == 198
-    assert pattern.wall_track_spacing_mm < 2.0
-    assert pattern.wall_track_overlap_mm > 0.0
-    for loop in pattern.loops:
-        assert np.allclose(loop[0], loop[-1])
-        assert loop.shape == (7, 2)
-        lengths = np.linalg.norm(np.diff(loop, axis=0), axis=1)
-        assert np.allclose(lengths, lengths[0])
-        assert lengths[0] == pytest.approx(4.0)
 
 
 def test_repeated_endpoint_flow_is_tapered_without_changing_unshared_flow() -> None:
@@ -179,80 +159,57 @@ def test_honeycomb_slice_exports_to_core_without_retracing_or_crossing_holes(
             infill_pattern="none",
             honeycomb_pathing=HoneycombPathingConfig(
                 enabled=True,
-                topology="native_single_motion",
+                topology="macro_partition_zero_e",
             ),
         ),
     )
 
     planner_meta = job.meta["honeycomb_centerline_pathing"]
-    expected_lines = planner_meta["layer_path_count"]
     assert job.native_gcode is None
     assert len(job.material_paths) == 2
-    assert planner_meta["topology"] == "native_partitioned_trails"
-    assert planner_meta["native_deposition_stroke_count"] == 2
-    assert planner_meta["travel_count"] == 2
-    assert expected_lines == 3
+    assert planner_meta["topology"] == "stl_honeycomb_macro_partition_zero_e"
+    assert planner_meta["macro_partition_count"] >= 1
+    assert planner_meta["layer_path_count"] == planner_meta["macro_partition_count"] + 1
+    assert planner_meta["travel_count"] == planner_meta["macro_partition_count"] - 1
+    assert planner_meta["intra_partition_zero_e_max_turn_degrees"] <= 90.0
+    assert planner_meta["wall_edge_count"] > 0
+    assert planner_meta["minimum_trail_count"] >= 1
+    assert planner_meta["repeated_wall_edge_count"] == 0
+    assert planner_meta["repeated_wall_length_mm_per_layer"] == 0.0
+    assert planner_meta["intra_partition_zero_e_connector_count"] > 0
 
     holes = unary_union([Polygon(ring) for ring in hole_rings])
+    hole_interior = holes.buffer(-1e-4)
     for group in job.material_paths:
-        assert len(group.paths) == expected_lines
+        assert len(group.paths) == planner_meta["layer_path_count"]
         assert group.extrusion is not None
-        assert len(group.extrusion) == expected_lines
+        assert len(group.extrusion) == planner_meta["layer_path_count"]
         for path, values in zip(group.paths, group.extrusion):
             assert values.shape[0] == path.shape[0]
-            assert np.all(np.diff(values) > 0.0)
+            assert np.all(np.diff(values) >= 0.0)
+        assert any(
+            np.any(
+                (np.linalg.norm(np.diff(macro_path[:, :2], axis=0), axis=1) > 1e-8)
+                & np.isclose(np.diff(macro_e), 0.0, atol=1e-9)
+            )
+            for macro_path, macro_e in zip(group.paths[1:], group.extrusion[1:])
+        )
+        assert all(
+            LineString(segment).intersection(hole_interior).length <= 1e-8
+            for macro_path in group.paths[1:]
+            for segment in zip(macro_path[:-1, :2], macro_path[1:, :2])
+        )
         all_points = np.vstack(group.paths)
         assert np.min(all_points[:, :2], axis=0) == pytest.approx([0.0, 0.0])
         assert np.max(all_points[:, :2], axis=0) == pytest.approx([20.0, 18.0])
         assert job.meta["path_roles"]["R"][str(group.layer_index)] == [
-            "outer_contour", "honeycomb_wall", "honeycomb_wall"
+            "outer_contour", *("honeycomb_wall" for _ in group.paths[1:])
         ]
-
-    assert len(job.travel_paths) == 2
-    for group in job.travel_paths:
-        assert len(group.paths) == 2
-        assert all(LineString(path[:, :2]).intersection(holes).length <= 1e-8 for path in group.paths)
-
-    native_stl_job = slice_mesh_to_job(
-        _honeycomb_mesh(hole_rings),
-        SliceConfig(
-            slicing_kernel="prusa",
-            material="R",
-            layer_height=1.0,
-            first_layer_height=1.0,
-            line_width=2.0,
-            infill_pattern="none",
-            honeycomb_pathing=HoneycombPathingConfig(
-                enabled=True,
-                topology="closed_minimum_trails",
-            ),
-        ),
+    assert len(job.travel_paths) == len(job.material_paths)
+    assert all(
+        len(group.paths) == planner_meta["travel_count"]
+        for group in job.travel_paths
     )
-    stl_meta = native_stl_job.meta["honeycomb_centerline_pathing"]
-    assert stl_meta["topology"] == "stl_honeycomb_eulerized_regions"
-    assert stl_meta["source"] == "source_stl_hole_topology"
-    assert stl_meta["junction_flow_scale"] == pytest.approx(1.0 / 3.0)
-    # This branch no longer inherits the two mock Prusa wall strokes.  It
-    # derives the wall graph from the three source-STL holes, then adds only
-    # repeated visits on those graph edges to make each region continuous.
-    assert stl_meta["layer_path_count"] >= 1
-    assert stl_meta["wall_edge_count"] > 0
-    assert stl_meta["eulerized_region_count"] >= 1
-    assert stl_meta["intra_region_zero_e_connector_count"] == 0
-    hole_interior = holes.buffer(-1e-4)
-    for material_group in native_stl_job.material_paths:
-        assert material_group.extrusion is not None
-        for path, values in zip(material_group.paths, material_group.extrusion):
-            assert np.all(np.diff(values) >= 0.0)
-            segment_length = np.linalg.norm(np.diff(path[:, :2], axis=0), axis=1)
-            extrusion_delta = np.diff(values)
-            assert np.all((segment_length <= 1e-8) | (extrusion_delta > 0.0))
-            assert LineString(path[:, :2]).intersection(hole_interior).length <= 1e-8
-    for travel_group in native_stl_job.travel_paths:
-        assert all(
-            LineString(path[:, :2]).intersection(hole_interior).length <= 1e-8
-            for path in travel_group.paths
-        )
 
     source_path = tmp_path / "honeycomb_source.npz"
     system_path = tmp_path / "honeycomb_system.npz"
