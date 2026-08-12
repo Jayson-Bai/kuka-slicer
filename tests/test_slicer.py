@@ -1,5 +1,7 @@
 ﻿import math
 
+import inspect
+
 import numpy as np
 import pytest
 from shapely import maximum_inscribed_circle
@@ -60,6 +62,8 @@ from kuka_slicer.slicer import (
 from kuka_slicer.stl_io import Mesh
 from kuka_slicer.ui_server import (
     DEFAULT_UI_RESIN_INFILL_OVERLAP_PERCENT,
+    _choose_mapped_surface_npz_file,
+    _load_surface_preview_last_directory,
     _index_html,
     _parse_prusa_slice_config,
     _resolved_slice_config,
@@ -67,6 +71,7 @@ from kuka_slicer.ui_server import (
     _preview_payload_from_source_npz,
     _raft_layers_from_params,
     _simplify_preview_path,
+    _save_surface_preview_last_directory,
     expand_fiber_template_for_resin_layers,
     load_fiber_template_json,
 )
@@ -968,6 +973,31 @@ def test_preview_marks_mapped_xyzabc_paths_as_a_surface_and_preserves_orientatio
     assert preview["geometry_mode"] == "surface_3d"
     assert preview["tool_orientation"]["available"] is True
     assert preview["layers"][0]["resin_paths"][0]["points"] == mapped_path.tolist()
+
+
+def test_preview_keeps_a_long_honeycomb_macro_partition_as_one_path():
+    frame = np.asarray(
+        [[0.0, 0.0, 0.5], [10.0, 0.0, 0.5], [10.0, 8.0, 0.5], [0.0, 0.0, 0.5]],
+        dtype=np.float64,
+    )
+    x = np.linspace(0.0, 10.0, 7_201)
+    macro = np.column_stack((x, np.sin(x), np.full_like(x, 0.5)))
+    macro_e = np.concatenate(([0.0], np.cumsum(np.where(np.arange(7_200) % 7 == 0, 0.0, 1.0))))
+    job = ExternalSourceJob(
+        material_paths=[MaterialPaths(0, "R", [frame, macro], extrusion=[np.arange(4.0), macro_e])],
+        meta={
+            "path_roles": {"R": {"0": ["outer_contour", "honeycomb_wall"]}},
+            "motion_order": {"0": [{"kind": "deposit", "index": 0}, {"kind": "deposit", "index": 1}]},
+        },
+    )
+
+    preview = _preview_payload(Mesh(_cube_triangles(size=10.0)), SliceConfig(line_width=2.0), job)
+    layer = preview["layers"][0]
+
+    assert len(layer["resin_paths"]) == 2
+    assert len(layer["motion_paths"]) == 2
+    assert len(layer["resin_paths"][1]["points"]) == 7_201
+    assert layer["resin_paths"][1]["extrusion"] == macro_e.tolist()
 
 
 def test_preview_import_adapter_reads_mapped_external_npz(tmp_path):
@@ -4513,6 +4543,67 @@ def test_ui_preview_reuses_canvas_for_surface_3d_tool_direction():
         "左键旋转；右键或中键平移",
     ):
         assert feature in html
+
+
+def test_ui_surface_preview_can_overlay_prior_layers_and_always_labels_curvature():
+    html = _index_html()
+
+    assert 'id="showLayerOverlay" type="checkbox"' in html
+    assert 'id="showLayerOverlay" type="checkbox" checked' not in html
+    assert "showLayerOverlayInput.checked" in html
+    assert "historicalOverlayEntries" in html
+    assert "drawHistoricalOverlay(historicalOverlayEntries())" in html
+    assert "const batches = new Map()" in html
+    assert "requestAnimationFrame" in html
+    assert "drawPreviewNow" in html
+    assert "historicalPathStride" in html
+    assert "Math.ceil(path.length / 240)" in html
+    assert "the complete E-aware view is restored on release" in html
+    assert "surfaceLayerCurvatureText" in html
+    assert "drawSurfaceLayerCurvature(ctx, viewport, layer)" in html
+    assert "κ min/avg/max" in html
+
+
+def test_ui_can_play_the_selected_print_path_with_direction_markers():
+    html = _index_html()
+
+    assert 'id="playCurrentPath" type="button"' in html
+    assert "播放当前路径" in html
+    assert 'id="pathPlaybackRate" type="range" min="0" max="1"' in html
+    assert 'value="1" aria-label="当前路径播放速率"' in html
+    assert "PLAYBACK_MAX_SPEED_MM_PER_S = 8" in html
+    assert "buildPathPlaybackTimeline" in html
+    assert "drawPlaybackPathArrow" in html
+    assert "buildPathPlaybackTimeline(entry.points, entry.extrusion)" in html
+    assert "deltaE <= 1e-9 ? '#2563eb' : '#dc2626'" in html
+    assert "drawPathDirectionMarkers" not in html
+    assert "pathPlayback.running && pathPlayback.timeline" in html
+    assert "stopPathPlayback();" in html
+
+
+def test_ui_remembers_the_last_surface_npz_preview_directory_when_supported():
+    html = _index_html()
+
+    assert "fetch('/choose-surface-npz-preview'" in html
+    assert "applyMappedSurfacePreview(result.preview, result.file_name)" in html
+    assert "window.showOpenFilePicker" not in html
+
+
+def test_surface_npz_picker_directory_is_persisted_in_local_ui_state(tmp_path):
+    selected_directory = tmp_path / "mapped"
+    selected_directory.mkdir()
+    state_path = tmp_path / ".surface_preview_picker.json"
+
+    _save_surface_preview_last_directory(state_path, selected_directory)
+
+    assert _load_surface_preview_last_directory(state_path) == selected_directory
+
+
+def test_surface_npz_picker_uses_a_native_dialog_without_launching_powershell():
+    picker_source = inspect.getsource(_choose_mapped_surface_npz_file)
+
+    assert "filedialog.askopenfilename" in picker_source
+    assert '"powershell"' not in picker_source
 
 
 def test_preview_simplification_keeps_contour_corners():

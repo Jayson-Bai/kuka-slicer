@@ -72,6 +72,63 @@ MAX_SURFACE_PREVIEW_NPZ_BYTES = 256 * 1024 * 1024
 DEFAULT_UI_RESIN_INFILL_OVERLAP_PERCENT = 0.0
 
 
+def _surface_preview_picker_state_path(output_dir: Path) -> Path:
+    return output_dir / ".surface_preview_picker.json"
+
+
+def _load_surface_preview_last_directory(state_path: Path) -> Path | None:
+    try:
+        raw = json.loads(state_path.read_text(encoding="utf-8"))
+        directory = raw.get("last_directory") if isinstance(raw, dict) else None
+        candidate = Path(directory) if isinstance(directory, str) else None
+        return candidate if candidate is not None and candidate.is_dir() else None
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _save_surface_preview_last_directory(state_path: Path, directory: Path) -> None:
+    try:
+        state_path.write_text(
+            json.dumps({"last_directory": str(directory)}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError:
+        # Directory recall improves this local UI command but must never make
+        # an otherwise valid NPZ preview fail to load.
+        pass
+
+
+def _choose_mapped_surface_npz_file(initial_directory: Path | None) -> Path | None:
+    """Open the Windows picker at the last successful mapped-NPZ directory."""
+
+    if sys.platform != "win32":
+        raise RuntimeError("native mapped-NPZ picker is available only on Windows")
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except ImportError as exc:
+        raise RuntimeError("无法加载 Windows 原生文件选择组件") from exc
+
+    root = tk.Tk()
+    try:
+        root.withdraw()
+        root.attributes("-topmost", True)
+        root.update()
+        selected = filedialog.askopenfilename(
+            parent=root,
+            title="选择映射曲面 NPZ",
+            initialdir=(
+                str(initial_directory)
+                if initial_directory is not None and initial_directory.is_dir()
+                else None
+            ),
+            filetypes=[("映射曲面 NPZ", "*.npz"), ("所有文件", "*.*")],
+        )
+    finally:
+        root.destroy()
+    return Path(selected) if selected else None
+
+
 def _offline_planner_data_root() -> Path:
     return (
         Path(__file__).resolve().parent.parent
@@ -386,6 +443,11 @@ def run_ui_server(host: str, port: int, output_dir: Path) -> None:
         slice_jobs_lock = threading.Lock()
         tool_launchers: dict[str, subprocess.Popen[bytes]] = {}
         tool_launchers_lock = threading.Lock()
+        surface_preview_picker_lock = threading.Lock()
+        surface_preview_picker_state_path = _surface_preview_picker_state_path(server_output_dir)
+        surface_preview_last_directory = _load_surface_preview_last_directory(
+            surface_preview_picker_state_path
+        )
 
     server = ThreadingHTTPServer((host, port), SlicerUiHandler)
     print(f"KUKA slicer UI running at http://{host}:{port}")
@@ -403,6 +465,9 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
     slice_jobs_lock = threading.Lock()
     tool_launchers: dict[str, subprocess.Popen[bytes]] = {}
     tool_launchers_lock = threading.Lock()
+    surface_preview_picker_lock = threading.Lock()
+    surface_preview_last_directory: Path | None = None
+    surface_preview_picker_state_path: Path | None = None
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -429,6 +494,12 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
                 return
             self._send_json({"ok": True})
+            return
+        if parsed.path == "/choose-surface-npz-preview":
+            try:
+                self._choose_surface_npz_preview()
+            except Exception as exc:  # noqa: BLE001
+                self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
         if parsed.path == "/preview-source-npz":
             try:
@@ -468,6 +539,34 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                 "state": "queued",
                 "progress": 0,
                 "message": "已接收任务，等待处理",
+            }
+        )
+
+    def _choose_surface_npz_preview(self) -> None:
+        """Choose and load a mapped NPZ through the native Windows dialog."""
+
+        handler_type = type(self)
+        with handler_type.surface_preview_picker_lock:
+            selected = _choose_mapped_surface_npz_file(handler_type.surface_preview_last_directory)
+        if selected is None:
+            self._send_json({"ok": True, "cancelled": True})
+            return
+        selected = selected.resolve()
+        if selected.suffix.lower() != ".npz":
+            raise ValueError("请选择 .npz 映射曲面文件")
+        if not selected.is_file():
+            raise ValueError("所选映射曲面 NPZ 不存在")
+        if selected.stat().st_size > MAX_SURFACE_PREVIEW_NPZ_BYTES:
+            raise ValueError("mapped source NPZ exceeds the 256 MB preview limit")
+        handler_type.surface_preview_last_directory = selected.parent
+        state_path = handler_type.surface_preview_picker_state_path
+        if state_path is not None:
+            _save_surface_preview_last_directory(state_path, selected.parent)
+        self._send_json(
+            {
+                "ok": True,
+                "file_name": selected.name,
+                "preview": _preview_payload_from_source_npz(selected.read_bytes(), selected.name),
             }
         )
 
@@ -1238,7 +1337,10 @@ def _parse_prusa_slice_config(
         prusa_geometry=prusa_geometry,
         honeycomb_pathing=HoneycombPathingConfig(
             enabled=_bool_param(params, "honeycomb_centerline_enabled", False),
-            topology=params.get("honeycomb_topology", ["closed_minimum_trails"])[0],  # type: ignore[arg-type]
+            # Saved UI states may still contain one of the removed topology
+            # names.  The only supported mode is deliberately selected here
+            # instead of allowing an old setting to make slicing fail.
+            topology="macro_partition_zero_e",
         ),
         brim_enabled=brim_enabled,
         brim_width_mm=_float_param(params, "prusa_brim_width", 5.0),
@@ -1792,10 +1894,17 @@ def _preview_payload(
                 )
                 # Rendering must never uniformly decimate a long polyline:
                 # that joins unrelated honeycomb nodes with false chords.
-                # Keep every source point and split only the *preview payload*
-                # into contiguous overlapping chunks.
+                # Honeycomb macro partitions must remain one logical preview
+                # path so the slider and playback show the actual full
+                # execution flow.  Other very long paths keep their bounded
+                # transport chunks to protect general preview responsiveness.
+                preview_chunk_size = 16_000 if role == "honeycomb_wall" else 2_000
                 chunk_indices: list[int] = []
-                for points, extrusion in _preview_path_chunks(raw_points, raw_extrusion, max_points=2000):
+                for points, extrusion in _preview_path_chunks(
+                    raw_points,
+                    raw_extrusion,
+                    max_points=preview_chunk_size,
+                ):
                     entry: dict[str, object] = {"role": preview_role, "points": points}
                     if extrusion is not None:
                         entry["extrusion"] = extrusion
@@ -3048,6 +3157,29 @@ def _index_html() -> str:
       font-size: 13px;
       color: var(--muted);
     }}
+    .pathPlaybackControls {{
+      margin-top: var(--space-2);
+      display: grid;
+      grid-template-columns: auto auto minmax(110px, 1fr) auto;
+      gap: var(--space-2);
+      align-items: center;
+    }}
+    .pathPlaybackControls button {{
+      min-height: 30px;
+      height: 30px;
+      padding: 0 10px;
+      font-size: 13px;
+    }}
+    .pathPlaybackControls label {{
+      margin: 0;
+      font-size: 13px;
+      color: var(--muted);
+      white-space: nowrap;
+    }}
+    .pathPlaybackControls input {{
+      min-width: 0;
+      padding: 0;
+    }}
     .legend {{
       margin-top: var(--space-4);
       display: flex;
@@ -3274,6 +3406,12 @@ def _index_html() -> str:
             <input id="pathProgressSlider" type="range" min="0" max="0" value="0" disabled>
             <output id="pathProgressLabel">-</output>
           </div>
+          <div id="pathPlaybackControl" class="pathPlaybackControls" hidden>
+            <button id="playCurrentPath" type="button" disabled aria-pressed="false">播放当前路径</button>
+            <label for="pathPlaybackRate">播放速率</label>
+            <input id="pathPlaybackRate" type="range" min="0" max="1" step="0.05" value="1" aria-label="当前路径播放速率">
+            <output id="pathPlaybackRateLabel">1.00</output>
+          </div>
         </div>
       </div>
       <div class="legend" aria-label="预览图例">
@@ -3288,6 +3426,7 @@ def _index_html() -> str:
         <span class="legendItem"><span class="swatch originSwatch"></span>打印平面原点 (0, 0)</span>
       </div>
       <div class="viewOptions" aria-label="显示选项">
+        <label title="开启后同时绘制当前层及此前各层的完整路径；每层保留自身实际 Z 高度。"><input id="showLayerOverlay" type="checkbox">叠加层显示</label>
         <label title="仅改变预览笔触宽度，不改变轨迹中心线或挤出倍率"><input id="showLineWidth" type="checkbox">按实际规划线宽显示（当前 <span id="previewLineWidthValue">2.2 mm</span>）</label>
         <label title="仅对包含 Prusa E 数据的树脂路径按绝对单位长度挤出量着色；关闭时保持轮廓/填充原有配色。"><input id="showExtrusion" type="checkbox">显示绝对挤出量（E/mm）</label>
         <span id="extrusionColorLegend" class="extrusionColorLegend" hidden>0.00 E/mm <span class="extrusionColorRamp"></span> 0.50 E/mm</span>
@@ -3477,13 +3616,11 @@ def _index_html() -> str:
               <label for="prusaBrimOneStroke" class="tooltipLabel checkboxLabel" data-tooltip="尝试复用 Core 的安全边界连接策略，将 Prusa Brim 连接为一条连续挤出路径；无法安全连接时保留原生多路径。"><input id="prusaBrimOneStroke" type="checkbox"> Brim 一笔画</label>
             </div>
             <div class="prusaFeatureToggle">
-              <label for="honeycombCenterlineEnabled" class="tooltipLabel checkboxLabel" data-tooltip="附加于完整 Prusa 切片之后：每层先打印正式 150×100 外框，再保留 Prusa 切出的原始蜂窝壁。路径合并为一条连续运动，连接段为零挤出并避开孔洞；虚线表示这些无材料连接。重复端点最多允许三次，并在一个线宽内渐降/渐升挤出，减少节点堆料。启用后 Core 使用该附加路径，不使用原生 Prusa G-code。"><input id="honeycombCenterlineEnabled" type="checkbox"{prusa_checked('honeycomb_centerline_enabled', False)}> 蜂窝连续路径（每层外框）</label>
+              <label for="honeycombCenterlineEnabled" class="tooltipLabel checkboxLabel" data-tooltip="附加于完整 Prusa 切片之后：每层先打印正式 150×100 外框，再生成原始 STL 孔壁的蜂窝路径。每个宏观分区内以不跨孔的零挤出安全换段连接，分区之间采用最短安全空走；所有沉积蜂窝壁均不重走。区内连接转角不超过 90°，三岔节点在一个线宽内渐降/渐升挤出。启用后 Core 使用该附加路径，不使用原生 Prusa G-code。"><input id="honeycombCenterlineEnabled" type="checkbox"{prusa_checked('honeycomb_centerline_enabled', False)}> 蜂窝连续路径（每层外框）</label>
               <div class="fieldGroup">
-                <label for="honeycombTopology" class="tooltipLabel" data-tooltip="默认模式从原始 STL 的蜂窝孔壁生成最少不重走分区轨迹；三岔节点以 1/3 挤出量平滑过渡，分区间用不跨孔的独立 Travel。Prusa 原始路径模式保留原始沉积段，仅用于对比。">蜂窝拓扑</label>
+                <label for="honeycombTopology" class="tooltipLabel" data-tooltip="从原始 STL 的蜂窝孔壁生成不重走轨迹；通过多起点安全连接搜索，优先减少宏观分区数。分区内以不跨孔、转角不超过 90° 的零挤出安全换段连接；分区之间为最短安全空走。三岔节点以 1/3 挤出量平滑过渡。">蜂窝拓扑</label>
                 <select id="honeycombTopology">
-                  <option value="closed_minimum_trails"{prusa_selected('honeycomb_topology', 'closed_minimum_trails', 'closed_minimum_trails')}>原始 STL 孔壁（分区连续沉积 + 节点渐变）</option>
-                  <option value="native_single_motion"{prusa_selected('honeycomb_topology', 'closed_minimum_trails', 'native_single_motion')}>Prusa 原始沉积段（严格保形对比）</option>
-                  <option value="closed_hexagon_double_wall"{prusa_selected('honeycomb_topology', 'closed_minimum_trails', 'closed_hexagon_double_wall')}>严格闭合六边形（双线壁，改变拓扑）</option>
+                  <option value="macro_partition_zero_e"{prusa_selected('honeycomb_topology', 'macro_partition_zero_e', 'macro_partition_zero_e')}>原始 STL 孔壁（最少宏观分区，区内零挤出安全换段）</option>
                 </select>
               </div>
             </div>
@@ -4014,36 +4151,52 @@ def _index_html() -> str:
     }}
     surfaceToolButtons['surface-preview'].addEventListener('click', () => launchSurfaceTool('surface-preview'));
     surfaceToolButtons['surface-map'].addEventListener('click', () => launchSurfaceTool('surface-map'));
-    surfaceNpzPreviewButton.addEventListener('click', () => surfaceNpzInput.click());
-    surfaceNpzInput.addEventListener('change', async () => {{
-      const file = surfaceNpzInput.files?.[0];
+    function applyMappedSurfacePreview(preview, fileName) {{
+      previewData = preview;
+      configureViewer();
+      layersEl.textContent = String(previewData.layers?.length || 0);
+      outputNameEl.textContent = fileName;
+      downloadEl.removeAttribute('href');
+      downloadEl.textContent = '已载入曲面预览（未导出）';
+      statusEl.className = 'status ok';
+      statusEl.textContent = '已载入映射曲面 NPZ：左键旋转，箭头尖端为当前打印点。';
+      drawPreview();
+    }}
+    async function loadMappedSurfaceNpz(file) {{
       if (!file) return;
-      const originalLabel = surfaceNpzPreviewButton.textContent;
-      surfaceNpzPreviewButton.disabled = true;
-      surfaceNpzPreviewButton.textContent = '正在载入预览…';
       try {{
         const payload = new FormData();
         payload.append('source_npz', file, file.name);
         const response = await fetch('/preview-source-npz', {{ method: 'POST', body: payload }});
         const result = await response.json();
         if (!response.ok || !result.ok) throw new Error(result.error || '曲面 NPZ 预览载入失败');
-        previewData = result.preview;
-        configureViewer();
-        layersEl.textContent = String(previewData.layers?.length || 0);
-        outputNameEl.textContent = file.name;
-        downloadEl.removeAttribute('href');
-        downloadEl.textContent = '已载入曲面预览（未导出）';
-        statusEl.className = 'status ok';
-        statusEl.textContent = '已载入映射曲面 NPZ：左键旋转，箭头尖端为当前打印点。';
-        drawPreview();
+        applyMappedSurfacePreview(result.preview, file.name);
       }} catch (error) {{
         statusEl.className = 'status error';
         statusEl.textContent = '无法载入曲面 NPZ：' + error.message;
       }} finally {{
-        surfaceNpzPreviewButton.disabled = false;
-        surfaceNpzPreviewButton.textContent = originalLabel;
         surfaceNpzInput.value = '';
       }}
+    }}
+    surfaceNpzPreviewButton.addEventListener('click', async () => {{
+      const originalLabel = surfaceNpzPreviewButton.textContent;
+      surfaceNpzPreviewButton.disabled = true;
+      surfaceNpzPreviewButton.textContent = '正在选择文件…';
+      try {{
+        const response = await fetch('/choose-surface-npz-preview', {{ method: 'POST' }});
+        const result = await response.json();
+        if (!response.ok || !result.ok) throw new Error(result.error || '曲面 NPZ 选择失败');
+        if (!result.cancelled) applyMappedSurfacePreview(result.preview, result.file_name);
+      }} catch (error) {{
+        statusEl.className = 'status error';
+        statusEl.textContent = '无法选择曲面 NPZ：' + error.message;
+      }} finally {{
+        surfaceNpzPreviewButton.disabled = false;
+        surfaceNpzPreviewButton.textContent = originalLabel;
+      }}
+    }});
+    surfaceNpzInput.addEventListener('change', async () => {{
+      await loadMappedSurfaceNpz(surfaceNpzInput.files?.[0]);
     }});
     const exportProgressEl = document.getElementById('exportProgress');
     const exportProgressBarEl = document.getElementById('exportProgressBar');
@@ -4061,10 +4214,27 @@ def _index_html() -> str:
     const pathProgressSlider = document.getElementById('pathProgressSlider');
     const layerLabel = document.getElementById('layerLabel');
     const pathProgressLabel = document.getElementById('pathProgressLabel');
+    const pathPlaybackControl = document.getElementById('pathPlaybackControl');
+    const playCurrentPathButton = document.getElementById('playCurrentPath');
+    const pathPlaybackRateInput = document.getElementById('pathPlaybackRate');
+    const pathPlaybackRateLabel = document.getElementById('pathPlaybackRateLabel');
     const printSizeLabel = document.getElementById('printSizeLabel');
     const stlFileInput = document.getElementById('stlFile');
     const fiberJsonInput = document.getElementById('fiberJsonFile');
     const fiberNotice = document.getElementById('fiberNotice');
+    const showLayerOverlayInput = document.getElementById('showLayerOverlay');
+    const surfaceCurvatureTextCache = new WeakMap();
+    let historicalOverlayCache = {{ preview: null, key: '', entries: [] }};
+    let pendingPreviewFrame = null;
+    const pathPlayback = {{
+      entry: null,
+      timeline: null,
+      distanceMm: 0,
+      running: false,
+      frame: null,
+      previousTimestamp: null,
+    }};
+    const PLAYBACK_MAX_SPEED_MM_PER_S = 8;
     const showLineWidthInput = document.getElementById('showLineWidth');
     const showExtrusionInput = document.getElementById('showExtrusion');
     const extrusionColorLegend = document.getElementById('extrusionColorLegend');
@@ -4232,7 +4402,10 @@ def _index_html() -> str:
     ];
     function setInitialValue(id, value) {{
       const input = document.getElementById(id);
-      if (input && value !== null && value !== undefined && value !== '') input.value = String(value);
+      if (!input || value === null || value === undefined || value === '') return;
+      const normalized = String(value);
+      if (input instanceof HTMLSelectElement && !Array.from(input.options).some((option) => option.value === normalized)) return;
+      input.value = normalized;
     }}
     function applyInitialSavedSettings() {{
       const core = initialCoreParams || {{}};
@@ -5013,16 +5186,18 @@ def _index_html() -> str:
 
     function configureViewer() {{
       const layers = previewData?.layers || [];
+      stopPathPlayback();
       layerSlider.disabled = layers.length === 0;
       layerSlider.max = Math.max(0, layers.length - 1);
       layerSlider.value = 0;
       resetPreviewView();
       const isSurface = isSurfacePreview();
-      showDirectionLabel.textContent = isSurface ? '显示打印头方向' : '显示打印方向';
+      showDirectionLabel.textContent = isSurface ? '显示路径方向/打印头' : '显示打印方向';
       previewCanvas.title = isSurface
         ? '滚轮缩放；左键旋转；右键或中键平移；双击复位'
         : '滚轮缩放；鼠标左键、右键或中键拖动视图；双击复位';
       updatePrintSizeLabel();
+      updatePathPlaybackRateLabel();
       updatePathSlider(true);
     }}
 
@@ -5115,6 +5290,90 @@ def _index_html() -> str:
       return orderedEntries.filter((entry) => roleIsSelected(entry.role));
     }}
 
+    function historicalOverlayEntries() {{
+      const layers = previewData?.layers || [];
+      const currentLayerPosition = Number(layerSlider.value);
+      const visibilityKey = [
+        showOuterContourInput,
+        showInnerContourInput,
+        showResinInfillInput,
+        showRaftPathsInput,
+        showFiberPathsInput,
+        showTravelPathsInput,
+        showCoreTravelPathsInput,
+        showPrimelineInput,
+      ].map((input) => input.checked ? '1' : '0').join('');
+      const key = `${{currentLayerPosition}}:${{visibilityKey}}`;
+      if (historicalOverlayCache.preview === previewData && historicalOverlayCache.key === key) {{
+        return historicalOverlayCache.entries;
+      }}
+      const entries = [];
+      for (let layerPosition = 0; layerPosition < currentLayerPosition; layerPosition++) {{
+        entries.push(...selectedPrintEntries(layers[layerPosition]));
+      }}
+      historicalOverlayCache = {{ preview: previewData, key, entries }};
+      return entries;
+    }}
+
+    function currentPlaybackEntry() {{
+      const entries = selectedPrintEntries(currentLayer());
+      const visibleCount = Math.min(Number(pathProgressSlider.value), entries.length);
+      for (let index = visibleCount - 1; index >= 0; index--) {{
+        const entry = entries[index];
+        if (entry.kind === 'deposit' && entry.points?.length >= 2) return entry;
+      }}
+      return null;
+    }}
+
+    function buildPathPlaybackTimeline(path, extrusion) {{
+      const cumulative = [0];
+      for (let index = 1; index < path.length; index++) {{
+        const previous = path[index - 1];
+        const point = path[index];
+        cumulative.push(cumulative[index - 1] + Math.hypot(
+          Number(point[0]) - Number(previous[0]),
+          Number(point[1]) - Number(previous[1]),
+          Number(point[2]) - Number(previous[2]),
+        ));
+      }}
+      const eProfile = Array.isArray(extrusion) && extrusion.length === path.length
+        ? extrusion.map(Number)
+        : null;
+      return {{ path, eProfile, cumulative, totalMm: cumulative[cumulative.length - 1] }};
+    }}
+
+    function stopPathPlayback({{ keepArrow = false }} = {{}}) {{
+      if (pathPlayback.frame !== null) cancelAnimationFrame(pathPlayback.frame);
+      pathPlayback.frame = null;
+      pathPlayback.running = false;
+      pathPlayback.previousTimestamp = null;
+      if (!keepArrow) {{
+        pathPlayback.entry = null;
+        pathPlayback.timeline = null;
+        pathPlayback.distanceMm = 0;
+      }}
+      playCurrentPathButton.textContent = '播放当前路径';
+      playCurrentPathButton.setAttribute('aria-pressed', 'false');
+    }}
+
+    function updatePathPlaybackControl() {{
+      const entry = currentPlaybackEntry();
+      const selectedEntryChanged = pathPlayback.entry && (
+        !entry
+        || pathPlayback.entry.points !== entry.points
+        || pathPlayback.entry.role !== entry.role
+      );
+      if (selectedEntryChanged) stopPathPlayback();
+      pathPlaybackControl.hidden = !entry;
+      playCurrentPathButton.disabled = !entry;
+      pathPlaybackRateInput.disabled = !entry;
+      if (!entry) stopPathPlayback();
+    }}
+
+    function updatePathPlaybackRateLabel() {{
+      pathPlaybackRateLabel.textContent = Number(pathPlaybackRateInput.value).toFixed(2);
+    }}
+
     function updatePathSlider(resetToEnd = false) {{
       const pathCount = selectedPrintEntries(currentLayer()).length;
       const previousValue = Number(pathProgressSlider.value);
@@ -5126,6 +5385,7 @@ def _index_html() -> str:
       pathProgressSlider.value = resetToEnd || wasAtEnd
         ? pathCount
         : Math.min(previousValue, pathCount);
+      updatePathPlaybackControl();
       updateViewerLabels();
     }}
 
@@ -5137,6 +5397,7 @@ def _index_html() -> str:
       pathProgressLabel.textContent = pathCount
         ? `${{pathProgressSlider.value}} / ${{pathCount}}`
         : '-';
+      updatePathPlaybackControl();
     }}
 
     function updatePrintSizeLabel() {{
@@ -5314,6 +5575,75 @@ def _index_html() -> str:
       ctx.textAlign = 'right';
       ctx.textBaseline = 'top';
       ctx.fillText('三维曲面预览 · 左键旋转', plot.right - 7, plot.top + 7);
+    }}
+
+    function surfaceLayerCurvatureText(layer) {{
+      // This is the geometric curvature of the deposited 3D centerlines, not
+      // a fit or a remapping result.  It intentionally reads the raw preview
+      // layer, so visibility and path-progress controls cannot change it.
+      if (layer && surfaceCurvatureTextCache.has(layer)) {{
+        return surfaceCurvatureTextCache.get(layer);
+      }}
+      const paths = [
+        ...(layer?.resin_paths || []).map((entry) => entry.points),
+        ...(layer?.fiber_paths || []),
+      ].filter((path) => Array.isArray(path) && path.length >= 3);
+      let curvatureCount = 0;
+      let curvatureTotal = 0;
+      let minimumCurvature = Infinity;
+      let maximumCurvature = -Infinity;
+      for (const path of paths) {{
+        for (let index = 1; index < path.length - 1; index++) {{
+          const a = path[index - 1];
+          const b = path[index];
+          const c = path[index + 1];
+          const ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+          const bc = [c[0] - b[0], c[1] - b[1], c[2] - b[2]];
+          const ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+          const abLength = Math.hypot(...ab);
+          const bcLength = Math.hypot(...bc);
+          const acLength = Math.hypot(...ac);
+          if (abLength <= 1e-9 || bcLength <= 1e-9 || acLength <= 1e-9) continue;
+          const crossLength = Math.hypot(
+            ab[1] * bc[2] - ab[2] * bc[1],
+            ab[2] * bc[0] - ab[0] * bc[2],
+            ab[0] * bc[1] - ab[1] * bc[0],
+          );
+          const curvature = 2 * crossLength / (abLength * bcLength * acLength);
+          if (Number.isFinite(curvature)) {{
+            curvatureCount += 1;
+            curvatureTotal += curvature;
+            minimumCurvature = Math.min(minimumCurvature, curvature);
+            maximumCurvature = Math.max(maximumCurvature, curvature);
+          }}
+        }}
+      }}
+      const displayLayer = Number(layerSlider.value) + 1;
+      const text = curvatureCount
+        ? `第${{displayLayer}}层 · κ min/avg/max: ${{minimumCurvature.toFixed(4)}} / ${{(curvatureTotal / curvatureCount).toFixed(4)}} / ${{maximumCurvature.toFixed(4)}} mm⁻¹`
+        : `第${{displayLayer}}层 · κ = 0.0000 mm⁻¹（直线段/采样不足）`;
+      if (layer) surfaceCurvatureTextCache.set(layer, text);
+      return text;
+    }}
+
+    function drawSurfaceLayerCurvature(ctx, viewport, layer) {{
+      const text = surfaceLayerCurvatureText(layer);
+      const {{ plot }} = viewport;
+      ctx.save();
+      ctx.font = '600 11px Segoe UI, Arial, sans-serif';
+      const x = plot.left + 8;
+      const y = plot.top + 8;
+      const width = Math.min(plot.width - 16, ctx.measureText(text).width + 16);
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.88)';
+      ctx.fillRect(x - 5, y - 4, width, 21);
+      ctx.strokeStyle = 'rgba(174, 184, 192, 0.88)';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(x - 4.5, y - 3.5, width - 1, 20);
+      ctx.fillStyle = '#31414d';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(text, x, y + 6);
+      ctx.restore();
     }}
 
     function niceGridStep(pixelsPerMm) {{
@@ -5524,7 +5854,7 @@ def _index_html() -> str:
       return `rgb(${{channel(0)}}, ${{channel(1)}}, ${{channel(2)}})`;
     }}
 
-    function drawPreview() {{
+    function drawPreviewNow() {{
       const canvas = previewCanvas;
       const rect = canvas.getBoundingClientRect();
       const deviceScale = Math.min(window.devicePixelRatio || 1, 2);
@@ -5589,13 +5919,14 @@ def _index_html() -> str:
           const zeroExtrusion = Number.isFinite(deltaE) && Math.abs(deltaE) <= 1e-9;
           const density = extrusionDensity(path, extrusion, pointIndex);
           const activeLineWidth = ctx.lineWidth;
+          const activeAlpha = ctx.globalAlpha;
           if (zeroExtrusion) {{
             // A continuous honeycomb motion has connector segments with
             // exactly constant E.  Draw them distinctly even when the
             // extrusion heat map is disabled, so they cannot be mistaken for
             // deposited walls in the preview.
             ctx.strokeStyle = '#526f8c';
-            ctx.globalAlpha = 0.95;
+            ctx.globalAlpha = activeAlpha * 0.95;
             ctx.lineWidth = Math.min(activeLineWidth, 1.5);
             ctx.setLineDash([7, 5]);
           }} else if (density === null || extrusionRange === null) {{
@@ -5612,31 +5943,21 @@ def _index_html() -> str:
           if (zeroExtrusion) {{
             ctx.setLineDash([]);
             ctx.lineWidth = activeLineWidth;
-            ctx.globalAlpha = 1;
+            ctx.globalAlpha = activeAlpha;
           }}
         }}
       }}
 
-      ctx.save();
-      ctx.beginPath();
-      ctx.rect(
-        viewport.plot.left,
-        viewport.plot.top,
-        viewport.plot.width,
-        viewport.plot.height
-      );
-      ctx.clip();
-      ctx.lineCap = 'round';
-      ctx.lineJoin = 'round';
-      for (let index = 0; index < visibleCount; index++) {{
-        const entry = entries[index];
+      function drawEntry(entry, opacity = 1) {{
+        ctx.save();
+        ctx.globalAlpha = opacity;
         if (entry.kind === 'travel') {{
           ctx.strokeStyle = entry.role === 'core_travel'
             ? '#c2410c'
             : entry.role === 'layer_lift'
               ? '#f59e0b'
               : '#526f8c';
-          ctx.globalAlpha = 0.95;
+          ctx.globalAlpha = opacity * 0.95;
           ctx.lineWidth = entry.role === 'layer_lift' ? 2.2 : entry.role === 'core_travel' ? 2.0 : 1.5;
           ctx.setLineDash(
             entry.role === 'layer_lift' ? [2, 3]
@@ -5644,9 +5965,8 @@ def _index_html() -> str:
               : [7, 5]
           );
           drawPath(entry.points);
-          ctx.setLineDash([]);
-          ctx.globalAlpha = 1;
-          continue;
+          ctx.restore();
+          return;
         }}
         const physicalWidth = entry.role === 'fiber'
           ? Number(lineWidths.fiber || 1.0)
@@ -5664,11 +5984,137 @@ def _index_html() -> str:
           ctx.strokeStyle = pathColor(entry.role);
           drawPath(entry.points);
         }}
+        ctx.restore();
+      }}
+
+      function drawHistoricalOverlay(entries) {{
+        // Historical layers share one opacity and are immutable until the
+        // layer or role filters change.  Batch their Canvas strokes by style
+        // to avoid a beginPath/stroke pair for every individual path.
+        const batches = new Map();
+        const historicalPathStride = (path) => viewerState.dragging
+          ? Math.max(1, Math.ceil(path.length / 240))
+          : 1;
+        const addToBatch = (key, style, path = null, segment = null) => {{
+          let batch = batches.get(key);
+          if (!batch) {{
+            batch = {{ ...style, paths: [], segments: [] }};
+            batches.set(key, batch);
+          }}
+          if (path) batch.paths.push({{ points: path, stride: historicalPathStride(path) }});
+          if (segment) batch.segments.push(segment);
+        }};
+        const depositionStyle = (role) => {{
+          const physicalWidth = role === 'fiber'
+            ? Number(lineWidths.fiber || 1.0)
+            : Number(lineWidths.resin || 2.0);
+          return {{
+            color: pathColor(role),
+            width: usePhysicalWidth
+              ? Math.max(1.0, physicalWidth * viewport.pixelsPerMm)
+              : role === 'fiber' ? 2.0 : 1.7,
+            dash: [],
+          }};
+        }};
+        for (const entry of entries) {{
+          if (entry.kind === 'travel') {{
+            const style = entry.role === 'core_travel'
+              ? {{ color: '#c2410c', width: 2.0, dash: [5, 4], alpha: 0.95 }}
+              : entry.role === 'layer_lift'
+                ? {{ color: '#f59e0b', width: 2.2, dash: [2, 3], alpha: 0.95 }}
+                : {{ color: '#526f8c', width: 1.5, dash: [7, 5], alpha: 0.95 }};
+            addToBatch(`travel:${{entry.role}}`, style, entry.points);
+            continue;
+          }}
+          const fallback = depositionStyle(entry.role);
+          const extrusion = entry.extrusion;
+          // Rotating a dense overlay is projection-bound, not data-bound.
+          // During the gesture, sample only historical paths and use their
+          // role color; the complete E-aware view is restored on release.
+          if (viewerState.dragging) {{
+            addToBatch(`deposit:${{entry.role}}`, fallback, entry.points);
+            continue;
+          }}
+          if (!Array.isArray(extrusion) || extrusion.length !== entry.points.length || entry.role === 'fiber') {{
+            addToBatch(`deposit:${{entry.role}}`, fallback, entry.points);
+            continue;
+          }}
+          for (let pointIndex = 0; pointIndex < entry.points.length - 1; pointIndex++) {{
+            const deltaE = Number(extrusion[pointIndex + 1]) - Number(extrusion[pointIndex]);
+            const zeroExtrusion = Number.isFinite(deltaE) && Math.abs(deltaE) <= 1e-9;
+            if (zeroExtrusion) {{
+              const connectorStyle = {{
+                color: '#526f8c',
+                width: Math.min(fallback.width, 1.5),
+                dash: [7, 5],
+                alpha: 0.95,
+              }};
+              addToBatch('connector', connectorStyle, null, [entry.points[pointIndex], entry.points[pointIndex + 1]]);
+              continue;
+            }}
+            const density = extrusionDensity(entry.points, extrusion, pointIndex);
+            const color = showExtrusionInput.checked && density !== null && extrusionRange !== null
+              ? extrusionColorForSegment(density, extrusionRange)
+              : fallback.color;
+            addToBatch(
+              `deposit-segment:${{fallback.width}}:${{color}}`,
+              {{ color, width: fallback.width, dash: [] }},
+              null,
+              [entry.points[pointIndex], entry.points[pointIndex + 1]],
+            );
+          }}
+        }}
+        ctx.save();
+        for (const batch of batches.values()) {{
+          ctx.globalAlpha = 0.32 * (batch.alpha ?? 1);
+          ctx.strokeStyle = batch.color;
+          ctx.lineWidth = batch.width;
+          ctx.setLineDash(batch.dash);
+          ctx.beginPath();
+          for (const {{ points: path, stride }} of batch.paths) {{
+            const first = viewport.project(path[0]);
+            ctx.moveTo(first[0], first[1]);
+            for (let pointIndex = stride; pointIndex < path.length - 1; pointIndex += stride) {{
+              const point = viewport.project(path[pointIndex]);
+              ctx.lineTo(point[0], point[1]);
+            }}
+            if (path.length > 1) {{
+              const last = viewport.project(path[path.length - 1]);
+              ctx.lineTo(last[0], last[1]);
+            }}
+          }}
+          for (const [start, end] of batch.segments) {{
+            const projectedStart = viewport.project(start);
+            const projectedEnd = viewport.project(end);
+            ctx.moveTo(projectedStart[0], projectedStart[1]);
+            ctx.lineTo(projectedEnd[0], projectedEnd[1]);
+          }}
+          ctx.stroke();
+        }}
+        ctx.restore();
+      }}
+
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(
+        viewport.plot.left,
+        viewport.plot.top,
+        viewport.plot.width,
+        viewport.plot.height
+      );
+      ctx.clip();
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      if (showLayerOverlayInput.checked) {{
+        drawHistoricalOverlay(historicalOverlayEntries());
+      }}
+      for (let index = 0; index < visibleCount; index++) {{
+        drawEntry(entries[index]);
       }}
       if (currentEntry && showPathPointsInput.checked) {{
         drawPathPoints(ctx, currentEntry.points, pathColor(currentEntry.role), viewport.project);
       }}
-      if (surfacePreview && showDirectionInput.checked) {{
+      if (surfacePreview && showDirectionInput.checked && !pathPlayback.running) {{
         const currentDeposit = entries
           .slice(0, visibleCount)
           .reverse()
@@ -5680,12 +6126,65 @@ def _index_html() -> str:
             viewport
           );
         }}
-      }} else if (currentEntry && showDirectionInput.checked) {{
+      }} else if (!surfacePreview && currentEntry && showDirectionInput.checked) {{
         drawDirection(ctx, currentEntry.points, pathColor(currentEntry.role), viewport.project);
       }}
+      if (pathPlayback.running && pathPlayback.timeline) {{
+        drawPlaybackPathArrow(ctx, pathPlayback.timeline, pathPlayback.distanceMm, viewport);
+      }}
       ctx.restore();
+      if (surfacePreview) drawSurfaceLayerCurvature(ctx, viewport, layer);
       if (!surfacePreview) drawOriginMarker(ctx, viewport);
       updateViewerLabels();
+    }}
+
+    function drawPreview() {{
+      if (pendingPreviewFrame !== null) return;
+      pendingPreviewFrame = requestAnimationFrame(() => {{
+        pendingPreviewFrame = null;
+        drawPreviewNow();
+      }});
+    }}
+
+    function playCurrentPath(timestamp) {{
+      if (!pathPlayback.running || !pathPlayback.timeline) return;
+      if (pathPlayback.previousTimestamp === null) pathPlayback.previousTimestamp = timestamp;
+      const elapsedSeconds = Math.min(0.1, (timestamp - pathPlayback.previousTimestamp) / 1000);
+      pathPlayback.previousTimestamp = timestamp;
+      const rate = Math.max(0, Number(pathPlaybackRateInput.value));
+      pathPlayback.distanceMm = Math.min(
+        pathPlayback.timeline.totalMm,
+        pathPlayback.distanceMm + elapsedSeconds * PLAYBACK_MAX_SPEED_MM_PER_S * rate,
+      );
+      drawPreviewNow();
+      if (pathPlayback.distanceMm >= pathPlayback.timeline.totalMm || rate <= 0) {{
+        stopPathPlayback();
+        drawPreview();
+        return;
+      }}
+      pathPlayback.frame = requestAnimationFrame(playCurrentPath);
+    }}
+
+    function startPathPlayback() {{
+      const entry = currentPlaybackEntry();
+      if (!entry) return;
+      if (pathPlayback.running) {{
+        stopPathPlayback();
+        drawPreview();
+        return;
+      }}
+      pathPlayback.entry = entry;
+      pathPlayback.timeline = buildPathPlaybackTimeline(entry.points, entry.extrusion);
+      pathPlayback.distanceMm = 0;
+      pathPlayback.previousTimestamp = null;
+      if (pathPlayback.timeline.totalMm <= 1e-9 || Number(pathPlaybackRateInput.value) <= 0) {{
+        drawPreview();
+        return;
+      }}
+      pathPlayback.running = true;
+      playCurrentPathButton.textContent = '停止播放';
+      playCurrentPathButton.setAttribute('aria-pressed', 'true');
+      pathPlayback.frame = requestAnimationFrame(playCurrentPath);
     }}
 
     function drawPathPoints(ctx, path, color, project) {{
@@ -5767,6 +6266,67 @@ def _index_html() -> str:
       ctx.moveTo(tip[0], tip[1]);
       ctx.lineTo(tip[0] - Math.cos(angle - 0.58) * 14, tip[1] - Math.sin(angle - 0.58) * 14);
       ctx.lineTo(tip[0] - Math.cos(angle + 0.58) * 14, tip[1] - Math.sin(angle + 0.58) * 14);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+    }}
+
+    function pathPointAtDistance(timeline, distanceMm) {{
+      const distance = Math.max(0, Math.min(distanceMm, timeline.totalMm));
+      const cumulative = timeline.cumulative;
+      let index = 1;
+      while (index < cumulative.length && cumulative[index] < distance) index++;
+      const endIndex = Math.min(index, timeline.path.length - 1);
+      const startIndex = Math.max(0, endIndex - 1);
+      const startDistance = cumulative[startIndex];
+      const endDistance = cumulative[endIndex];
+      const segmentLength = endDistance - startDistance;
+      const t = segmentLength > 1e-9 ? (distance - startDistance) / segmentLength : 0;
+      const start = timeline.path[startIndex];
+      const end = timeline.path[endIndex];
+      return {{
+        point: start.map((value, axis) => Number(value) + (Number(end[axis]) - Number(value)) * t),
+        previous: start,
+        ahead: end,
+        segmentIndex: startIndex,
+        atEnd: distance >= timeline.totalMm,
+      }};
+    }}
+
+    function drawPlaybackPathArrow(ctx, timeline, distanceMm, viewport) {{
+      const {{ point, previous, ahead, segmentIndex, atEnd }} = pathPointAtDistance(timeline, distanceMm);
+      const current = viewport.project(point);
+      const neighboringPoint = viewport.project(atEnd ? previous : ahead);
+      const angle = atEnd
+        ? Math.atan2(current[1] - neighboringPoint[1], current[0] - neighboringPoint[0])
+        : Math.atan2(neighboringPoint[1] - current[1], neighboringPoint[0] - current[0]);
+      const arrowLength = 22;
+      const tip = [
+        current[0] + Math.cos(angle) * arrowLength * 0.55,
+        current[1] + Math.sin(angle) * arrowLength * 0.55,
+      ];
+      const tail = [
+        current[0] - Math.cos(angle) * arrowLength * 0.45,
+        current[1] - Math.sin(angle) * arrowLength * 0.45,
+      ];
+      const deltaE = timeline.eProfile
+        ? Number(timeline.eProfile[segmentIndex + 1]) - Number(timeline.eProfile[segmentIndex])
+        : Number.NaN;
+      const color = Number.isFinite(deltaE) && deltaE <= 1e-9 ? '#2563eb' : '#dc2626';
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.fillStyle = color;
+      ctx.lineWidth = 4;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.beginPath();
+      ctx.moveTo(tail[0], tail[1]);
+      ctx.lineTo(tip[0], tip[1]);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(tip[0], tip[1]);
+      ctx.lineTo(tip[0] - Math.cos(angle - 0.58) * 11, tip[1] - Math.sin(angle - 0.58) * 11);
+      ctx.lineTo(tip[0] - Math.cos(angle + 0.58) * 11, tip[1] - Math.sin(angle + 0.58) * 11);
       ctx.closePath();
       ctx.fill();
       ctx.restore();
@@ -5980,6 +6540,7 @@ def _index_html() -> str:
       if (previewCanvas.hasPointerCapture(event.pointerId)) {{
         previewCanvas.releasePointerCapture(event.pointerId);
       }}
+      drawPreview();
     }}
 
     previewCanvas.addEventListener('pointerup', finishPreviewDrag);
@@ -5994,7 +6555,18 @@ def _index_html() -> str:
       updatePathSlider(true);
       drawPreview();
     }});
-    pathProgressSlider.addEventListener('input', drawPreview);
+    pathProgressSlider.addEventListener('input', () => {{
+      updatePathPlaybackControl();
+      drawPreview();
+    }});
+    playCurrentPathButton.addEventListener('click', startPathPlayback);
+    pathPlaybackRateInput.addEventListener('input', () => {{
+      updatePathPlaybackRateLabel();
+      if (pathPlayback.running && Number(pathPlaybackRateInput.value) <= 0) {{
+        stopPathPlayback();
+        drawPreview();
+      }}
+    }});
     for (const input of [
       showOuterContourInput,
       showInnerContourInput,
@@ -6010,6 +6582,7 @@ def _index_html() -> str:
     }}
     showCoreTravelPathsInput.addEventListener('change', drawPreview);
     showPrimelineInput.addEventListener('change', drawPreview);
+    showLayerOverlayInput.addEventListener('change', drawPreview);
     showLineWidthInput.addEventListener('change', drawPreview);
     showExtrusionInput.addEventListener('change', drawPreview);
     showPathPointsInput.addEventListener('change', drawPreview);
