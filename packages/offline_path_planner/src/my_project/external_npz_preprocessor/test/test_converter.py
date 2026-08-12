@@ -99,6 +99,36 @@ def test_prusa_source_e_profile_is_preserved_per_move_before_core_fitting():
     assert moves[-1].e_val - moves[0].e_val == pytest.approx(8.0)
 
 
+def test_zero_e_segment_inside_material_path_stays_a_print_move():
+    """Macro-partition connectors are print-context motion, never Travel."""
+
+    commands = source_job_to_parsed_commands(
+        _job(
+            resin_paths=[
+                _path(
+                    "R",
+                    [[0, 0, 0.5], [5, 0, 0.5], [5, 5, 0.5], [10, 5, 0.5]],
+                    extrusion=[40.0, 43.0, 43.0, 47.0],
+                )
+            ]
+        ),
+        ProcessParams(primeline_enabled=False),
+    )
+
+    moves = _print_moves(commands)
+
+    assert [move.delta_e for move in moves] == pytest.approx([3.0, 0.0, 4.0])
+    assert moves[1].type == "PRINT"
+    assert moves[1].cmd == "G1"
+    assert not any(
+        isinstance(command, MoveCommand)
+        and command.type == "TRAVEL"
+        and command.start_pos == moves[1].start_pos
+        and command.pos == moves[1].pos
+        for command in commands
+    )
+
+
 def test_path_events_and_reset_boundaries_remain_outside_core_spline_input():
     commands = source_job_to_parsed_commands(
         _job(
