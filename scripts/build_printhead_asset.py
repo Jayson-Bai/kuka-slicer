@@ -234,12 +234,30 @@ def _model_components(
                 "triangle_indices": list(component["triangle_indices"]),
             })
 
-    merged.sort(key=lambda item: item["minimum"][0])
     if len(merged) != 3:
         raise ValueError(f"expected upper housing, heater block, and nozzle; found {len(merged)} components")
-    names = ("upper_housing", "heater_block", "nozzle")
+    # Export order in an STL is not a physical-component contract.  In the
+    # replacement assembly the long nozzle/heat-break sorts ahead of the
+    # compact heater block along X, so identify the components by their
+    # physical transverse extent instead.  The housing is the broadest
+    # cross-section; the heater is the remaining component with the broadest
+    # minimum transverse span; the third component is the nozzle/heat-break.
+    def transverse_spans(component: dict[str, object]) -> tuple[float, float]:
+        minimum = component["minimum"]
+        maximum = component["maximum"]
+        return float(maximum[1] - minimum[1]), float(maximum[2] - minimum[2])
+
+    upper_housing = max(merged, key=lambda component: math.prod(transverse_spans(component)))
+    remaining = [component for component in merged if component is not upper_housing]
+    heater_block = max(remaining, key=lambda component: min(transverse_spans(component)))
+    nozzle = next(component for component in remaining if component is not heater_block)
+    named_components = (
+        ("upper_housing", upper_housing),
+        ("heater_block", heater_block),
+        ("nozzle", nozzle),
+    )
     exported: list[dict[str, object]] = []
-    for name, component in zip(names, merged):
+    for name, component in named_components:
         exported.append({
             "name": name,
             "local_bounds_mm": {

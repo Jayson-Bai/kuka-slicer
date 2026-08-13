@@ -4971,7 +4971,7 @@ def _index_html() -> str:
       lastY: 0
     }};
     const printHeadAsset = {{ data: null, error: null }};
-    fetch('/assets/printhead/printhead_interference_check.preview.json?v=mesh-preflight-v5')
+    fetch('/assets/printhead/printhead_interference_check.preview.json?v=mesh-preflight-v6')
       .then((response) => {{
         if (!response.ok) throw new Error(`HTTP ${{response.status}}`);
         return response.json();
