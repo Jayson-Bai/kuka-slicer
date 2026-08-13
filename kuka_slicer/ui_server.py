@@ -64,9 +64,11 @@ from .slicer import (
     slice_mesh_to_job,
 )
 from .stl_io import load_stl
+from .surface_peak_collision import check_peak_surface_collision
 
 
 MAX_SURFACE_PREVIEW_NPZ_BYTES = 256 * 1024 * 1024
+PRINTHEAD_ASSET_DIR = Path(__file__).resolve().parent.parent / "assets" / "printhead"
 
 
 DEFAULT_UI_RESIN_INFILL_OVERLAP_PERCENT = 0.0
@@ -468,6 +470,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
     surface_preview_picker_lock = threading.Lock()
     surface_preview_last_directory: Path | None = None
     surface_preview_picker_state_path: Path | None = None
+    surface_preview_selected_path: Path | None = None
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -479,6 +482,9 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             return
         if parsed.path.startswith("/outputs/"):
             self._send_output_file(parsed.path.removeprefix("/outputs/"))
+            return
+        if parsed.path.startswith("/assets/printhead/"):
+            self._send_printhead_asset(parsed.path.removeprefix("/assets/printhead/"))
             return
         self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
@@ -498,6 +504,15 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         if parsed.path == "/choose-surface-npz-preview":
             try:
                 self._choose_surface_npz_preview()
+            except Exception as exc:  # noqa: BLE001
+                self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path == "/check-surface-npz-collision":
+            try:
+                selected = type(self).surface_preview_selected_path
+                if selected is None:
+                    raise ValueError("请选择本地映射 NPZ 后再执行碰撞检查")
+                self._send_json(check_peak_surface_collision(selected))
             except Exception as exc:  # noqa: BLE001
                 self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
@@ -559,6 +574,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         if selected.stat().st_size > MAX_SURFACE_PREVIEW_NPZ_BYTES:
             raise ValueError("mapped source NPZ exceeds the 256 MB preview limit")
         handler_type.surface_preview_last_directory = selected.parent
+        handler_type.surface_preview_selected_path = selected
         state_path = handler_type.surface_preview_picker_state_path
         if state_path is not None:
             _save_surface_preview_last_directory(state_path, selected.parent)
@@ -566,6 +582,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             {
                 "ok": True,
                 "file_name": selected.name,
+                "collision_check_available": True,
                 "preview": _preview_payload_from_source_npz(selected.read_bytes(), selected.name),
             }
         )
@@ -997,6 +1014,28 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Disposition", f'attachment; filename="{html.escape(target.name)}"')
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _send_printhead_asset(self, asset_name: str) -> None:
+        allowed_types = {
+            ".glb": "model/gltf-binary",
+            ".json": "application/json; charset=utf-8",
+        }
+        target = (PRINTHEAD_ASSET_DIR / unquote(asset_name)).resolve()
+        if (
+            target.parent != PRINTHEAD_ASSET_DIR.resolve()
+            or target.suffix.lower() not in allowed_types
+            or not target.is_file()
+        ):
+            self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+            return
+        data = target.read_bytes()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", allowed_types[target.suffix.lower()])
+        cache_control = "no-cache" if target.suffix.lower() == ".json" else "public, max-age=3600"
+        self.send_header("Cache-Control", cache_control)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -2577,8 +2616,17 @@ def _index_html() -> str:
       font-size: 13px;
       cursor: pointer;
     }}
-    .surfaceToolButton:hover {{ background: #eef6ff; }}
-    .surfaceToolButton:disabled {{ cursor: wait; opacity: 0.7; }}
+      .surfaceToolButton:hover {{ background: #eef6ff; }}
+      .surfaceToolButton:disabled {{ cursor: wait; opacity: 0.7; }}
+      .surfaceCollisionResult {{
+        flex: 1 1 100%;
+        min-height: 18px;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.35;
+      }}
+      .surfaceCollisionResult.ok {{ color: var(--ok); }}
+      .surfaceCollisionResult.error {{ color: var(--error); }}
     .inputBand input[type="file"] {{
       padding: 0;
       line-height: calc(var(--control-height) - 2px);
@@ -3381,6 +3429,8 @@ def _index_html() -> str:
       <button id="surfacePreviewButton" class="surfaceToolButton" type="button">启动曲面预览器</button>
       <button id="surfaceMapperButton" class="surfaceToolButton" type="button">启动曲面映射器</button>
       <button id="surfaceNpzPreviewButton" class="surfaceToolButton" type="button">导入映射 NPZ 预览</button>
+      <button id="surfaceNpzCollisionButton" class="surfaceToolButton" type="button" disabled>检查当前 NPZ 碰撞</button>
+      <output id="surfaceNpzCollisionResult" class="surfaceCollisionResult" aria-live="polite">请先导入本地映射 NPZ。</output>
       <input id="surfaceNpzInput" type="file" accept=".npz,application/octet-stream" hidden>
     </div>
   </header>
@@ -4126,6 +4176,8 @@ def _index_html() -> str:
       'surface-map': document.getElementById('surfaceMapperButton')
     }};
     const surfaceNpzPreviewButton = document.getElementById('surfaceNpzPreviewButton');
+    const surfaceNpzCollisionButton = document.getElementById('surfaceNpzCollisionButton');
+    const surfaceNpzCollisionResult = document.getElementById('surfaceNpzCollisionResult');
     const surfaceNpzInput = document.getElementById('surfaceNpzInput');
     const statusEl = document.getElementById('status');
     async function launchSurfaceTool(tool) {{
@@ -4151,7 +4203,7 @@ def _index_html() -> str:
     }}
     surfaceToolButtons['surface-preview'].addEventListener('click', () => launchSurfaceTool('surface-preview'));
     surfaceToolButtons['surface-map'].addEventListener('click', () => launchSurfaceTool('surface-map'));
-    function applyMappedSurfacePreview(preview, fileName) {{
+    function applyMappedSurfacePreview(preview, fileName, collisionCheckAvailable = false) {{
       previewData = preview;
       configureViewer();
       layersEl.textContent = String(previewData.layers?.length || 0);
@@ -4160,6 +4212,11 @@ def _index_html() -> str:
       downloadEl.textContent = '已载入曲面预览（未导出）';
       statusEl.className = 'status ok';
       statusEl.textContent = '已载入映射曲面 NPZ：左键旋转，箭头尖端为当前打印点。';
+      surfaceNpzCollisionButton.disabled = !collisionCheckAvailable;
+      surfaceNpzCollisionResult.className = 'surfaceCollisionResult';
+      surfaceNpzCollisionResult.textContent = collisionCheckAvailable
+        ? '已就绪：可检查峰值曲率层的加热块实体碰撞。'
+        : '浏览器上传的 NPZ 仅供预览；请通过“导入映射 NPZ 预览”选择本地文件后检查。';
       drawPreview();
     }}
     async function loadMappedSurfaceNpz(file) {{
@@ -4170,7 +4227,7 @@ def _index_html() -> str:
         const response = await fetch('/preview-source-npz', {{ method: 'POST', body: payload }});
         const result = await response.json();
         if (!response.ok || !result.ok) throw new Error(result.error || '曲面 NPZ 预览载入失败');
-        applyMappedSurfacePreview(result.preview, file.name);
+        applyMappedSurfacePreview(result.preview, file.name, false);
       }} catch (error) {{
         statusEl.className = 'status error';
         statusEl.textContent = '无法载入曲面 NPZ：' + error.message;
@@ -4186,13 +4243,56 @@ def _index_html() -> str:
         const response = await fetch('/choose-surface-npz-preview', {{ method: 'POST' }});
         const result = await response.json();
         if (!response.ok || !result.ok) throw new Error(result.error || '曲面 NPZ 选择失败');
-        if (!result.cancelled) applyMappedSurfacePreview(result.preview, result.file_name);
+        if (!result.cancelled) applyMappedSurfacePreview(result.preview, result.file_name, result.collision_check_available === true);
       }} catch (error) {{
         statusEl.className = 'status error';
         statusEl.textContent = '无法选择曲面 NPZ：' + error.message;
       }} finally {{
         surfaceNpzPreviewButton.disabled = false;
         surfaceNpzPreviewButton.textContent = originalLabel;
+      }}
+    }});
+    surfaceNpzCollisionButton.addEventListener('click', async () => {{
+      const originalLabel = surfaceNpzCollisionButton.textContent;
+      surfaceNpzCollisionButton.disabled = true;
+      surfaceNpzCollisionButton.textContent = '正在检查峰值层…';
+      surfaceNpzCollisionResult.className = 'surfaceCollisionResult';
+      surfaceNpzCollisionResult.textContent = '正在检查峰值曲率层，请稍候…';
+      statusEl.className = 'status';
+      statusEl.textContent = '正在以加热块实体和蜂窝 STL 孔洞截面检查最大曲率打印层…';
+      try {{
+        const response = await fetch('/check-surface-npz-collision', {{ method: 'POST' }});
+        const result = await response.json();
+        if (!response.ok || !result.ok) throw new Error(result.error || '碰撞检查失败');
+        if (result.passed) {{
+          statusEl.className = 'status ok';
+          const clearance = Number(result.minimum_sampled_clearance_mm);
+          const clearanceText = Number.isFinite(clearance) ? clearance.toFixed(3) + ' mm' : '无有效候选点';
+          const coarsePitch = Number(result.coarse_sampling_pitch_mm);
+          const finePitch = Number(result.refinement_sampling_pitch_mm);
+          const refinedPoses = Number(result.refinement?.tested_pose_count);
+          const refinementText = Number.isFinite(finePitch) && Number.isFinite(refinedPoses)
+            ? `；${{coarsePitch.toFixed(1)}} mm 全路径初筛后，以 ${{finePitch.toFixed(1)}} mm 复核最小净空附近 ${{refinedPoses}} 个姿态`
+            : '';
+          const message = `通过：峰值层 ${{result.peak_layers.join('、')}} 未发现加热块实体相交；最小采样净空 ${{clearanceText}}（最终采样 ${{result.sampling_pitch_mm}} mm）${{refinementText}}。`;
+          statusEl.textContent = message;
+          surfaceNpzCollisionResult.className = 'surfaceCollisionResult ok';
+          surfaceNpzCollisionResult.textContent = message;
+        }} else {{
+          const hit = result.collision;
+          statusEl.className = 'status error';
+          statusEl.textContent = `检测到碰撞：第 ${{hit.layer}} 层，峰值层路径姿态 #${{hit.pose_index + 1}}。已停止检查；加热块实体与蜂窝材料区域相交。`;
+          surfaceNpzCollisionResult.className = 'surfaceCollisionResult error';
+          surfaceNpzCollisionResult.textContent = statusEl.textContent;
+        }}
+      }} catch (error) {{
+        statusEl.className = 'status error';
+        statusEl.textContent = '碰撞检查无法完成：' + error.message;
+        surfaceNpzCollisionResult.className = 'surfaceCollisionResult error';
+        surfaceNpzCollisionResult.textContent = statusEl.textContent;
+      }} finally {{
+        surfaceNpzCollisionButton.disabled = false;
+        surfaceNpzCollisionButton.textContent = originalLabel;
       }}
     }});
     surfaceNpzInput.addEventListener('change', async () => {{
@@ -4870,6 +4970,20 @@ def _index_html() -> str:
       lastX: 0,
       lastY: 0
     }};
+    const printHeadAsset = {{ data: null, error: null }};
+    fetch('/assets/printhead/printhead_interference_check.preview.json?v=mesh-preflight-v5')
+      .then((response) => {{
+        if (!response.ok) throw new Error(`HTTP ${{response.status}}`);
+        return response.json();
+      }})
+      .then((data) => {{
+        printHeadAsset.data = data;
+        drawPreview();
+      }})
+      .catch((error) => {{
+        printHeadAsset.error = error;
+        console.warn('Printhead preview asset unavailable:', error);
+      }});
     function updatePyslmStrategyDefaults() {{
       if (!pyslmPatternAutoInput.checked) return;
       const layerHeight = Number(layerHeightInput.value);
@@ -5492,7 +5606,7 @@ def _index_html() -> str:
       // whenever the user turned the model.  The unrotated 3D bounding-sphere
       // diameter safely contains every orientation while leaving zoom solely
       // under explicit user control.
-      const modelSpan = Math.max(
+      const partSpan = Math.max(
         0.001,
         Math.hypot(
           maximum[0] - minimum[0],
@@ -5500,6 +5614,9 @@ def _index_html() -> str:
           maximum[2] - minimum[2]
         )
       );
+      const headBoxSize = printHeadAsset.data?.model_bounds?.size_mm || [0, 0, 0];
+      const headReach = Math.max(0, ...headBoxSize.map(Number));
+      const modelSpan = partSpan + headReach;
       const baseScale = Math.max(
         1e-6,
         Math.min(
@@ -6120,17 +6237,22 @@ def _index_html() -> str:
           .reverse()
           .find((entry) => entry.kind === 'deposit' && entry.points?.length);
         if (currentDeposit) {{
-          drawPrintHeadArrow(
+          drawPrintHeadModel(
             ctx,
             currentDeposit.points[currentDeposit.points.length - 1],
-            viewport
+            viewport,
           );
         }}
       }} else if (!surfacePreview && currentEntry && showDirectionInput.checked) {{
         drawDirection(ctx, currentEntry.points, pathColor(currentEntry.role), viewport.project);
       }}
       if (pathPlayback.running && pathPlayback.timeline) {{
-        drawPlaybackPathArrow(ctx, pathPlayback.timeline, pathPlayback.distanceMm, viewport);
+        drawPlaybackPathArrow(
+          ctx,
+          pathPlayback.timeline,
+          pathPlayback.distanceMm,
+          viewport,
+        );
       }}
       ctx.restore();
       if (surfacePreview) drawSurfaceLayerCurvature(ctx, viewport, layer);
@@ -6293,8 +6415,17 @@ def _index_html() -> str:
       }};
     }}
 
-    function drawPlaybackPathArrow(ctx, timeline, distanceMm, viewport) {{
+    function drawPlaybackPathArrow(
+      ctx,
+      timeline,
+      distanceMm,
+      viewport,
+    ) {{
       const {{ point, previous, ahead, segmentIndex, atEnd }} = pathPointAtDistance(timeline, distanceMm);
+      if (viewport?.isSurface) {{
+        drawPrintHeadModel(ctx, point, viewport);
+        return;
+      }}
       const current = viewport.project(point);
       const neighboringPoint = viewport.project(atEnd ? previous : ahead);
       const angle = atEnd
@@ -6376,6 +6507,95 @@ def _index_html() -> str:
         ]),
         exact: true,
       }};
+    }}
+
+    function kukaToolFrame(point) {{
+      const flatFrame = {{
+        xAxis: [0, 0, -1],
+        yAxis: [0, 1, 0],
+        zAxis: [1, 0, 0],
+        exact: false,
+      }};
+      if (!Array.isArray(point) || point.length < 6) return flatFrame;
+      const [a, b, c] = point.slice(3, 6).map(Number);
+      if (![a, b, c].every(Number.isFinite)) return flatFrame;
+      const radians = Math.PI / 180;
+      const cosA = Math.cos(a * radians);
+      const sinA = Math.sin(a * radians);
+      const cosB = Math.cos(b * radians);
+      const sinB = Math.sin(b * radians);
+      const cosC = Math.cos(c * radians);
+      const sinC = Math.sin(c * radians);
+      const rotate = (vector) => {{
+        const afterX = [
+          vector[0],
+          cosC * vector[1] - sinC * vector[2],
+          sinC * vector[1] + cosC * vector[2],
+        ];
+        const afterY = [
+          cosB * afterX[0] + sinB * afterX[2],
+          afterX[1],
+          -sinB * afterX[0] + cosB * afterX[2],
+        ];
+        return normalizeVector([
+          cosA * afterY[0] - sinA * afterY[1],
+          sinA * afterY[0] + cosA * afterY[1],
+          afterY[2],
+        ]);
+      }};
+      return {{
+        xAxis: rotate(flatFrame.xAxis),
+        yAxis: rotate(flatFrame.yAxis),
+        zAxis: rotate(flatFrame.zAxis),
+        exact: true,
+      }};
+    }}
+
+    function toolPointToBase(toolPoint, tcpPoint, frame) {{
+      return [0, 1, 2].map((axis) => Number(tcpPoint[axis])
+        + Number(toolPoint[0]) * frame.xAxis[axis]
+        + Number(toolPoint[1]) * frame.yAxis[axis]
+        + Number(toolPoint[2]) * frame.zAxis[axis]);
+    }}
+
+    function drawPrintHeadModel(ctx, point, viewport) {{
+      const asset = printHeadAsset.data;
+      if (!point || !viewport?.isSurface) return;
+      if (!asset?.positions?.length || !asset?.triangles?.length) {{
+        drawPrintHeadArrow(ctx, point, viewport);
+        return;
+      }}
+      const frame = kukaToolFrame(point);
+      const projected = asset.positions.map((toolPoint) =>
+        viewport.project(toolPointToBase(toolPoint, point, frame))
+      );
+      const faces = [];
+      for (let index = 0; index < asset.triangles.length; index++) {{
+        const triangle = asset.triangles[index];
+        const vertices = triangle.map((vertexIndex) => projected[vertexIndex]);
+        const screenArea = (vertices[1][0] - vertices[0][0]) * (vertices[2][1] - vertices[0][1])
+          - (vertices[1][1] - vertices[0][1]) * (vertices[2][0] - vertices[0][0]);
+        if (Math.abs(screenArea) < 0.035) continue;
+        faces.push({{
+          vertices,
+          depth: (vertices[0][2] + vertices[1][2] + vertices[2][2]) / 3,
+          facing: screenArea,
+        }});
+      }}
+      faces.sort((left, right) => left.depth - right.depth);
+      ctx.save();
+      ctx.lineJoin = 'round';
+      for (const face of faces) {{
+        const front = face.facing < 0;
+        ctx.fillStyle = front ? 'rgba(91, 111, 124, 0.88)' : 'rgba(149, 163, 173, 0.62)';
+        ctx.beginPath();
+        ctx.moveTo(face.vertices[0][0], face.vertices[0][1]);
+        ctx.lineTo(face.vertices[1][0], face.vertices[1][1]);
+        ctx.lineTo(face.vertices[2][0], face.vertices[2][1]);
+        ctx.closePath();
+        ctx.fill();
+      }}
+      ctx.restore();
     }}
 
     function drawPrintHeadArrow(ctx, point, viewport) {{

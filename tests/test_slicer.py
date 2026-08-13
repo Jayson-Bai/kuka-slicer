@@ -4536,13 +4536,33 @@ def test_ui_preview_reuses_canvas_for_surface_3d_tool_direction():
         "geometry_mode === 'surface_3d'",
         "buildSurfaceViewport",
         "drawSurfaceReference",
-        "drawPrintHeadArrow",
+        "drawPrintHeadModel",
         "kukaToolDirection",
+        "kukaToolFrame",
+        "/assets/printhead/printhead_interference_check.preview.json",
         "showDirectionLabel",
         "Math.min(window.devicePixelRatio || 1, 2)",
         "左键旋转；右键或中键平移",
     ):
         assert feature in html
+    for removed_collision_feature in (
+        "printHeadInterferenceAt",
+        "segmentIntersectsBox",
+        "drawPrintHeadBoxes",
+        "collision_boxes",
+        "printHeadClearanceAt",
+        "clearance_cone",
+    ):
+        assert removed_collision_feature not in html
+
+    assert "safety_clearance_mm" not in html
+    assert "drawPrintHeadModel(ctx, point, viewport)" in html
+    assert 'id="surfaceNpzCollisionButton"' in html
+    assert 'id="surfaceNpzCollisionResult"' in html
+    assert "/check-surface-npz-collision" in html
+    assert "minimum_sampled_clearance_mm" in html
+    assert "coarse_sampling_pitch_mm" in html
+    assert "refinement_sampling_pitch_mm" in html
 
 
 def test_ui_surface_preview_can_overlay_prior_layers_and_always_labels_curvature():
@@ -4585,7 +4605,7 @@ def test_ui_remembers_the_last_surface_npz_preview_directory_when_supported():
     html = _index_html()
 
     assert "fetch('/choose-surface-npz-preview'" in html
-    assert "applyMappedSurfacePreview(result.preview, result.file_name)" in html
+    assert "applyMappedSurfacePreview(result.preview, result.file_name, result.collision_check_available === true)" in html
     assert "window.showOpenFilePicker" not in html
 
 
