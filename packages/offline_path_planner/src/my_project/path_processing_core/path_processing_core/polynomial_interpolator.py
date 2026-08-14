@@ -22,6 +22,14 @@ from .kuka_orientation import (
 
 
 _MAX_ORIENTATION_STEP_DEG = 0.1
+# A density-6 fit can contain more than one thousand control points.  Ten
+# uniform parameter samples per point were insufficient around tight fitted
+# turns: the arc map understated local Cartesian distance, so a nominal
+# 20 mm/s sample could exceed the RSI step limit.  This refines the *internal*
+# arc-length estimate only; it neither inserts trajectory rows nor changes the
+# user-selected feedrate/time profile.
+_ARC_LENGTH_MAP_SAMPLES_PER_CONTROL_POINT = 24
+_ARC_LENGTH_MAP_MIN_SAMPLES = 800
 
 
 # -------------------------- 基础工具 --------------------------
@@ -186,6 +194,15 @@ def _build_arc_length_map(ctrl: List[Position], degree: int = 3, samples: int = 
 
     total_length = len_list[-1]
     return u_list, len_list, total_length, knots
+
+
+def _arc_length_map_sample_count(control_point_count: int) -> int:
+    """Return a conservative uniform budget for a fitted spline's arc map."""
+
+    return max(
+        _ARC_LENGTH_MAP_MIN_SAMPLES,
+        max(2, int(control_point_count)) * _ARC_LENGTH_MAP_SAMPLES_PER_CONTROL_POINT,
+    )
 
 
 def _is_linear_fallback_curve(curve: GlobalCurveCommand) -> bool:
@@ -604,7 +621,10 @@ def sample_global_curve_iter(
     # 构建弧长映射
     t0 = time.perf_counter()
     u_list, len_list, total_length, knots = _build_arc_length_map(
-        ctrl, degree=degree, samples=max(400, len(ctrl) * 10))
+        ctrl,
+        degree=degree,
+        samples=_arc_length_map_sample_count(len(ctrl)),
+    )
     if profile is not None:
         profile["sample_arc_map_s"] += time.perf_counter() - t0
     if total_length <= 1e-9:

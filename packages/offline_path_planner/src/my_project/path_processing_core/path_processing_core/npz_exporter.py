@@ -148,6 +148,7 @@ def export_npz(
     last_pose: Optional[CsvRow] = None
     last_feedrate_mm_min: Optional[float] = None
     resin_z_offset: float = 0.0
+    short_travel_min_ramp_s = 0.08
 
     def _command_layer(cmd) -> int:
         try:
@@ -650,6 +651,9 @@ def export_npz(
             target_velocity = default_feed_mm_s
         else:
             target_velocity = feed_mm_min / 60.0
+        is_waypoint_preserving_travel = (
+            gc.type == "TRAVEL" and (gc.cmd or "").upper() == "POLYLINE"
+        )
         if gc.feedrate is not None and gc.feedrate > 0:
             last_feedrate_mm_min = gc.feedrate
         has_any = False
@@ -669,9 +673,38 @@ def export_npz(
         if sample_profile is not None:
             sample_kwargs["profile"] = sample_profile
         time_acc_s = getattr(gc, "time_acc_s", None)
-        if time_acc_s is not None and float(time_acc_s) > 0.0:
-            sample_kwargs["t_acc"] = float(time_acc_s)
-        t_acc_value = float(time_acc_s) if time_acc_s is not None and float(time_acc_s) > 0.0 else 2.0
+        if is_waypoint_preserving_travel:
+            points = [gc.start_pos, *gc.control_points]
+            travel_length = sum(
+                math.dist(
+                    (start.x, start.y, start.z),
+                    (end.x, end.y, end.z),
+                )
+                for start, end in zip(points, points[1:])
+            )
+            # Short routes keep the same seventh-order zero-speed endpoints,
+            # but use a ramp proportional to their own length rather than an
+            # unconditional 2 s + 2 s hold.  The route feedrate remains the
+            # value selected in the UI.
+            adaptive_ramp_s = min(
+                2.0,
+                max(short_travel_min_ramp_s, 0.5 * travel_length / target_velocity),
+            )
+            t_acc_value = adaptive_ramp_s
+            t_dec_value = adaptive_ramp_s
+        else:
+            t_acc_value = (
+                float(time_acc_s)
+                if time_acc_s is not None and float(time_acc_s) > 0.0
+                else 2.0
+            )
+            t_dec_value = 2.0
+        if is_waypoint_preserving_travel:
+            sample_kwargs["t_acc"] = t_acc_value
+            sample_kwargs["t_dec"] = t_dec_value
+        else:
+            if time_acc_s is not None and float(time_acc_s) > 0.0:
+                sample_kwargs["t_acc"] = t_acc_value
         for pt in sample_global_curve_iter(gc, **sample_kwargs):
             if not has_any:
                 timing.start_segment(path_id=path_id, move_type=gc.type, start_seq=seq)
@@ -724,8 +757,11 @@ def export_npz(
                     row.injection_role = marker_role
             timing.finish_segment(
                 t_acc_s=t_acc_value,
-                t_flat_s=max(0.0, float(pt.t) - t_acc_value - 2.0),
-                t_dec_s=2.0,
+                t_flat_s=max(
+                    0.0,
+                    (len(sampled_rows) - 1) * dt - t_acc_value - t_dec_value,
+                ),
+                t_dec_s=t_dec_value,
                 end_seq=sampled_rows[-1].seq,
             )
             writer = _writer_for(layer, subtype, occ)
@@ -1261,7 +1297,13 @@ def export_npz(
         work_buffer = _merge_collinear_wall_moves(
             _rebuild_solid_infill_core(_sanitize_solid_infill_endpoints(buffer))
         )
-        if work_buffer and _is_wall_outline_subtype(work_buffer[0].subtype):
+        if work_buffer and work_buffer[0].type == "TRAVEL":
+            # A travel route may deliberately turn around perimeters or holes.
+            # Its source waypoints are therefore a safety contract: emit one
+            # exact polyline and give the sampler one continuous time profile
+            # instead of independently stopping on every short source edge.
+            gc_list = [_make_polyline_gc(work_buffer, " | travel_polyline")]
+        elif work_buffer and _is_wall_outline_subtype(work_buffer[0].subtype):
             gc_list = [_make_polyline_gc(work_buffer, " | wall_polyline")]
         elif work_buffer and _should_disable_spline_for_subtype(work_buffer[0].subtype):
             t0 = time.perf_counter()
