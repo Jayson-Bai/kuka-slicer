@@ -1,10 +1,10 @@
 """Keep local slicing work from monopolising the workstation CPU.
 
 The native Prusa bridge and numerical export code can both create worker
-threads.  Limiting Python threads alone therefore is not sufficient.  This
-module applies a temporary *process* affinity cap while a slicer task runs.
-Windows background priority is available as an explicit opt-in, rather than a
-default source of extra latency.
+threads. Limiting Python threads alone therefore is not sufficient. This module
+applies temporary process affinity and working-set caps while a slicer task
+runs. Windows background priority is available as an explicit opt-in, rather
+than a default source of extra latency.
 """
 
 from __future__ import annotations
@@ -21,7 +21,8 @@ from typing import Iterator
 
 MAX_CPU_CORES_ENV = "KUKA_SLICER_MAX_CPU_CORES"
 LOW_PRIORITY_ENV = "KUKA_SLICER_LOW_PRIORITY"
-DEFAULT_MAX_CPU_CORES = 12
+MAX_MEMORY_PERCENT_ENV = "KUKA_SLICER_MAX_MEMORY_PERCENT"
+DEFAULT_RESOURCE_PERCENT = 70
 _NUMERIC_THREAD_ENVS = (
     "OMP_NUM_THREADS",
     "OPENBLAS_NUM_THREADS",
@@ -40,6 +41,9 @@ class CpuLimitInfo:
     max_cores: int
     affinity_applied: bool
     priority_lowered: bool
+    total_memory_bytes: int | None = None
+    max_memory_bytes: int | None = None
+    memory_cap_applied: bool = False
 
     def to_metadata(self) -> dict[str, int | bool]:
         return {
@@ -47,13 +51,17 @@ class CpuLimitInfo:
             "max_cores": self.max_cores,
             "affinity_applied": self.affinity_applied,
             "priority_lowered": self.priority_lowered,
+            "total_memory_bytes": self.total_memory_bytes,
+            "max_memory_bytes": self.max_memory_bytes,
+            "memory_cap_applied": self.memory_cap_applied,
         }
 
 
 def configured_max_cpu_cores(available_cores: int | None = None) -> int:
-    """Return the requested core cap, defaulting to at most 12 cores."""
+    """Return a core cap that never exceeds 70% of local logical CPUs."""
 
     available = max(1, int(available_cores if available_cores is not None else (os.cpu_count() or 1)))
+    budget = max(1, available * DEFAULT_RESOURCE_PERCENT // 100)
     requested = os.environ.get(MAX_CPU_CORES_ENV, "").strip()
     if requested:
         try:
@@ -61,8 +69,24 @@ def configured_max_cpu_cores(available_cores: int | None = None) -> int:
         except ValueError:
             value = 0
         if value > 0:
-            return min(value, available)
-    return min(DEFAULT_MAX_CPU_CORES, available)
+            # An explicit setting is useful for quieter machines, but must
+            # never defeat the workstation-protection budget.
+            return min(value, budget)
+    return budget
+
+
+def configured_max_memory_percent() -> int:
+    """Return a memory percent cap, allowing environment overrides only down."""
+
+    requested = os.environ.get(MAX_MEMORY_PERCENT_ENV, "").strip()
+    if requested:
+        try:
+            value = int(requested)
+        except ValueError:
+            value = 0
+        if value > 0:
+            return min(DEFAULT_RESOURCE_PERCENT, max(1, value))
+    return DEFAULT_RESOURCE_PERCENT
 
 
 def low_priority_requested() -> bool:
@@ -129,6 +153,70 @@ def _set_windows_priority(priority: int) -> bool:
     return bool(kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), priority))
 
 
+def _windows_total_physical_memory_bytes() -> int | None:
+    """Return installed physical RAM through the native Windows API."""
+
+    if sys.platform != "win32":
+        return None
+
+    class MemoryStatusEx(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", wintypes.DWORD),
+            ("dwMemoryLoad", wintypes.DWORD),
+            ("ullTotalPhys", ctypes.c_ulonglong),
+            ("ullAvailPhys", ctypes.c_ulonglong),
+            ("ullTotalPageFile", ctypes.c_ulonglong),
+            ("ullAvailPageFile", ctypes.c_ulonglong),
+            ("ullTotalVirtual", ctypes.c_ulonglong),
+            ("ullAvailVirtual", ctypes.c_ulonglong),
+            ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+        ]
+
+    status = MemoryStatusEx()
+    status.dwLength = ctypes.sizeof(MemoryStatusEx)
+    kernel32 = _windows_kernel32()
+    if not kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        return None
+    return int(status.ullTotalPhys) if status.ullTotalPhys > 0 else None
+
+
+def _get_windows_working_set_limits() -> tuple[int, int, int] | None:
+    """Return the current process working-set (minimum, maximum, flags)."""
+
+    if sys.platform != "win32":
+        return None
+    minimum = ctypes.c_size_t()
+    maximum = ctypes.c_size_t()
+    flags = wintypes.DWORD()
+    kernel32 = _windows_kernel32()
+    if not kernel32.GetProcessWorkingSetSizeEx(
+        kernel32.GetCurrentProcess(),
+        ctypes.byref(minimum),
+        ctypes.byref(maximum),
+        ctypes.byref(flags),
+    ):
+        return None
+    return int(minimum.value), int(maximum.value), int(flags.value)
+
+
+def _set_windows_working_set_limits(
+    minimum: int,
+    maximum: int,
+    flags: int,
+) -> bool:
+    if sys.platform != "win32" or maximum <= 0 or minimum < 0 or minimum > maximum:
+        return False
+    kernel32 = _windows_kernel32()
+    return bool(
+        kernel32.SetProcessWorkingSetSizeEx(
+            kernel32.GetCurrentProcess(),
+            ctypes.c_size_t(minimum),
+            ctypes.c_size_t(maximum),
+            wintypes.DWORD(flags),
+        )
+    )
+
+
 def _windows_kernel32():
     """Return Kernel32 with pointer-width-safe process API signatures."""
 
@@ -147,6 +235,22 @@ def _windows_kernel32():
     kernel32.GetPriorityClass.restype = wintypes.DWORD
     kernel32.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
     kernel32.SetPriorityClass.restype = wintypes.BOOL
+    kernel32.GlobalMemoryStatusEx.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalMemoryStatusEx.restype = wintypes.BOOL
+    kernel32.GetProcessWorkingSetSizeEx.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.GetProcessWorkingSetSizeEx.restype = wintypes.BOOL
+    kernel32.SetProcessWorkingSetSizeEx.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        wintypes.DWORD,
+    ]
+    kernel32.SetProcessWorkingSetSizeEx.restype = wintypes.BOOL
     return kernel32
 
 
@@ -178,15 +282,41 @@ def limit_slicer_task() -> Iterator[CpuLimitInfo]:
         priority_lowered = bool(
             original_priority is not None and _set_windows_priority(0x00004000)
         )
+        total_memory_bytes = _windows_total_physical_memory_bytes()
+        max_memory_bytes = (
+            total_memory_bytes * configured_max_memory_percent() // 100
+            if total_memory_bytes is not None
+            else None
+        )
+        original_working_set = _get_windows_working_set_limits()
+        memory_cap_applied = False
+        if (
+            original_working_set is not None
+            and max_memory_bytes is not None
+            and original_working_set[0] <= max_memory_bytes
+        ):
+            try:
+                memory_cap_applied = _set_windows_working_set_limits(
+                    original_working_set[0],
+                    max_memory_bytes,
+                    original_working_set[2],
+                )
+            except OSError:
+                memory_cap_applied = False
         info = CpuLimitInfo(
             available_cores=available,
             max_cores=max_cores,
             affinity_applied=affinity_applied,
             priority_lowered=priority_lowered,
+            total_memory_bytes=total_memory_bytes,
+            max_memory_bytes=max_memory_bytes,
+            memory_cap_applied=memory_cap_applied,
         )
         try:
             yield info
         finally:
+            if memory_cap_applied and original_working_set is not None:
+                _set_windows_working_set_limits(*original_working_set)
             if priority_lowered and original_priority is not None:
                 _set_windows_priority(original_priority)
             if affinity_applied and original_affinity is not None:
