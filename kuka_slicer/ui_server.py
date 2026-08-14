@@ -29,6 +29,7 @@ from .external_npz import (
     write_external_source_npz,
 )
 from .cpu_limiter import limit_slicer_task
+from .fiber_travel import plan_fiber_interpath_travels
 from .honeycomb_pathing import HoneycombPathingConfig
 
 from .slicer import (
@@ -70,8 +71,20 @@ from .surface_peak_collision import check_peak_surface_collision
 MAX_SURFACE_PREVIEW_NPZ_BYTES = 256 * 1024 * 1024
 PRINTHEAD_ASSET_DIR = Path(__file__).resolve().parent.parent / "assets" / "printhead"
 
-
 DEFAULT_UI_RESIN_INFILL_OVERLAP_PERCENT = 0.0
+
+
+class FiberTemplatePaths(list[list[list[float]]]):
+    """Fiber geometry together with the declared XY coordinate semantics."""
+
+    def __init__(
+        self,
+        paths: list[list[list[float]]],
+        *,
+        coordinate_system: str | None,
+    ) -> None:
+        super().__init__(paths)
+        self.coordinate_system = coordinate_system
 
 
 def _surface_preview_picker_state_path(output_dir: Path) -> Path:
@@ -798,15 +811,31 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         if isinstance(slicing_meta, dict):
             slicing_meta["resolved_config"] = resolved_config
         fiber_preview_paths = {}
+        fiber_travel_paths = {}
         if fiber_template_paths:
+            fiber_template_paths = align_fiber_template_paths_to_resin(
+                job,
+                fiber_template_paths,
+            )
             fiber_preview_paths = expand_fiber_template_for_resin_layers(
                 job, fiber_template_paths
             )
-            merge_fiber_paths_into_job(job, fiber_preview_paths)
+            fiber_travel_paths = plan_fiber_interpath_travels(
+                mesh,
+                config,
+                fiber_preview_paths,
+                reference_z_by_layer=job.meta.get("fiber_interpath_reference_z_mm"),
+            )
+            merge_fiber_paths_into_job(
+                job,
+                fiber_preview_paths,
+                fiber_travel_paths,
+            )
             if core_source_job is not None and source_gcode_module is not None:
                 core_source_job = source_gcode_module.with_fiber_paths(
                     core_source_job,
                     fiber_preview_paths,
+                    fiber_travel_paths_by_layer=fiber_travel_paths,
                 )
         if raft_layers:
             z_shift = add_raft_to_job(job, mesh, config, raft_layers, DEFAULT_RAFT_TOP_GAP_MM)
@@ -818,6 +847,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         normalize_job_xy_origin(
             job,
             target_xy=(float(config.start_x_mm), float(config.start_y_mm)),
+            reference_material="R",
         )
         primeline_enabled = _bool_param(params, "core_primeline_enabled", True)
         if slicing_kernel == "prusa":
@@ -1664,7 +1694,13 @@ def resolve_build_axis(mesh, requested_axis: str) -> str:
 
 def load_fiber_template_json(json_path: Path) -> list[list[list[float]]]:
     data = json.loads(json_path.read_text(encoding="utf-8"))
+    coordinate_system: str | None = None
     if isinstance(data, dict):
+        raw_coordinate_system = data.get("coordinate_system")
+        if raw_coordinate_system is not None:
+            if not isinstance(raw_coordinate_system, str):
+                raise ValueError("fiber JSON coordinate_system must be a string")
+            coordinate_system = raw_coordinate_system
         # Canonical fiber paths use one record per trajectory under ``paths``.
         if "paths" in data:
             data = data["paths"]
@@ -1714,7 +1750,54 @@ def load_fiber_template_json(json_path: Path) -> list[list[list[float]]]:
 
     if not paths:
         raise ValueError("fiber JSON contains no valid paths")
-    return paths
+    return FiberTemplatePaths(paths, coordinate_system=coordinate_system)
+
+
+def align_fiber_template_paths_to_resin(
+    job,
+    template_paths: list[list[list[float]]],
+) -> list[list[list[float]]]:
+    """Map declared fiber XY coordinates into the unnormalized resin frame.
+
+    ``project_default`` is the coordinate convention emitted by the fiber
+    planner: (0, 0) is the center of the STL build plane.  Slicer paths retain
+    the STL's local XY translation until the later UI placement step, so map
+    that origin to the resin bounding-box center before fibers are injected.
+    The later normalization then applies the existing UI start/travel offset
+    equally to both materials.
+    """
+
+    coordinate_system = getattr(template_paths, "coordinate_system", None)
+    if coordinate_system is None or coordinate_system == "slicer_xy":
+        return template_paths
+    if coordinate_system != "project_default":
+        raise ValueError(
+            "fiber JSON coordinate_system must be project_default or slicer_xy"
+        )
+
+    resin_paths = [
+        np.asarray(path, dtype=np.float64)
+        for group in job.material_paths
+        if group.material == "R"
+        for path in group.paths
+        if np.asarray(path).size
+    ]
+    if not resin_paths:
+        raise ValueError("cannot align project_default fiber JSON without resin paths")
+    resin_points = np.vstack(resin_paths)
+    translation_x = float((np.min(resin_points[:, 0]) + np.max(resin_points[:, 0])) * 0.5)
+    translation_y = float((np.min(resin_points[:, 1]) + np.max(resin_points[:, 1])) * 0.5)
+    aligned_paths = [
+        [[float(x) + translation_x, float(y) + translation_y, float(z)] for x, y, z in path]
+        for path in template_paths
+    ]
+    job.meta["fiber_coordinate_alignment"] = {
+        "source_coordinate_system": coordinate_system,
+        "reference": "resin_xy_bounds_center",
+        "translation_x_mm": translation_x,
+        "translation_y_mm": translation_y,
+    }
+    return aligned_paths
 
 
 def expand_fiber_template_for_resin_layers(
@@ -1733,6 +1816,10 @@ def expand_fiber_template_for_resin_layers(
             if isinstance(raw_count, int) and raw_count > 0:
                 raft_layer_count = raw_count
     part_resin_groups = resin_groups[raft_layer_count:]
+    fiber_reference_z_by_layer = {
+        int(group.layer_index): _group_layer_z(group)
+        for group in part_resin_groups
+    }
 
     # A brim is printed on the first part resin layer, but fiber should start
     # only above the following resin layer.  Keep the normal resin/fiber
@@ -1790,6 +1877,14 @@ def expand_fiber_template_for_resin_layers(
         slicing_metadata["fiber_layer_height_applied_mm"] = fiber_layer_height
         slicing_metadata["fiber_layers_skipped_for_brim"] = skipped_fiber_layers
 
+    # The physical fiber Z accumulates earlier fiber courses.  Routing must
+    # inspect the same unshifted STL section that produced the resin layer,
+    # while the connector itself retains its raised output Z.
+    job.meta["fiber_interpath_reference_z_mm"] = {
+        str(layer_index): float(z)
+        for layer_index, z in fiber_reference_z_by_layer.items()
+    }
+
     # Fiber is printed between resin layers; the final resin layer is a cap.
     for group in part_resin_groups[skipped_fiber_layers:-1]:
         z = _group_layer_z(group) + fiber_layer_height
@@ -1834,15 +1929,60 @@ def _group_layer_z(group) -> float:
     return float(group.layer_index)
 
 
-def merge_fiber_paths_into_job(job, fiber_paths_by_layer: dict[int, list[list[list[float]]]]) -> None:
+def merge_fiber_paths_into_job(
+    job,
+    fiber_paths_by_layer: dict[int, list[list[list[float]]]],
+    fiber_travel_paths_by_layer: dict[int, list[np.ndarray]] | None = None,
+) -> None:
+    """Attach fiber deposition and only its explicit interpath travels.
+
+    Native resin paths and their Prusa travel order are copied verbatim.  The
+    appended records describe the UI-planned fiber sequence exclusively, so
+    the pre-Core source NPZ and the native-G-code Core adapter share identical
+    fiber travel geometry without changing any resin motion.
+    """
+
+    fiber_travel_paths_by_layer = fiber_travel_paths_by_layer or {}
     existing = {(group.layer_index, group.material) for group in job.material_paths}
     for layer_index in sorted(fiber_paths_by_layer):
         if (layer_index, "F") in existing:
             continue
         paths = [np.asarray(path, dtype=np.float64) for path in fiber_paths_by_layer[layer_index]]
+        connector_paths = [
+            np.asarray(path, dtype=np.float64)
+            for path in fiber_travel_paths_by_layer.get(layer_index, [])
+        ]
+        if len(connector_paths) != max(0, len(paths) - 1):
+            raise ValueError(
+                f"fiber layer {layer_index} needs {max(0, len(paths) - 1)} interpath travels, "
+                f"received {len(connector_paths)}"
+            )
         if paths:
             job.material_paths.append(MaterialPaths(layer_index, "F", paths))
+            travel_group = next(
+                (group for group in job.travel_paths if group.layer_index == layer_index),
+                None,
+            )
+            if travel_group is None:
+                travel_group = TravelPaths(layer_index, [])
+                job.travel_paths.append(travel_group)
+            first_travel_index = len(travel_group.paths)
+            travel_group.paths.extend(connector_paths)
+            motion_root = job.meta.get("motion_order")
+            if isinstance(motion_root, dict):
+                records = motion_root.setdefault(str(layer_index), [])
+                if isinstance(records, list):
+                    for fiber_index in range(len(paths)):
+                        if fiber_index:
+                            records.append(
+                                {
+                                    "kind": "fiber_travel",
+                                    "index": first_travel_index + fiber_index - 1,
+                                }
+                            )
+                        records.append({"kind": "fiber_deposit", "index": fiber_index})
     job.material_paths.sort(key=lambda group: (group.layer_index, 0 if group.material == "R" else 1))
+    job.travel_paths.sort(key=lambda group: group.layer_index)
 
 
 def _fiber_preview_paths_from_job(job) -> dict[int, list[list[list[float]]]]:

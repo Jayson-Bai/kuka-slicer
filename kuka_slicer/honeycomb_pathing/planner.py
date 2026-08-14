@@ -67,7 +67,7 @@ def apply_honeycomb_centerline_pathing(
         raise ValueError("unsupported honeycomb topology")
 
     reference_z = _layer_z(resin_groups[0])
-    solid = _solid_geometry_at_z(mesh, reference_z, tolerance_mm)
+    solid = solid_geometry_at_z(mesh, reference_z, tolerance_mm)
     # Native Prusa labels every disconnected honeycomb-wall ring as an outer
     # contour.  Derive the frame from the STL section instead of selecting the
     # largest native ring, which can otherwise be only one honeycomb cell.
@@ -997,7 +997,13 @@ def _outer_frame_from_solid(solid, z: float) -> np.ndarray:
     return frame
 
 
-def _solid_geometry_at_z(mesh: Mesh, z: float, tolerance: float):
+def solid_geometry_at_z(mesh: Mesh, z: float, tolerance: float):
+    """Return the printable XY solid at ``z``, retaining its internal holes.
+
+    This is shared by derived-path planners that need to connect endpoints
+    after Prusa has finished.  It deliberately leaves native Prusa geometry
+    and travel planning untouched.
+    """
     segments: list[tuple[np.ndarray, np.ndarray]] = []
     for triangle in np.asarray(mesh.triangles, dtype=np.float64):
         points: list[np.ndarray] = []

@@ -1124,10 +1124,11 @@ def normalize_job_xy_origin(
     job: ExternalSourceJob,
     *,
     target_xy: tuple[float, float] = (0.0, 0.0),
+    reference_material: str | None = None,
 ) -> tuple[float, float]:
-    """Translate all exported paths so the lower-left XY bound reaches target_xy."""
+    """Translate all paths so a material bound's lower-left reaches target_xy."""
 
-    bounds = _job_xy_bounds(job)
+    bounds = _job_xy_bounds(job, material=reference_material)
     if bounds is None:
         return (0.0, 0.0)
     min_x, min_y, _, _ = bounds
@@ -1158,13 +1159,19 @@ def normalize_job_xy_origin(
     return (float(translation_x), float(translation_y))
 
 
-def _job_xy_bounds(job: ExternalSourceJob) -> tuple[float, float, float, float] | None:
+def _job_xy_bounds(
+    job: ExternalSourceJob,
+    *,
+    material: str | None = None,
+) -> tuple[float, float, float, float] | None:
     min_x = math.inf
     min_y = math.inf
     max_x = -math.inf
     max_y = -math.inf
     found = False
     for group in job.material_paths:
+        if material is not None and group.material != material:
+            continue
         for path in group.paths:
             if path.size == 0:
                 continue

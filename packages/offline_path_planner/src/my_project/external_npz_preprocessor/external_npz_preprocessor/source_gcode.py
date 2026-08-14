@@ -187,18 +187,26 @@ def with_fiber_paths(
     job: SourceJob,
     fiber_paths_by_layer: Mapping[int, Sequence[np.ndarray]],
     *,
+    fiber_travel_paths_by_layer: Mapping[int, Sequence[np.ndarray]] | None = None,
     default_abc: tuple[float, float, float] = (0.0, 0.0, 0.0),
 ) -> SourceJob:
     """Attach already-expanded fiber paths without changing G-code resin data.
 
     Fiber JSON has project-specific placement rules and is expanded before it
     reaches Core.  This narrow adapter accepts that resulting mapping and
-    leaves all resin paths, travel paths, E values and motion-order records
-    from native G-code untouched.
+    leaves all resin paths, native travel paths, E values and motion-order
+    records from G-code untouched.  Optional fiber connectors are appended as
+    explicit source travels and indexed separately so only the fiber-to-fiber
+    boundaries consume them.
     """
 
     remaining = {int(index): paths for index, paths in fiber_paths_by_layer.items()}
+    remaining_travels = {
+        int(index): paths
+        for index, paths in (fiber_travel_paths_by_layer or {}).items()
+    }
     layers: list[LayerPaths] = []
+    fiber_travel_indexes: dict[str, list[int]] = {}
     for layer in job.layers:
         source_paths = remaining.pop(layer.index, ())
         fiber_paths = [
@@ -209,19 +217,44 @@ def with_fiber_paths(
             )
             for order, points in enumerate(source_paths)
         ]
+        source_travels = remaining_travels.pop(layer.index, ())
+        expected_travel_count = max(0, len(fiber_paths) - 1)
+        if len(source_travels) != expected_travel_count:
+            raise ValueError(
+                f"fiber layer {layer.index} needs {expected_travel_count} interpath travels, "
+                f"received {len(source_travels)}"
+            )
+        travel_paths = list(layer.travel_paths)
+        if source_travels:
+            first_travel_index = len(travel_paths)
+            travel_paths.extend(
+                TravelPath(
+                    order=first_travel_index + index,
+                    points=_normalize_fiber_path(points, default_abc),
+                )
+                for index, points in enumerate(source_travels)
+            )
+            fiber_travel_indexes[str(layer.index)] = list(
+                range(first_travel_index, first_travel_index + len(source_travels))
+            )
         layers.append(
             LayerPaths(
                 index=layer.index,
                 resin_paths=list(layer.resin_paths),
                 fiber_paths=fiber_paths,
-                travel_paths=list(layer.travel_paths),
+                travel_paths=travel_paths,
             )
         )
     if remaining:
         unknown = ", ".join(str(index) for index in sorted(remaining))
         raise ValueError(f"fiber paths reference G-code layers that do not exist: {unknown}")
+    if remaining_travels:
+        unknown = ", ".join(str(index) for index in sorted(remaining_travels))
+        raise ValueError(f"fiber travels reference G-code layers that do not exist: {unknown}")
     meta = dict(job.meta)
     meta["fiber_source"] = "expanded_external_fiber_paths"
+    if fiber_travel_indexes:
+        meta["fiber_travel_path_indexes"] = fiber_travel_indexes
     return SourceJob(meta=meta, layers=layers)
 
 

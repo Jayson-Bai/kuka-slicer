@@ -14,6 +14,7 @@ from external_npz_preprocessor.source_gcode import (
     translate_source_job,
     with_fiber_paths,
 )
+from external_npz_preprocessor.converter import source_job_to_parsed_commands
 
 
 _PRUSA_GCODE = """\
@@ -259,6 +260,40 @@ def test_gcode_with_expanded_fiber_paths_matches_external_npz_byte_for_byte(tmp_
     convert_external_npz(source_npz, output_npz, _params(), calibration_path=calibration)
 
     assert output_gcode.read_bytes() == output_npz.read_bytes()
+
+
+def test_expanded_fiber_connectors_are_emitted_as_explicit_source_travel(tmp_path):
+    gcode = tmp_path / "native.gcode"
+    gcode.write_text(_PRUSA_GCODE, encoding="utf-8")
+    fiber_paths = {
+        0: [
+            np.asarray([[0.0, 2.0, 0.6], [1.0, 2.0, 0.6]]),
+            np.asarray([[3.0, 2.0, 0.6], [4.0, 2.0, 0.6]]),
+        ],
+    }
+    connector = np.asarray(
+        [[1.0, 2.0, 0.6], [1.0, 1.0, 0.6], [3.0, 1.0, 0.6], [3.0, 2.0, 0.6]]
+    )
+
+    job = with_fiber_paths(
+        load_source_gcode(gcode),
+        fiber_paths,
+        fiber_travel_paths_by_layer={0: [connector]},
+    )
+    commands = source_job_to_parsed_commands(job, _params())
+
+    assert len(job.layers[0].travel_paths) == 2
+    assert job.meta["fiber_travel_path_indexes"] == {"0": [1]}
+    fiber_travel = [command for command in commands if command.raw == "external_npz_fiber_travel"]
+    assert len(fiber_travel) == len(connector) - 1
+    assert all(command.type == "TRAVEL" for command in fiber_travel)
+    emitted_endpoints = np.asarray(
+        [[command.pos.x, command.pos.y, command.pos.z] for command in fiber_travel]
+    )
+    np.testing.assert_allclose(
+        np.diff(emitted_endpoints, axis=0),
+        np.diff(connector[1:], axis=0),
+    )
 
 
 def test_prusa_ui_gcode_route_matches_legacy_normalized_npz_byte_for_byte(tmp_path):

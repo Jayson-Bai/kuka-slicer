@@ -7,7 +7,12 @@ from external_npz_preprocessor.process_params import (
     ProcessParams,
     ResinProcessParams,
 )
-from external_npz_preprocessor.source_npz import LayerPaths, MaterialPath, SourceJob
+from external_npz_preprocessor.source_npz import (
+    LayerPaths,
+    MaterialPath,
+    SourceJob,
+    TravelPath,
+)
 from path_processing_core.types import (
     ExtrudeWait,
     GlobalCurveCommand,
@@ -30,7 +35,7 @@ def _path(material: str, points, extrusion=None) -> MaterialPath:
     )
 
 
-def _job(*, resin_paths=(), fiber_paths=()) -> SourceJob:
+def _job(*, resin_paths=(), fiber_paths=(), travel_paths=()) -> SourceJob:
     return SourceJob(
         meta={},
         layers=[
@@ -38,6 +43,7 @@ def _job(*, resin_paths=(), fiber_paths=()) -> SourceJob:
                 index=0,
                 resin_paths=list(resin_paths),
                 fiber_paths=list(fiber_paths),
+                travel_paths=list(travel_paths),
             )
         ],
     )
@@ -48,6 +54,14 @@ def _print_moves(commands):
         command
         for command in commands
         if isinstance(command, MoveCommand) and command.type == "PRINT"
+    ]
+
+
+def _travel_moves(commands):
+    return [
+        command
+        for command in commands
+        if isinstance(command, MoveCommand) and command.type == "TRAVEL"
     ]
 
 
@@ -77,6 +91,20 @@ def test_print_paths_remain_moves_with_source_xyz_and_material_metadata():
     ]
     assert [move.feedrate for move in moves] == [600.0, 900.0]
     assert not any(isinstance(command, GlobalCurveCommand) for command in commands)
+
+
+def test_fiber_paths_do_not_redefine_resin_start_xy_origin():
+    commands = source_job_to_parsed_commands(
+        _job(
+            resin_paths=[_path("R", [[20, 30, 0.5], [25, 30, 0.5]])],
+            fiber_paths=[_path("F", [[-100, -100, 0.6], [-99, -100, 0.6]])],
+        ),
+        ProcessParams(primeline_enabled=False, start_x_mm=10.0, start_y_mm=15.0),
+    )
+
+    resin_move = next(move for move in _print_moves(commands) if move.subtype == "RESIN_PRINT")
+
+    assert (resin_move.start_pos.x, resin_move.start_pos.y) == pytest.approx((10.0, 15.0))
 
 
 def test_prusa_source_e_profile_is_preserved_per_move_before_core_fitting():
@@ -126,6 +154,72 @@ def test_zero_e_segment_inside_material_path_stays_a_print_move():
         and command.start_pos == moves[1].start_pos
         and command.pos == moves[1].pos
         for command in commands
+    )
+
+
+def test_collinear_source_travel_is_collapsed_before_core_handoff():
+    commands = source_job_to_parsed_commands(
+        _job(
+            resin_paths=[_path("R", [[4, 0, 0.5], [6, 0, 0.5]])],
+            travel_paths=[
+                TravelPath(
+                    order=0,
+                    points=np.asarray(
+                        [
+                            [0.0, 0.0, 0.5, 0.0, 0.0, 0.0],
+                            [1.0, 0.0, 0.5, 0.0, 0.0, 0.0],
+                            [2.5, 0.0, 0.5, 0.0, 0.0, 0.0],
+                            [4.0, 0.0, 0.5, 0.0, 0.0, 0.0],
+                        ],
+                        dtype=np.float64,
+                    ),
+                )
+            ],
+        ),
+        ProcessParams(primeline_enabled=False),
+    )
+
+    travels = _travel_moves(commands)
+
+    assert len(travels) == 1
+    assert travels[0].raw == "external_npz_prusa_travel"
+    assert (travels[0].start_pos.x, travels[0].start_pos.y) == pytest.approx((6.0, 10.0))
+    assert (travels[0].pos.x, travels[0].pos.y) == pytest.approx((10.0, 10.0))
+
+
+def test_turning_source_travel_keeps_hole_avoidance_waypoints():
+    commands = source_job_to_parsed_commands(
+        _job(
+            resin_paths=[_path("R", [[4, 2, 0.5], [6, 2, 0.5]])],
+            travel_paths=[
+                TravelPath(
+                    order=0,
+                    points=np.asarray(
+                        [
+                            [0.0, 0.0, 0.5, 0.0, 0.0, 0.0],
+                            [0.0, 2.0, 0.5, 0.0, 0.0, 0.0],
+                            [4.0, 2.0, 0.5, 0.0, 0.0, 0.0],
+                        ],
+                        dtype=np.float64,
+                    ),
+                )
+            ],
+        ),
+        ProcessParams(primeline_enabled=False),
+    )
+
+    travels = _travel_moves(commands)
+
+    assert len(travels) == 2
+    np.testing.assert_allclose(
+        [
+            (move.start_pos.x, move.start_pos.y, move.pos.x, move.pos.y)
+            for move in travels
+        ],
+        [
+            (6.0, 8.0, 6.0, 10.0),
+            (6.0, 10.0, 10.0, 10.0),
+        ],
     )
 
 

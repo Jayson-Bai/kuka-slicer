@@ -7,7 +7,7 @@ left untouched.
 """
 
 from .config import HoneycombPathingConfig, HoneycombTopology
-from .planner import apply_honeycomb_centerline_pathing
+from .planner import apply_honeycomb_centerline_pathing, solid_geometry_at_z
 from .travel_router import HoleSafeTravelRouter
 
 __all__ = [
@@ -15,4 +15,5 @@ __all__ = [
     "HoneycombTopology",
     "HoleSafeTravelRouter",
     "apply_honeycomb_centerline_pathing",
+    "solid_geometry_at_z",
 ]

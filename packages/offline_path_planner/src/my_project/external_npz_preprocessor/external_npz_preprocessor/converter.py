@@ -249,7 +249,24 @@ def source_job_to_parsed_commands(job: SourceJob, params: ProcessParams) -> Pars
                 current_tool = tool
                 current_e = 0.0
 
-            if (
+            fiber_travel = (
+                _source_travel_for_fiber_path(job, layer, fiber_path_number)
+                if is_fiber and fiber_path_number > 0
+                else None
+            )
+            if fiber_travel is not None:
+                line, current_pose = _append_source_travel_path(
+                    commands,
+                    fiber_travel,
+                    current_pose,
+                    params,
+                    line,
+                    layer.index,
+                    raw="external_npz_fiber_travel",
+                    source_min_x=source_min_x,
+                    source_min_y=source_min_y,
+                )
+            elif (
                 current_pose is not None
                 and _distance(current_pose, first_pose) > _EPS
             ):
@@ -879,7 +896,11 @@ def _job_source_xy_min(job: SourceJob) -> tuple[float, float]:
     min_x: float | None = None
     min_y: float | None = None
     for layer in job.layers:
-        for material_path in [*layer.resin_paths, *layer.fiber_paths]:
+        # The UI start position is the placement of the STL/resin job.  Fiber
+        # geometry must never redefine that origin, even if an imported path
+        # reaches beyond the resin footprint.
+        material_paths = layer.resin_paths
+        for material_path in material_paths:
             points = np.asarray(material_path.points)
             if points.size == 0:
                 continue
@@ -887,6 +908,16 @@ def _job_source_xy_min(job: SourceJob) -> tuple[float, float]:
             path_min_y = float(np.min(points[:, 1]))
             min_x = path_min_x if min_x is None else min(min_x, path_min_x)
             min_y = path_min_y if min_y is None else min(min_y, path_min_y)
+    if min_x is None or min_y is None:
+        for layer in job.layers:
+            for material_path in layer.fiber_paths:
+                points = np.asarray(material_path.points)
+                if points.size == 0:
+                    continue
+                path_min_x = float(np.min(points[:, 0]))
+                path_min_y = float(np.min(points[:, 1]))
+                min_x = path_min_x if min_x is None else min(min_x, path_min_x)
+                min_y = path_min_y if min_y is None else min(min_y, path_min_y)
     return (0.0 if min_x is None else min_x, 0.0 if min_y is None else min_y)
 
 
@@ -1040,6 +1071,34 @@ def _source_travel_for_resin_path(
     return None
 
 
+def _source_travel_for_fiber_path(
+    job: SourceJob,
+    layer: LayerPaths,
+    fiber_index: int,
+) -> TravelPath | None:
+    """Return the explicit connector immediately before a fiber path.
+
+    Native Prusa travel records remain associated only with resin deposition.
+    The UI attaches these routes after the native list and records their exact
+    indexes here, preventing a fiber connector from being mistaken for a
+    Prusa travel on a later resin path.
+    """
+
+    root = job.meta.get("fiber_travel_path_indexes")
+    if not isinstance(root, dict):
+        return None
+    indexes = root.get(str(layer.index))
+    if not isinstance(indexes, list):
+        return None
+    connector_index = fiber_index - 1
+    if not 0 <= connector_index < len(indexes):
+        return None
+    path_index = indexes[connector_index]
+    if not isinstance(path_index, int) or not 0 <= path_index < len(layer.travel_paths):
+        return None
+    return layer.travel_paths[path_index]
+
+
 def _append_linear_travel(
     commands: ParsedCommandList,
     start: Position,
@@ -1106,6 +1165,26 @@ def _append_source_travel_path(
             raw="external_npz_travel" if raw != "external_npz_start_xy_travel" else raw,
         )
         current_pose = points[0]
+
+    # Prusa represents an uninterrupted G0 route as one source travel path.
+    # Most such routes are a single straight move, but a path can also contain
+    # deliberate detour waypoints added to avoid a perimeter or an internal
+    # hole.  Only collapse a route when removing its interior vertices leaves
+    # the exact same monotonic line.  A turn, a backtrack, or an ABC change is
+    # therefore preserved as individual MoveCommands and cannot be shortened
+    # through an obstacle by this pre-Core optimization.
+    if len(points) >= 2 and _is_direct_source_travel(points):
+        line = _append_linear_travel(
+            commands,
+            current_pose,
+            points[-1],
+            params,
+            line,
+            layer,
+            raw=raw,
+        )
+        return line, points[-1]
+
     for point in points[1:]:
         line = _append_linear_travel(
             commands,
@@ -1118,6 +1197,64 @@ def _append_source_travel_path(
         )
         current_pose = point
     return line, current_pose
+
+
+def _is_direct_source_travel(points: list[Position]) -> bool:
+    """Return whether a source travel may safely lose its interior points.
+
+    The source adapter coalesces consecutive G0 lines.  Multi-point paths are
+    not automatically straight: Prusa's avoid-crossing route can use those
+    points to go around a hole.  Directly joining only an ordered collinear
+    sequence is geometry-preserving; every other route must retain its
+    waypoints.
+    """
+
+    if len(points) <= 2:
+        return True
+    start = points[0]
+    end = points[-1]
+    direction = (
+        end.x - start.x,
+        end.y - start.y,
+        end.z - start.z,
+    )
+    length_squared = sum(value * value for value in direction)
+    if length_squared <= _EPS * _EPS:
+        return False
+
+    # Source coordinates are float64 but may have travelled through one
+    # float32 NPZ round-trip.  This tolerance admits numerical noise only; it
+    # is intentionally far below any meaningful detour clearance.
+    tolerance = 1e-6
+    previous_projection = 0.0
+    for point in points:
+        if (
+            abs(point.a - start.a) > tolerance
+            or abs(point.b - start.b) > tolerance
+            or abs(point.c - start.c) > tolerance
+        ):
+            return False
+        relative = (
+            point.x - start.x,
+            point.y - start.y,
+            point.z - start.z,
+        )
+        projection = sum(a * b for a, b in zip(relative, direction)) / length_squared
+        if projection < -tolerance or projection > 1.0 + tolerance:
+            return False
+        if projection + tolerance < previous_projection:
+            return False
+        nearest = tuple(start_value + projection * vector for start_value, vector in zip(
+            (start.x, start.y, start.z), direction
+        ))
+        deviation = math.sqrt(sum(
+            (actual - expected) ** 2
+            for actual, expected in zip((point.x, point.y, point.z), nearest)
+        ))
+        if deviation > tolerance:
+            return False
+        previous_projection = max(previous_projection, projection)
+    return True
 
 
 def _position_from_row(row: np.ndarray) -> Position:
