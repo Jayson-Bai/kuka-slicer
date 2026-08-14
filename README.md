@@ -348,9 +348,12 @@ to the slicing core.
 `kuka_slicer.surface_mapper` is a second, independent package. It imports a
 planar `external_layer_paths_v1` NPZ and the geometry-only
 `graded_surface_v1.json` export, then applies a mapper-owned logical-layer
-progression to Z only. It preserves XY, `layer_XXXX_R/F/T` grouping, path and
-point order, and existing E values. The resulting `curved.npz` remains a valid
-input for the existing Core preprocessor.
+progression to Z and generates KUKA ABC from the analytical surface normal. It
+preserves XY, `layer_XXXX_R/F/T` grouping, logical-layer identity, path order,
+and point order. Deposited R/F paths are resampled before analytical mapping,
+and every existing E array is recalculated from the curved-to-flat 3D arc-length
+ratio. The resulting `curved.npz` remains a valid input for the existing Core
+preprocessor.
 
 ```powershell
 python -m kuka_slicer surface-map
@@ -358,8 +361,27 @@ python -m kuka_slicer surface-map
 
 Open `http://127.0.0.1:8767`. The page accepts one surface-start layer and
 automatically mirrors the completion and return-to-flat regions about the
-middle logical layer, then rejects any mapped result containing negative Z. E
-recalculation and ABC orientation generation are intentionally deferred.
+middle logical layer, then rejects any mapped result containing negative Z.
+Preview and export report the resampling, E compensation, Z range, and surface
+normal orientation contract.
+
+## Production honeycomb surface reference
+
+The production honeycomb planner is `macro_partition_zero_e`, introduced by
+commit `08fc814`. It reconstructs the wall graph from the real STL section,
+deposits every wall edge once, joins safe sub-trails inside each tested minimum
+macro partition with constant-E print motion, and emits explicit T travel only
+between macro partitions. The later `cc23961` commit adds an isolated regular-
+grid visualization prototype; it is not a replacement production planner.
+
+The fixed local regression sample is the 150 x 100 x 10 mm, side-5-mm model
+under `C:\Users\caRRot\Desktop\print_test\曲面测试\蜂窝-150x100x10mm-08-11`.
+The reference NPZ is
+`02_曲面参数与预览\honeycomb_minimum_no_u_turn_partitions_surface_preview.npz`.
+It must be paired with the STL in `01_模型` and the **phase-45-degree**
+`蜂窝-150x100x10mm-08-11-相位45度-全边界曲面参数.json`; the zero-phase JSON is
+not the matching surface definition. On another machine, set
+`KUKA_SLICER_HONEYCOMB_REFERENCE_ROOT` to the corresponding dataset root.
 
 The UI groups adjustable inputs into:
 
