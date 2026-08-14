@@ -72,6 +72,7 @@ from kuka_slicer.ui_server import (
     _raft_layers_from_params,
     _simplify_preview_path,
     _save_surface_preview_last_directory,
+    align_fiber_template_paths_to_resin,
     expand_fiber_template_for_resin_layers,
     load_fiber_template_json,
 )
@@ -391,6 +392,59 @@ def test_fiber_json_loads_canonical_one_record_per_path_format(tmp_path):
         [[1.0, 2.0, 0.0], [3.0, 4.0, 0.0]],
         [[5.0, 6.0, 0.0], [7.0, 8.0, 0.0]],
     ]
+
+
+def test_project_default_fiber_json_aligns_to_resin_before_ui_placement(tmp_path):
+    json_path = tmp_path / "project_default_fiber.json"
+    json_path.write_text(
+        """
+        {
+          "coordinate_system": "project_default",
+          "paths": [[[-2.0, -1.0], [2.0, 1.0]]]
+        }
+        """,
+        encoding="utf-8",
+    )
+    template_paths = load_fiber_template_json(json_path)
+    job = ExternalSourceJob(
+        material_paths=[
+            MaterialPaths(
+                0,
+                "R",
+                [np.asarray([[20.0, 30.0, 0.5], [30.0, 50.0, 0.5]])],
+            )
+        ]
+    )
+
+    aligned = align_fiber_template_paths_to_resin(job, template_paths)
+
+    assert aligned == [[[23.0, 39.0, 0.0], [27.0, 41.0, 0.0]]]
+    assert job.meta["fiber_coordinate_alignment"] == {
+        "source_coordinate_system": "project_default",
+        "reference": "resin_xy_bounds_center",
+        "translation_x_mm": 25.0,
+        "translation_y_mm": 40.0,
+    }
+
+
+def test_fiber_paths_do_not_change_resin_ui_origin_normalization():
+    resin_path = np.asarray([[20.0, 30.0, 0.5], [30.0, 50.0, 0.5]])
+    job = ExternalSourceJob(
+        material_paths=[
+            MaterialPaths(0, "R", [resin_path.copy()]),
+            MaterialPaths(0, "F", [np.asarray([[-100.0, -100.0, 0.6], [0.0, 0.0, 0.6]])]),
+        ]
+    )
+
+    translation = normalize_job_xy_origin(
+        job,
+        target_xy=(10.0, 15.0),
+        reference_material="R",
+    )
+
+    assert translation == pytest.approx((-10.0, -15.0))
+    assert np.min(job.material_paths[0].paths[0][:, :2], axis=0) == pytest.approx((10.0, 15.0))
+    assert job.material_paths[1].paths[0][0, :2] == pytest.approx((-110.0, -115.0))
 
 
 def test_fiber_template_paths_preserve_input_vertices_before_export():
@@ -886,8 +940,10 @@ def test_preview_payload_uses_slim_role_aware_layer_schema_and_complete_bounds()
         "line_widths",
         "layers",
         "origin",
+        "preview_source",
         "tool_orientation",
     }
+    assert preview["preview_source"] == "pre_core_source_npz"
     assert preview["geometry_mode"] == "planar_2d"
     assert preview["tool_orientation"] == {
         "available": False,
