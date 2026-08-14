@@ -191,6 +191,274 @@ def _core_output_download_path(core_npz_path: Path) -> Path:
     return package_path
 
 
+def _final_core_npz_parts(core_npz_path: Path) -> list[Path]:
+    """Return the exact final Core files that the runtime would load."""
+
+    if core_npz_path.is_file():
+        return [core_npz_path]
+    parts = sorted(core_npz_path.parent.glob(f"{core_npz_path.stem}_part*.npz"))
+    if not parts:
+        raise FileNotFoundError(f"final Core NPZ was not written: {core_npz_path}")
+    return parts
+
+
+def _core_move_type_codes(data) -> set[int]:
+    """Return vocabulary codes that represent deposited Core trajectory rows."""
+
+    keys_name = "move_type_vocab_keys"
+    values_name = "move_type_vocab_vals"
+    if keys_name in data.files and values_name in data.files:
+        def _name(value) -> str:
+            raw = value.item() if hasattr(value, "item") else value
+            return raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
+
+        return {
+            int(value)
+            for key, value in zip(data[keys_name], data[values_name])
+            if _name(key).upper() in {"PRINT", "PRINT_FIT"}
+        }
+    # Legacy Core files use these stable numeric values when no vocabulary is
+    # present.  Keep the fallback local to preview decoding.
+    return {1, 3}
+
+
+def _use_native_prusa_gcode_for_core(
+    config: SliceConfig,
+    native_gcode: bytes | str | None,
+) -> bool:
+    """Return whether Core may consume the unmodified native Prusa G-code.
+
+    ``brim_one_stroke`` rewrites the adapter's ``ExternalSourceJob`` only.  It
+    does not rewrite ``native_gcode``, so routing that original G-code directly
+    to Core would discard an accepted deposited Brim connector.  Keep native
+    G-code passthrough for every other standard Prusa export.
+    """
+
+    return (
+        config.slicing_kernel == "prusa"
+        and not config.honeycomb_pathing.enabled
+        and not config.brim_one_stroke
+        and isinstance(native_gcode, (bytes, str))
+    )
+
+
+def _preview_payload_from_final_core_npz(
+    core_npz_path: Path,
+    config: SliceConfig,
+) -> dict[str, object]:
+    """Build the browser payload from the final Core NPZ, never from its source.
+
+    Only non-event rows are considered because the runtime queue likewise does
+    not emit trajectory points for event rows.  The browser receives direct
+    samples of those final rows; it performs no Core-like fitting, smoothing,
+    offsetting, or interpolation.  Stationary process rows (prime/retract/
+    reset at a fixed XYZ) remain in the NPZ for runtime timing, but are not
+    spatial paths and therefore are not rendered as deposition points.
+    """
+
+    entries_by_layer: dict[int, list[dict[str, object]]] = {}
+    bounds = {
+        "min_x": None,
+        "max_x": None,
+        "min_y": None,
+        "max_y": None,
+        "min_z": None,
+        "max_z": None,
+    }
+    has_curved_deposition = False
+    has_tool_orientation = False
+    order = 0
+
+    for path in _final_core_npz_parts(core_npz_path):
+        with np.load(path, allow_pickle=False) as data:
+            required = {"x", "y", "z", "tool_id", "move_type"}
+            missing = sorted(required.difference(data.files))
+            if missing:
+                raise ValueError(f"final Core NPZ is missing fields: {', '.join(missing)}")
+
+            x = np.asarray(data["x"], dtype=np.float64)
+            y = np.asarray(data["y"], dtype=np.float64)
+            z = np.asarray(data["z"], dtype=np.float64)
+            count = len(x)
+            if count == 0:
+                continue
+            tool_id = np.asarray(data["tool_id"], dtype=np.int64)
+            move_type = np.asarray(data["move_type"], dtype=np.int64)
+            event_flag = (
+                np.asarray(data["event_flag"], dtype=np.int64)
+                if "event_flag" in data.files
+                else np.zeros(count, dtype=np.int64)
+            )
+            layer = np.asarray(
+                data["preview_layer_index"]
+                if "preview_layer_index" in data.files
+                else data["layer_index"]
+                if "layer_index" in data.files
+                else np.zeros(count, dtype=np.int64),
+                dtype=np.int64,
+            )
+            path_id = (
+                np.asarray(data["path_id"], dtype=np.int64)
+                if "path_id" in data.files
+                else np.zeros(count, dtype=np.int64)
+            )
+            path_end = (
+                np.asarray(data["path_end_flag"], dtype=np.int64)
+                if "path_end_flag" in data.files
+                else np.zeros(count, dtype=np.int64)
+            )
+            a = np.asarray(data["a"], dtype=np.float64) if "a" in data.files else None
+            b = np.asarray(data["b"], dtype=np.float64) if "b" in data.files else None
+            c = np.asarray(data["c"], dtype=np.float64) if "c" in data.files else None
+
+            valid = (
+                (event_flag != 1)
+                & np.isfinite(x)
+                & np.isfinite(y)
+                & np.isfinite(z)
+            )
+            if not np.any(valid):
+                continue
+
+            valid_x, valid_y, valid_z = x[valid], y[valid], z[valid]
+            for key, value in (
+                ("min_x", valid_x.min()), ("max_x", valid_x.max()),
+                ("min_y", valid_y.min()), ("max_y", valid_y.max()),
+                ("min_z", valid_z.min()), ("max_z", valid_z.max()),
+            ):
+                bounds[key] = float(value) if bounds[key] is None else (
+                    min(float(bounds[key]), float(value)) if key.startswith("min")
+                    else max(float(bounds[key]), float(value))
+                )
+
+            include_abc = (
+                a is not None
+                and b is not None
+                and c is not None
+                and bool(np.any(np.abs(a[valid]) > 1e-9)
+                         or np.any(np.abs(b[valid]) > 1e-9)
+                         or np.any(np.abs(c[valid]) > 1e-9))
+            )
+            has_tool_orientation = has_tool_orientation or include_abc
+            print_codes = _core_move_type_codes(data)
+            is_print = np.isin(move_type, list(print_codes))
+
+            indices = np.flatnonzero(valid)
+            start = 0
+            while start < len(indices):
+                first = int(indices[start])
+                is_fiber = bool(is_print[first] and tool_id[first] == 1)
+                is_resin = bool(is_print[first] and not is_fiber)
+                role = "fiber" if is_fiber else "final_resin" if is_resin else "travel"
+                end = start + 1
+                while end < len(indices):
+                    previous = int(indices[end - 1])
+                    current = int(indices[end])
+                    current_is_fiber = bool(is_print[current] and tool_id[current] == 1)
+                    current_is_resin = bool(is_print[current] and not current_is_fiber)
+                    current_role = (
+                        "fiber" if current_is_fiber
+                        else "final_resin" if current_is_resin
+                        else "travel"
+                    )
+                    same_path = path_id[current] == path_id[first]
+                    # Final NPZ path IDs describe Core command boundaries,
+                    # not a discontinuity in the RSI point sequence.  For
+                    # adjacent non-event Travel rows, join the browser path
+                    # across those metadata boundaries while retaining every
+                    # final XYZABC point.  This is intentionally display-only:
+                    # no avoidance waypoint, sequence value, or exported NPZ
+                    # row is changed.
+                    adjacent_travel = role == "travel" and current_role == "travel"
+                    if (
+                        current != previous + 1
+                        or layer[current] != layer[first]
+                        or current_role != role
+                        or tool_id[current] != tool_id[first]
+                        or (
+                            not adjacent_travel
+                            and (not same_path or path_end[previous] == 1)
+                        )
+                    ):
+                        break
+                    end += 1
+
+                segment_indices = indices[start:end]
+                is_stationary_process = role != "travel" and bool(
+                    np.ptp(x[segment_indices]) <= 1e-9
+                    and np.ptp(y[segment_indices]) <= 1e-9
+                    and np.ptp(z[segment_indices]) <= 1e-9
+                )
+                point_columns = [x[segment_indices], y[segment_indices], z[segment_indices]]
+                if include_abc:
+                    point_columns.extend((a[segment_indices], b[segment_indices], c[segment_indices]))
+                # For diagnosis the browser receives the complete final Core
+                # point sequence.  No display-side point decimation is allowed:
+                # a sharp corner must be attributable to the NPZ itself.
+                points = np.column_stack(point_columns).tolist()
+                if points and not is_stationary_process:
+                    if role != "travel" and float(np.ptp(z[segment_indices])) > 1e-7:
+                        has_curved_deposition = True
+                    entries_by_layer.setdefault(int(layer[first]), []).append(
+                        {
+                            "kind": "deposit" if role != "travel" else "travel",
+                            "role": role,
+                            "points": points,
+                            "order": order,
+                        }
+                    )
+                    order += 1
+                start = end
+
+    all_entries = [entry for entries in entries_by_layer.values() for entry in entries]
+    if not all_entries:
+        raise ValueError("final Core NPZ contains no displayable trajectory rows")
+    layers = []
+    for layer_index in sorted(entries_by_layer):
+        entries = entries_by_layer[layer_index]
+        resin_paths = [
+            {"role": entry["role"], "points": entry["points"]}
+            for entry in entries if entry["role"] == "final_resin"
+        ]
+        fiber_paths = [
+            entry["points"] for entry in entries if entry["role"] == "fiber"
+        ]
+        travel_paths = [
+            entry["points"] for entry in entries if entry["role"] == "travel"
+        ]
+        layers.append(
+            {
+                "index": layer_index,
+                "resin_paths": resin_paths,
+                "fiber_paths": fiber_paths,
+                "travel_paths": travel_paths,
+                "motion_paths": entries,
+            }
+        )
+
+    planning_line_width = (
+        config.line_width
+        if config.slicing_kernel != "legacy" or config.planning_line_width is None
+        else config.planning_line_width
+    )
+    return {
+        "bounds": bounds,
+        "origin": [0.0, 0.0],
+        "geometry_mode": "surface_3d" if has_curved_deposition else "planar_2d",
+        "tool_orientation": {
+            "available": has_tool_orientation,
+            "fallback": "calibrated_flat_downward",
+        },
+        "line_widths": {
+            "resin": float(planning_line_width),
+            "resin_nominal": float(config.line_width),
+            "fiber": DEFAULT_FIBER_LINE_WIDTH_MM,
+        },
+        "preview_source": "final_core_npz",
+        "layers": layers,
+    }
+
+
 def _preview_position(point, xy_offset: tuple[float, float] = (0.0, 0.0)) -> list[float]:
     return [
         float(point.x) + float(xy_offset[0]),
@@ -786,11 +1054,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         core_source_job = None
         native_gcode_path = None
         source_gcode_module = None
-        if (
-            slicing_kernel == "prusa"
-            and not config.honeycomb_pathing.enabled
-            and isinstance(job.native_gcode, (bytes, str))
-        ):
+        if _use_native_prusa_gcode_for_core(config, job.native_gcode):
             _ensure_offline_planner_import_paths()
             source_gcode_module = importlib.import_module(
                 "external_npz_preprocessor.source_gcode"
@@ -873,16 +1137,9 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         fiber_preview_paths = _fiber_preview_paths_from_job(job)
         if core_source_job is None:
             write_external_source_npz(job, npz_path)
-        progress(45, "Prusa 预览数据已保留，正在交给 path_processing_core")
+        progress(45, "Prusa 路径生成完成，正在交给 path_processing_core")
 
         path_count = sum(len(group.paths) for group in job.material_paths)
-        preview = _preview_payload(
-            mesh,
-            config,
-            job,
-            fiber_preview_paths,
-            hide_initial_prusa_travel=(slicing_kernel == "prusa" and primeline_enabled),
-        )
         recommendation = _triangle_infill_recommendation(mesh, config, job)
         slicing_metadata = job.meta.get("slicing", {})
         if not isinstance(slicing_metadata, dict):
@@ -896,7 +1153,6 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             "external_npz_preprocessor.process_params"
         )
         core_params = _parse_core_process_params(params, process_params_module)
-        core_preview_xy_offset = _core_preview_xy_offset(job, core_params)
 
         core_npz_path = job_dir / f"{Path(filename).stem}_core.npz"
 
@@ -907,12 +1163,6 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                 "正在执行 path_processing_core 并写出系统 NPZ",
             )
 
-        def capture_core_preview(commands) -> None:
-            preview["core_overlay"] = _core_preview_overlay_from_commands(
-                commands,
-                xy_offset=core_preview_xy_offset,
-            )
-
         if core_source_job is None:
             core_stats = export_runner.convert_external_npz(
                 npz_path,
@@ -920,7 +1170,6 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                 core_params,
                 progress_callback=core_progress,
                 chunk_size=5_000_000,
-                commands_callback=capture_core_preview,
             )
         else:
             core_stats = export_runner.convert_source_job(
@@ -930,9 +1179,19 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                 params=core_params,
                 progress_callback=core_progress,
                 chunk_size=5_000_000,
-                commands_callback=capture_core_preview,
             )
         progress(98, "正在完成系统 NPZ 和时间元数据写入")
+        # The browser is a source-trajectory inspector: it must show the
+        # exact geometry written to the NPZ handed into Core, not Core's
+        # fitted/resampled output.  In particular, a multi-waypoint travel
+        # remains visibly routed around its avoidance vertices while Core
+        # applies one zero-speed-endpoint profile to that complete route.
+        preview = _preview_payload(
+            mesh,
+            config,
+            job,
+            fiber_preview_paths,
+        )
         download_path = _core_output_download_path(core_npz_path)
         return {
             "download_url": f"/outputs/{quote(stamp)}/{quote(download_path.name)}",
@@ -2093,17 +2352,17 @@ def _preview_payload(
                         _expand_bounds(bounds, point[0], point[1], point[2])
                 preview_resin_indices[source_resin_index] = chunk_indices
 
+        # The preview is a source-NPZ geometry inspector.  Never decimate a
+        # deposited or travel route: a skipped point can turn a hole-avoiding
+        # path into a false chord on the Canvas.
         serialized_fiber_paths = [
-            _simplify_preview_path(path, max_points=2000)
+            [list(point) for point in path]
             for path in fiber_paths_by_layer.get(layer_index, [])
         ]
         if not serialized_fiber_paths:
             for group in groups_by_layer.get(layer_index, {}).get("F", []):
                 serialized_fiber_paths.extend(
-                    _simplify_preview_path(
-                        [_serialize_preview_point(point) for point in path],
-                        max_points=2000,
-                    )
+                    [_serialize_preview_point(point) for point in path]
                     for path in group.paths
                 )
         for fiber_path in serialized_fiber_paths:
@@ -2115,10 +2374,7 @@ def _preview_payload(
         serialized_travel_paths: list[list[list[float]]] = []
         for group in travel_groups_by_layer.get(layer_index, []):
             serialized_travel_paths.extend(
-                _simplify_preview_path(
-                    [_serialize_preview_point(point) for point in path],
-                    max_points=2000,
-                )
+                [_serialize_preview_point(point) for point in path]
                 for path in group.paths
             )
         for travel_path in serialized_travel_paths:
@@ -2220,6 +2476,7 @@ def _preview_payload(
             "resin_nominal": float(config.line_width),
             "fiber": DEFAULT_FIBER_LINE_WIDTH_MM,
         },
+        "preview_source": "pre_core_source_npz",
         "layers": list(layers_by_index.values()),
     }
 
@@ -5421,9 +5678,14 @@ def _index_html() -> str:
         downloadEl.href = result.download_url;
         downloadEl.textContent = '下载 ' + result.filename;
         downloadEl.className = 'download visible';
+        const previewLabel = result.preview?.preview_source === 'pre_core_source_npz'
+          ? '完成（预览：送入 Core 前的源 NPZ；travel 保留全部避障点，连续段仅在首尾速度为 0）。'
+          : result.preview?.preview_source === 'final_core_npz'
+            ? '完成（预览：最终 Core NPZ）。'
+            : '完成。';
         statusEl.textContent = result.recommendation?.message
-          ? '完成。' + result.recommendation.message
-          : '完成';
+          ? previewLabel + result.recommendation.message
+          : previewLabel;
         statusEl.className = 'status ok';
         const coreSeconds = Number(result.core_export_seconds);
         if (Number.isFinite(coreSeconds)) {{
@@ -5500,12 +5762,17 @@ def _index_html() -> str:
         const kind = rawEntry.kind === 'travel' ? 'travel' : 'deposit';
         const role = kind === 'travel' ? 'travel' : (rawEntry.role || 'infill');
         const points = rawEntry.points || rawEntry;
-        if (points && points.length >= 2) {{
+        if (points && points.length >= 1) {{
           entries.push({{ kind, role, points, extrusion: rawEntry.extrusion || null }});
         }}
       }}
-      for (const points of layer.fiber_paths || []) {{
-        if (points && points.length >= 2) entries.push({{ kind: 'deposit', role: 'fiber', points }});
+      const hasOrderedFiber = motionEntries.some((entry) =>
+        entry?.kind !== 'travel' && entry?.role === 'fiber'
+      );
+      if (!hasOrderedFiber) {{
+        for (const points of layer.fiber_paths || []) {{
+          if (points && points.length >= 1) entries.push({{ kind: 'deposit', role: 'fiber', points }});
+        }}
       }}
       const additions = (previewData?.core_overlay?.sequence || [])
         .filter((entry) => Number(entry.layer) === Number(layer.index))
@@ -5531,7 +5798,7 @@ def _index_html() -> str:
           orderedEntries.push(entries[baseIndex++]);
         }}
         const points = addition.points;
-        if (points && points.length >= 2) {{
+        if (points && points.length >= 1) {{
           orderedEntries.push({{
             kind: addition.kind === 'travel' ? 'travel' : 'deposit',
             role: addition.role || 'travel',
@@ -6155,6 +6422,13 @@ def _index_html() -> str:
 
       function drawPath(path) {{
         const first = viewport.project(path[0]);
+        if (path.length === 1) {{
+          ctx.beginPath();
+          ctx.arc(first[0], first[1], Math.max(1.2, ctx.lineWidth * 0.5), 0, Math.PI * 2);
+          ctx.fillStyle = ctx.strokeStyle;
+          ctx.fill();
+          return;
+        }}
         ctx.beginPath();
         ctx.moveTo(first[0], first[1]);
         for (let pointIndex = 1; pointIndex < path.length; pointIndex++) {{
