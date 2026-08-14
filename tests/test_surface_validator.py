@@ -80,6 +80,27 @@ def test_validator_reports_mapped_geometry_e_and_unassessed_topology(tmp_path):
     assert "曲面路径可打印性验证报告" in render_html_report(report)
 
 
+def test_validator_reports_honeycomb_contract_without_claiming_stl_geometry_proof(tmp_path):
+    flat = _flat_source(tmp_path)
+    flat.meta["path_roles"] = {"R": {str(layer): ["outer_contour"] for layer in range(4)}}
+    flat.meta["honeycomb_centerline_pathing"] = {
+        "format": "honeycomb_macro_partition_zero_e_v1",
+        "topology": "stl_honeycomb_macro_partition_zero_e",
+        "topology_change": "none; wall graph is derived from the source STL section",
+        "wall_edge_count": 693,
+        "repeated_wall_edge_count": 0,
+    }
+
+    report = validate_surface_job(flat, _curved_source(flat), _target())
+    topology = _check(report, "XY 拓扑与边界")
+
+    assert topology.status == "warning"
+    assert "生产蜂窝元数据" in topology.summary
+    assert "输入不含 STL 实体" in topology.summary
+    assert topology.details["wall_edge_count"] == 693
+    assert topology.details["repeated_wall_edge_count"] == 0
+
+
 def test_validator_rejects_changed_xy_and_reports_t_risk(tmp_path):
     flat = _flat_source(tmp_path, include_travel=True)
     curved = _curved_source(flat)

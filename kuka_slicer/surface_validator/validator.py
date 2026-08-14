@@ -489,7 +489,7 @@ def _check_travel_risk(curved_source: SourceNPZ, limits: ValidatorLimits) -> Che
     return CheckResult(
         "T 空走风险",
         "warning",
-        "检测到 T 空走路径；尚无自动避障/安全抬升策略，必须人工确认",
+        "检测到 T 空走路径；当前仅完成同 XY 顶点净空筛查，尚未执行实体喷头扫掠碰撞检测",
         {
             "travel_point_count": travel_points,
             "vertex_level_potential_collision_count": potential_collisions,
@@ -515,6 +515,27 @@ def _check_topology_evidence(
                 changed_closure += 1
     if changed_closure:
         return CheckResult("XY 拓扑与边界", "fail", "原本闭合的路径在曲面后失去 XY 闭合", {"changed_closure_count": changed_closure})
+    planner = curved_source.meta.get("honeycomb_centerline_pathing")
+    path_roles = curved_source.meta.get("path_roles")
+    if (
+        isinstance(planner, dict)
+        and planner.get("topology") == "stl_honeycomb_macro_partition_zero_e"
+        and planner.get("topology_change", "").startswith("none;")
+        and isinstance(path_roles, dict)
+    ):
+        return CheckResult(
+            "XY 拓扑与边界",
+            "warning",
+            "XY 未变、闭合路径保持闭合，且生产蜂窝元数据声明原始 STL 墙边一次沉积；当前输入不含 STL 实体，尚未独立重建孔洞区域复核封孔线段",
+            {
+                "verified_closed_path_count": closed_paths,
+                "production_contract": planner.get("format"),
+                "wall_edge_count": planner.get("wall_edge_count"),
+                "repeated_wall_edge_count": planner.get("repeated_wall_edge_count"),
+                "path_roles_present": True,
+                "unassessed": ["independent_stl_hole_region_reconstruction"],
+            },
+        )
     return CheckResult(
         "XY 拓扑与边界",
         "warning",
