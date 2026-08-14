@@ -10,12 +10,15 @@ from __future__ import annotations
 import numpy as np
 
 from .external_npz import ExternalSourceJob, MaterialPaths, TravelPaths
+from .honeycomb_pathing import solid_geometry_at_z
 from .prusa_bridge import require_native
 from .stl_io import Mesh
 from .slicer import (
     DEFAULT_MATERIAL_PROCESS,
     SliceConfig,
+    _connect_boundary_infill_paths,
     _connect_brim_paths_one_stroke,
+    _connect_zigzag_infill_paths,
     orient_mesh_for_build_axis,
 )
 
@@ -184,6 +187,17 @@ def slice_mesh_to_job_with_prusa(mesh: Mesh, config: SliceConfig) -> ExternalSou
                     ordered_motions,
                     line_width=float(config.line_width),
                     tolerance=float(config.tolerance),
+                )
+            if pattern == "rectilinear":
+                paths, extrusion, roles, travel, ordered_motions = _apply_prusa_infill_one_stroke(
+                    paths,
+                    extrusion,
+                    roles,
+                    travel,
+                    ordered_motions,
+                    mesh=oriented_mesh,
+                    z=z,
+                    config=config,
                 )
             material_paths.append(MaterialPaths(layer_index, "R", paths, extrusion))
             path_roles["R"][str(layer_index)] = roles
@@ -402,6 +416,327 @@ def _apply_brim_one_stroke(
             kept_motions.append({"kind": "travel", "index": travel_to_new[index]})
 
     return kept_paths, kept_extrusion, kept_roles, kept_travel, kept_motions
+
+
+def _apply_prusa_infill_one_stroke(
+    paths: list[np.ndarray],
+    extrusion: list[np.ndarray],
+    roles: list[str],
+    travel: list[np.ndarray],
+    motions: list[dict[str, object]],
+    *,
+    mesh: Mesh,
+    z: float,
+    config: SliceConfig,
+) -> tuple[
+    list[np.ndarray],
+    list[np.ndarray],
+    list[str],
+    list[np.ndarray],
+    list[dict[str, object]],
+]:
+    """Safely chain Native Prusa rectilinear infill without touching other roles.
+
+    Native Prusa emits its hatches as independent deposited paths.  The
+    project-owned connector can turn adjacent paths into material-bearing U
+    turns, but it needs the actual STL cross-section to reject a route across
+    an exterior wall or a hole.  This adapter deliberately changes only the
+    selected ``infill`` deposited paths and their now-obsolete in-between
+    native travels; perimeter, Brim, fiber and all other motion records are
+    retained verbatim.
+    """
+
+    infill_indices = [index for index, role in enumerate(roles) if role == "infill"]
+    if len(infill_indices) < 2:
+        return paths, extrusion, roles, travel, motions
+
+    try:
+        solid = solid_geometry_at_z(mesh, z, float(config.tolerance))
+    except ValueError:
+        # A malformed or tangential STL section must retain Native Prusa's
+        # baseline rather than guessing a connector corridor.
+        return paths, extrusion, roles, travel, motions
+    if solid.is_empty:
+        return paths, extrusion, roles, travel, motions
+
+    infill_paths = [paths[index] for index in infill_indices]
+    spacing = _native_infill_spacing(infill_paths, config)
+    if spacing <= float(config.tolerance):
+        return paths, extrusion, roles, travel, motions
+    # Native Prusa groups a number of short hatch fragments into one deposited
+    # path.  Run the original adjacent-scanline policy first.  If that native
+    # grouping hides scan levels, use the same connector/clearance engine in
+    # its endpoint-driven mode; it still rejects every route through a hole
+    # or across existing infill, but can recover a safe join between two
+    # composite native strokes.
+    connected = _connect_zigzag_infill_paths(
+        infill_paths,
+        solid,
+        spacing,
+        spacing,
+        float(config.tolerance),
+        maximum_spacing=spacing * 1.05,
+        solid_bead_width=float(config.line_width),
+        follow_boundaries=bool(config.print_perimeters),
+    )
+    if len(connected) >= len(infill_paths):
+        connected = _connect_boundary_infill_paths(
+            infill_paths,
+            solid,
+            spacing,
+            spacing,
+            float(config.tolerance),
+            adjacent_scanlines_only=False,
+            solid_bead_width=float(config.line_width),
+            follow_boundaries=bool(config.print_perimeters),
+        )
+    return _replace_connected_role_paths(
+        paths,
+        extrusion,
+        roles,
+        travel,
+        motions,
+        role="infill",
+        selected_indices=infill_indices,
+        connected=connected,
+        tolerance=float(config.tolerance),
+    )
+
+
+def _native_infill_spacing(paths: list[np.ndarray], config: SliceConfig) -> float:
+    """Estimate the Native Prusa hatch pitch from its preserved centerlines."""
+
+    directions: list[np.ndarray] = []
+    centers: list[np.ndarray] = []
+    for path in paths:
+        values = np.asarray(path, dtype=np.float64)
+        if values.ndim != 2 or values.shape[0] < 2:
+            continue
+        deltas = np.diff(values[:, :2], axis=0)
+        lengths = np.linalg.norm(deltas, axis=1)
+        if not np.any(lengths > config.tolerance):
+            continue
+        direction = deltas[int(np.argmax(lengths))]
+        direction /= np.linalg.norm(direction)
+        directions.append(direction)
+        centers.append(np.mean(values[:, :2], axis=0))
+    fallback = float(config.line_width) / max(float(config.infill_density) / 100.0, 1e-9)
+    if len(directions) < 2:
+        return fallback
+
+    reference = directions[0]
+    aligned = np.asarray(
+        [direction if float(np.dot(direction, reference)) >= 0.0 else -direction for direction in directions],
+        dtype=np.float64,
+    )
+    direction = np.mean(aligned, axis=0)
+    direction_length = float(np.linalg.norm(direction))
+    if direction_length <= config.tolerance:
+        return fallback
+    normal = np.asarray([-direction[1], direction[0]], dtype=np.float64) / direction_length
+    levels = np.sort(np.asarray(centers, dtype=np.float64) @ normal)
+    differences = np.diff(levels)
+    minimum = max(float(config.tolerance) * 20.0, fallback * 0.1)
+    pitches = differences[differences >= minimum]
+    return float(np.median(pitches)) if pitches.size else fallback
+
+
+def _replace_connected_role_paths(
+    paths: list[np.ndarray],
+    extrusion: list[np.ndarray],
+    roles: list[str],
+    travel: list[np.ndarray],
+    motions: list[dict[str, object]],
+    *,
+    role: str,
+    selected_indices: list[int],
+    connected: list[np.ndarray],
+    tolerance: float,
+) -> tuple[
+    list[np.ndarray],
+    list[np.ndarray],
+    list[str],
+    list[np.ndarray],
+    list[dict[str, object]],
+]:
+    """Replace one role's connected components while preserving all others."""
+
+    selected = set(selected_indices)
+    endpoint_tolerance = max(tolerance * 50.0, 1e-4)
+    remaining = set(selected_indices)
+    components: list[tuple[list[int], np.ndarray]] = []
+    for merged_xy in connected:
+        merged_xy = np.asarray(merged_xy, dtype=np.float64)
+        if merged_xy.ndim != 2 or merged_xy.shape[0] < 2 or merged_xy.shape[1] < 2:
+            return paths, extrusion, roles, travel, motions
+        merged_xy = merged_xy[:, :2]
+        matched: list[int] = []
+        for index in selected_indices:
+            if index not in remaining:
+                continue
+            source = np.asarray(paths[index][:, :2], dtype=np.float64)
+            start_distance = float(np.linalg.norm(merged_xy - source[0], axis=1).min())
+            end_distance = float(np.linalg.norm(merged_xy - source[-1], axis=1).min())
+            if min(start_distance, end_distance) <= endpoint_tolerance:
+                matched.append(index)
+        if matched:
+            remaining.difference_update(matched)
+            components.append((matched, merged_xy))
+    if remaining:
+        # Provenance must be complete: do not silently drop an independent
+        # native hatch if a connector implementation returns an opaque path.
+        return paths, extrusion, roles, travel, motions
+    if not any(len(indices) > 1 for indices, _ in components):
+        return paths, extrusion, roles, travel, motions
+
+    component_by_path: dict[int, int] = {}
+    merged_paths: dict[int, np.ndarray] = {}
+    merged_extrusion: dict[int, np.ndarray] = {}
+    for source_indices, merged_xy in components:
+        representative = min(source_indices)
+        component_by_path.update({index: representative for index in source_indices})
+        if len(source_indices) == 1:
+            merged_paths[representative] = paths[representative]
+            merged_extrusion[representative] = extrusion[representative]
+            continue
+        rates: list[float] = []
+        for index in source_indices:
+            path = np.asarray(paths[index], dtype=np.float64)
+            values = np.asarray(extrusion[index], dtype=np.float64)
+            if values.shape[0] != path.shape[0] or values.shape[0] < 2:
+                return paths, extrusion, roles, travel, motions
+            length = float(np.linalg.norm(np.diff(path[:, :2], axis=0), axis=1).sum())
+            delta_e = float(values[-1] - values[0])
+            if length > max(tolerance, 1e-9) and delta_e >= 0.0:
+                rates.append(delta_e / length)
+        if not rates:
+            return paths, extrusion, roles, travel, motions
+        z_value = float(paths[representative][0, 2])
+        merged = np.column_stack(
+            (merged_xy[:, 0], merged_xy[:, 1], np.full(merged_xy.shape[0], z_value))
+        )
+        rate = float(np.median(np.asarray(rates, dtype=np.float64)))
+        distances = np.linalg.norm(np.diff(merged[:, :2], axis=0), axis=1)
+        merged_paths[representative] = merged
+        merged_extrusion[representative] = float(extrusion[representative][0]) + np.concatenate(
+            ([0.0], np.cumsum(distances * rate))
+        )
+
+    kept_paths: list[np.ndarray] = []
+    kept_extrusion: list[np.ndarray] = []
+    kept_roles: list[str] = []
+    old_to_new: dict[int, int] = {}
+    for old_index, (path, values, path_role) in enumerate(zip(paths, extrusion, roles)):
+        if old_index in selected:
+            representative = component_by_path[old_index]
+            if old_index != representative:
+                continue
+            path = merged_paths[representative]
+            values = merged_extrusion[representative]
+            path_role = role
+        old_to_new[old_index] = len(kept_paths)
+        kept_paths.append(path)
+        kept_extrusion.append(values)
+        kept_roles.append(path_role)
+
+    removed_travel: set[int] = set()
+    last_deposit: int | None = None
+    pending_travel: list[int] = []
+    for motion in motions:
+        kind = motion.get("kind")
+        index = motion.get("index")
+        if not isinstance(index, int):
+            continue
+        if kind == "travel":
+            pending_travel.append(index)
+        elif kind == "deposit":
+            if (
+                last_deposit in selected
+                and index in selected
+                and component_by_path.get(last_deposit) == component_by_path.get(index)
+            ):
+                removed_travel.update(pending_travel)
+            pending_travel = []
+            last_deposit = index
+
+    kept_travel: list[np.ndarray] = []
+    travel_to_new: dict[int, int] = {}
+    for old_index, path in enumerate(travel):
+        if old_index in removed_travel:
+            continue
+        travel_to_new[old_index] = len(kept_travel)
+        kept_travel.append(path)
+
+    kept_motions: list[dict[str, object]] = []
+    emitted_components: set[int] = set()
+    for motion in motions:
+        kind = motion.get("kind")
+        index = motion.get("index")
+        if not isinstance(index, int):
+            continue
+        if kind == "deposit":
+            if index in selected:
+                representative = component_by_path[index]
+                if representative in emitted_components:
+                    continue
+                emitted_components.add(representative)
+                index = representative
+            if index in old_to_new:
+                kept_motions.append({"kind": "deposit", "index": old_to_new[index]})
+        elif kind == "travel" and index not in removed_travel and index in travel_to_new:
+            kept_motions.append({"kind": "travel", "index": travel_to_new[index]})
+
+    # A connector is only useful when it replaces an existing transition.  If
+    # its new chain endpoints no longer meet the surrounding Native Prusa
+    # motion, the downstream converter would have to inject another travel;
+    # that is a path jump, not a one-stroke improvement.  Retain the exact
+    # native layer in that case.
+    baseline_gaps = _motion_discontinuity_score(paths, travel, motions, tolerance)
+    connected_gaps = _motion_discontinuity_score(
+        kept_paths,
+        kept_travel,
+        kept_motions,
+        tolerance,
+    )
+    if (
+        connected_gaps[0] > baseline_gaps[0]
+        or connected_gaps[1] > baseline_gaps[1] + endpoint_tolerance
+    ):
+        return paths, extrusion, roles, travel, motions
+
+    return kept_paths, kept_extrusion, kept_roles, kept_travel, kept_motions
+
+
+def _motion_discontinuity_score(
+    paths: list[np.ndarray],
+    travel: list[np.ndarray],
+    motions: list[dict[str, object]],
+    tolerance: float,
+) -> tuple[int, float]:
+    """Return the count and total length of source-motion endpoint gaps."""
+
+    previous: np.ndarray | None = None
+    count = 0
+    total = 0.0
+    for motion in motions:
+        kind = motion.get("kind")
+        index = motion.get("index")
+        if not isinstance(index, int):
+            continue
+        source = paths if kind == "deposit" else travel if kind == "travel" else None
+        if source is None or not 0 <= index < len(source):
+            continue
+        path = np.asarray(source[index], dtype=np.float64)
+        path = path[np.isfinite(path).all(axis=1)]
+        if path.ndim != 2 or path.shape[0] < 2:
+            continue
+        if previous is not None:
+            gap = float(np.linalg.norm(path[0] - previous))
+            if gap > tolerance:
+                count += 1
+                total += gap
+        previous = path[-1]
+    return count, total
 
 
 def _prusa_metadata(
