@@ -9,6 +9,7 @@ import pytest
 
 from kuka_slicer.slicer import SliceConfig
 from kuka_slicer.ui_server import (
+    _SlicerUiHandler,
     _core_output_download_path,
     _core_preview_overlay_from_commands,
     _core_preview_xy_offset,
@@ -16,6 +17,7 @@ from kuka_slicer.ui_server import (
     _index_html,
     _load_core_print_params,
     _parse_core_process_params,
+    _planning_mesh_for_gcode_source,
     _preview_payload_from_final_core_npz,
     _use_native_prusa_gcode_for_core,
     merge_fiber_paths_into_job,
@@ -30,13 +32,24 @@ def test_core_download_keeps_single_part_npz_as_npz(tmp_path: Path):
     assert _core_output_download_path(output) == output
 
 
-def test_prusa_brim_one_stroke_uses_adapter_job_for_final_core_input():
+def test_prusa_brim_one_stroke_uses_native_gcode_for_final_core_input():
     native_gcode = b"G1 X1 Y1 E1"
     standard_prusa = SliceConfig(slicing_kernel="prusa")
     one_stroke_prusa = SliceConfig(slicing_kernel="prusa", brim_one_stroke=True)
 
     assert _use_native_prusa_gcode_for_core(standard_prusa, native_gcode)
-    assert not _use_native_prusa_gcode_for_core(one_stroke_prusa, native_gcode)
+    assert _use_native_prusa_gcode_for_core(one_stroke_prusa, native_gcode)
+
+
+def test_gcode_planning_mesh_uses_the_resolved_build_axis():
+    from kuka_slicer.stl_io import Mesh
+
+    raw = Mesh(np.asarray([[
+        [1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0],
+    ]]))
+    planning = _planning_mesh_for_gcode_source(raw, SliceConfig(build_axis="y"))
+
+    np.testing.assert_array_equal(planning.triangles, raw.triangles[:, :, [0, 2, 1]])
 
 
 def test_fiber_interpath_travels_are_included_in_the_source_preview_timeline():
@@ -94,7 +107,8 @@ def test_ui_uses_pre_core_source_preview_and_exposes_core_export_progress():
     assert "points.length >= 1" in html
     assert "path.length === 1" in html
     assert "送入 Core 前的源 NPZ" in html
-    assert "preview = _preview_payload(" in handler_source
+    assert "_preview_payload_from_core_source_job" in handler_source
+    assert "_planning_mesh_for_gcode_source(mesh, config)" in handler_source
     assert "_preview_payload_from_final_core_npz(core_npz_path, config)" not in handler_source
     assert "commands_callback=capture_core_preview" not in handler_source
     assert 'id="exportProgressBar"' in html
@@ -117,6 +131,9 @@ def test_ui_uses_pre_core_source_preview_and_exposes_core_export_progress():
     assert 'id="coreFiberFan"' not in html
     assert "coreMaterialColumns" in html
     assert "coreTravelPanel" in html
+    assert 'id="coreNpzPreviewButton"' in html
+    assert "/choose-core-npz-preview" in html
+    assert "applyFinalCorePreview" in html
     assert 'id="paths"' not in html
     assert 'id="executedKernel"' not in html
     assert 'id="executedPlanningLineWidth"' not in html
@@ -137,6 +154,65 @@ def test_ui_uses_pre_core_source_preview_and_exposes_core_export_progress():
     assert '.processBand .actions {\n      display: flex;' in html
     assert 'grid-column: 1 / -1;' in html
     assert 'flex-wrap: nowrap;' in html
+
+
+def test_ui_local_core_preview_uses_final_npz_trajectory(tmp_path: Path, monkeypatch):
+    output = tmp_path / "ordinary_core.npz"
+    np.savez_compressed(
+        output,
+        x=np.asarray([1.0, 2.0]),
+        y=np.asarray([3.0, 4.0]),
+        z=np.asarray([0.5, 0.5]),
+        tool_id=np.asarray([2, 2]),
+        move_type=np.asarray([1, 1]),
+        event_flag=np.asarray([0, 0]),
+        layer_index=np.asarray([0, 0]),
+        path_id=np.asarray([1, 1]),
+        path_end_flag=np.asarray([0, 1]),
+        move_type_vocab_keys=np.asarray(["PRINT"]),
+        move_type_vocab_vals=np.asarray([1]),
+    )
+    monkeypatch.setattr("kuka_slicer.ui_server._choose_final_core_npz_file", lambda _: output)
+    handler = object.__new__(_SlicerUiHandler)
+    captured: dict[str, object] = {}
+    handler._send_json = captured.update
+    _SlicerUiHandler.core_preview_last_directory = None
+    _SlicerUiHandler.core_preview_picker_state_path = None
+
+    handler._choose_core_npz_preview()
+
+    assert captured["ok"] is True
+    assert captured["file_name"] == output.name
+    assert captured["preview"]["preview_source"] == "final_core_npz"
+    assert captured["preview"]["layers"][0]["resin_paths"][0]["points"] == [
+        [1.0, 3.0, 0.5],
+        [2.0, 4.0, 0.5],
+    ]
+
+
+def test_final_core_preview_loads_all_parts_when_selecting_one_part(tmp_path: Path):
+    for index, x in enumerate((1.0, 2.0)):
+        np.savez_compressed(
+            tmp_path / f"ordinary_core_part{index:03d}.npz",
+            x=np.asarray([x, x + 0.1]),
+            y=np.asarray([0.0, 0.0]),
+            z=np.asarray([0.5, 0.5]),
+            tool_id=np.asarray([2, 2]),
+            move_type=np.asarray([1, 1]),
+            event_flag=np.asarray([0, 0]),
+            layer_index=np.asarray([index, index]),
+            path_id=np.asarray([1, 1]),
+            path_end_flag=np.asarray([0, 1]),
+            move_type_vocab_keys=np.asarray(["PRINT"]),
+            move_type_vocab_vals=np.asarray([1]),
+        )
+
+    preview = _preview_payload_from_final_core_npz(
+        tmp_path / "ordinary_core_part000.npz",
+        SliceConfig(line_width=2.0),
+    )
+
+    assert [layer["index"] for layer in preview["layers"]] == [0, 1]
 
 
 def test_final_core_preview_uses_final_rows_and_bounds_each_path(tmp_path: Path):

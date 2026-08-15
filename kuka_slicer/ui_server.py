@@ -30,6 +30,7 @@ from .external_npz import (
 )
 from .cpu_limiter import limit_slicer_task
 from .fiber_travel import plan_fiber_interpath_travels
+from .gcode_legacy_postprocess import apply_legacy_resin_optimization
 from .honeycomb_pathing import HoneycombPathingConfig
 
 from .slicer import (
@@ -91,6 +92,10 @@ def _surface_preview_picker_state_path(output_dir: Path) -> Path:
     return output_dir / ".surface_preview_picker.json"
 
 
+def _core_preview_picker_state_path(output_dir: Path) -> Path:
+    return output_dir / ".core_preview_picker.json"
+
+
 def _load_surface_preview_last_directory(state_path: Path) -> Path | None:
     try:
         raw = json.loads(state_path.read_text(encoding="utf-8"))
@@ -138,6 +143,37 @@ def _choose_mapped_surface_npz_file(initial_directory: Path | None) -> Path | No
                 else None
             ),
             filetypes=[("映射曲面 NPZ", "*.npz"), ("所有文件", "*.*")],
+        )
+    finally:
+        root.destroy()
+    return Path(selected) if selected else None
+
+
+def _choose_final_core_npz_file(initial_directory: Path | None) -> Path | None:
+    """Open the Windows picker for a regular final Core trajectory NPZ."""
+
+    if sys.platform != "win32":
+        raise RuntimeError("native Core-NPZ picker is available only on Windows")
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except ImportError as exc:
+        raise RuntimeError("无法加载 Windows 原生文件选择组件") from exc
+
+    root = tk.Tk()
+    try:
+        root.withdraw()
+        root.attributes("-topmost", True)
+        root.update()
+        selected = filedialog.askopenfilename(
+            parent=root,
+            title="选择 Core 导出 NPZ",
+            initialdir=(
+                str(initial_directory)
+                if initial_directory is not None and initial_directory.is_dir()
+                else None
+            ),
+            filetypes=[("Core 导出 NPZ", "*.npz"), ("所有文件", "*.*")],
         )
     finally:
         root.destroy()
@@ -195,6 +231,11 @@ def _final_core_npz_parts(core_npz_path: Path) -> list[Path]:
     """Return the exact final Core files that the runtime would load."""
 
     if core_npz_path.is_file():
+        part_match = re.fullmatch(r"(.+)_part\d+", core_npz_path.stem)
+        if part_match is not None:
+            parts = sorted(core_npz_path.parent.glob(f"{part_match.group(1)}_part*.npz"))
+            if parts:
+                return parts
         return [core_npz_path]
     parts = sorted(core_npz_path.parent.glob(f"{core_npz_path.stem}_part*.npz"))
     if not parts:
@@ -226,19 +267,63 @@ def _use_native_prusa_gcode_for_core(
     config: SliceConfig,
     native_gcode: bytes | str | None,
 ) -> bool:
-    """Return whether Core may consume the unmodified native Prusa G-code.
+    """Return whether Core may consume the native Prusa G-code chain.
 
-    ``brim_one_stroke`` rewrites the adapter's ``ExternalSourceJob`` only.  It
-    does not rewrite ``native_gcode``, so routing that original G-code directly
-    to Core would discard an accepted deposited Brim connector.  Keep native
-    G-code passthrough for every other standard Prusa export.
+    The project-owned G-code postprocess applies Legacy infill continuity and,
+    when selected, Brim one-stroke continuity to the parsed ``SourceJob``.
+    Therefore ordinary Prusa jobs, including Brim jobs, retain G-code as the
+    sole Core input representation.  Honeycomb remains a separate planner.
     """
 
     return (
         config.slicing_kernel == "prusa"
         and not config.honeycomb_pathing.enabled
-        and not config.brim_one_stroke
         and isinstance(native_gcode, (bytes, str))
+    )
+
+
+def _planning_mesh_for_gcode_source(mesh, config: SliceConfig):
+    """Return geometry in the same frame as translated native Prusa G-code.
+
+    The Prusa backend slices an oriented mesh and exposes the inverse of its
+    temporary bed placement as ``native_gcode_translation_mm``.  Once that
+    translation has been applied, SourceJob coordinates are in the oriented
+    model frame.  Legacy avoidance geometry must use that frame as well.
+    """
+
+    return orient_mesh_for_build_axis(mesh, config.build_axis)
+
+
+def _preview_payload_from_core_source_job(mesh, config: SliceConfig, source_job) -> dict[str, object]:
+    """Render the exact G-code SourceJob that is handed to Core."""
+
+    material_paths = []
+    travel_paths = []
+    for layer in source_job.layers:
+        if layer.resin_paths:
+            material_paths.append(
+                MaterialPaths(
+                    layer.index,
+                    "R",
+                    [path.points for path in layer.resin_paths],
+                    [path.extrusion for path in layer.resin_paths],
+                )
+            )
+        if layer.fiber_paths:
+            material_paths.append(
+                MaterialPaths(
+                    layer.index,
+                    "F",
+                    [path.points for path in layer.fiber_paths],
+                    [path.extrusion for path in layer.fiber_paths],
+                )
+            )
+        if layer.travel_paths:
+            travel_paths.append(TravelPaths(layer.index, [path.points for path in layer.travel_paths]))
+    return _preview_payload(
+        mesh,
+        config,
+        ExternalSourceJob(material_paths=material_paths, travel_paths=travel_paths, meta=source_job.meta),
     )
 
 
@@ -731,6 +816,10 @@ def run_ui_server(host: str, port: int, output_dir: Path) -> None:
         surface_preview_last_directory = _load_surface_preview_last_directory(
             surface_preview_picker_state_path
         )
+        core_preview_picker_state_path = _core_preview_picker_state_path(server_output_dir)
+        core_preview_last_directory = _load_surface_preview_last_directory(
+            core_preview_picker_state_path
+        )
 
     server = ThreadingHTTPServer((host, port), SlicerUiHandler)
     print(f"KUKA slicer UI running at http://{host}:{port}")
@@ -752,6 +841,8 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
     surface_preview_last_directory: Path | None = None
     surface_preview_picker_state_path: Path | None = None
     surface_preview_selected_path: Path | None = None
+    core_preview_last_directory: Path | None = None
+    core_preview_picker_state_path: Path | None = None
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -785,6 +876,12 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         if parsed.path == "/choose-surface-npz-preview":
             try:
                 self._choose_surface_npz_preview()
+            except Exception as exc:  # noqa: BLE001
+                self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path == "/choose-core-npz-preview":
+            try:
+                self._choose_core_npz_preview()
             except Exception as exc:  # noqa: BLE001
                 self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
@@ -865,6 +962,39 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                 "file_name": selected.name,
                 "collision_check_available": True,
                 "preview": _preview_payload_from_source_npz(selected.read_bytes(), selected.name),
+            }
+        )
+
+    def _choose_core_npz_preview(self) -> None:
+        """Choose a final Core NPZ and render its exported trajectory directly."""
+
+        handler_type = type(self)
+        with handler_type.surface_preview_picker_lock:
+            selected = _choose_final_core_npz_file(handler_type.core_preview_last_directory)
+        if selected is None:
+            self._send_json({"ok": True, "cancelled": True})
+            return
+        selected = selected.resolve()
+        if selected.suffix.lower() != ".npz":
+            raise ValueError("请选择 .npz Core 导出文件")
+        if not selected.is_file():
+            raise ValueError("所选 Core NPZ 不存在")
+        core_parts = _final_core_npz_parts(selected)
+        total_size = sum(part.stat().st_size for part in core_parts)
+        if total_size > MAX_SURFACE_PREVIEW_NPZ_BYTES:
+            raise ValueError("Core NPZ exceeds the 256 MB preview limit")
+        handler_type.core_preview_last_directory = selected.parent
+        state_path = handler_type.core_preview_picker_state_path
+        if state_path is not None:
+            _save_surface_preview_last_directory(state_path, selected.parent)
+        self._send_json(
+            {
+                "ok": True,
+                "file_name": selected.name,
+                "preview": _preview_payload_from_final_core_npz(
+                    selected,
+                    SliceConfig(line_width=2.0),
+                ),
             }
         )
 
@@ -1069,6 +1199,11 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                 source_gcode_module.load_source_gcode(native_gcode_path),
                 job.native_gcode_translation_mm or (0.0, 0.0, 0.0),
             )
+            core_source_job = apply_legacy_resin_optimization(
+                core_source_job,
+                _planning_mesh_for_gcode_source(mesh, config),
+                config,
+            )
         progress(35, "Prusa 路径生成完成，正在保留原始预览")
         resolved_config = _resolved_slice_config(config)
         slicing_meta = job.meta.get("slicing")
@@ -1186,11 +1321,10 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         # fitted/resampled output.  In particular, a multi-waypoint travel
         # remains visibly routed around its avoidance vertices while Core
         # applies one zero-speed-endpoint profile to that complete route.
-        preview = _preview_payload(
-            mesh,
-            config,
-            job,
-            fiber_preview_paths,
+        preview = (
+            _preview_payload_from_core_source_job(mesh, config, core_source_job)
+            if core_source_job is not None
+            else _preview_payload(mesh, config, job, fiber_preview_paths)
         )
         download_path = _core_output_download_path(core_npz_path)
         return {
@@ -3825,6 +3959,7 @@ def _index_html() -> str:
     <div class="surfaceTools" aria-label="曲面工具">
       <button id="surfacePreviewButton" class="surfaceToolButton" type="button">启动曲面预览器</button>
       <button id="surfaceMapperButton" class="surfaceToolButton" type="button">启动曲面映射器</button>
+      <button id="coreNpzPreviewButton" class="surfaceToolButton" type="button">导入 Core NPZ 预览</button>
       <button id="surfaceNpzPreviewButton" class="surfaceToolButton" type="button">导入映射 NPZ 预览</button>
       <button id="surfaceNpzCollisionButton" class="surfaceToolButton" type="button" disabled>检查当前 NPZ 碰撞</button>
       <output id="surfaceNpzCollisionResult" class="surfaceCollisionResult" aria-live="polite">请先导入本地映射 NPZ。</output>
@@ -4573,6 +4708,7 @@ def _index_html() -> str:
       'surface-map': document.getElementById('surfaceMapperButton')
     }};
     const surfaceNpzPreviewButton = document.getElementById('surfaceNpzPreviewButton');
+    const coreNpzPreviewButton = document.getElementById('coreNpzPreviewButton');
     const surfaceNpzCollisionButton = document.getElementById('surfaceNpzCollisionButton');
     const surfaceNpzCollisionResult = document.getElementById('surfaceNpzCollisionResult');
     const surfaceNpzInput = document.getElementById('surfaceNpzInput');
@@ -4616,6 +4752,21 @@ def _index_html() -> str:
         : '浏览器上传的 NPZ 仅供预览；请通过“导入映射 NPZ 预览”选择本地文件后检查。';
       drawPreview();
     }}
+    function applyFinalCorePreview(preview, fileName) {{
+      previewData = preview;
+      configureViewer();
+      layersEl.textContent = String(previewData.layers?.length || 0);
+      outputNameEl.textContent = fileName;
+      executedInfillPatternEl.textContent = '最终 Core 轨迹';
+      downloadEl.removeAttribute('href');
+      downloadEl.textContent = '已载入 Core 轨迹预览（未导出）';
+      statusEl.className = 'status ok';
+      statusEl.textContent = '已载入 Core NPZ：预览显示最终导出的 print 与 travel 实际采样轨迹。';
+      surfaceNpzCollisionButton.disabled = true;
+      surfaceNpzCollisionResult.className = 'surfaceCollisionResult';
+      surfaceNpzCollisionResult.textContent = '当前为普通 Core NPZ 预览，不适用曲面碰撞检查。';
+      drawPreview();
+    }}
     async function loadMappedSurfaceNpz(file) {{
       if (!file) return;
       try {{
@@ -4647,6 +4798,23 @@ def _index_html() -> str:
       }} finally {{
         surfaceNpzPreviewButton.disabled = false;
         surfaceNpzPreviewButton.textContent = originalLabel;
+      }}
+    }});
+    coreNpzPreviewButton.addEventListener('click', async () => {{
+      const originalLabel = coreNpzPreviewButton.textContent;
+      coreNpzPreviewButton.disabled = true;
+      coreNpzPreviewButton.textContent = '正在选择文件…';
+      try {{
+        const response = await fetch('/choose-core-npz-preview', {{ method: 'POST' }});
+        const result = await response.json();
+        if (!response.ok || !result.ok) throw new Error(result.error || 'Core NPZ 选择失败');
+        if (!result.cancelled) applyFinalCorePreview(result.preview, result.file_name);
+      }} catch (error) {{
+        statusEl.className = 'status error';
+        statusEl.textContent = '无法载入 Core NPZ：' + error.message;
+      }} finally {{
+        coreNpzPreviewButton.disabled = false;
+        coreNpzPreviewButton.textContent = originalLabel;
       }}
     }});
     surfaceNpzCollisionButton.addEventListener('click', async () => {{
