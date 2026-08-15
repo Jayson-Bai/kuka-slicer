@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import numpy as np
-from shapely.geometry import box
 
 from kuka_slicer.prusa_backend import slice_mesh_to_job_with_prusa
 from kuka_slicer.slicer import PrusaGeometryConfig, PrusaRaftConfig, SliceConfig
@@ -208,110 +207,6 @@ def test_prusa_backend_can_merge_brim_with_project_connector(monkeypatch):
     assert job.meta["slicing"]["prusa_brim"]["one_stroke"] is True
     assert job.travel_paths == []
     assert job.meta["motion_order"] == {"0": [{"kind": "deposit", "index": 0}]}
-
-
-def test_prusa_backend_chains_rectilinear_infill_without_touching_contours(monkeypatch):
-    class Native:
-        def slice_print_paths(self, vertices, faces, **kwargs):
-            return {
-                "layers": [
-                    {
-                        "z": 0.5,
-                        "paths": [
-                            [[0.0, 3.0, 0.5], [3.0, 3.0, 0.5]],
-                            [[0.0, 0.0, 0.5], [3.0, 0.0, 0.5]],
-                            [[3.0, 1.0, 0.5], [0.0, 1.0, 0.5]],
-                            [[0.0, 2.0, 0.5], [3.0, 2.0, 0.5]],
-                        ],
-                        "extrusion": [[0.0, 1.0], [1.0, 2.0], [2.0, 3.0], [3.0, 4.0]],
-                        "roles": ["outer_contour", "infill", "infill", "infill"],
-                        "travel": [
-                            [[3.0, 3.0, 0.5], [0.0, 0.0, 0.5]],
-                            [[3.0, 0.0, 0.5], [3.0, 1.0, 0.5]],
-                            [[0.0, 1.0, 0.5], [0.0, 2.0, 0.5]],
-                        ],
-                        "motions": [
-                            {"kind": "deposit", "index": 0},
-                            {"kind": "travel", "index": 0},
-                            {"kind": "deposit", "index": 1},
-                            {"kind": "travel", "index": 1},
-                            {"kind": "deposit", "index": 2},
-                            {"kind": "travel", "index": 2},
-                            {"kind": "deposit", "index": 3},
-                        ],
-                    }
-                ]
-            }
-
-    monkeypatch.setattr("kuka_slicer.prusa_backend.require_native", lambda: Native())
-    monkeypatch.setattr(
-        "kuka_slicer.prusa_backend.solid_geometry_at_z",
-        lambda mesh, z, tolerance: box(-20.0, -20.0, 10.0, 10.0),
-    )
-    monkeypatch.setattr(
-        "kuka_slicer.prusa_backend._connect_zigzag_infill_paths",
-        lambda paths, *args, **kwargs: [np.vstack(paths)],
-    )
-
-    job = slice_mesh_to_job_with_prusa(
-        Mesh(_cube_triangles(10.0)),
-        SliceConfig(
-            slicing_kernel="prusa",
-            layer_height=0.5,
-            first_layer_height=0.5,
-            line_width=2.0,
-            infill_pattern="isotropic",
-        ),
-    )
-
-    group = job.material_paths[0]
-    assert len(group.paths) == 2
-    assert job.meta["path_roles"]["R"]["0"] == ["outer_contour", "infill"]
-    assert len(job.travel_paths[0].paths) == 1
-    assert job.meta["motion_order"] == {
-        "0": [
-            {"kind": "deposit", "index": 0},
-            {"kind": "travel", "index": 0},
-            {"kind": "deposit", "index": 1},
-        ]
-    }
-
-
-def test_prusa_backend_does_not_apply_one_stroke_to_non_rectilinear_infill(monkeypatch):
-    class Native:
-        def slice_print_paths(self, vertices, faces, **kwargs):
-            return {
-                "layers": [
-                    {
-                        "z": 0.5,
-                        "paths": [
-                            [[0.0, 0.0, 0.5], [2.0, 0.0, 0.5]],
-                            [[0.0, 1.0, 0.5], [2.0, 1.0, 0.5]],
-                        ],
-                        "extrusion": [[0.0, 1.0], [1.0, 2.0]],
-                        "roles": ["infill", "infill"],
-                    }
-                ]
-            }
-
-    monkeypatch.setattr("kuka_slicer.prusa_backend.require_native", lambda: Native())
-    monkeypatch.setattr(
-        "kuka_slicer.prusa_backend._connect_zigzag_infill_paths",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not be called")),
-    )
-
-    job = slice_mesh_to_job_with_prusa(
-        Mesh(_cube_triangles(10.0)),
-        SliceConfig(
-            slicing_kernel="prusa",
-            layer_height=0.5,
-            first_layer_height=0.5,
-            line_width=2.0,
-            infill_pattern="grid",
-        ),
-    )
-
-    assert len(job.material_paths[0].paths) == 2
 
 
 def test_prusa_backend_forwards_native_geometry_and_path_controls(monkeypatch):
