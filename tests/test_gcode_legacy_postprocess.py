@@ -33,7 +33,7 @@ def _terminal_loop_path() -> MaterialPath:
     return MaterialPath("R", 0, points, np.linspace(0.0, 6.0, len(points)))
 
 
-def test_gcode_source_uses_legacy_infill_connector_after_parse(monkeypatch):
+def test_gcode_source_keeps_normal_infill_unchanged_after_parse(monkeypatch):
     source = SourceJob(
         meta={
             "path_roles": {"R": {"0": ["infill", "infill", "infill"]}},
@@ -51,11 +51,6 @@ def test_gcode_source_uses_legacy_infill_connector_after_parse(monkeypatch):
             _path([0, 2, 0.5, 0, 0, 0], [4, 2, 0.5, 0, 0, 0], 2.0),
         ])],
     )
-    monkeypatch.setattr(
-        "kuka_slicer.gcode_legacy_postprocess.solid_geometry_at_z",
-        lambda *_args: box(-1, -1, 5, 3),
-    )
-
     optimized = apply_legacy_resin_optimization(
         source,
         _mesh(),
@@ -63,42 +58,9 @@ def test_gcode_source_uses_legacy_infill_connector_after_parse(monkeypatch):
     )
 
     layer = optimized.layers[0]
-    assert len(layer.resin_paths) < 3
-    assert optimized.meta["resin_source"] == "prusa_gcode_legacy_postprocess"
-    assert optimized.meta["motion_order"]["0"] == [{"kind": "deposit", "index": 0}]
+    assert len(layer.resin_paths) == 3
+    assert optimized is source
     assert np.all(np.diff(layer.resin_paths[0].extrusion) >= 0.0)
-
-
-def test_gcode_source_rebuilds_legacy_travel_around_a_hole(monkeypatch):
-    source = SourceJob(
-        meta={
-            "path_roles": {"R": {"0": ["infill", "infill"]}},
-            "motion_order": {"0": [
-                {"kind": "deposit", "index": 0},
-                {"kind": "travel", "index": 0},
-                {"kind": "deposit", "index": 1},
-            ]},
-        },
-        layers=[LayerPaths(0, [
-            _path([1, 5, 0.5, 0, 0, 0], [3, 5, 0.5, 0, 0, 0], 0.0),
-            _path([7, 5, 0.5, 0, 0, 0], [9, 5, 0.5, 0, 0, 0], 1.0),
-        ])],
-    )
-    solid = box(0, 0, 10, 10).difference(box(4, 3, 6, 7))
-    monkeypatch.setattr(
-        "kuka_slicer.gcode_legacy_postprocess.solid_geometry_at_z",
-        lambda *_args: solid,
-    )
-
-    optimized = apply_legacy_resin_optimization(
-        source,
-        _mesh(),
-        SliceConfig(slicing_kernel="prusa", infill_pattern="triangles", infill_density=100.0),
-    )
-
-    route = optimized.layers[0].travel_paths[-1].points
-    assert len(route) > 2
-    assert solid.covers(LineString(route[:, :2]))
 
 
 def test_gcode_source_trims_only_infill_terminal_loop_and_rebuilds_travel(monkeypatch):

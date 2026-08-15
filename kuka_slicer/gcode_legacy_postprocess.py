@@ -1,9 +1,9 @@
-"""Apply the project-owned Legacy resin planning policy to a G-code SourceJob.
+"""Apply narrow project-owned G-code cleanup to a Prusa ``SourceJob``.
 
 The Prusa bridge remains responsible for slicing and emitting G-code.  This
 module deliberately runs *after* that G-code has been parsed, so Core receives
-one source representation while the project retains its established safe
-infill-continuity policy.
+one source representation while terminal Prusa loops are cleaned without
+changing native infill topology.
 """
 
 from __future__ import annotations
@@ -34,15 +34,15 @@ _TERMINAL_LOOP_MAX_SUFFIX_POINTS = 12
 
 
 def apply_legacy_resin_optimization(job, planning_mesh: Mesh, config: SliceConfig):
-    """Return a SourceJob with Legacy infill optimization applied.
+    """Return a SourceJob with narrow, G-code-local resin cleanup applied.
 
     ``planning_mesh`` must use the same oriented, placement-restored frame as
-    ``job``. Native ``infill`` blocks are rewritten by the Legacy continuity policy.
-    When the UI enables Brim one-stroke, native ``brim`` blocks use the same
-    safe boundary connector in this G-code representation. Perimeters and all
-    unrelated Prusa travel records are kept. New infill inter-trail travel is
-    produced by ``HoleSafeTravelRouter`` rather than by drawing an unchecked
-    chord through a void.
+    ``job``. Only tiny terminal loops in native ``infill`` blocks are removed;
+    their immediately following travels are regenerated with
+    ``HoleSafeTravelRouter``. Infill paths are deliberately not merged or
+    reordered. When the UI enables Brim one-stroke, native ``brim`` blocks use
+    their separate accepted boundary connector. Perimeters and unrelated Prusa
+    travels remain untouched.
     """
 
     # Keep the SourceJob contract boundary runtime-only.  The slicer package
@@ -101,19 +101,6 @@ def apply_legacy_resin_optimization(job, planning_mesh: Mesh, config: SliceConfi
             candidate_layer, candidate_motions = trim_result
             changed = True
             terminal_loop_trim_layers.append(layer.index)
-        result = _optimize_layer(
-            candidate_layer,
-            candidate_roles,
-            candidate_motions,
-            planning_mesh,
-            config,
-            LayerPaths=LayerPaths,
-            MaterialPath=MaterialPath,
-            TravelPath=TravelPath,
-        )
-        if result is not None:
-            candidate_layer, candidate_roles, candidate_motions = result
-            changed = True
         if not changed:
             updated_layers.append(layer)
             continue
