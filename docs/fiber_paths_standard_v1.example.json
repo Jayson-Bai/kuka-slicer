@@ -1,0 +1,81 @@
+{
+  "format": "external_fiber_paths_v1",
+  "unit": "mm",
+  "coordinate_system": "project_default",
+  "point_columns": [
+    "x",
+    "y"
+  ],
+  "path_order": "sequence",
+  "paths": [
+    {
+      "path_id": "S+-0000",
+      "family": "S+-family",
+      "source_file": "two_hole_tension_specimen_planar_S_family_sorted.json",
+      "source_index": 0,
+      "sequence": 0,
+      "closed": false,
+      "points": [
+        {
+          "x": 15.000000954,
+          "y": 46.32623175045949
+        },
+        {
+          "x": 15.500000000,
+          "y": 45.900000000
+        },
+        {
+          "x": 16.000000000,
+          "y": 45.400000000
+        }
+      ]
+    },
+    {
+      "path_id": "S--0000",
+      "family": "S--family",
+      "source_file": "two_hole_tension_specimen_planar_S_family_sorted.json",
+      "source_index": 0,
+      "sequence": 1,
+      "closed": false,
+      "points": [
+        {
+          "x": 15.072213526533691,
+          "y": 135.9175601208945
+        },
+        {
+          "x": 15.500000000,
+          "y": 136.400000000
+        },
+        {
+          "x": 16.000000000,
+          "y": 137.000000000
+        }
+      ]
+    },
+    {
+      "path_id": "T-0000",
+      "family": "T-family",
+      "source_file": "two_hole_tension_specimen_planar_T_family_sorted.json",
+      "source_index": 0,
+      "sequence": 2,
+      "closed": false,
+      "points": [
+        {
+          "x": 57.51476867017256,
+          "y": 155.0
+        },
+        {
+          "x": 58.100000000,
+          "y": 149.500000000
+        },
+        {
+          "x": 59.457941538496414,
+          "y": 133.98371064784067
+        }
+      ]
+    }
+  ],
+  "metadata": {
+    "description": "每个 paths 元素表示一条独立纤维轨迹；示例点为展示格式，实际文件应保留完整点序列。"
+  }
+}
