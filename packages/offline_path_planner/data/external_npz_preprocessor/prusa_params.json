@@ -7,12 +7,12 @@
     "first_layer_height": 0.4,
     "line_width": 2.0,
     "build_axis": "auto",
-    "prusa_start_x_mm": 20.0,
-    "prusa_start_y_mm": 0.0,
+    "prusa_start_x_mm": 10.0,
+    "prusa_start_y_mm": 10.0,
     "prusa_perimeter_count": 1,
     "prusa_print_perimeters": true,
     "prusa_infill_pattern": "isotropic",
-    "prusa_infill_density": 95.0,
+    "prusa_infill_density": 100.0,
     "prusa_contour_infill_overlap": 5.0,
     "prusa_raft_enabled": false,
     "prusa_raft_layers": 1,
@@ -39,6 +39,8 @@
     "prusa_brim_width": 15.0,
     "prusa_brim_type": "outer_only",
     "prusa_brim_separation": 0.4,
-    "prusa_brim_one_stroke": true
+    "prusa_brim_one_stroke": true,
+    "honeycomb_centerline_enabled": false,
+    "honeycomb_topology": "macro_partition_zero_e"
   }
 }
