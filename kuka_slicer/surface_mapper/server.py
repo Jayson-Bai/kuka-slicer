@@ -324,6 +324,8 @@ def surface_mapper_html() -> str:
     body { margin: 0; }
     main { max-width: 1180px; margin: auto; padding: 26px; }
     header { margin: 0 0 18px; } h1 { margin: 0; font-size: 24px; } header p { color: #58677d; margin: 7px 0 0; line-height: 1.55; }
+    .mode { display: inline-block; margin-left: 8px; border-radius: 999px; padding: 3px 8px; vertical-align: middle; font-size: 12px; font-weight: 600; }
+    .mode-legacy { background: #eaf2fb; color: #075eaf; } .mode-planned { background: #f6f1e6; color: #775d12; }
     .workspace { display: grid; grid-template-columns: minmax(310px, .9fr) minmax(360px, 1.1fr); gap: 18px; }
     .panel { background: #fff; border: 1px solid #dbe5f0; border-radius: 12px; box-shadow: 0 8px 24px rgba(35, 60, 90, .06); }
     .controls { padding: 18px; } h2 { font-size: 16px; margin: 0 0 12px; } h3 { font-size: 14px; margin: 18px 0 8px; }
@@ -348,8 +350,9 @@ def surface_mapper_html() -> str:
 <body>
   <main>
     <header>
-      <h1>曲面映射器</h1>
-      <p>读取平面 NPZ 与目标曲面 JSON；仅按逻辑层逐点修改 Z，不改变 XY、路径顺序、材料分组或层号。</p>
+      <h1>曲面映射器 <span class="mode mode-legacy" data-mapping-mode="legacy">Legacy：surface_mapping_v1</span></h1>
+      <p>当前页面仅提供旧版高度场映射：按逻辑层逐点修改 Z，不改变 XY、路径顺序、材料分组或层号。</p>
+      <p><span class="mode mode-planned" data-mapping-mode="conformal">Conformal：规划中</span> 曲面共形格栅将作为独立结构几何流程实现；在该流程完成并验证前，本页面不会将旧版 Z 映射称为共形映射。</p>
     </header>
     <section class="workspace">
       <form class="panel controls" id="mapperForm">

@@ -133,6 +133,11 @@ def test_mapper_preview_and_web_shell_expose_the_separate_mapping_controls(tmp_p
     assert payload["plan"]["alpha_by_layer"] == {0: 0.0, 1: 1.0, 2: 1.0, 3: 0.0}
     assert payload["result"]["extrusion"]["status"] == "arc_length_ratio_compensated"
     html = surface_mapper_html()
+    assert 'data-mapping-mode="legacy"' in html
+    assert "Legacy：surface_mapping_v1" in html
+    assert 'data-mapping-mode="conformal"' in html
+    assert "Conformal：规划中" in html
+    assert "不会将旧版 Z 映射称为共形映射" in html
     assert 'id="sourceFile"' in html
     assert 'id="targetFile"' in html
     assert 'id="startLayer"' in html

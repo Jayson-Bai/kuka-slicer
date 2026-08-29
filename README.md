@@ -365,6 +365,19 @@ middle logical layer, then rejects any mapped result containing negative Z.
 Preview and export report the resampling, E compensation, Z range, and surface
 normal orientation contract.
 
+### Surface mapping modes
+
+The current `surface-map` page is explicitly the **Legacy** mode.  It emits
+`surface_mapping_v1` and implements an analytical `double_sine_product`
+height-field Z mapping; it is not a discrete conformal parameterization and
+must continue to preserve its XY, path-order, and logical-layer contracts.
+
+**Conformal** is a separate, currently unavailable structure-generation mode.
+It will begin with `conformal_lattice_spec_v1`, a triangular surface domain,
+and an independently validated UV parameterization.  It must not be added as
+a conditional branch to the Legacy mapper, and no UI label may describe a
+Legacy export as conformal before that pipeline exists.
+
 ## Production honeycomb surface reference
 
 The production honeycomb planner is `macro_partition_zero_e`, introduced by
@@ -382,6 +395,9 @@ It must be paired with the STL in `01_模型` and the **phase-45-degree**
 `蜂窝-150x100x10mm-08-11-相位45度-全边界曲面参数.json`; the zero-phase JSON is
 not the matching surface definition. On another machine, set
 `KUKA_SLICER_HONEYCOMB_REFERENCE_ROOT` to the corresponding dataset root.
+`tests/test_honeycomb_surface_reference.py` locks this sample to the Legacy
+`surface_mapping_v1` production contract; it is a comparison baseline, not a
+conformal-lattice acceptance result.
 
 The UI groups adjustable inputs into:
 
