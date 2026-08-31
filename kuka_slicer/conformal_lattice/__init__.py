@@ -6,6 +6,7 @@ generation are added by later gates.
 """
 
 from .contracts import ConformalLatticeSpec, load_conformal_lattice_spec
+from .distortion import ConformalQuality, evaluate_conformal_quality
 from .mesh_domain import (
     SurfaceMeshDomain,
     build_double_sine_surface_domain,
@@ -13,13 +14,25 @@ from .mesh_domain import (
     load_triangle_mesh_domain,
     prepare_surface_mesh_domain,
 )
+from .parameterization import (
+    LSCMParameterization,
+    farthest_boundary_anchors,
+    parameterize_lscm,
+    parameterize_spec_lscm,
+)
 
 __all__ = [
     "ConformalLatticeSpec",
+    "ConformalQuality",
+    "LSCMParameterization",
     "SurfaceMeshDomain",
     "build_double_sine_surface_domain",
     "cut_mesh_along_edges",
+    "evaluate_conformal_quality",
+    "farthest_boundary_anchors",
     "load_conformal_lattice_spec",
     "load_triangle_mesh_domain",
     "prepare_surface_mesh_domain",
+    "parameterize_lscm",
+    "parameterize_spec_lscm",
 ]

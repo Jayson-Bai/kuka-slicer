@@ -105,10 +105,17 @@ def load_conformal_lattice_spec(data: bytes | str | Mapping[str, object]) -> Con
     parameterization = _object(raw, "parameterization")
     if parameterization.get("method") != "lscm":
         raise ValueError("parameterization.method must be lscm")
-    if parameterization.get("anchor_strategy") not in ("farthest_boundary_pair", "user"):
+    anchor_strategy = parameterization.get("anchor_strategy")
+    if anchor_strategy not in ("farthest_boundary_pair", "user"):
         raise ValueError("parameterization.anchor_strategy must be farthest_boundary_pair or user")
     if parameterization.get("seam_strategy") not in ("none", "user", "auto_cut_graph"):
         raise ValueError("parameterization.seam_strategy must be none, user, or auto_cut_graph")
+    if anchor_strategy == "user":
+        anchors = parameterization.get("anchors")
+        if not isinstance(anchors, list) or len(anchors) != 2 or any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in anchors
+        ) or anchors[0] == anchors[1]:
+            raise ValueError("parameterization.anchors must contain two distinct non-negative vertex indices")
 
     lattice = _object(raw, "lattice")
     if lattice.get("family") != "triangular_dual_hex":
