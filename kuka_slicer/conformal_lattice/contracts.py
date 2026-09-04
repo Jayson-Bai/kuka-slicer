@@ -142,6 +142,12 @@ def load_conformal_lattice_spec(data: bytes | str | Mapping[str, object]) -> Con
     _finite(orientation_field.get("angle_deg", 0.0), "orientation_field.angle_deg")
     if layer_embedding.get("mode") not in ("target_surface_normal_stack", "symmetric_shape_morphing"):
         raise ValueError("layer_embedding.mode is unsupported")
+    if layer_embedding.get("mode") == "symmetric_shape_morphing":
+        if layer_embedding.get("transition") != "smoothstep":
+            raise ValueError("symmetric_shape_morphing requires transition=smoothstep")
+        start_layer = layer_embedding.get("surface_start_layer")
+        if not isinstance(start_layer, int) or isinstance(start_layer, bool) or start_layer < 0:
+            raise ValueError("symmetric_shape_morphing requires a non-negative integer surface_start_layer")
     seed = raw.get("random_seed")
     if not isinstance(seed, int) or isinstance(seed, bool) or seed < 0:
         raise ValueError("random_seed must be a non-negative integer")

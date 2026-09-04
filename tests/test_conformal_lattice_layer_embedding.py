@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from kuka_slicer.conformal_lattice import (
     conformal_lattice_preview_payload,
@@ -10,6 +11,8 @@ from kuka_slicer.conformal_lattice import (
     validate_realized_fill_ratio,
 )
 from tests.test_conformal_lattice_lattice_generator import _inputs
+from kuka_slicer.conformal_lattice.layer_embedding import _symmetric_alphas
+from kuka_slicer.surface_mapper.progression import LayerProgression
 
 
 def test_normal_stack_preserves_node_and_edge_topology_at_each_explicit_offset():
@@ -43,6 +46,51 @@ def test_symmetric_compatibility_mode_requires_flat_reference_and_labels_nonconf
     np.testing.assert_allclose(stack.node_positions_xyz[1], geometry.lattice_nodes_xyz)
     np.testing.assert_allclose(stack.node_positions_xyz[2], geometry.lattice_nodes_xyz)
     assert stack.report["strict_conformal_claim"].startswith("not_claimed")
+
+
+@pytest.mark.parametrize(
+    ("layer_count", "surface_start_layer"),
+    [(1, 0), (2, 0), (3, 0), (4, 0), (9, 2), (10, 3)],
+)
+def test_symmetric_alphas_are_exactly_the_old_layer_progression(layer_count, surface_start_layer):
+    progression = LayerProgression(surface_start_layer, layer_count - 1)
+
+    actual = _symmetric_alphas(layer_count, surface_start_layer=surface_start_layer)
+    expected = np.asarray([progression.alpha(index) for index in range(layer_count)])
+
+    np.testing.assert_allclose(actual, expected)
+    assert np.flatnonzero(np.isclose(actual, 1.0)).tolist() == list(progression.peak_layers)
+
+
+def test_symmetric_compatibility_mode_respects_the_requested_start_and_return_layers():
+    domain, parameterization, fields, orientation, phase = _inputs()
+    geometry = generate_conformal_lattice_geometry(domain, parameterization, fields, orientation, phase, boundary_mode="inset")
+    flat = geometry.lattice_nodes_xyz + np.asarray([0.0, 0.0, 5.0])
+    stack = embed_lattice_layers(
+        domain,
+        orientation,
+        geometry,
+        mode="symmetric_shape_morphing",
+        symmetric_layer_count=10,
+        surface_start_layer=3,
+        flat_reference_nodes_xyz=flat,
+    )
+
+    expected = np.asarray([LayerProgression(3, 9).alpha(index) for index in range(10)])
+    np.testing.assert_allclose(stack.layer_offsets_mm, expected)
+    np.testing.assert_allclose(stack.node_positions_xyz[3], flat)
+    assert stack.report["surface_start_layer"] == 3
+    assert stack.report["surface_return_layer"] == 6
+    assert stack.report["peak_layer_indices"] == [4, 5]
+
+
+@pytest.mark.parametrize(
+    ("layer_count", "surface_start_layer"),
+    [(3, 2), (4, -1), (0, 0)],
+)
+def test_symmetric_alphas_reject_invalid_legacy_progression_inputs(layer_count, surface_start_layer):
+    with pytest.raises(ValueError):
+        _symmetric_alphas(layer_count, surface_start_layer=surface_start_layer)
 
 
 def test_read_only_preview_contains_required_geometry_and_quality_views_without_mutating_geometry():

@@ -46,6 +46,7 @@ def embed_lattice_layers(
     mode: LayerEmbeddingMode = "target_surface_normal_stack",
     layer_offsets_mm: np.ndarray | tuple[float, ...] | None = None,
     symmetric_layer_count: int | None = None,
+    surface_start_layer: int = 0,
     flat_reference_nodes_xyz: np.ndarray | None = None,
 ) -> LayerEmbedding:
     """Embed one lattice topology into normal-stack or compatibility layers.
@@ -76,16 +77,21 @@ def embed_lattice_layers(
         flat = np.asarray(flat_reference_nodes_xyz, dtype=np.float64)
         if flat.shape != geometry.lattice_nodes_xyz.shape or not np.all(np.isfinite(flat)):
             raise ValueError("flat_reference_nodes_xyz must be finite and match lattice nodes")
-        alphas = _symmetric_alphas(symmetric_layer_count)
+        alphas = _symmetric_alphas(symmetric_layer_count, surface_start_layer=surface_start_layer)
         positions = flat[None, :, :] + alphas[:, None, None] * (geometry.lattice_nodes_xyz[None, :, :] - flat[None, :, :])
         offsets = alphas
+        final_layer = symmetric_layer_count - 1
+        return_layer = final_layer - surface_start_layer
         report = {
             "mode": mode,
             "strict_conformal_claim": "not_claimed_for_intermediate_layers; this is a legacy-compatible morphology transition",
             "topology_shared_across_layers": True,
             "node_count_per_layer": int(len(geometry.lattice_nodes_xyz)),
+            "surface_start_layer": surface_start_layer,
+            "surface_return_layer": return_layer,
             "peak_layer_indices": np.flatnonzero(np.isclose(alphas, 1.0)).tolist(),
             "alpha_range": {"min": float(np.min(alphas)), "max": float(np.max(alphas))},
+            "alpha_by_layer": alphas.tolist(),
         }
     else:
         raise ValueError("unsupported layer embedding mode")
@@ -134,16 +140,34 @@ def _offsets(values: np.ndarray | tuple[float, ...] | None) -> np.ndarray:
     return offsets
 
 
-def _symmetric_alphas(layer_count: int) -> np.ndarray:
-    if not isinstance(layer_count, int) or isinstance(layer_count, bool) or layer_count < 3:
-        raise ValueError("symmetric_layer_count must be an integer >= 3")
-    indices = np.arange(layer_count, dtype=np.float64)
-    edge_distance = np.minimum(indices, layer_count - 1 - indices)
-    half_transition_steps = (layer_count - 1) // 2
-    # Same smoothstep/central-peak semantics as the legacy progression,
-    # reimplemented here to keep the new package independent from it.
+def _symmetric_alphas(layer_count: int, *, surface_start_layer: int = 0) -> np.ndarray:
+    """Return the exact old ``LayerProgression`` alpha semantics without importing it.
+
+    The independent conformal package deliberately does not take a runtime
+    dependency on ``surface_mapper``.  The accompanying regression tests compare
+    this implementation against ``LayerProgression`` for odd/even stacks and the
+    one/two-layer active-region exceptions.
+    """
+
+    if not isinstance(layer_count, int) or isinstance(layer_count, bool) or layer_count < 1:
+        raise ValueError("symmetric_layer_count must be an integer >= 1")
+    if not isinstance(surface_start_layer, int) or isinstance(surface_start_layer, bool) or surface_start_layer < 0:
+        raise ValueError("surface_start_layer must be a non-negative integer")
+    final_layer = layer_count - 1
+    if surface_start_layer > final_layer // 2:
+        raise ValueError("surface_start_layer must leave a symmetric curved region around the middle layer")
+    return_layer = final_layer - surface_start_layer
+    active_count = return_layer - surface_start_layer + 1
+    alphas = np.zeros(layer_count, dtype=np.float64)
+    if active_count <= 2:
+        alphas[surface_start_layer : return_layer + 1] = 1.0
+        return alphas
+    indices = np.arange(surface_start_layer, return_layer + 1, dtype=np.float64)
+    edge_distance = np.minimum(indices - surface_start_layer, return_layer - indices)
+    half_transition_steps = (active_count - 1) // 2
     raw = edge_distance / half_transition_steps
-    return raw * raw * (3.0 - 2.0 * raw)
+    alphas[surface_start_layer : return_layer + 1] = raw * raw * (3.0 - 2.0 * raw)
+    return alphas
 
 
 def _readonly(value: np.ndarray) -> np.ndarray:
