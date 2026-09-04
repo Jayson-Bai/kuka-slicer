@@ -161,6 +161,8 @@ def conformal_lattice_config_payload(
 ) -> dict[str, object]:
     """Build and validate a new conformal-lattice config without touching legacy export."""
 
+    if domain.build_axis != "z":
+        raise ValueError("the first-version double-sine conformal workflow supports only build_axis=z")
     surface = surface_payload(params, domain, include_projection_geometry=False)["surface"]
     wall_width_mm = _query_float(params, "wall_width_mm", 2.0, positive=True)
     base_cell_size_mm = _query_float(params, "base_cell_size_mm", 5.0, positive=True)

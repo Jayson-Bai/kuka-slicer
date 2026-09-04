@@ -45,14 +45,17 @@ from .scalar_fields import (
     ExternalScalarMetadata,
     FieldComponent,
     compose_design_fields,
+    compose_design_fields_from_spec,
     constant_driver,
     curvature_driver,
     external_scalar_driver,
     roi_driver,
 )
+from .pipeline import ConformalLatticeRun, run_conformal_lattice_pipeline, write_conformal_lattice_outputs
 
 __all__ = [
     "ConformalLatticeSpec",
+    "ConformalLatticeRun",
     "CellScaleCorrection",
     "ConformalLatticeGeometry",
     "ConformalLatticePathGraph",
@@ -73,6 +76,7 @@ __all__ = [
     "build_orientation_field",
     "build_conformal_lattice_path_graph",
     "compose_design_fields",
+    "compose_design_fields_from_spec",
     "conformal_lattice_preview_payload",
     "conformal_lattice_preview_html",
     "constant_driver",
@@ -93,8 +97,10 @@ __all__ = [
     "nonadjacent_triangle_overlap_pairs",
     "require_valid_phase",
     "run_conformal_lattice_preview_server",
+    "run_conformal_lattice_pipeline",
     "roi_driver",
     "solve_phase_coordinates",
     "validate_realized_fill_ratio",
     "write_conformal_lattice_external_npz",
+    "write_conformal_lattice_outputs",
 ]

@@ -228,3 +228,14 @@ def test_conformal_lattice_export_rejects_invalid_design_inputs(params, error):
 
     with pytest.raises(ValueError, match=error):
         conformal_lattice_config_payload(params, domain)
+
+
+def test_conformal_export_requires_z_build_axis_but_legacy_export_remains_available():
+    domain = stl_projection_domain_from_bytes(
+        _box_stl_bytes(), file_name="part.stl", build_axis="x"
+    )
+
+    legacy = graded_surface_config_payload({}, domain)
+    assert legacy["coordinate_system"]["source_build_axis"] == "x"
+    with pytest.raises(ValueError, match="build_axis=z"):
+        conformal_lattice_config_payload({}, domain)

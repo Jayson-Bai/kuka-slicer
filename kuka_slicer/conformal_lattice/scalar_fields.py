@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import math
-from typing import Iterable, Literal, Sequence
+from typing import TYPE_CHECKING, Iterable, Literal, Sequence
 
 import numpy as np
 from scipy.sparse import coo_matrix, csr_matrix
@@ -18,6 +18,9 @@ from scipy.sparse.csgraph import dijkstra
 from scipy.sparse.linalg import spsolve
 
 from .mesh_domain import SurfaceMeshDomain
+
+if TYPE_CHECKING:
+    from .contracts import ConformalLatticeSpec
 
 
 CurvatureMode = Literal["mean_abs", "gaussian_abs", "max_principal_abs"]
@@ -293,6 +296,21 @@ def compose_design_fields(
         target_fill_ratio=_readonly(smoothed),
         target_cell_size_mm=_readonly(cell_size),
         report=report,
+    )
+
+
+def compose_design_fields_from_spec(
+    domain: SurfaceMeshDomain,
+    spec: "ConformalLatticeSpec",
+) -> DesignFieldResult:
+    """Create the first-version fixed-scale field declared by a UI config."""
+
+    if spec.fill_field.get("mode") != "fixed_cell_size":
+        raise ValueError("first-version UI pipeline requires fill_field.mode=fixed_cell_size")
+    return compose_design_fields(
+        domain,
+        wall_width_mm=float(spec.lattice["wall_width_mm"]),
+        target_cell_size_mm=float(spec.lattice["base_cell_size_mm"]),
     )
 
 
