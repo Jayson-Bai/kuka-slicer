@@ -32,6 +32,8 @@ class ConformalLatticeSpec:
     fill_field: dict[str, object]
     orientation_field: dict[str, object]
     layer_embedding: dict[str, object]
+    part: dict[str, object]
+    manufacturing: dict[str, object]
     quality_limits: dict[str, object]
     random_seed: int
     raw_config: dict[str, object]
@@ -60,6 +62,8 @@ class ConformalLatticeSpec:
             "fill_field": self.fill_field,
             "orientation_field": self.orientation_field,
             "layer_embedding": self.layer_embedding,
+            "part": self.part,
+            "manufacturing": self.manufacturing,
             "quality_limits": self.quality_limits,
         }
 
@@ -102,6 +106,11 @@ def load_conformal_lattice_spec(data: bytes | str | Mapping[str, object]) -> Con
     if provider == "double_sine":
         _validate_double_sine_source(source)
 
+    part = _optional_object(raw, "part")
+    manufacturing = _optional_object(raw, "manufacturing")
+    if part or manufacturing:
+        _validate_rectangular_part(part, manufacturing)
+
     parameterization = _object(raw, "parameterization")
     if parameterization.get("method") != "lscm":
         raise ValueError("parameterization.method must be lscm")
@@ -125,6 +134,13 @@ def load_conformal_lattice_spec(data: bytes | str | Mapping[str, object]) -> Con
     if lattice.get("boundary_mode") not in ("clip", "inset", "boundary_frame"):
         raise ValueError("lattice.boundary_mode must be clip, inset, or boundary_frame")
     _vector(lattice.get("phase_origin"), "lattice.phase_origin", length=2)
+    if part:
+        bead_count = lattice.get("wall_bead_count")
+        if not isinstance(bead_count, int) or isinstance(bead_count, bool) or bead_count < 1:
+            raise ValueError("rectangular conformal designs require lattice.wall_bead_count >= 1")
+        bead_width = float(manufacturing["nominal_bead_width_mm"])
+        if not math.isclose(float(lattice["wall_width_mm"]), bead_count * bead_width, rel_tol=0.0, abs_tol=1e-9):
+            raise ValueError("lattice.wall_width_mm must equal wall_bead_count times manufacturing.nominal_bead_width_mm")
 
     fill_field = _object(raw, "fill_field")
     orientation_field = _object(raw, "orientation_field")
@@ -159,6 +175,8 @@ def load_conformal_lattice_spec(data: bytes | str | Mapping[str, object]) -> Con
         fill_field=dict(fill_field),
         orientation_field=dict(orientation_field),
         layer_embedding=dict(layer_embedding),
+        part=dict(part),
+        manufacturing=dict(manufacturing),
         quality_limits=dict(quality_limits),
         random_seed=seed,
         raw_config=raw,
@@ -179,6 +197,15 @@ def _decode(data: bytes | str | Mapping[str, object]) -> dict[str, object]:
 
 def _object(parent: Mapping[str, object], name: str) -> Mapping[str, object]:
     value = parent.get(name)
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{name} must be an object")
+    return value
+
+
+def _optional_object(parent: Mapping[str, object], name: str) -> Mapping[str, object]:
+    value = parent.get(name)
+    if value is None:
+        return {}
     if not isinstance(value, Mapping):
         raise ValueError(f"{name} must be an object")
     return value
@@ -219,3 +246,14 @@ def _validate_double_sine_source(source: Mapping[str, object]) -> None:
     samples = surface.get("samples")
     if not isinstance(samples, list) or len(samples) != 2 or any(not isinstance(value, int) or value < 2 for value in samples):
         raise ValueError("source_surface.double_sine.samples must contain two integers >= 2")
+
+
+def _validate_rectangular_part(part: Mapping[str, object], manufacturing: Mapping[str, object]) -> None:
+    if part.get("boundary") != "rectangle":
+        raise ValueError("part.boundary must be rectangle")
+    for key in ("length_mm", "width_mm", "final_height_mm"):
+        _positive(part.get(key), f"part.{key}")
+    _positive(manufacturing.get("layer_height_mm"), "manufacturing.layer_height_mm")
+    bead_width = _positive(manufacturing.get("nominal_bead_width_mm"), "manufacturing.nominal_bead_width_mm")
+    if not math.isclose(bead_width, 2.0, rel_tol=0.0, abs_tol=1e-9):
+        raise ValueError("manufacturing.nominal_bead_width_mm must be exactly 2.0 for the configured resin nozzle")

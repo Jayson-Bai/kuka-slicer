@@ -156,15 +156,19 @@ def graded_surface_config_payload(
     }
 
 
-def conformal_lattice_config_payload(
-    params: dict[str, list[str]], domain: STLProjectionDomain
-) -> dict[str, object]:
-    """Build and validate a new conformal-lattice config without touching legacy export."""
+def conformal_lattice_config_payload(params: dict[str, list[str]]) -> dict[str, object]:
+    """Build the STL-free rectangular conformal-design contract."""
 
-    if domain.build_axis != "z":
-        raise ValueError("the first-version double-sine conformal workflow supports only build_axis=z")
-    surface = surface_payload(params, domain, include_projection_geometry=False)["surface"]
+    length_mm = _query_float(params, "part_length_mm", 150.0, positive=True)
+    width_mm = _query_float(params, "part_width_mm", 100.0, positive=True)
+    final_height_mm = _query_float(params, "part_height_mm", 10.0, positive=True)
+    layer_height_mm = _query_float(params, "layer_height_mm", 0.5, positive=True)
+    surface_params = {**params, "width_mm": [str(length_mm)], "height_mm": [str(width_mm)]}
+    surface = surface_payload(surface_params, include_projection_geometry=False)["surface"]
     wall_width_mm = _query_float(params, "wall_width_mm", 2.0, positive=True)
+    wall_bead_count = round(wall_width_mm / 2.0)
+    if wall_bead_count < 1 or not math.isclose(wall_width_mm, 2.0 * wall_bead_count, rel_tol=0.0, abs_tol=1e-9):
+        raise ValueError("wall_width_mm must be a positive integer multiple of the fixed 2 mm resin nozzle width")
     base_cell_size_mm = _query_float(params, "base_cell_size_mm", 5.0, positive=True)
     nominal_fill = (2.0 * wall_width_mm) / (math.sqrt(3.0) * base_cell_size_mm)
     if nominal_fill >= 1.0:
@@ -173,26 +177,22 @@ def conformal_lattice_config_payload(
             "reduce wall_width_mm or increase base_cell_size_mm"
         )
     surface_start_layer = _query_nonnegative_int(params, "surface_start_layer", 3)
+    logical_layer_count = math.ceil(final_height_mm / layer_height_mm)
+    if surface_start_layer > (logical_layer_count - 1) // 2:
+        raise ValueError("surface_start_layer must leave a symmetric curved region inside the final physical height")
     samples_x = _query_nonnegative_int(
         params, "samples_x", DEFAULT_PREVIEW_SAMPLES, minimum=2, maximum=MAX_CONFORMAL_SAMPLES
     )
     samples_y = _query_nonnegative_int(
         params, "samples_y", DEFAULT_PREVIEW_SAMPLES, minimum=2, maximum=MAX_CONFORMAL_SAMPLES
     )
-    projection = domain.preview_payload(include_polygons=False)
     source_surface: dict[str, object] = {
         "provider": "double_sine",
-        "source_file": "generated://double-sine",
+        "source_file": "generated://double-sine-rectangular-part",
         "domain": "outer_boundary_only",
-        "reference_stl": {
-            "file_name": projection["file_name"],
-            "sha256": projection["sha256"],
-            "build_axis": projection["build_axis"],
-            "xy_bounds_mm": projection["source_xy_bounds_mm"],
-        },
         "double_sine": {
             **surface,
-            "xy_bounds_mm": [0.0, 0.0, domain.width_mm, domain.height_mm],
+            "xy_bounds_mm": [0.0, 0.0, length_mm, width_mm],
             "samples": [samples_x, samples_y],
         },
     }
@@ -201,6 +201,16 @@ def conformal_lattice_config_payload(
         "format": CONFORMAL_LATTICE_SPEC_V1,
         "units": "mm",
         "source_surface": source_surface,
+        "part": {
+            "boundary": "rectangle",
+            "length_mm": length_mm,
+            "width_mm": width_mm,
+            "final_height_mm": final_height_mm,
+        },
+        "manufacturing": {
+            "layer_height_mm": layer_height_mm,
+            "nominal_bead_width_mm": 2.0,
+        },
         "parameterization": {
             "method": "lscm",
             "anchor_strategy": "farthest_boundary_pair",
@@ -209,6 +219,7 @@ def conformal_lattice_config_payload(
         "lattice": {
             "family": "triangular_dual_hex",
             "wall_width_mm": wall_width_mm,
+            "wall_bead_count": wall_bead_count,
             "base_cell_size_mm": base_cell_size_mm,
             "boundary_mode": "clip",
             "phase_origin": [0.0, 0.0],
@@ -279,9 +290,7 @@ class SurfacePreviewHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/export-conformal-lattice-config":
             try:
                 params = parse_qs(parsed.query)
-                config = conformal_lattice_config_payload(
-                    params, self._domain_from_params(params, required=True)
-                )
+                config = conformal_lattice_config_payload(params)
             except ValueError as exc:
                 self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
                 return

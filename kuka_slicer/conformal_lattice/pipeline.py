@@ -83,7 +83,7 @@ class ConformalLatticeRun:
 def run_conformal_lattice_pipeline(
     config: ConformalLatticeSpec | bytes | str | Mapping[str, object],
     *,
-    logical_layer_count: int,
+    logical_layer_count: int | None = None,
     extrusion: ExtrusionVolumeModel | None = None,
     fill_samples_per_triangle_side: int = 6,
 ) -> ConformalLatticeRun:
@@ -98,8 +98,12 @@ def run_conformal_lattice_pipeline(
     if spec.source_provider != "double_sine":
         raise ValueError("first-version UI pipeline supports only source_surface.provider=double_sine")
     reference = spec.source_surface.get("reference_stl")
-    if not isinstance(reference, Mapping) or reference.get("build_axis") != "z":
+    if spec.part:
+        logical_layer_count, base_z_by_layer = _physical_layer_schedule(spec, logical_layer_count)
+    elif not isinstance(reference, Mapping) or reference.get("build_axis") != "z":
         raise ValueError("first-version double-sine conformal workflow requires reference_stl.build_axis=z")
+    else:
+        base_z_by_layer = None
     if not isinstance(logical_layer_count, int) or isinstance(logical_layer_count, bool) or logical_layer_count < 1:
         raise ValueError("logical_layer_count must be an integer >= 1")
     if not isinstance(fill_samples_per_triangle_side, int) or fill_samples_per_triangle_side < 2:
@@ -133,7 +137,7 @@ def run_conformal_lattice_pipeline(
         wall_width_mm=float(spec.lattice["wall_width_mm"]),
         samples_per_triangle_side=fill_samples_per_triangle_side,
     )
-    layer_embedding = _symmetric_layer_embedding(domain, orientation, geometry, spec, logical_layer_count)
+    layer_embedding = _symmetric_layer_embedding(domain, orientation, geometry, spec, logical_layer_count, base_z_by_layer)
     path_graph = None if extrusion is None else build_conformal_lattice_path_graph(
         geometry,
         extrusion,
@@ -204,6 +208,7 @@ def _symmetric_layer_embedding(
     geometry: ConformalLatticeGeometry,
     spec: ConformalLatticeSpec,
     logical_layer_count: int,
+    base_z_by_layer: np.ndarray | None,
 ) -> LayerEmbedding:
     embedding = spec.layer_embedding
     if embedding.get("mode") != "symmetric_shape_morphing" or embedding.get("transition") != "smoothstep":
@@ -221,4 +226,19 @@ def _symmetric_layer_embedding(
         symmetric_layer_count=logical_layer_count,
         surface_start_layer=int(embedding["surface_start_layer"]),
         flat_reference_nodes_xyz=flat,
+        base_z_by_layer_mm=base_z_by_layer,
     )
+
+
+def _physical_layer_schedule(spec: ConformalLatticeSpec, requested_count: int | None) -> tuple[int, np.ndarray]:
+    """Return monotonic layer-centre Z values whose printed extent is the requested part height."""
+
+    final_height = float(spec.part["final_height_mm"])
+    nominal_height = float(spec.manufacturing["layer_height_mm"])
+    count = int(math.ceil(final_height / nominal_height))
+    if requested_count is not None and requested_count != count:
+        raise ValueError("logical_layer_count must match the rectangular part final_height_mm and layer_height_mm")
+    thicknesses = np.full(count, nominal_height, dtype=np.float64)
+    thicknesses[-1] = final_height - nominal_height * (count - 1)
+    centres = np.cumsum(thicknesses) - thicknesses * 0.5
+    return count, centres

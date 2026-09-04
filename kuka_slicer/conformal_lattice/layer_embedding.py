@@ -48,6 +48,7 @@ def embed_lattice_layers(
     symmetric_layer_count: int | None = None,
     surface_start_layer: int = 0,
     flat_reference_nodes_xyz: np.ndarray | None = None,
+    base_z_by_layer_mm: np.ndarray | tuple[float, ...] | None = None,
 ) -> LayerEmbedding:
     """Embed one lattice topology into normal-stack or compatibility layers.
 
@@ -79,6 +80,8 @@ def embed_lattice_layers(
             raise ValueError("flat_reference_nodes_xyz must be finite and match lattice nodes")
         alphas = _symmetric_alphas(symmetric_layer_count, surface_start_layer=surface_start_layer)
         positions = flat[None, :, :] + alphas[:, None, None] * (geometry.lattice_nodes_xyz[None, :, :] - flat[None, :, :])
+        base_z = _base_z_by_layer(base_z_by_layer_mm, symmetric_layer_count)
+        positions[:, :, 2] += base_z[:, None]
         offsets = alphas
         final_layer = symmetric_layer_count - 1
         return_layer = final_layer - surface_start_layer
@@ -92,6 +95,7 @@ def embed_lattice_layers(
             "peak_layer_indices": np.flatnonzero(np.isclose(alphas, 1.0)).tolist(),
             "alpha_range": {"min": float(np.min(alphas)), "max": float(np.max(alphas))},
             "alpha_by_layer": alphas.tolist(),
+            "base_z_by_layer_mm": base_z.tolist(),
         }
     else:
         raise ValueError("unsupported layer embedding mode")
@@ -138,6 +142,17 @@ def _offsets(values: np.ndarray | tuple[float, ...] | None) -> np.ndarray:
     if len(np.unique(offsets)) != len(offsets):
         raise ValueError("layer_offsets_mm must not contain duplicate layers")
     return offsets
+
+
+def _base_z_by_layer(values: np.ndarray | tuple[float, ...] | None, layer_count: int) -> np.ndarray:
+    if values is None:
+        return np.zeros(layer_count, dtype=np.float64)
+    base_z = np.asarray(values, dtype=np.float64)
+    if base_z.shape != (layer_count,) or not np.all(np.isfinite(base_z)):
+        raise ValueError("base_z_by_layer_mm must contain one finite Z value for every symmetric layer")
+    if np.any(np.diff(base_z) <= 0.0):
+        raise ValueError("base_z_by_layer_mm must be strictly increasing")
+    return base_z
 
 
 def _symmetric_alphas(layer_count: int, *, surface_start_layer: int = 0) -> np.ndarray:
