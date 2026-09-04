@@ -109,6 +109,13 @@ def test_surface_preview_html_has_an_independent_surface_api_and_controls():
     assert 'id="canvas"' in html
     assert 'id="importStl"' in html
     assert 'id="exportConfig"' in html
+    assert 'id="wall_width_mm"' in html
+    assert 'id="base_cell_size_mm"' in html
+    assert 'id="surface_start_layer"' in html
+    assert 'id="samples_x"' in html
+    assert 'id="samples_y"' in html
+    assert "updateConformalDesignSummary" in html
+    assert "不会写入共形格栅参数" in html
     assert '/api/stl-domain' in html
     assert "canvas.addEventListener('lostpointercapture', endDrag)" in html
 
@@ -149,3 +156,24 @@ def test_exported_surface_config_binds_the_surface_to_the_imported_stl_domain():
     assert config["surface"]["amplitude_mm"] == pytest.approx(1.5)
     assert "progression" not in config
     assert "printability" not in config
+
+
+def test_legacy_surface_export_ignores_conformal_design_inputs():
+    domain = stl_projection_domain_from_bytes(_box_stl_bytes(), file_name="part.stl")
+
+    config = graded_surface_config_payload(
+        {
+            "amplitude_mm": ["1.5"],
+            "wall_width_mm": ["2.0"],
+            "base_cell_size_mm": ["5.0"],
+            "surface_start_layer": ["3"],
+            "samples_x": ["48"],
+            "samples_y": ["48"],
+        },
+        domain,
+    )
+
+    assert config["format"] == "graded_surface_v1"
+    assert config["surface"]["amplitude_mm"] == pytest.approx(1.5)
+    assert "lattice" not in config
+    assert "layer_embedding" not in config

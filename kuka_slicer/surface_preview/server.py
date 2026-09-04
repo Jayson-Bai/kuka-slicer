@@ -293,6 +293,11 @@ def surface_preview_html() -> str:
     .fileInput { margin: 8px 0 0; font-size: 12px; }
     .modelMeta { min-height: 18px; margin: 9px 0 0; color: #526074; font-size: 12px; line-height: 1.5; word-break: break-word; }
     .hint { margin: 12px 0 0; color: #66758b; font-size: 12px; line-height: 1.55; }
+    .designSummary { margin: 10px 0 0; padding: 9px 10px; border: 1px solid #d9e5f4; border-radius: 8px; background: #f5f9fd; color: #40516a; font-size: 12px; line-height: 1.55; }
+    .designSummary.error { border-color: #f0c5c2; background: #fff7f6; color: #a52a21; }
+    details.advanced { margin-top: 12px; color: #40516a; font-size: 13px; }
+    details.advanced summary { cursor: pointer; color: #2e405a; font-weight: 600; }
+    .advancedBody { padding-top: 4px; }
     .preview { overflow: hidden; }
     .previewHead { padding: 18px 18px 0; display: flex; justify-content: space-between; gap: 12px; align-items: start; }
     .stats { display: flex; flex-wrap: wrap; gap: 7px; justify-content: end; }
@@ -313,8 +318,7 @@ def surface_preview_html() -> str:
     </header>
     <section class="workspace">
       <form class="panel controls" id="surfaceForm">
-        <h2>曲面参数</h2>
-        <h2>STL 投影域</h2>
+        <h2>输入模型</h2>
         <label for="stlFile">导入用于最终切片的平面蜂窝 STL</label>
         <input class="fileInput" id="stlFile" type="file" accept=".stl,model/stl,application/sla">
         <div class="field"><label for="build_axis">源构建轴</label><select id="build_axis"><option value="z" selected>Z</option><option value="y">Y</option><option value="x">X</option></select></div>
@@ -329,13 +333,32 @@ def surface_preview_html() -> str:
         <div class="field"><label for="phase_y_rad">Y 相位 φy（rad）</label><input id="phase_y_rad" type="number" step="0.01" value="0"></div>
         <div class="field"><label for="z_reference_mm">Z 基准（mm）</label><input id="z_reference_mm" type="number" step="0.01" value="0"></div>
         <div class="divider"></div>
+        <h2>固定六边形格栅</h2>
+        <div class="field"><label for="wall_width_mm">设计墙宽（mm）</label><input id="wall_width_mm" type="number" min="0.001" step="0.01" value="2"></div>
+        <div class="field"><label for="base_cell_size_mm">目标六边形边长（mm）</label><input id="base_cell_size_mm" type="number" min="0.001" step="0.01" value="5"></div>
+        <p class="hint">设计墙宽用于格栅几何，不等同于实际挤出道宽；目标边长沿承载曲面测量。</p>
+        <div class="designSummary" id="latticeDesignSummary" aria-live="polite"></div>
+        <div class="divider"></div>
+        <h2>对称层间渐变</h2>
+        <div class="field"><label for="surface_start_layer">曲面起始层</label><input id="surface_start_layer" type="number" min="0" step="1" value="3"></div>
+        <p class="hint">沿用旧版语义：起始层本身保持平面，下一层才开始增大曲率。</p>
+        <div class="designSummary" id="layerProgressionSummary" aria-live="polite"></div>
+        <details class="advanced">
+          <summary>高级参数（共形计算）</summary>
+          <div class="advancedBody">
+            <div class="field"><label for="samples_x">曲面采样 X</label><input id="samples_x" type="number" min="2" step="1" value="48"></div>
+            <div class="field"><label for="samples_y">曲面采样 Y</label><input id="samples_y" type="number" min="2" step="1" value="48"></div>
+            <p class="hint">这两个值将在导出共形配置时用于 LSCM 和格栅计算；当前旧版曲面预览仍使用下方独立的显示网格密度。</p>
+          </div>
+        </details>
+        <div class="divider"></div>
         <h2>预览域</h2>
         <div class="field"><label for="width_mm">X 宽度（mm）</label><input id="width_mm" type="number" min="0.001" step="1" value="120"></div>
         <div class="field"><label for="height_mm">Y 高度（mm）</label><input id="height_mm" type="number" min="0.001" step="1" value="100"></div>
-        <div class="field"><label for="samples">网格密度</label><input id="samples" type="number" min="8" max="120" step="1" value="48"></div>
-        <button type="button" id="exportConfig" disabled>导出曲面指导 JSON</button>
+        <div class="field"><label for="samples">显示网格密度</label><input id="samples" type="number" min="8" max="120" step="1" value="48"></div>
+        <button type="button" id="exportConfig" disabled>导出旧版曲面 JSON</button>
         <button type="button" class="secondary" id="reset">恢复示例参数</button>
-        <p class="hint">方程：H(x,y)=A·sin(2πx/λx+φx)·sin(2πy/λy+φy)+Zref</p>
+        <p class="hint">方程：H(x,y)=A·sin(2πx/λx+φx)·sin(2πy/λy+φy)+Zref。当前按钮仍只导出旧版 <code>graded_surface_v1</code>，不会写入共形格栅参数。</p>
       </form>
       <section class="panel preview">
         <div class="previewHead"><h2>三维曲面</h2><div class="stats" id="stats"></div></div>
@@ -347,6 +370,7 @@ def surface_preview_html() -> str:
   </main>
   <script>
     const surfaceIds = ['amplitude_mm', 'wavelength_x_mm', 'wavelength_y_mm', 'phase_x_rad', 'phase_y_rad', 'z_reference_mm', 'width_mm', 'height_mm', 'samples'];
+    const conformalDesignIds = ['wall_width_mm', 'base_cell_size_mm', 'surface_start_layer', 'samples_x', 'samples_y'];
     const canvas = document.getElementById('canvas');
     const statusEl = document.getElementById('status');
     const statsEl = document.getElementById('stats');
@@ -359,6 +383,50 @@ def surface_preview_html() -> str:
     const initialView = { yaw: -42 * Math.PI / 180, pitch: 54 * Math.PI / 180, zoom: 1, panX: 0, panY: 0 };
     const view = { ...initialView };
     let drag = null;
+
+    function positiveNumber(id) {
+      const value = Number(document.getElementById(id).value);
+      return Number.isFinite(value) && value > 0 ? value : null;
+    }
+
+    function nonNegativeInteger(id) {
+      const value = Number(document.getElementById(id).value);
+      return Number.isInteger(value) && value >= 0 ? value : null;
+    }
+
+    function updateConformalDesignSummary() {
+      const wallWidth = positiveNumber('wall_width_mm');
+      const cellSize = positiveNumber('base_cell_size_mm');
+      const latticeSummary = document.getElementById('latticeDesignSummary');
+      if (wallWidth === null || cellSize === null) {
+        latticeSummary.className = 'designSummary error';
+        latticeSummary.textContent = '设计墙宽和目标六边形边长都必须是正数。';
+      } else {
+        const nominalFill = (2 * wallWidth) / (Math.sqrt(3) * cellSize);
+        if (nominalFill >= 1) {
+          latticeSummary.className = 'designSummary error';
+          latticeSummary.textContent = `名义填充率为 ${(nominalFill * 100).toFixed(1)}%，必须小于 100%。请减小墙宽或增大单元边长。`;
+        } else {
+          latticeSummary.className = 'designSummary';
+          latticeSummary.textContent = `名义填充率：${(nominalFill * 100).toFixed(1)}%。实际填充率将在 Gate 6 按生成几何测量。`;
+        }
+      }
+
+      const startLayer = nonNegativeInteger('surface_start_layer');
+      const samplesX = nonNegativeInteger('samples_x');
+      const samplesY = nonNegativeInteger('samples_y');
+      const progressionSummary = document.getElementById('layerProgressionSummary');
+      if (startLayer === null) {
+        progressionSummary.className = 'designSummary error';
+        progressionSummary.textContent = '曲面起始层必须是非负整数。';
+      } else if (samplesX === null || samplesX < 2 || samplesY === null || samplesY < 2) {
+        progressionSummary.className = 'designSummary error';
+        progressionSummary.textContent = '曲面采样 X 和 Y 都必须是不小于 2 的整数。';
+      } else {
+        progressionSummary.className = 'designSummary';
+        progressionSummary.textContent = `曲面起始层：${startLayer}；共形采样：${samplesX} × ${samplesY}。生成共形配置时将结合主切片器的逻辑层数校验镜像回落层。`;
+      }
+    }
 
     function parameters() {
       const query = new URLSearchParams();
@@ -524,6 +592,7 @@ def surface_preview_html() -> str:
     let timer = null;
     function scheduleRefresh() { clearTimeout(timer); timer = setTimeout(refresh, 120); }
     surfaceIds.forEach((id) => document.getElementById(id).addEventListener('input', scheduleRefresh));
+    conformalDesignIds.forEach((id) => document.getElementById(id).addEventListener('input', updateConformalDesignSummary));
     document.getElementById('importStl').addEventListener('click', async () => {
       const input = document.getElementById('stlFile');
       const file = input.files[0];
@@ -577,7 +646,7 @@ def surface_preview_html() -> str:
         link.click();
         URL.revokeObjectURL(link.href);
         statusEl.className = 'status';
-        statusEl.textContent = '已导出曲面指导 JSON；后续曲面映射器将与同一 STL 一起使用它。';
+        statusEl.textContent = '已导出旧版曲面 JSON；后续曲面映射器将与同一 STL 一起使用它。';
       } catch (error) {
         statusEl.className = 'status error';
         statusEl.textContent = error.message;
@@ -630,14 +699,16 @@ def surface_preview_html() -> str:
       render();
     });
     document.getElementById('reset').addEventListener('click', () => {
-      const defaults = { amplitude_mm: 0.8, wavelength_x_mm: 40, wavelength_y_mm: 50, phase_x_rad: 0, phase_y_rad: 0, z_reference_mm: 0, width_mm: 120, height_mm: 100, samples: 48 };
+      const defaults = { amplitude_mm: 0.8, wavelength_x_mm: 40, wavelength_y_mm: 50, phase_x_rad: 0, phase_y_rad: 0, z_reference_mm: 0, wall_width_mm: 2, base_cell_size_mm: 5, surface_start_layer: 3, samples_x: 48, samples_y: 48, width_mm: 120, height_mm: 100, samples: 48 };
       Object.entries(defaults).forEach(([id, value]) => {
         if (domainId && (id === 'width_mm' || id === 'height_mm')) return;
         document.getElementById(id).value = value;
       });
+      updateConformalDesignSummary();
       refresh();
     });
     window.addEventListener('resize', render);
+    updateConformalDesignSummary();
     refresh();
   </script>
 </body>
