@@ -967,6 +967,17 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             except Exception as exc:  # noqa: BLE001
                 self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
+        if parsed.path == "/conformal-slice":
+            try:
+                request_data = self._read_slice_request(parsed.query)
+                job_id = self._start_conformal_slice_job(parsed.query, request_data)
+            except Exception as exc:  # noqa: BLE001
+                self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(
+                {"ok": True, "job_id": job_id, "state": "queued", "progress": 0, "message": "已接收共形蜂窝任务，等待处理"}
+            )
+            return
         if parsed.path != "/slice":
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
             return
@@ -1105,6 +1116,22 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         worker.start()
         return job_id
 
+    def _start_conformal_slice_job(
+        self,
+        query: str,
+        request_data: tuple[dict[str, list[str]], dict[str, tuple[str | None, bytes]]],
+    ) -> str:
+        job_id = uuid4().hex
+        self._update_slice_job(job_id, state="queued", progress=0, message="已接收共形蜂窝任务，等待处理", elapsed_s=0.0)
+        worker = threading.Thread(
+            target=self._run_conformal_slice_job,
+            args=(job_id, query, request_data),
+            daemon=True,
+            name=f"slicer-conformal-{job_id[:8]}",
+        )
+        worker.start()
+        return job_id
+
     def _run_slice_job(
         self,
         job_id: str,
@@ -1151,6 +1178,49 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                 progress=0,
                 message="导出失败",
                 elapsed_s=elapsed_s,
+                error=str(exc),
+            )
+
+    def _run_conformal_slice_job(
+        self,
+        job_id: str,
+        query: str,
+        request_data: tuple[dict[str, list[str]], dict[str, tuple[str | None, bytes]]],
+    ) -> None:
+        started_at = time.perf_counter()
+
+        def update_progress(progress: int, message: str) -> None:
+            self._update_slice_job(
+                job_id,
+                state="running",
+                progress=max(0, min(99, int(progress))),
+                message=message,
+                elapsed_s=time.perf_counter() - started_at,
+            )
+
+        try:
+            with limit_slicer_task() as cpu_limit:
+                result = self._handle_conformal_slice(
+                    query,
+                    request_data=request_data,
+                    progress_callback=update_progress,
+                )
+            result["cpu_limit"] = cpu_limit.to_metadata()
+            self._update_slice_job(
+                job_id,
+                state="complete",
+                progress=100,
+                message="共形蜂窝已生成并送入 Core",
+                elapsed_s=time.perf_counter() - started_at,
+                result=result,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._update_slice_job(
+                job_id,
+                state="error",
+                progress=0,
+                message="共形蜂窝导出失败",
+                elapsed_s=time.perf_counter() - started_at,
                 error=str(exc),
             )
 
@@ -1406,6 +1476,105 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                 )
                 else config.planning_line_width
             ),
+            "core_export_seconds": float(core_stats.get("total_s", 0.0)),
+            "core_rows": int(core_stats.get("rows", 0)),
+            "core_parts": int(core_stats.get("parts", 0)),
+        }
+
+    def _handle_conformal_slice(
+        self,
+        query: str,
+        *,
+        request_data=None,
+        progress_callback=None,
+    ) -> dict[str, object]:
+        """Generate the STL-free rectangular conformal workflow and run Core."""
+
+        params, files = request_data or self._read_slice_request(query)
+
+        def progress(value: int, message: str) -> None:
+            if progress_callback is not None:
+                progress_callback(value, message)
+
+        uploaded = files.get("conformal_spec")
+        if uploaded is None:
+            raise ValueError("请选择共形蜂窝设计 JSON")
+        source_name, source_bytes = uploaded
+        source_filename = _safe_filename(source_name or "conformal_lattice_spec_v1.json")
+        progress(3, "正在校验共形蜂窝设计 JSON")
+        spec = load_conformal_lattice_spec(source_bytes)
+        if not spec.part or not spec.manufacturing:
+            raise ValueError("共形蜂窝路径仅支持矩形实体设计 JSON")
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        job_dir = self.server_output_dir / stamp
+        job_dir.mkdir(parents=True, exist_ok=True)
+        (job_dir / source_filename).write_bytes(source_bytes)
+
+        _ensure_offline_planner_import_paths()
+        process_params_module = importlib.import_module("external_npz_preprocessor.process_params")
+        core_params_input = dict(params)
+        layer_height = float(spec.manufacturing["layer_height_mm"])
+        # The design JSON is the authority for the physical build height and
+        # its layer schedule; prevent an unrelated regular-STL form value from
+        # silently changing conformal extrusion density.
+        core_params_input["core_resin_layer_height"] = [str(layer_height)]
+        core_params = _parse_core_process_params(core_params_input, process_params_module)
+        resin = core_params.resin
+        e_per_mm = float(resin.e_per_mm())
+        if e_per_mm <= 0.0:
+            raise ValueError("当前 Core 树脂 E/mm 必须为正数")
+        bead_area = 2.0 * layer_height * float(resin.extrusion_scale)
+        if bead_area <= 0.0:
+            raise ValueError("当前 Core 树脂挤出倍率必须为正数")
+
+        from .conformal_lattice.path_bridge import ExtrusionVolumeModel
+        from .conformal_lattice.pipeline import run_conformal_lattice_pipeline, write_conformal_lattice_outputs
+
+        progress(12, "正在计算双正弦曲面、共形参数化和蜂窝结构")
+        run = run_conformal_lattice_pipeline(
+            spec,
+            extrusion=ExtrusionVolumeModel(
+                bead_cross_section_area_mm2=bead_area,
+                # This effective volume/E value makes the authoritative
+                # source profile exactly match the selected Core calibration,
+                # including an explicit E/mm override when one is supplied.
+                e_volume_per_unit_mm3=bead_area / e_per_mm,
+                preview_line_width_mm=2.0,
+            ),
+        )
+        progress(55, "正在按一笔画分区生成 External Source NPZ")
+        outputs = write_conformal_lattice_outputs(run, job_dir)
+        source_npz_path = outputs.get("paths")
+        if source_npz_path is None:
+            raise RuntimeError("共形蜂窝路径桥接未生成 External Source NPZ")
+
+        export_runner = importlib.import_module("external_npz_preprocessor.export_runner")
+        core_npz_path = job_dir / "conformal_lattice_core.npz"
+
+        def core_progress(ratio: float) -> None:
+            progress(60 + int(max(0.0, min(1.0, float(ratio))) * 35), "正在执行 path_processing_core 并写出系统 NPZ")
+
+        core_stats = export_runner.convert_external_npz(
+            source_npz_path,
+            core_npz_path,
+            core_params,
+            progress_callback=core_progress,
+            chunk_size=5_000_000,
+        )
+        progress(97, "正在生成主界面三维预览")
+        preview = run.main_preview_payload(planning_line_width_mm=2.0)
+        download_path = _core_output_download_path(core_npz_path)
+        path_count = sum(len(group.paths) for group in run.path_graph.to_external_source_job().material_paths) if run.path_graph else 0
+        return {
+            "download_url": f"/outputs/{quote(stamp)}/{quote(download_path.name)}",
+            "filename": download_path.name,
+            "layers": len(preview["layers"]),
+            "paths": path_count,
+            "preview": preview,
+            "effective_infill_pattern": "共形蜂窝一笔画分区",
+            "infill_pattern_execution": {"applied": False, "mode": "conformal_lattice_macro_partition"},
+            "conformal_lattice": run.report,
             "core_export_seconds": float(core_stats.get("total_s", 0.0)),
             "core_rows": int(core_stats.get("rows", 0)),
             "core_parts": int(core_stats.get("parts", 0)),
@@ -4023,6 +4192,7 @@ def _index_html() -> str:
       <button id="surfacePreviewButton" class="surfaceToolButton" type="button">启动蜂窝网格共形设计器</button>
       <button id="surfaceMapperButton" class="surfaceToolButton" type="button">启动曲面映射器</button>
       <button id="conformalSpecButton" class="surfaceToolButton" type="button">导入共形设计 JSON</button>
+      <button id="conformalSliceButton" class="surfaceToolButton" type="button" disabled>生成共形蜂窝并送入 Core</button>
       <button id="coreNpzPreviewButton" class="surfaceToolButton" type="button">导入 Core NPZ 预览</button>
       <button id="surfaceNpzPreviewButton" class="surfaceToolButton" type="button">导入曲面/共形 NPZ 预览</button>
       <button id="surfaceNpzCollisionButton" class="surfaceToolButton" type="button" disabled>检查当前 NPZ 碰撞</button>
@@ -4776,12 +4946,14 @@ def _index_html() -> str:
     const surfaceNpzPreviewButton = document.getElementById('surfaceNpzPreviewButton');
     const coreNpzPreviewButton = document.getElementById('coreNpzPreviewButton');
     const conformalSpecButton = document.getElementById('conformalSpecButton');
+    const conformalSliceButton = document.getElementById('conformalSliceButton');
     const conformalSpecInput = document.getElementById('conformalSpecInput');
     const conformalSpecResult = document.getElementById('conformalSpecResult');
     const surfaceNpzCollisionButton = document.getElementById('surfaceNpzCollisionButton');
     const surfaceNpzCollisionResult = document.getElementById('surfaceNpzCollisionResult');
     const surfaceNpzInput = document.getElementById('surfaceNpzInput');
     const statusEl = document.getElementById('status');
+    let selectedConformalSpec = null;
     async function launchSurfaceTool(tool) {{
       const toolButton = surfaceToolButtons[tool];
       const originalLabel = toolButton.textContent;
@@ -4892,9 +5064,13 @@ def _index_html() -> str:
         const lattice = summary.lattice;
         conformalSpecResult.className = 'surfaceCollisionResult ok';
         conformalSpecResult.textContent = `已识别共形蜂窝模式：${{part.length_mm}} × ${{part.width_mm}} × ${{part.final_height_mm}} mm，${{part.logical_layer_count}} 层；${{lattice.wall_width_mm}} mm 墙体（${{lattice.wall_bead_count}} 条 2 mm 沉积道），单元边长 ${{lattice.base_cell_size_mm}} mm。`;
+        selectedConformalSpec = file;
+        conformalSliceButton.disabled = false;
         statusEl.className = 'status ok';
-        statusEl.textContent = '共形设计已载入。路径一笔画分区完成后，该文件将直接生成 External Source NPZ 并送入 Core。';
+        statusEl.textContent = '共形设计已载入。可直接生成一笔画分区路径，并写入 Core NPZ。';
       }} catch (error) {{
+        selectedConformalSpec = null;
+        conformalSliceButton.disabled = true;
         conformalSpecResult.className = 'surfaceCollisionResult error';
         conformalSpecResult.textContent = '共形设计 JSON 无法使用：' + error.message;
         statusEl.className = 'status error';
@@ -4908,6 +5084,78 @@ def _index_html() -> str:
     conformalSpecButton.addEventListener('click', () => conformalSpecInput.click());
     conformalSpecInput.addEventListener('change', async () => {{
       await inspectConformalSpec(conformalSpecInput.files?.[0]);
+    }});
+    function appendCurrentCoreSettings(formData) {{
+      const coreFieldIds = [
+        'coreResinLayerHeight', 'coreResinExtrusionScale', 'coreResinFeed',
+        'coreResinFirstLayerFeed', 'coreResinTemp', 'coreResinPrimeLength',
+        'coreResinPrimeSpeed', 'coreResinRetractLength', 'coreResinRetractSpeed',
+        'coreResinEOverride', 'coreFiberLayerHeight', 'coreFiberExtrusionScale',
+        'coreFiberFeed', 'coreFiberFirstLayerFeed', 'coreFiberTemp',
+        'coreFiberPrimeLength', 'coreFiberPrimeSpeed', 'coreFiberRetractLength',
+        'coreFiberRetractSpeed', 'coreFiberStartAccel', 'coreTravelFeed',
+        'coreFirstLayerTravelFeed', 'corePrimeSettle', 'coreDefaultA',
+        'coreDefaultB', 'coreDefaultC', 'corePrimelineX', 'corePrimelineY',
+        'corePrimelineLength', 'coreDt', 'coreCornerAngle',
+        'coreCornerRetreatRatio', 'coreSplineMaxError', 'coreSplineMaxAngle',
+        'coreSourceMergeDistance', 'coreCornerRetreatMax', 'coreCornerBlendSegments',
+        'coreDensity', 'coreDegree', 'coreMaxFitPoints', 'coreFiberOffsetX',
+        'coreFiberOffsetY', 'coreFiberOffsetZ', 'coreResinZComp',
+        'coreToolSafeLift', 'coreCutLift', 'coreCutWait', 'coreFiberRetractOverride',
+        'coreInitialTool'
+      ];
+      for (const id of coreFieldIds) {{
+        const input = document.getElementById(id);
+        const name = 'core_' + id.slice(4).replace(/[A-Z]/g, m => '_' + m.toLowerCase());
+        formData.append(name, input.value);
+      }}
+      formData.append('core_primeline_enabled', corePrimelineEnabledInput.checked ? 'true' : 'false');
+      for (const [id, name] of [
+        ['coreEnableExtrudeWait', 'core_enable_extrude_wait'],
+        ['coreTravelExtrudeOverlap', 'core_enable_travel_extrude_overlap'],
+        ['coreCutAbsoluteE', 'core_external_npz_cut_absolute_e']
+      ]) {{
+        formData.append(name, document.getElementById(id).checked ? 'true' : 'false');
+      }}
+    }}
+    conformalSliceButton.addEventListener('click', async () => {{
+      if (!selectedConformalSpec) return;
+      const originalLabel = conformalSliceButton.textContent;
+      conformalSliceButton.disabled = true;
+      conformalSliceButton.textContent = '处理中…';
+      statusEl.className = 'status';
+      statusEl.textContent = '正在生成共形蜂窝并送入 Core…';
+      downloadEl.className = 'download';
+      updateExportProgress({{ progress: 0, message: '正在提交共形蜂窝任务', elapsed_s: 0 }});
+      try {{
+        const formData = new FormData();
+        formData.append('conformal_spec', selectedConformalSpec, selectedConformalSpec.name);
+        appendCurrentCoreSettings(formData);
+        const response = await fetch('/conformal-slice', {{ method: 'POST', body: formData }});
+        const queued = await response.json();
+        if (!response.ok || !queued.ok) throw new Error(queued.error || '共形蜂窝任务提交失败');
+        const result = await waitForSliceJob(queued.job_id);
+        layersEl.textContent = result.layers;
+        outputNameEl.textContent = result.filename;
+        executedInfillPatternEl.textContent = '共形蜂窝一笔画分区';
+        previewData = result.preview;
+        updatePreviewLineWidthValue();
+        configureViewer();
+        drawPreview();
+        downloadEl.href = result.download_url;
+        downloadEl.textContent = '下载 ' + result.filename;
+        downloadEl.className = 'download visible';
+        statusEl.className = 'status ok';
+        statusEl.textContent = '完成：共形蜂窝路径已按图分区规划，并已生成 Core NPZ。';
+        const coreSeconds = Number(result.core_export_seconds);
+        if (Number.isFinite(coreSeconds)) exportElapsedEl.textContent = 'core 最终 NPZ 处理耗时 ' + coreSeconds.toFixed(1) + ' 秒';
+      }} catch (error) {{
+        statusEl.className = 'status error';
+        statusEl.textContent = error.message;
+      }} finally {{
+        conformalSliceButton.disabled = selectedConformalSpec === null;
+        conformalSliceButton.textContent = originalLabel;
+      }}
     }});
     coreNpzPreviewButton.addEventListener('click', async () => {{
       const originalLabel = coreNpzPreviewButton.textContent;

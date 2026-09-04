@@ -2,6 +2,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import importlib
 import inspect
+import json
 import zipfile
 
 import numpy as np
@@ -23,6 +24,41 @@ from kuka_slicer.ui_server import (
     merge_fiber_paths_into_job,
 )
 from kuka_slicer.external_npz import ExternalSourceJob, MaterialPaths
+from kuka_slicer.surface_preview.server import conformal_lattice_config_payload
+
+
+def test_conformal_design_json_generates_external_source_and_core_output(tmp_path: Path):
+    config = conformal_lattice_config_payload(
+        {
+            "part_length_mm": ["10"],
+            "part_width_mm": ["8"],
+            "part_height_mm": ["1"],
+            "layer_height_mm": ["0.5"],
+            "wall_width_mm": ["2"],
+            "base_cell_size_mm": ["3"],
+            "surface_start_layer": ["0"],
+            "samples_x": ["8"],
+            "samples_y": ["8"],
+        }
+    )
+    handler = object.__new__(_SlicerUiHandler)
+    handler.server_output_dir = tmp_path
+    progress: list[int] = []
+
+    result = handler._handle_conformal_slice(
+        "",
+        request_data=(
+            {},
+            {"conformal_spec": ("small_design.json", json.dumps(config).encode("utf-8"))},
+        ),
+        progress_callback=lambda value, _message: progress.append(value),
+    )
+
+    assert result["layers"] == 2
+    assert result["effective_infill_pattern"] == "共形蜂窝一笔画分区"
+    assert result["preview"]["preview_source"] == "conformal_lattice_external_source_job"
+    assert (tmp_path / result["download_url"].split("/")[-2] / "external_layer_paths_v1.npz").is_file()
+    assert progress[-1] == 97
 
 
 def test_core_download_keeps_single_part_npz_as_npz(tmp_path: Path):

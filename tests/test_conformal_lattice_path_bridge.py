@@ -30,7 +30,7 @@ def test_path_bridge_uses_stable_structure_ids_and_actual_3d_edge_lengths():
         graph.cumulative_extrusion_e[..., 1],
         graph.edge_length_mm * 0.24 / 0.08,
     )
-    assert graph.metadata["quality"]["all_edge_paths_are_two_points"] is True
+    assert graph.metadata["quality"]["all_structural_edges_are_two_points"] is True
     assert graph.metadata["solver_seed"] == 0
     assert graph.report["legacy_surface_mapper_used"] is False
     assert graph.report["legacy_honeycomb_pathing_used"] is False
@@ -50,14 +50,15 @@ def test_path_bridge_exports_existing_npz_contract_with_edge_path_provenance(tmp
 
     with np.load(output, allow_pickle=False) as archive:
         assert {"meta", "layer_0000_R", "layer_0000_R_E", "layer_0000_F", "layer_0000_T", "layer_0001_R", "layer_0001_R_E", "layer_0001_F", "layer_0001_T"} <= set(archive.files)
-        assert archive["layer_0000_R"].shape == (len(graph.edge_ids), 2, 3)
-        np.testing.assert_allclose(archive["layer_0000_R_E"][:, 0], 0.0)
-        np.testing.assert_allclose(archive["layer_0000_R_E"][:, 1], graph.cumulative_extrusion_e[0, :, 1])
+        assert archive["layer_0000_R"].ndim == 3
+        assert archive["layer_0000_R"].shape[0] < len(graph.edge_ids)
+        assert archive["layer_0000_R_E"].shape[:2] == archive["layer_0000_R"].shape[:2]
+        assert np.any(np.isclose(np.diff(archive["layer_0000_R_E"], axis=1), 0.0))
         metadata = json.loads(str(archive["meta"]))
     assert metadata["format"] == "external_layer_paths_v1"
     bridge = metadata["conformal_lattice_path_bridge"]
     assert bridge["edge_ids_by_layer"]["0"] == graph.edge_ids.tolist()
-    assert bridge["trail_partition_status"].startswith("not_planned")
+    assert bridge["trail_partition_status"] == "planned_from_conformal_structural_graph"
     assert bridge["core_handoff"].endswith("final XYZABC")
     assert metadata["extrusion_compensation"]["requires_xy_preservation"] is False
 
@@ -79,3 +80,20 @@ def test_path_bridge_keeps_the_optional_process_preview_width_in_external_npz_me
 
     job = graph.to_external_source_job()
     assert job.meta["slicing"]["resolved_config"]["line_width"] == pytest.approx(0.62)
+
+
+def test_path_bridge_expands_a_4mm_wall_into_two_2mm_bead_lanes():
+    domain, parameterization, fields, orientation, phase = _inputs()
+    geometry = generate_conformal_lattice_geometry(domain, parameterization, fields, orientation, phase, boundary_mode="inset")
+    graph = build_conformal_lattice_path_graph(
+        geometry,
+        ExtrusionVolumeModel(bead_cross_section_area_mm2=0.2, e_volume_per_unit_mm3=0.1),
+        wall_bead_count=2,
+        nominal_bead_width_mm=2.0,
+    )
+
+    job = graph.to_external_source_job()
+    bridge = job.meta["conformal_lattice_path_bridge"]
+    assert bridge["wall_bead_lanes"] == 2
+    assert bridge["trail_partition"]["bead_lane_offsets_mm"] == [-1.0, 1.0]
+    assert len(job.material_paths[0].paths) == bridge["trail_partition"]["macro_partition_count"] * 2

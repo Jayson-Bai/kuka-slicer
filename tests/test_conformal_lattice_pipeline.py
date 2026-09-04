@@ -94,7 +94,7 @@ def test_pipeline_runs_gates_one_to_eight_and_only_enables_paths_with_an_explici
     assert main_preview["line_widths"]["resin"] == pytest.approx(0.6)
     assert main_preview["conformal_lattice"]["uses_existing_main_canvas"] is True
     assert len(main_preview["layers"]) == 4
-    assert all(len(layer["resin_paths"]) == len(run.path_graph.edge_ids) for layer in main_preview["layers"])
+    assert all(0 < len(layer["resin_paths"]) < len(run.path_graph.edge_ids) for layer in main_preview["layers"])
 
     outputs = write_conformal_lattice_outputs(run, tmp_path)
     assert set(outputs) == {"geometry", "paths"}
@@ -103,7 +103,7 @@ def test_pipeline_runs_gates_one_to_eight_and_only_enables_paths_with_an_explici
     with np.load(outputs["paths"], allow_pickle=False) as archive:
         metadata = json.loads(str(archive["meta"]))
     assert metadata["format"] == "external_layer_paths_v1"
-    assert metadata["conformal_lattice_path_bridge"]["trail_partition_status"].startswith("not_planned")
+    assert metadata["conformal_lattice_path_bridge"]["trail_partition_status"] == "planned_from_conformal_structural_graph"
     from kuka_slicer.ui_server import _preview_payload_from_source_npz
 
     loaded_preview = _preview_payload_from_source_npz(outputs["paths"].read_bytes(), outputs["paths"].name)

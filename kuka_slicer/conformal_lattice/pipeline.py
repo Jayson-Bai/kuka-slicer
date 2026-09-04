@@ -142,6 +142,9 @@ def run_conformal_lattice_pipeline(
         geometry,
         extrusion,
         layer_embedding=layer_embedding,
+        node_normals_xyz=_lattice_node_normals(domain, orientation, geometry),
+        wall_bead_count=int(spec.lattice.get("wall_bead_count", 1)),
+        nominal_bead_width_mm=float(spec.manufacturing.get("nominal_bead_width_mm", 2.0)),
         config_metadata=spec.metadata(),
     )
     return ConformalLatticeRun(
@@ -228,6 +231,23 @@ def _symmetric_layer_embedding(
         flat_reference_nodes_xyz=flat,
         base_z_by_layer_mm=base_z_by_layer,
     )
+
+
+def _lattice_node_normals(
+    domain: SurfaceMeshDomain,
+    orientation: OrientationField,
+    geometry: ConformalLatticeGeometry,
+) -> np.ndarray:
+    normals = np.empty_like(geometry.lattice_nodes_xyz, dtype=np.float64)
+    for index, (face_id, barycentric) in enumerate(
+        zip(geometry.source_triangle_id_per_node, geometry.barycentric_weights_per_node)
+    ):
+        normal = barycentric @ orientation.vertex_normals_xyz[domain.faces[face_id]]
+        length = float(np.linalg.norm(normal))
+        if length <= 1e-12:
+            raise ValueError("conformal lattice node has an undefined surface normal")
+        normals[index] = normal / length
+    return normals
 
 
 def _physical_layer_schedule(spec: ConformalLatticeSpec, requested_count: int | None) -> tuple[int, np.ndarray]:

@@ -4698,7 +4698,9 @@ def test_main_ui_recognizes_rectangular_conformal_design_json_before_slicing():
     html = _index_html()
     assert 'id="conformalSpecButton"' in html
     assert 'id="conformalSpecInput"' in html
+    assert 'id="conformalSliceButton"' in html
     assert "fetch('/inspect-conformal-spec'" in html
+    assert "fetch('/conformal-slice'" in html
 
 
 def test_surface_npz_picker_directory_is_persisted_in_local_ui_state(tmp_path):
