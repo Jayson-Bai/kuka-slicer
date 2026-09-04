@@ -54,6 +54,7 @@ class PhaseCoordinates:
     q_per_face: np.ndarray
     grad_phi_p_per_face: np.ndarray
     grad_phi_q_per_face: np.ndarray
+    physical_cell_size_mm_per_vertex: np.ndarray
     conformal_length_scale_per_vertex: np.ndarray
     cell_size_uv_per_vertex: np.ndarray
     phase_anchor: PhaseAnchor
@@ -78,6 +79,7 @@ def solve_phase_coordinates(
     orientation: OrientationField,
     *,
     phase_anchor: PhaseAnchor | None = None,
+    cell_size_mm_override: np.ndarray | None = None,
     solver_tolerance: float = 1e-10,
 ) -> PhaseCoordinates:
     """Fit two scalar phase fields to the requested UV target gradients.
@@ -89,11 +91,16 @@ def solve_phase_coordinates(
     errors because no later reverse map may be attempted from such a result.
     """
 
-    _validate_inputs(domain, parameterization, design_fields, orientation, solver_tolerance)
+    _validate_inputs(domain, parameterization, design_fields, orientation, cell_size_mm_override, solver_tolerance)
     anchor = _phase_anchor(phase_anchor, len(domain.vertices))
     gradients, uv_areas = _triangle_gradient_operator(parameterization.uv, domain.faces)
     scale = _conformal_length_scale_at_vertices(domain, parameterization)
-    cell_size_uv = np.asarray(design_fields.target_cell_size_mm, dtype=np.float64) / scale
+    physical_cell_size = (
+        np.asarray(design_fields.target_cell_size_mm, dtype=np.float64)
+        if cell_size_mm_override is None
+        else np.asarray(cell_size_mm_override, dtype=np.float64)
+    )
+    cell_size_uv = physical_cell_size / scale
     p, q = _target_phase_gradients(domain, parameterization.uv, orientation, cell_size_uv)
     phi_p, p_diagnostics = _solve_weighted_phase(gradients, domain.faces, len(domain.vertices), uv_areas, p, anchor.vertex, anchor.phi_p, solver_tolerance)
     phi_q, q_diagnostics = _solve_weighted_phase(gradients, domain.faces, len(domain.vertices), uv_areas, q, anchor.vertex, anchor.phi_q, solver_tolerance)
@@ -108,6 +115,7 @@ def solve_phase_coordinates(
         q_per_face=_readonly(q),
         grad_phi_p_per_face=_readonly(grad_phi_p),
         grad_phi_q_per_face=_readonly(grad_phi_q),
+        physical_cell_size_mm_per_vertex=_readonly(physical_cell_size),
         conformal_length_scale_per_vertex=_readonly(scale),
         cell_size_uv_per_vertex=_readonly(cell_size_uv),
         phase_anchor=anchor,
@@ -115,6 +123,7 @@ def solve_phase_coordinates(
             "backend": "scipy.sparse.linalg.lsmr",
             "scipy_version": scipy_version,
             "tolerance": float(solver_tolerance),
+            "physical_cell_size_source": "design_field" if cell_size_mm_override is None else "gate_6_override",
             "p_stop_code": p_diagnostics[0],
             "p_iterations": p_diagnostics[1],
             "p_residual_norm": p_diagnostics[2],
@@ -201,6 +210,7 @@ def _validate_inputs(
     parameterization: LSCMParameterization,
     design_fields: DesignFieldResult,
     orientation: OrientationField,
+    cell_size_mm_override: np.ndarray | None,
     solver_tolerance: float,
 ) -> None:
     count = len(domain.vertices)
@@ -210,6 +220,10 @@ def _validate_inputs(
         raise ValueError("phase coordinates require a valid Gate 2 UV parameterization")
     if design_fields.target_cell_size_mm.shape != (count,) or np.any(design_fields.target_cell_size_mm <= 0.0):
         raise ValueError("design field must provide one positive physical cell size per vertex")
+    if cell_size_mm_override is not None:
+        override = np.asarray(cell_size_mm_override, dtype=np.float64)
+        if override.shape != (count,) or not np.all(np.isfinite(override)) or np.any(override <= 0.0):
+            raise ValueError("cell_size_mm_override must be a finite positive per-vertex array")
     if orientation.tangent_vectors_xyz.shape != (count, 3):
         raise ValueError("orientation field must belong to the supplied domain")
     if not math.isfinite(solver_tolerance) or not 0.0 < solver_tolerance < 1.0:

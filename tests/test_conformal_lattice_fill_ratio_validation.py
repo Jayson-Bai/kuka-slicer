@@ -4,7 +4,12 @@ import json
 
 import numpy as np
 
-from kuka_slicer.conformal_lattice import generate_conformal_lattice_geometry, solve_phase_coordinates, validate_realized_fill_ratio
+from kuka_slicer.conformal_lattice import (
+    derive_fill_ratio_cell_size_override,
+    generate_conformal_lattice_geometry,
+    solve_phase_coordinates,
+    validate_realized_fill_ratio,
+)
 from tests.test_conformal_lattice_lattice_generator import _inputs
 from tests.test_conformal_lattice_phase_coordinates import _inputs as _variable_inputs
 
@@ -52,3 +57,29 @@ def test_variable_target_field_is_measured_as_a_per_cell_window_average():
     measured_targets = validation.target_fill_ratio_per_cell[validation.evaluation_mask]
     assert np.ptp(measured_targets) > 0.1
     assert fields.target_fill_ratio.min() <= measured_targets.min() <= measured_targets.max() <= fields.target_fill_ratio.max()
+
+
+def test_measured_correction_is_explicitly_projected_then_consumed_by_a_new_phase_solve():
+    domain, parameterization, fields, orientation, phase = _inputs()
+    geometry = generate_conformal_lattice_geometry(domain, parameterization, fields, orientation, phase, boundary_mode="inset")
+    validation = validate_realized_fill_ratio(domain, parameterization, fields, phase, geometry, samples_per_triangle_side=6)
+    correction = derive_fill_ratio_cell_size_override(domain, fields, phase, geometry, validation)
+    corrected_phase = solve_phase_coordinates(
+        domain,
+        parameterization,
+        fields,
+        orientation,
+        cell_size_mm_override=correction.cell_size_mm_override_per_vertex,
+    )
+
+    assert correction.report["projected_cell_count"] > 0
+    assert np.all(correction.cell_size_mm_override_per_vertex >= fields.target_cell_size_mm)
+    np.testing.assert_allclose(corrected_phase.physical_cell_size_mm_per_vertex, correction.cell_size_mm_override_per_vertex)
+    assert corrected_phase.solver["physical_cell_size_source"] == "gate_6_override"
+    corrected_geometry = generate_conformal_lattice_geometry(
+        domain, parameterization, fields, orientation, corrected_phase, boundary_mode="inset"
+    )
+    corrected_validation = validate_realized_fill_ratio(
+        domain, parameterization, fields, corrected_phase, corrected_geometry, samples_per_triangle_side=6
+    )
+    assert corrected_validation.report["mae"] < validation.report["mae"]

@@ -7,6 +7,7 @@ import math
 
 import numpy as np
 
+from .inverse_mapping import locate_phase_point
 from .lattice_generator import ConformalLatticeGeometry
 from .mesh_domain import SurfaceMeshDomain
 from .parameterization import LSCMParameterization
@@ -38,6 +39,15 @@ class FillRatioValidation:
             "suggested_cell_scale_factor_per_cell": self.suggested_cell_scale_factor_per_cell.tolist(),
             "report": self.report,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class CellScaleCorrection:
+    """Explicit per-vertex physical cell-size override for the next iteration."""
+
+    scale_factor_per_vertex: np.ndarray
+    cell_size_mm_override_per_vertex: np.ndarray
+    report: dict[str, object]
 
 
 def validate_realized_fill_ratio(
@@ -105,6 +115,57 @@ def validate_realized_fill_ratio(
         evaluation_mask=_readonly(valid),
         suggested_cell_scale_factor_per_cell=_readonly(correction),
         report=report,
+    )
+
+
+def derive_fill_ratio_cell_size_override(
+    domain: SurfaceMeshDomain,
+    design_fields: DesignFieldResult,
+    phase: PhaseCoordinates,
+    geometry: ConformalLatticeGeometry,
+    validation: FillRatioValidation,
+) -> CellScaleCorrection:
+    """Project measured cell corrections to vertices for an explicit rerun.
+
+    This function does not mutate a design field or a lattice.  Pass the
+    returned override to ``solve_phase_coordinates(...,
+    cell_size_mm_override=...)`` and then regenerate/validate the lattice.
+    """
+
+    count = len(domain.vertices)
+    if design_fields.target_cell_size_mm.shape != (count,) or phase.phi_p.shape != (count,):
+        raise ValueError("domain, design fields, and phase data must share vertices")
+    if len(validation.suggested_cell_scale_factor_per_cell) != len(geometry.cell_valence):
+        raise ValueError("validation correction count must equal geometry cell count")
+    phase_vertices = np.column_stack((phase.phi_p, phase.phi_q))
+    weighted_factor = np.zeros(count, dtype=np.float64)
+    weights = np.zeros(count, dtype=np.float64)
+    used_cells = 0
+    for cell_id, factor in enumerate(validation.suggested_cell_scale_factor_per_cell):
+        if not validation.evaluation_mask[cell_id] or not math.isfinite(float(factor)):
+            continue
+        parent = int(geometry.cell_parent_id[cell_id])
+        center = geometry.triangular_lattice_points_phase[parent]
+        face_id, barycentric = locate_phase_point(center, phase_vertices, domain.faces)
+        if face_id is None or barycentric is None:
+            continue
+        weight = float(validation.cell_surface_area_mm2[cell_id])
+        face = domain.faces[face_id]
+        weighted_factor[face] += weight * barycentric * float(factor)
+        weights[face] += weight * barycentric
+        used_cells += 1
+    factor_per_vertex = np.divide(weighted_factor, weights, out=np.ones(count, dtype=np.float64), where=weights > _EPSILON)
+    override = design_fields.target_cell_size_mm * factor_per_vertex
+    return CellScaleCorrection(
+        scale_factor_per_vertex=_readonly(factor_per_vertex),
+        cell_size_mm_override_per_vertex=_readonly(override),
+        report={
+            "source": "gate_6_measured_wall_coverage",
+            "projected_cell_count": used_cells,
+            "unobserved_vertex_count": int(np.count_nonzero(weights <= _EPSILON)),
+            "scale_factor_range": {"min": float(np.min(factor_per_vertex)), "max": float(np.max(factor_per_vertex))},
+            "application": "pass cell_size_mm_override to an explicit Gate 4 rerun; this object does not mutate prior outputs",
+        },
     )
 
 

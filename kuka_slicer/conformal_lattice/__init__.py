@@ -22,7 +22,7 @@ from .parameterization import (
 )
 from .orientation_field import OrientationField, build_orientation_field
 from .lattice_generator import ConformalLatticeGeometry, generate_conformal_lattice_geometry
-from .fill_ratio_validation import FillRatioValidation, validate_realized_fill_ratio
+from .fill_ratio_validation import CellScaleCorrection, FillRatioValidation, derive_fill_ratio_cell_size_override, validate_realized_fill_ratio
 from .phase_coordinates import (
     PhaseAnchor,
     PhaseCoordinates,
@@ -44,6 +44,7 @@ from .scalar_fields import (
 
 __all__ = [
     "ConformalLatticeSpec",
+    "CellScaleCorrection",
     "ConformalLatticeGeometry",
     "ConformalQuality",
     "DesignFieldResult",
@@ -62,6 +63,7 @@ __all__ = [
     "constant_driver",
     "curvature_driver",
     "cut_mesh_along_edges",
+    "derive_fill_ratio_cell_size_override",
     "evaluate_conformal_quality",
     "evaluate_phase_quality",
     "external_scalar_driver",
