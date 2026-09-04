@@ -8,6 +8,7 @@ import pytest
 
 from kuka_slicer.surface_preview.model import DoubleSineSurface
 from kuka_slicer.surface_preview.server import (
+    conformal_lattice_config_payload,
     graded_surface_config_payload,
     surface_payload,
     surface_preview_html,
@@ -109,6 +110,7 @@ def test_surface_preview_html_has_an_independent_surface_api_and_controls():
     assert 'id="canvas"' in html
     assert 'id="importStl"' in html
     assert 'id="exportConfig"' in html
+    assert 'id="exportConformalConfig"' in html
     assert 'id="wall_width_mm"' in html
     assert 'id="base_cell_size_mm"' in html
     assert 'id="surface_start_layer"' in html
@@ -117,6 +119,7 @@ def test_surface_preview_html_has_an_independent_surface_api_and_controls():
     assert "updateConformalDesignSummary" in html
     assert "不会写入共形格栅参数" in html
     assert '/api/stl-domain' in html
+    assert '/api/export-conformal-lattice-config' in html
     assert "canvas.addEventListener('lostpointercapture', endDrag)" in html
 
 
@@ -177,3 +180,51 @@ def test_legacy_surface_export_ignores_conformal_design_inputs():
     assert config["surface"]["amplitude_mm"] == pytest.approx(1.5)
     assert "lattice" not in config
     assert "layer_embedding" not in config
+
+
+def test_conformal_lattice_export_binds_double_sine_to_the_stl_outer_domain():
+    domain = stl_projection_domain_from_bytes(_box_stl_bytes(), file_name="honeycomb.stl")
+
+    config = conformal_lattice_config_payload(
+        {
+            "amplitude_mm": ["1.5"],
+            "wavelength_x_mm": ["30"],
+            "wavelength_y_mm": ["40"],
+            "wall_width_mm": ["1.0"],
+            "base_cell_size_mm": ["5.0"],
+            "surface_start_layer": ["3"],
+            "samples_x": ["31"],
+            "samples_y": ["29"],
+            "samples": ["8"],
+        },
+        domain,
+    )
+
+    assert config["format"] == "conformal_lattice_spec_v1"
+    source = config["source_surface"]
+    assert source["provider"] == "double_sine"
+    assert source["domain"] == "outer_boundary_only"
+    assert source["reference_stl"]["file_name"] == "honeycomb.stl"
+    assert source["reference_stl"]["sha256"] == domain.sha256
+    assert source["double_sine"]["xy_bounds_mm"] == [0.0, 0.0, 10.0, 8.0]
+    assert source["double_sine"]["samples"] == [31, 29]
+    assert config["lattice"]["wall_width_mm"] == pytest.approx(1.0)
+    assert config["lattice"]["base_cell_size_mm"] == pytest.approx(5.0)
+    assert config["fill_field"] == {"mode": "fixed_cell_size", "drivers": []}
+    assert config["layer_embedding"]["surface_start_layer"] == 3
+
+
+@pytest.mark.parametrize(
+    ("params", "error"),
+    [
+        ({"wall_width_mm": ["5"], "base_cell_size_mm": ["5"]}, "nominal fill ratio"),
+        ({"surface_start_layer": ["-1"]}, "surface_start_layer"),
+        ({"samples_x": ["1"]}, "samples_x"),
+        ({"samples_y": ["513"]}, "samples_y"),
+    ],
+)
+def test_conformal_lattice_export_rejects_invalid_design_inputs(params, error):
+    domain = stl_projection_domain_from_bytes(_box_stl_bytes(), file_name="honeycomb.stl")
+
+    with pytest.raises(ValueError, match=error):
+        conformal_lattice_config_payload(params, domain)

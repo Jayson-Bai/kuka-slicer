@@ -9,6 +9,11 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
+from ..conformal_lattice.contracts import (
+    CONFORMAL_LATTICE_SPEC_V1,
+    double_sine_source_sha256,
+    load_conformal_lattice_spec,
+)
 from .model import DoubleSineSurface
 from .stl_domain import STLProjectionDomain, stl_projection_domain_from_bytes
 
@@ -17,6 +22,7 @@ DEFAULT_PREVIEW_WIDTH_MM = 120.0
 DEFAULT_PREVIEW_HEIGHT_MM = 100.0
 DEFAULT_PREVIEW_SAMPLES = 48
 MAX_PREVIEW_SAMPLES = 120
+MAX_CONFORMAL_SAMPLES = 512
 MAX_STL_BYTES = 64 * 1024 * 1024
 
 
@@ -48,6 +54,20 @@ def _query_samples(params: dict[str, list[str]]) -> int:
     if not 8 <= samples <= MAX_PREVIEW_SAMPLES:
         raise ValueError(f"samples must be in the range [8, {MAX_PREVIEW_SAMPLES}]")
     return samples
+
+
+def _query_nonnegative_int(
+    params: dict[str, list[str]], name: str, default: int, *, minimum: int = 0, maximum: int | None = None
+) -> int:
+    raw = params.get(name, [str(default)])[0]
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if value < minimum or (maximum is not None and value > maximum):
+        upper = f", {maximum}" if maximum is not None else ""
+        raise ValueError(f"{name} must be in the range [{minimum}{upper}]")
+    return value
 
 
 def surface_payload(
@@ -136,6 +156,75 @@ def graded_surface_config_payload(
     }
 
 
+def conformal_lattice_config_payload(
+    params: dict[str, list[str]], domain: STLProjectionDomain
+) -> dict[str, object]:
+    """Build and validate a new conformal-lattice config without touching legacy export."""
+
+    surface = surface_payload(params, domain, include_projection_geometry=False)["surface"]
+    wall_width_mm = _query_float(params, "wall_width_mm", 2.0, positive=True)
+    base_cell_size_mm = _query_float(params, "base_cell_size_mm", 5.0, positive=True)
+    nominal_fill = (2.0 * wall_width_mm) / (math.sqrt(3.0) * base_cell_size_mm)
+    if nominal_fill >= 1.0:
+        raise ValueError(
+            "wall_width_mm and base_cell_size_mm produce a nominal fill ratio of at least 1; "
+            "reduce wall_width_mm or increase base_cell_size_mm"
+        )
+    surface_start_layer = _query_nonnegative_int(params, "surface_start_layer", 3)
+    samples_x = _query_nonnegative_int(
+        params, "samples_x", DEFAULT_PREVIEW_SAMPLES, minimum=2, maximum=MAX_CONFORMAL_SAMPLES
+    )
+    samples_y = _query_nonnegative_int(
+        params, "samples_y", DEFAULT_PREVIEW_SAMPLES, minimum=2, maximum=MAX_CONFORMAL_SAMPLES
+    )
+    projection = domain.preview_payload(include_polygons=False)
+    source_surface: dict[str, object] = {
+        "provider": "double_sine",
+        "source_file": "generated://double-sine",
+        "domain": "outer_boundary_only",
+        "reference_stl": {
+            "file_name": projection["file_name"],
+            "sha256": projection["sha256"],
+            "build_axis": projection["build_axis"],
+            "xy_bounds_mm": projection["source_xy_bounds_mm"],
+        },
+        "double_sine": {
+            **surface,
+            "xy_bounds_mm": [0.0, 0.0, domain.width_mm, domain.height_mm],
+            "samples": [samples_x, samples_y],
+        },
+    }
+    source_surface["sha256"] = double_sine_source_sha256(source_surface)
+    config: dict[str, object] = {
+        "format": CONFORMAL_LATTICE_SPEC_V1,
+        "units": "mm",
+        "source_surface": source_surface,
+        "parameterization": {
+            "method": "lscm",
+            "anchor_strategy": "farthest_boundary_pair",
+            "seam_strategy": "none",
+        },
+        "lattice": {
+            "family": "triangular_dual_hex",
+            "wall_width_mm": wall_width_mm,
+            "base_cell_size_mm": base_cell_size_mm,
+            "boundary_mode": "clip",
+            "phase_origin": [0.0, 0.0],
+        },
+        "fill_field": {"mode": "fixed_cell_size", "drivers": []},
+        "orientation_field": {"mode": "global_axis", "angle_deg": 0.0, "constraints": []},
+        "layer_embedding": {
+            "mode": "symmetric_shape_morphing",
+            "transition": "smoothstep",
+            "surface_start_layer": surface_start_layer,
+        },
+        "quality_limits": {},
+        "random_seed": 0,
+    }
+    load_conformal_lattice_spec(config)
+    return config
+
+
 def run_surface_preview_server(host: str, port: int) -> None:
     """Start the independent local surface-preview server."""
 
@@ -183,6 +272,20 @@ class SurfacePreviewHandler(BaseHTTPRequestHandler):
             self._send_json(
                 config,
                 attachment_name="graded_surface_v1.json",
+            )
+            return
+        if parsed.path == "/api/export-conformal-lattice-config":
+            try:
+                params = parse_qs(parsed.query)
+                config = conformal_lattice_config_payload(
+                    params, self._domain_from_params(params, required=True)
+                )
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(
+                config,
+                attachment_name="conformal_lattice_spec_v1.json",
             )
             return
         self.send_error(HTTPStatus.NOT_FOUND, "Not found")
@@ -346,8 +449,8 @@ def surface_preview_html() -> str:
         <details class="advanced">
           <summary>高级参数（共形计算）</summary>
           <div class="advancedBody">
-            <div class="field"><label for="samples_x">曲面采样 X</label><input id="samples_x" type="number" min="2" step="1" value="48"></div>
-            <div class="field"><label for="samples_y">曲面采样 Y</label><input id="samples_y" type="number" min="2" step="1" value="48"></div>
+            <div class="field"><label for="samples_x">曲面采样 X</label><input id="samples_x" type="number" min="2" max="512" step="1" value="48"></div>
+            <div class="field"><label for="samples_y">曲面采样 Y</label><input id="samples_y" type="number" min="2" max="512" step="1" value="48"></div>
             <p class="hint">这两个值将在导出共形配置时用于 LSCM 和格栅计算；当前旧版曲面预览仍使用下方独立的显示网格密度。</p>
           </div>
         </details>
@@ -356,7 +459,8 @@ def surface_preview_html() -> str:
         <div class="field"><label for="width_mm">X 宽度（mm）</label><input id="width_mm" type="number" min="0.001" step="1" value="120"></div>
         <div class="field"><label for="height_mm">Y 高度（mm）</label><input id="height_mm" type="number" min="0.001" step="1" value="100"></div>
         <div class="field"><label for="samples">显示网格密度</label><input id="samples" type="number" min="8" max="120" step="1" value="48"></div>
-        <button type="button" id="exportConfig" disabled>导出旧版曲面 JSON</button>
+        <button type="button" id="exportConformalConfig" disabled>导出共形格栅配置 JSON</button>
+        <button type="button" class="secondary" id="exportConfig" disabled>导出旧版曲面 JSON</button>
         <button type="button" class="secondary" id="reset">恢复示例参数</button>
         <p class="hint">方程：H(x,y)=A·sin(2πx/λx+φx)·sin(2πy/λy+φy)+Zref。当前按钮仍只导出旧版 <code>graded_surface_v1</code>，不会写入共形格栅参数。</p>
       </form>
@@ -376,6 +480,7 @@ def surface_preview_html() -> str:
     const statsEl = document.getElementById('stats');
     const modelMetaEl = document.getElementById('modelMeta');
     const exportConfigButton = document.getElementById('exportConfig');
+    const exportConformalConfigButton = document.getElementById('exportConformalConfig');
     let payload = null;
     let queued = 0;
     let domainId = null;
@@ -435,6 +540,12 @@ def surface_preview_html() -> str:
         query.set('domain_id', domainId);
         query.set('compact', '1');
       }
+      return query;
+    }
+
+    function conformalParameters() {
+      const query = parameters();
+      conformalDesignIds.forEach((id) => query.set(id, document.getElementById(id).value));
       return query;
     }
 
@@ -623,6 +734,7 @@ def surface_preview_html() -> str:
         document.getElementById('height_mm').readOnly = true;
         modelMetaEl.textContent = `${projection.file_name}：${projection.triangle_count.toLocaleString()} 个三角面，XY ${projection.width_mm.toFixed(3)} × ${projection.height_mm.toFixed(3)} mm，材料投影 ${projection.material_area_mm2.toFixed(3)} mm²。`;
         exportConfigButton.disabled = false;
+        exportConformalConfigButton.disabled = false;
         refresh();
       } catch (error) {
         statusEl.className = 'status error';
@@ -647,6 +759,27 @@ def surface_preview_html() -> str:
         URL.revokeObjectURL(link.href);
         statusEl.className = 'status';
         statusEl.textContent = '已导出旧版曲面 JSON；后续曲面映射器将与同一 STL 一起使用它。';
+      } catch (error) {
+        statusEl.className = 'status error';
+        statusEl.textContent = error.message;
+      }
+    });
+    exportConformalConfigButton.addEventListener('click', async () => {
+      if (!domainId) return;
+      try {
+        const response = await fetch(`/api/export-conformal-lattice-config?${conformalParameters().toString()}`);
+        if (!response.ok) {
+          const result = await response.json();
+          throw new Error(result.error || '无法导出共形格栅配置');
+        }
+        const blob = await response.blob();
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(blob);
+        link.download = 'conformal_lattice_spec_v1.json';
+        link.click();
+        URL.revokeObjectURL(link.href);
+        statusEl.className = 'status';
+        statusEl.textContent = '已导出共形格栅配置；下一步可用于生成、验证和导出共形格栅结构。';
       } catch (error) {
         statusEl.className = 'status error';
         statusEl.textContent = error.message;
