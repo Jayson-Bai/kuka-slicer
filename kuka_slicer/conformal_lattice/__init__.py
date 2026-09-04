@@ -21,6 +21,7 @@ from .parameterization import (
     parameterize_spec_lscm,
 )
 from .orientation_field import OrientationField, build_orientation_field
+from .lattice_generator import ConformalLatticeGeometry, generate_conformal_lattice_geometry
 from .phase_coordinates import (
     PhaseAnchor,
     PhaseCoordinates,
@@ -42,6 +43,7 @@ from .scalar_fields import (
 
 __all__ = [
     "ConformalLatticeSpec",
+    "ConformalLatticeGeometry",
     "ConformalQuality",
     "DesignFieldResult",
     "ExternalScalarMetadata",
@@ -62,6 +64,7 @@ __all__ = [
     "evaluate_phase_quality",
     "external_scalar_driver",
     "farthest_boundary_anchors",
+    "generate_conformal_lattice_geometry",
     "load_conformal_lattice_spec",
     "load_triangle_mesh_domain",
     "prepare_surface_mesh_domain",
