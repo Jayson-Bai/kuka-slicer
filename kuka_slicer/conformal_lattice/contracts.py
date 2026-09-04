@@ -130,8 +130,13 @@ def load_conformal_lattice_spec(data: bytes | str | Mapping[str, object]) -> Con
     orientation_field = _object(raw, "orientation_field")
     layer_embedding = _object(raw, "layer_embedding")
     quality_limits = _object(raw, "quality_limits")
+    fill_mode = fill_field.get("mode")
+    if fill_mode not in ("fixed_cell_size", "weighted_composite", "direct_target_fill_ratio"):
+        raise ValueError("fill_field.mode is unsupported")
     if not isinstance(fill_field.get("drivers"), list):
         raise ValueError("fill_field.drivers must be an array")
+    if fill_mode == "fixed_cell_size" and fill_field["drivers"]:
+        raise ValueError("fixed_cell_size must not declare fill_field.drivers")
     if orientation_field.get("mode") not in ("global_axis", "principal_curvature", "user", "stress", "external"):
         raise ValueError("orientation_field.mode is unsupported")
     _finite(orientation_field.get("angle_deg", 0.0), "orientation_field.angle_deg")

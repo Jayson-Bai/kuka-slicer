@@ -117,6 +117,42 @@ def test_weighted_composite_uses_one_interface_and_does_not_treat_driver_as_fill
     assert result.report["combination"]["mode"] == "weighted_composite"
 
 
+def test_fixed_target_cell_size_is_used_directly_and_only_derives_a_read_only_nominal_fill_ratio():
+    domain = _grid_domain(columns=4, rows=3)
+
+    result = compose_design_fields(
+        domain,
+        wall_width_mm=1.0,
+        target_cell_size_mm=5.0,
+    )
+
+    expected_eta = 2.0 / (math.sqrt(3.0) * 5.0)
+    assert result.target_cell_size_mm == pytest.approx(np.full(len(domain.vertices), 5.0))
+    assert result.target_fill_ratio == pytest.approx(np.full(len(domain.vertices), expected_eta))
+    assert result.unconstrained_target_fill_ratio == pytest.approx(result.target_fill_ratio)
+    assert result.report["combination"] == {"mode": "fixed_target_cell_size", "target_cell_size_mm": 5.0}
+    assert result.report["nominal_fill_ratio"] == pytest.approx(expected_eta)
+    assert result.report["eta_min"] is None
+    assert result.report["eta_max"] is None
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "error"),
+    [
+        ({"target_cell_size_mm": 1.0}, "nominal fill ratio"),
+        ({"target_cell_size_mm": 5.0, "eta_min": 0.1, "eta_max": 0.5}, "does not accept eta"),
+        ({"target_cell_size_mm": 5.0, "components": [FieldComponent("x", np.zeros(1))]}, "cannot be combined"),
+    ],
+)
+def test_fixed_target_cell_size_rejects_conflicting_fill_ratio_inputs(kwargs, error):
+    domain = _grid_domain(columns=3, rows=2)
+    if "components" in kwargs:
+        kwargs = {**kwargs, "components": [FieldComponent("x", np.zeros(len(domain.vertices)))]}
+
+    with pytest.raises(ValueError, match=error):
+        compose_design_fields(domain, wall_width_mm=1.0, **kwargs)
+
+
 def test_global_axis_orientation_is_tangent_unit_rosy6_and_has_serialisable_heatmap():
     domain = _grid_domain()
     field = build_orientation_field(domain, mode="global_axis", global_axis_xyz=np.asarray([1.0, 0.0, 0.0]), smoothing_iterations=3)

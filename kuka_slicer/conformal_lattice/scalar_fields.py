@@ -194,65 +194,90 @@ def compose_design_fields(
     domain: SurfaceMeshDomain,
     *,
     wall_width_mm: float,
-    eta_min: float,
-    eta_max: float,
+    eta_min: float | None = None,
+    eta_max: float | None = None,
     components: Sequence[FieldComponent] = (),
     baseline_logit: float = 0.0,
     direct_target_fill_ratio: np.ndarray | None = None,
+    target_cell_size_mm: float | None = None,
     smoothing_length_mm: float = 0.0,
     max_log_size_gradient: float | None = None,
     locked_vertices: np.ndarray | None = None,
 ) -> DesignFieldResult:
-    """Combine drivers, smooth on the mesh, and impose cell-scale constraints."""
+    """Combine fill drivers or use one fixed cell scale for the whole domain."""
 
     _positive(wall_width_mm, "wall_width_mm")
-    _positive(eta_min, "eta_min")
-    _positive(eta_max, "eta_max")
-    if eta_max <= eta_min or eta_max >= 1.0:
-        raise ValueError("fill-ratio bounds must satisfy 0 < eta_min < eta_max < 1")
-    if not math.isfinite(baseline_logit):
-        raise ValueError("baseline_logit must be finite")
     if not math.isfinite(smoothing_length_mm) or smoothing_length_mm < 0.0:
         raise ValueError("smoothing_length_mm must be finite and non-negative")
     count = len(domain.vertices)
     locks = _locked_mask(locked_vertices, count)
-    if direct_target_fill_ratio is not None:
-        raw_eta = np.asarray(direct_target_fill_ratio, dtype=np.float64)
-        if raw_eta.shape != (count,) or not np.all(np.isfinite(raw_eta)):
-            raise ValueError("direct_target_fill_ratio must be a finite per-vertex array")
-        density = _minmax(raw_eta)
-        combination = {"mode": "direct_target_fill_ratio"}
+    fixed_size = target_cell_size_mm is not None
+    if fixed_size:
+        _positive(float(target_cell_size_mm), "target_cell_size_mm")
+        if components or direct_target_fill_ratio is not None:
+            raise ValueError("target_cell_size_mm cannot be combined with fill-ratio drivers")
+        if eta_min is not None or eta_max is not None:
+            raise ValueError("target_cell_size_mm mode does not accept eta_min or eta_max")
+        cell_size = np.full(count, float(target_cell_size_mm), dtype=np.float64)
+        raw_eta = cell_size_to_fill_ratio(cell_size, wall_width_mm=wall_width_mm)
+        if np.any(raw_eta >= 1.0):
+            raise ValueError(
+                "wall_width_mm and target_cell_size_mm produce a nominal fill ratio of at least 1"
+            )
+        smoothed = np.array(raw_eta, copy=True)
+        density = np.zeros(count, dtype=np.float64)
+        combination = {"mode": "fixed_target_cell_size", "target_cell_size_mm": float(target_cell_size_mm)}
+        report_eta_min: float | None = None
+        report_eta_max: float | None = None
     else:
-        combined = np.full(count, baseline_logit, dtype=np.float64)
-        component_report = []
-        for component in components:
-            values = _normalised_values(component.values, f"component {component.name}")
-            if values.shape != (count,) or not math.isfinite(component.weight):
-                raise ValueError(f"component {component.name} must match the mesh vertex count and have a finite weight")
-            combined += component.weight * values
-            component_report.append({"name": component.name, "weight": component.weight, "metadata": component.metadata})
-        logistic = 1.0 / (1.0 + np.exp(-combined))
-        raw_eta = eta_min + (eta_max - eta_min) * logistic
-        density = _minmax(logistic)
-        combination = {"mode": "weighted_composite", "baseline_logit": baseline_logit, "components": component_report}
-    raw_eta = np.clip(raw_eta, eta_min, eta_max)
-    smoothed = smooth_vertex_field(domain, raw_eta, smoothing_length_mm=smoothing_length_mm, locked_vertices=locks)
-    smoothed = np.clip(smoothed, eta_min, eta_max)
-    cell_size = fill_ratio_to_cell_size(smoothed, wall_width_mm=wall_width_mm)
-    if max_log_size_gradient is not None:
-        if not math.isfinite(max_log_size_gradient) or max_log_size_gradient <= 0.0:
-            raise ValueError("max_log_size_gradient must be finite and positive")
-        cell_size = limit_log_cell_size_gradient(
-            domain, cell_size, max_log_gradient=max_log_size_gradient, locked_vertices=locks
-        )
-        smoothed = cell_size_to_fill_ratio(cell_size, wall_width_mm=wall_width_mm)
+        if eta_min is None or eta_max is None:
+            raise ValueError("fill-ratio mode requires eta_min and eta_max")
+        _positive(eta_min, "eta_min")
+        _positive(eta_max, "eta_max")
+        if eta_max <= eta_min or eta_max >= 1.0:
+            raise ValueError("fill-ratio bounds must satisfy 0 < eta_min < eta_max < 1")
+        if not math.isfinite(baseline_logit):
+            raise ValueError("baseline_logit must be finite")
+        if direct_target_fill_ratio is not None:
+            raw_eta = np.asarray(direct_target_fill_ratio, dtype=np.float64)
+            if raw_eta.shape != (count,) or not np.all(np.isfinite(raw_eta)):
+                raise ValueError("direct_target_fill_ratio must be a finite per-vertex array")
+            density = _minmax(raw_eta)
+            combination = {"mode": "direct_target_fill_ratio"}
+        else:
+            combined = np.full(count, baseline_logit, dtype=np.float64)
+            component_report = []
+            for component in components:
+                values = _normalised_values(component.values, f"component {component.name}")
+                if values.shape != (count,) or not math.isfinite(component.weight):
+                    raise ValueError(f"component {component.name} must match the mesh vertex count and have a finite weight")
+                combined += component.weight * values
+                component_report.append({"name": component.name, "weight": component.weight, "metadata": component.metadata})
+            logistic = 1.0 / (1.0 + np.exp(-combined))
+            raw_eta = eta_min + (eta_max - eta_min) * logistic
+            density = _minmax(logistic)
+            combination = {"mode": "weighted_composite", "baseline_logit": baseline_logit, "components": component_report}
+        raw_eta = np.clip(raw_eta, eta_min, eta_max)
+        smoothed = smooth_vertex_field(domain, raw_eta, smoothing_length_mm=smoothing_length_mm, locked_vertices=locks)
         smoothed = np.clip(smoothed, eta_min, eta_max)
         cell_size = fill_ratio_to_cell_size(smoothed, wall_width_mm=wall_width_mm)
+        if max_log_size_gradient is not None:
+            if not math.isfinite(max_log_size_gradient) or max_log_size_gradient <= 0.0:
+                raise ValueError("max_log_size_gradient must be finite and positive")
+            cell_size = limit_log_cell_size_gradient(
+                domain, cell_size, max_log_gradient=max_log_size_gradient, locked_vertices=locks
+            )
+            smoothed = cell_size_to_fill_ratio(cell_size, wall_width_mm=wall_width_mm)
+            smoothed = np.clip(smoothed, eta_min, eta_max)
+            cell_size = fill_ratio_to_cell_size(smoothed, wall_width_mm=wall_width_mm)
+        report_eta_min = eta_min
+        report_eta_max = eta_max
     report = {
         "combination": combination,
         "wall_width_mm": wall_width_mm,
-        "eta_min": eta_min,
-        "eta_max": eta_max,
+        "eta_min": report_eta_min,
+        "eta_max": report_eta_max,
+        "nominal_fill_ratio": float(raw_eta[0]) if fixed_size else None,
         "smoothing_length_mm": smoothing_length_mm,
         "max_log_size_gradient": max_log_size_gradient,
         "locked_vertex_count": int(np.count_nonzero(locks)),
