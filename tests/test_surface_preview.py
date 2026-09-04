@@ -108,17 +108,21 @@ def test_surface_preview_html_has_an_independent_surface_api_and_controls():
     assert 'id="amplitude_mm"' in html
     assert 'id="wavelength_x_mm"' in html
     assert 'id="canvas"' in html
-    assert 'id="importStl"' in html
-    assert 'id="exportConfig"' in html
     assert 'id="exportConformalConfig"' in html
+    assert 'id="part_length_mm"' in html
+    assert 'id="part_width_mm"' in html
+    assert 'id="part_height_mm"' in html
+    assert 'id="layer_height_mm"' in html
     assert 'id="wall_width_mm"' in html
     assert 'id="base_cell_size_mm"' in html
     assert 'id="surface_start_layer"' in html
     assert 'id="samples_x"' in html
     assert 'id="samples_y"' in html
     assert "updateConformalDesignSummary" in html
-    assert "不会写入共形格栅参数" in html
-    assert '/api/stl-domain' in html
+    assert '蜂窝网格共形设计器' in html
+    assert '外边界固定为矩形' in html
+    assert 'id="stlFile"' not in html
+    assert '/api/stl-domain' not in html
     assert '/api/export-conformal-lattice-config' in html
     assert "canvas.addEventListener('lostpointercapture', endDrag)" in html
 
@@ -197,6 +201,11 @@ def test_conformal_lattice_export_binds_double_sine_to_a_rectangular_physical_pa
             "surface_start_layer": ["3"],
             "samples_x": ["31"],
             "samples_y": ["29"],
+            "boundary_mode": ["inset"],
+            "phase_origin_x_mm": ["1.25"],
+            "phase_origin_y_mm": ["-0.5"],
+            "orientation_angle_deg": ["30"],
+            "random_seed": ["17"],
             "samples": ["8"],
         },
     )
@@ -213,8 +222,12 @@ def test_conformal_lattice_export_binds_double_sine_to_a_rectangular_physical_pa
     assert config["lattice"]["wall_width_mm"] == pytest.approx(2.0)
     assert config["lattice"]["wall_bead_count"] == 1
     assert config["lattice"]["base_cell_size_mm"] == pytest.approx(5.0)
+    assert config["lattice"]["boundary_mode"] == "inset"
+    assert config["lattice"]["phase_origin"] == [1.25, -0.5]
     assert config["fill_field"] == {"mode": "fixed_cell_size", "drivers": []}
+    assert config["orientation_field"]["angle_deg"] == pytest.approx(30.0)
     assert config["layer_embedding"]["surface_start_layer"] == 3
+    assert config["random_seed"] == 17
 
 
 @pytest.mark.parametrize(

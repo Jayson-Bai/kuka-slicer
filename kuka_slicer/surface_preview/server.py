@@ -186,6 +186,15 @@ def conformal_lattice_config_payload(params: dict[str, list[str]]) -> dict[str, 
     samples_y = _query_nonnegative_int(
         params, "samples_y", DEFAULT_PREVIEW_SAMPLES, minimum=2, maximum=MAX_CONFORMAL_SAMPLES
     )
+    boundary_mode = params.get("boundary_mode", ["clip"])[0]
+    if boundary_mode not in {"clip", "inset"}:
+        raise ValueError("boundary_mode must be clip or inset")
+    phase_origin = [
+        _query_float(params, "phase_origin_x_mm", 0.0),
+        _query_float(params, "phase_origin_y_mm", 0.0),
+    ]
+    orientation_angle_deg = _query_float(params, "orientation_angle_deg", 0.0)
+    random_seed = _query_nonnegative_int(params, "random_seed", 0)
     source_surface: dict[str, object] = {
         "provider": "double_sine",
         "source_file": "generated://double-sine-rectangular-part",
@@ -221,18 +230,18 @@ def conformal_lattice_config_payload(params: dict[str, list[str]]) -> dict[str, 
             "wall_width_mm": wall_width_mm,
             "wall_bead_count": wall_bead_count,
             "base_cell_size_mm": base_cell_size_mm,
-            "boundary_mode": "clip",
-            "phase_origin": [0.0, 0.0],
+            "boundary_mode": boundary_mode,
+            "phase_origin": phase_origin,
         },
         "fill_field": {"mode": "fixed_cell_size", "drivers": []},
-        "orientation_field": {"mode": "global_axis", "angle_deg": 0.0, "constraints": []},
+        "orientation_field": {"mode": "global_axis", "angle_deg": orientation_angle_deg, "constraints": []},
         "layer_embedding": {
             "mode": "symmetric_shape_morphing",
             "transition": "smoothstep",
             "surface_start_layer": surface_start_layer,
         },
         "quality_limits": {},
-        "random_seed": 0,
+        "random_seed": random_seed,
     }
     load_conformal_lattice_spec(config)
     return config
@@ -427,17 +436,17 @@ def surface_preview_html() -> str:
 <body>
   <main>
     <header>
-      <h1>渐变双正弦曲面预览器</h1>
-      <p>首版只负责曲面方程和几何诊断；不修改切片路径，也不写入 NPZ。</p>
+      <h1>蜂窝网格共形设计器</h1>
+      <p>在固定矩形实体上定义双正弦承载曲面和六边形格栅；导出 JSON 后回到主切片器生成路径与送入 Core。</p>
     </header>
     <section class="workspace">
       <form class="panel controls" id="surfaceForm">
-        <h2>输入模型</h2>
-        <label for="stlFile">导入用于最终切片的平面蜂窝 STL</label>
-        <input class="fileInput" id="stlFile" type="file" accept=".stl,model/stl,application/sla">
-        <div class="field"><label for="build_axis">源构建轴</label><select id="build_axis"><option value="z" selected>Z</option><option value="y">Y</option><option value="x">X</option></select></div>
-        <button type="button" id="importStl">导入并提取 XY 投影</button>
-        <p class="modelMeta" id="modelMeta">尚未导入 STL：当前仅显示矩形参考域。</p>
+        <h2>矩形实体</h2>
+        <div class="field"><label for="part_length_mm">零件长度 X（mm）</label><input id="part_length_mm" type="number" min="0.001" step="1" value="150"></div>
+        <div class="field"><label for="part_width_mm">零件宽度 Y（mm）</label><input id="part_width_mm" type="number" min="0.001" step="1" value="100"></div>
+        <div class="field"><label for="part_height_mm">最终物理高度 Z（mm）</label><input id="part_height_mm" type="number" min="0.001" step="0.1" value="10"></div>
+        <div class="field"><label for="layer_height_mm">切片层高（mm）</label><input id="layer_height_mm" type="number" min="0.001" step="0.01" value="0.5"></div>
+        <p class="modelMeta" id="modelMeta">外边界固定为矩形；新共形流程不读取 STL，也不继承 STL 中的蜂窝孔壁。</p>
         <div class="divider"></div>
         <h2>曲面参数</h2>
         <div class="field"><label for="amplitude_mm">幅值 A（mm）</label><input id="amplitude_mm" type="number" step="0.01" value="0.8"></div>
@@ -448,9 +457,10 @@ def surface_preview_html() -> str:
         <div class="field"><label for="z_reference_mm">Z 基准（mm）</label><input id="z_reference_mm" type="number" step="0.01" value="0"></div>
         <div class="divider"></div>
         <h2>固定六边形格栅</h2>
-        <div class="field"><label for="wall_width_mm">设计墙宽（mm）</label><input id="wall_width_mm" type="number" min="0.001" step="0.01" value="2"></div>
+        <div class="field"><label for="wall_width_mm">设计墙宽（mm）</label><input id="wall_width_mm" type="number" min="2" step="2" value="2"></div>
         <div class="field"><label for="base_cell_size_mm">目标六边形边长（mm）</label><input id="base_cell_size_mm" type="number" min="0.001" step="0.01" value="5"></div>
-        <p class="hint">设计墙宽用于格栅几何，不等同于实际挤出道宽；目标边长沿承载曲面测量。</p>
+        <div class="field"><label for="orientation_angle_deg">全局格栅方向角（°）</label><input id="orientation_angle_deg" type="number" step="1" value="0"></div>
+        <p class="hint">喷嘴基准线宽固定为 2 mm。墙宽只能填 2、4、6… mm；4 mm 代表后续由两条 2 mm 沉积道组成。目标边长沿承载曲面测量。</p>
         <div class="designSummary" id="latticeDesignSummary" aria-live="polite"></div>
         <div class="divider"></div>
         <h2>对称层间渐变</h2>
@@ -462,18 +472,19 @@ def surface_preview_html() -> str:
           <div class="advancedBody">
             <div class="field"><label for="samples_x">曲面采样 X</label><input id="samples_x" type="number" min="2" max="512" step="1" value="48"></div>
             <div class="field"><label for="samples_y">曲面采样 Y</label><input id="samples_y" type="number" min="2" max="512" step="1" value="48"></div>
-            <p class="hint">这两个值将在导出共形配置时用于 LSCM 和格栅计算；当前旧版曲面预览仍使用下方独立的显示网格密度。</p>
+            <div class="field"><label for="boundary_mode">边界策略</label><select id="boundary_mode"><option value="clip" selected>裁剪至矩形</option><option value="inset">向内缩进</option></select></div>
+            <div class="field"><label for="phase_origin_x_mm">格栅相位 X（mm）</label><input id="phase_origin_x_mm" type="number" step="0.01" value="0"></div>
+            <div class="field"><label for="phase_origin_y_mm">格栅相位 Y（mm）</label><input id="phase_origin_y_mm" type="number" step="0.01" value="0"></div>
+            <div class="field"><label for="random_seed">随机种子</label><input id="random_seed" type="number" min="0" step="1" value="0"></div>
+            <div class="field"><label for="samples">预览网格密度</label><input id="samples" type="number" min="8" max="120" step="1" value="48"></div>
+            <p class="hint">曲面采样 X/Y 参与共形计算；预览网格密度只影响本页显示。参数化固定使用 LSCM、最远边界锚点和无切缝。</p>
           </div>
         </details>
         <div class="divider"></div>
-        <h2>预览域</h2>
-        <div class="field"><label for="width_mm">X 宽度（mm）</label><input id="width_mm" type="number" min="0.001" step="1" value="120"></div>
-        <div class="field"><label for="height_mm">Y 高度（mm）</label><input id="height_mm" type="number" min="0.001" step="1" value="100"></div>
-        <div class="field"><label for="samples">显示网格密度</label><input id="samples" type="number" min="8" max="120" step="1" value="48"></div>
-        <button type="button" id="exportConformalConfig" disabled>导出共形格栅配置 JSON</button>
-        <button type="button" class="secondary" id="exportConfig" disabled>导出旧版曲面 JSON</button>
+        <h2>下一步</h2>
+        <button type="button" id="exportConformalConfig">导出共形蜂窝设计 JSON</button>
         <button type="button" class="secondary" id="reset">恢复示例参数</button>
-        <p class="hint">方程：H(x,y)=A·sin(2πx/λx+φx)·sin(2πy/λy+φy)+Zref。当前按钮仍只导出旧版 <code>graded_surface_v1</code>，不会写入共形格栅参数。</p>
+        <p class="hint">方程：H(x,y)=A·sin(2πx/λx+φx)·sin(2πy/λy+φy)+Zref。导出文件为 <code>conformal_lattice_spec_v1.json</code>，请在主切片器中导入该文件。</p>
       </form>
       <section class="panel preview">
         <div class="previewHead"><h2>三维曲面</h2><div class="stats" id="stats"></div></div>
@@ -484,18 +495,14 @@ def surface_preview_html() -> str:
     </section>
   </main>
   <script>
-    const surfaceIds = ['amplitude_mm', 'wavelength_x_mm', 'wavelength_y_mm', 'phase_x_rad', 'phase_y_rad', 'z_reference_mm', 'width_mm', 'height_mm', 'samples'];
-    const conformalDesignIds = ['wall_width_mm', 'base_cell_size_mm', 'surface_start_layer', 'samples_x', 'samples_y'];
+    const surfaceIds = ['amplitude_mm', 'wavelength_x_mm', 'wavelength_y_mm', 'phase_x_rad', 'phase_y_rad', 'z_reference_mm', 'samples'];
+    const conformalDesignIds = ['part_length_mm', 'part_width_mm', 'part_height_mm', 'layer_height_mm', 'wall_width_mm', 'base_cell_size_mm', 'orientation_angle_deg', 'surface_start_layer', 'samples_x', 'samples_y', 'boundary_mode', 'phase_origin_x_mm', 'phase_origin_y_mm', 'random_seed'];
     const canvas = document.getElementById('canvas');
     const statusEl = document.getElementById('status');
     const statsEl = document.getElementById('stats');
-    const modelMetaEl = document.getElementById('modelMeta');
-    const exportConfigButton = document.getElementById('exportConfig');
     const exportConformalConfigButton = document.getElementById('exportConformalConfig');
     let payload = null;
     let queued = 0;
-    let domainId = null;
-    let domainProjection = null;
     const initialView = { yaw: -42 * Math.PI / 180, pitch: 54 * Math.PI / 180, zoom: 1, panX: 0, panY: 0 };
     const view = { ...initialView };
     let drag = null;
@@ -514,9 +521,14 @@ def surface_preview_html() -> str:
       const wallWidth = positiveNumber('wall_width_mm');
       const cellSize = positiveNumber('base_cell_size_mm');
       const latticeSummary = document.getElementById('latticeDesignSummary');
+      const beadCount = wallWidth === null ? null : Math.round(wallWidth / 2);
+      const isNozzleMultiple = beadCount !== null && beadCount >= 1 && Math.abs(wallWidth - 2 * beadCount) < 1e-9;
       if (wallWidth === null || cellSize === null) {
         latticeSummary.className = 'designSummary error';
         latticeSummary.textContent = '设计墙宽和目标六边形边长都必须是正数。';
+      } else if (!isNozzleMultiple) {
+        latticeSummary.className = 'designSummary error';
+        latticeSummary.textContent = '设计墙宽必须是 2 mm 喷嘴基准线宽的正整数倍，例如 2、4、6。';
       } else {
         const nominalFill = (2 * wallWidth) / (Math.sqrt(3) * cellSize);
         if (nominalFill >= 1) {
@@ -524,33 +536,45 @@ def surface_preview_html() -> str:
           latticeSummary.textContent = `名义填充率为 ${(nominalFill * 100).toFixed(1)}%，必须小于 100%。请减小墙宽或增大单元边长。`;
         } else {
           latticeSummary.className = 'designSummary';
-          latticeSummary.textContent = `名义填充率：${(nominalFill * 100).toFixed(1)}%。实际填充率将在 Gate 6 按生成几何测量。`;
+          latticeSummary.textContent = `名义填充率：${(nominalFill * 100).toFixed(1)}%；墙体将规划为 ${beadCount} 条 2 mm 沉积道。实际填充率以生成几何测量结果为准。`;
         }
       }
 
       const startLayer = nonNegativeInteger('surface_start_layer');
       const samplesX = nonNegativeInteger('samples_x');
       const samplesY = nonNegativeInteger('samples_y');
+      const partHeight = positiveNumber('part_height_mm');
+      const layerHeight = positiveNumber('layer_height_mm');
       const progressionSummary = document.getElementById('layerProgressionSummary');
       if (startLayer === null) {
         progressionSummary.className = 'designSummary error';
         progressionSummary.textContent = '曲面起始层必须是非负整数。';
+      } else if (partHeight === null || layerHeight === null) {
+        progressionSummary.className = 'designSummary error';
+        progressionSummary.textContent = '最终物理高度和切片层高都必须是正数。';
       } else if (samplesX === null || samplesX < 2 || samplesY === null || samplesY < 2) {
         progressionSummary.className = 'designSummary error';
         progressionSummary.textContent = '曲面采样 X 和 Y 都必须是不小于 2 的整数。';
       } else {
-        progressionSummary.className = 'designSummary';
-        progressionSummary.textContent = `曲面起始层：${startLayer}；共形采样：${samplesX} × ${samplesY}。生成共形配置时将结合主切片器的逻辑层数校验镜像回落层。`;
+        const layerCount = Math.ceil(partHeight / layerHeight);
+        const maxStart = Math.floor((layerCount - 1) / 2);
+        if (startLayer > maxStart) {
+          progressionSummary.className = 'designSummary error';
+          progressionSummary.textContent = `当前高度与层高共得到 ${layerCount} 个逻辑层；曲面起始层不能大于 ${maxStart}。`;
+        } else {
+          const returnLayer = layerCount - 1 - startLayer;
+          const peakLayers = layerCount % 2 === 1 ? `${Math.floor(layerCount / 2)}` : `${layerCount / 2 - 1}、${layerCount / 2}`;
+          progressionSummary.className = 'designSummary';
+          progressionSummary.textContent = `逻辑层数：${layerCount}；曲面起始层：${startLayer}；镜像回落层：${returnLayer}；完整曲率层：${peakLayers}；共形采样：${samplesX} × ${samplesY}。`;
+        }
       }
     }
 
     function parameters() {
       const query = new URLSearchParams();
       surfaceIds.forEach((id) => query.set(id, document.getElementById(id).value));
-      if (domainId) {
-        query.set('domain_id', domainId);
-        query.set('compact', '1');
-      }
+      query.set('width_mm', document.getElementById('part_length_mm').value);
+      query.set('height_mm', document.getElementById('part_width_mm').value);
       return query;
     }
 
@@ -694,16 +718,10 @@ def surface_preview_html() -> str:
         const result = await response.json();
         if (!response.ok || !result.ok) throw new Error(result.error || '无法生成曲面');
         if (sequence !== queued) return;
-        if (result.domain.projection && result.domain.projection.polygons) {
-          domainProjection = result.domain.projection;
-        }
-        if (domainProjection) result.domain.projection = domainProjection;
         payload = result;
         showStats(result.statistics);
         render();
-        statusEl.textContent = result.domain.mode === 'stl_projection'
-          ? '已更新：曲面已裁剪到导入 STL 的 XY 材料投影。'
-          : '已更新。导入 STL 后将按真实 XY 投影裁剪曲面。';
+        statusEl.textContent = '已更新：当前预览对应固定矩形外边界的双正弦承载曲面。';
       } catch (error) {
         if (sequence !== queued) return;
         statusEl.className = 'status error';
@@ -715,68 +733,7 @@ def surface_preview_html() -> str:
     function scheduleRefresh() { clearTimeout(timer); timer = setTimeout(refresh, 120); }
     surfaceIds.forEach((id) => document.getElementById(id).addEventListener('input', scheduleRefresh));
     conformalDesignIds.forEach((id) => document.getElementById(id).addEventListener('input', updateConformalDesignSummary));
-    document.getElementById('importStl').addEventListener('click', async () => {
-      const input = document.getElementById('stlFile');
-      const file = input.files[0];
-      if (!file) {
-        statusEl.className = 'status error';
-        statusEl.textContent = '请先选择一个 STL 文件。';
-        return;
-      }
-      const button = document.getElementById('importStl');
-      button.disabled = true;
-      statusEl.className = 'status';
-      statusEl.textContent = '正在提取 STL 的 XY 投影…';
-      try {
-        const buildAxis = document.getElementById('build_axis').value;
-        const response = await fetch(`/api/stl-domain?build_axis=${encodeURIComponent(buildAxis)}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/sla', 'X-STL-File-Name': encodeURIComponent(file.name) },
-          body: file,
-        });
-        const result = await response.json();
-        if (!response.ok || !result.ok) throw new Error(result.error || '无法读取 STL');
-        domainId = result.domain_id;
-        const projection = result.projection;
-        domainProjection = projection;
-        document.getElementById('width_mm').value = projection.width_mm.toFixed(3);
-        document.getElementById('height_mm').value = projection.height_mm.toFixed(3);
-        document.getElementById('width_mm').readOnly = true;
-        document.getElementById('height_mm').readOnly = true;
-        modelMetaEl.textContent = `${projection.file_name}：${projection.triangle_count.toLocaleString()} 个三角面，XY ${projection.width_mm.toFixed(3)} × ${projection.height_mm.toFixed(3)} mm，材料投影 ${projection.material_area_mm2.toFixed(3)} mm²。`;
-        exportConfigButton.disabled = false;
-        exportConformalConfigButton.disabled = false;
-        refresh();
-      } catch (error) {
-        statusEl.className = 'status error';
-        statusEl.textContent = error.message;
-      } finally {
-        button.disabled = false;
-      }
-    });
-    exportConfigButton.addEventListener('click', async () => {
-      if (!domainId) return;
-      try {
-        const response = await fetch(`/api/export-surface-config?${parameters().toString()}`);
-        if (!response.ok) {
-          const result = await response.json();
-          throw new Error(result.error || '无法导出曲面配置');
-        }
-        const blob = await response.blob();
-        const link = document.createElement('a');
-        link.href = URL.createObjectURL(blob);
-        link.download = 'graded_surface_v1.json';
-        link.click();
-        URL.revokeObjectURL(link.href);
-        statusEl.className = 'status';
-        statusEl.textContent = '已导出旧版曲面 JSON；后续曲面映射器将与同一 STL 一起使用它。';
-      } catch (error) {
-        statusEl.className = 'status error';
-        statusEl.textContent = error.message;
-      }
-    });
     exportConformalConfigButton.addEventListener('click', async () => {
-      if (!domainId) return;
       try {
         const response = await fetch(`/api/export-conformal-lattice-config?${conformalParameters().toString()}`);
         if (!response.ok) {
@@ -790,7 +747,7 @@ def surface_preview_html() -> str:
         link.click();
         URL.revokeObjectURL(link.href);
         statusEl.className = 'status';
-        statusEl.textContent = '已导出共形格栅配置；下一步可用于生成、验证和导出共形格栅结构。';
+        statusEl.textContent = '已导出共形蜂窝设计 JSON；回到主切片器导入该文件以生成路径。';
       } catch (error) {
         statusEl.className = 'status error';
         statusEl.textContent = error.message;
@@ -843,9 +800,8 @@ def surface_preview_html() -> str:
       render();
     });
     document.getElementById('reset').addEventListener('click', () => {
-      const defaults = { amplitude_mm: 0.8, wavelength_x_mm: 40, wavelength_y_mm: 50, phase_x_rad: 0, phase_y_rad: 0, z_reference_mm: 0, wall_width_mm: 2, base_cell_size_mm: 5, surface_start_layer: 3, samples_x: 48, samples_y: 48, width_mm: 120, height_mm: 100, samples: 48 };
+      const defaults = { part_length_mm: 150, part_width_mm: 100, part_height_mm: 10, layer_height_mm: 0.5, amplitude_mm: 0.8, wavelength_x_mm: 40, wavelength_y_mm: 50, phase_x_rad: 0, phase_y_rad: 0, z_reference_mm: 0, wall_width_mm: 2, base_cell_size_mm: 5, orientation_angle_deg: 0, surface_start_layer: 3, samples_x: 48, samples_y: 48, boundary_mode: 'clip', phase_origin_x_mm: 0, phase_origin_y_mm: 0, random_seed: 0, samples: 48 };
       Object.entries(defaults).forEach(([id, value]) => {
-        if (domainId && (id === 'width_mm' || id === 'height_mm')) return;
         document.getElementById(id).value = value;
       });
       updateConformalDesignSummary();
