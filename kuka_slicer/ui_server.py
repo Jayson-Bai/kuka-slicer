@@ -119,10 +119,10 @@ def _save_surface_preview_last_directory(state_path: Path, directory: Path) -> N
 
 
 def _choose_mapped_surface_npz_file(initial_directory: Path | None) -> Path | None:
-    """Open the Windows picker at the last successful mapped-NPZ directory."""
+    """Open the Windows picker for legacy mapped or conformal-path NPZ files."""
 
     if sys.platform != "win32":
-        raise RuntimeError("native mapped-NPZ picker is available only on Windows")
+        raise RuntimeError("native surface/conformal-NPZ picker is available only on Windows")
     try:
         import tkinter as tk
         from tkinter import filedialog
@@ -136,13 +136,13 @@ def _choose_mapped_surface_npz_file(initial_directory: Path | None) -> Path | No
         root.update()
         selected = filedialog.askopenfilename(
             parent=root,
-            title="选择映射曲面 NPZ",
+            title="选择映射曲面或共形格栅 NPZ",
             initialdir=(
                 str(initial_directory)
                 if initial_directory is not None and initial_directory.is_dir()
                 else None
             ),
-            filetypes=[("映射曲面 NPZ", "*.npz"), ("所有文件", "*.*")],
+            filetypes=[("映射曲面或共形格栅 NPZ", "*.npz"), ("所有文件", "*.*")],
         )
     finally:
         root.destroy()
@@ -936,7 +936,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         )
 
     def _choose_surface_npz_preview(self) -> None:
-        """Choose and load a mapped NPZ through the native Windows dialog."""
+        """Choose and load a legacy mapped or conformal-path NPZ."""
 
         handler_type = type(self)
         with handler_type.surface_preview_picker_lock:
@@ -946,9 +946,9 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             return
         selected = selected.resolve()
         if selected.suffix.lower() != ".npz":
-            raise ValueError("请选择 .npz 映射曲面文件")
+            raise ValueError("请选择 .npz 映射曲面或共形格栅文件")
         if not selected.is_file():
-            raise ValueError("所选映射曲面 NPZ 不存在")
+            raise ValueError("所选曲面或共形格栅 NPZ 不存在")
         if selected.stat().st_size > MAX_SURFACE_PREVIEW_NPZ_BYTES:
             raise ValueError("mapped source NPZ exceeds the 256 MB preview limit")
         handler_type.surface_preview_last_directory = selected.parent
@@ -956,12 +956,13 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         state_path = handler_type.surface_preview_picker_state_path
         if state_path is not None:
             _save_surface_preview_last_directory(state_path, selected.parent)
+        preview = _preview_payload_from_source_npz(selected.read_bytes(), selected.name)
         self._send_json(
             {
                 "ok": True,
                 "file_name": selected.name,
-                "collision_check_available": True,
-                "preview": _preview_payload_from_source_npz(selected.read_bytes(), selected.name),
+                "collision_check_available": preview.get("preview_source") != "conformal_lattice_external_source_npz",
+                "preview": preview,
             }
         )
 
@@ -2616,7 +2617,7 @@ def _preview_payload(
 
 
 def _preview_payload_from_source_npz(source_bytes: bytes, source_name: str) -> dict[str, object]:
-    """Adapt a mapped external NPZ to the existing main-UI preview schema."""
+    """Adapt a legacy mapped or conformal external NPZ to the main preview schema."""
 
     # The mapper contract remains the authority for validation.  This adapter
     # only removes NaN padding and forwards XYZABC to the shared Canvas view;
@@ -2660,7 +2661,7 @@ def _preview_payload_from_source_npz(source_bytes: bytes, source_name: str) -> d
         config = SliceConfig(line_width=float(line_width))
     except (TypeError, ValueError):
         config = SliceConfig(line_width=DEFAULT_RESIN_LINE_WIDTH_MM)
-    return _preview_payload(
+    preview = _preview_payload(
         None,
         config,
         ExternalSourceJob(
@@ -2669,6 +2670,16 @@ def _preview_payload_from_source_npz(source_bytes: bytes, source_name: str) -> d
             meta=source.meta,
         ),
     )
+    bridge = source.meta.get("conformal_lattice_path_bridge")
+    if isinstance(bridge, dict):
+        preview["preview_source"] = "conformal_lattice_external_source_npz"
+        preview["conformal_lattice"] = {
+            "edge_count_per_layer": int(bridge.get("edge_count_per_layer", len(material_paths[0].paths) if material_paths else 0)),
+            "path_order": bridge.get("path_order"),
+            "uses_existing_main_canvas": True,
+            "planning_line_width_mm": float(config.line_width),
+        }
+    return preview
 
 
 def _triangle_infill_recommendation(mesh, config: SliceConfig, current_job) -> dict[str, object] | None:
@@ -3960,7 +3971,7 @@ def _index_html() -> str:
       <button id="surfacePreviewButton" class="surfaceToolButton" type="button">启动曲面预览器</button>
       <button id="surfaceMapperButton" class="surfaceToolButton" type="button">启动曲面映射器</button>
       <button id="coreNpzPreviewButton" class="surfaceToolButton" type="button">导入 Core NPZ 预览</button>
-      <button id="surfaceNpzPreviewButton" class="surfaceToolButton" type="button">导入映射 NPZ 预览</button>
+      <button id="surfaceNpzPreviewButton" class="surfaceToolButton" type="button">导入曲面/共形 NPZ 预览</button>
       <button id="surfaceNpzCollisionButton" class="surfaceToolButton" type="button" disabled>检查当前 NPZ 碰撞</button>
       <output id="surfaceNpzCollisionResult" class="surfaceCollisionResult" aria-live="polite">请先导入本地映射 NPZ。</output>
       <input id="surfaceNpzInput" type="file" accept=".npz,application/octet-stream" hidden>
@@ -4737,6 +4748,7 @@ def _index_html() -> str:
     surfaceToolButtons['surface-preview'].addEventListener('click', () => launchSurfaceTool('surface-preview'));
     surfaceToolButtons['surface-map'].addEventListener('click', () => launchSurfaceTool('surface-map'));
     function applyMappedSurfacePreview(preview, fileName, collisionCheckAvailable = false) {{
+      const isConformalLattice = preview?.preview_source === 'conformal_lattice_external_source_npz';
       previewData = preview;
       configureViewer();
       layersEl.textContent = String(previewData.layers?.length || 0);
@@ -4744,12 +4756,16 @@ def _index_html() -> str:
       downloadEl.removeAttribute('href');
       downloadEl.textContent = '已载入曲面预览（未导出）';
       statusEl.className = 'status ok';
-      statusEl.textContent = '已载入映射曲面 NPZ：左键旋转，箭头尖端为当前打印点。';
+      statusEl.textContent = isConformalLattice
+        ? '已载入共形格栅 NPZ：复用主三维预览的图层、路径播放和打印头显示。'
+        : '已载入映射曲面 NPZ：左键旋转，箭头尖端为当前打印点。';
       surfaceNpzCollisionButton.disabled = !collisionCheckAvailable;
       surfaceNpzCollisionResult.className = 'surfaceCollisionResult';
-      surfaceNpzCollisionResult.textContent = collisionCheckAvailable
+      surfaceNpzCollisionResult.textContent = isConformalLattice
+        ? '共形格栅结构边预览不适用旧版峰值曲率碰撞检查。'
+        : collisionCheckAvailable
         ? '已就绪：可检查峰值曲率层的加热块实体碰撞。'
-        : '浏览器上传的 NPZ 仅供预览；请通过“导入映射 NPZ 预览”选择本地文件后检查。';
+        : '浏览器上传的 NPZ 仅供预览；请通过“导入曲面/共形 NPZ 预览”选择本地文件后检查。';
       drawPreview();
     }}
     function applyFinalCorePreview(preview, fileName) {{

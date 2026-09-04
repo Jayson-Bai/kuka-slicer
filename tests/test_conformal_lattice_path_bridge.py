@@ -65,3 +65,17 @@ def test_path_bridge_exports_existing_npz_contract_with_edge_path_provenance(tmp
 def test_path_bridge_rejects_an_implicit_or_invalid_e_volume_conversion():
     with pytest.raises(ValueError, match="e_volume_per_unit_mm3"):
         ExtrusionVolumeModel(bead_cross_section_area_mm2=0.2, e_volume_per_unit_mm3=0.0)
+    with pytest.raises(ValueError, match="preview_line_width_mm"):
+        ExtrusionVolumeModel(bead_cross_section_area_mm2=0.2, e_volume_per_unit_mm3=0.1, preview_line_width_mm=0.0)
+
+
+def test_path_bridge_keeps_the_optional_process_preview_width_in_external_npz_metadata():
+    domain, parameterization, fields, orientation, phase = _inputs()
+    geometry = generate_conformal_lattice_geometry(domain, parameterization, fields, orientation, phase, boundary_mode="inset")
+    graph = build_conformal_lattice_path_graph(
+        geometry,
+        ExtrusionVolumeModel(bead_cross_section_area_mm2=0.2, e_volume_per_unit_mm3=0.1, preview_line_width_mm=0.62),
+    )
+
+    job = graph.to_external_source_job()
+    assert job.meta["slicing"]["resolved_config"]["line_width"] == pytest.approx(0.62)

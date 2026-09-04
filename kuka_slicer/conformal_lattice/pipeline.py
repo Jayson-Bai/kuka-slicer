@@ -51,6 +51,18 @@ class ConformalLatticeRun:
             layer_embedding=self.layer_embedding,
         )
 
+    def main_preview_payload(self, *, planning_line_width_mm: float) -> dict[str, object]:
+        """Return the final user-facing payload for the existing main Canvas."""
+
+        if self.path_graph is None:
+            raise ValueError("main preview requires an explicit process E conversion and path graph")
+        from .main_preview import main_preview_payload_from_conformal_path_graph
+
+        return main_preview_payload_from_conformal_path_graph(
+            self.path_graph,
+            planning_line_width_mm=planning_line_width_mm,
+        )
+
     @property
     def report(self) -> dict[str, object]:
         """Summarise output availability without pretending a path export exists."""

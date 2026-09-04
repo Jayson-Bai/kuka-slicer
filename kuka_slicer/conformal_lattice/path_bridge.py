@@ -37,6 +37,7 @@ class ExtrusionVolumeModel:
 
     bead_cross_section_area_mm2: float
     e_volume_per_unit_mm3: float
+    preview_line_width_mm: float | None = None
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -45,9 +46,13 @@ class ExtrusionVolumeModel:
         ):
             if not np.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be positive and finite")
+        if self.preview_line_width_mm is not None and (
+            not np.isfinite(self.preview_line_width_mm) or self.preview_line_width_mm <= 0.0
+        ):
+            raise ValueError("preview_line_width_mm must be positive and finite when supplied")
 
     def metadata(self) -> dict[str, object]:
-        return {
+        metadata: dict[str, object] = {
             "format": "conformal_edge_volume_e_v1",
             "bead_cross_section_area_mm2": float(self.bead_cross_section_area_mm2),
             "e_volume_per_unit_mm3": float(self.e_volume_per_unit_mm3),
@@ -55,6 +60,9 @@ class ExtrusionVolumeModel:
             "uses_actual_3d_length": True,
             "requires_xy_preservation": False,
         }
+        if self.preview_line_width_mm is not None:
+            metadata["preview_line_width_mm"] = float(self.preview_line_width_mm)
+        return metadata
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,24 +107,29 @@ class ConformalLatticePathGraph:
             "trail_partition_status": "not_planned; no edge joining, connector, or travel routing has been applied",
             "core_handoff": "external_layer_paths_v1 XYZ only; downstream Core remains responsible for final XYZABC",
         }
+        job_metadata: dict[str, object] = {
+            "conformal_lattice_path_bridge": bridge_meta,
+            "path_roles": {
+                material: {
+                    str(layer): ["conformal_structural_edge"] * len(self.edge_ids)
+                    for layer in range(len(self.layer_node_positions_xyz))
+                }
+            },
+            "extrusion_compensation": {
+                "format": "conformal_edge_volume_e_v1",
+                "scope": "per-edge cumulative E from actual 3-D arc length and explicit bead volume",
+                "requires_xy_preservation": False,
+                "replaces_legacy_arc_length_ratio": True,
+            },
+        }
+        extrusion = self.metadata.get("config", {}).get("extrusion") if isinstance(self.metadata.get("config"), Mapping) else None
+        preview_line_width = extrusion.get("preview_line_width_mm") if isinstance(extrusion, Mapping) else None
+        if isinstance(preview_line_width, (int, float)) and not isinstance(preview_line_width, bool):
+            job_metadata["slicing"] = {"resolved_config": {"line_width": float(preview_line_width)}}
         return ExternalSourceJob(
             material_paths=material_paths,
             travel_paths=travel_paths,
-            meta={
-                "conformal_lattice_path_bridge": bridge_meta,
-                "path_roles": {
-                    material: {
-                        str(layer): ["conformal_structural_edge"] * len(self.edge_ids)
-                        for layer in range(len(self.layer_node_positions_xyz))
-                    }
-                },
-                "extrusion_compensation": {
-                    "format": "conformal_edge_volume_e_v1",
-                    "scope": "per-edge cumulative E from actual 3-D arc length and explicit bead volume",
-                    "requires_xy_preservation": False,
-                    "replaces_legacy_arc_length_ratio": True,
-                },
-            },
+            meta=job_metadata,
         )
 
 

@@ -72,7 +72,11 @@ def test_pipeline_runs_gates_one_to_eight_and_only_enables_paths_with_an_explici
     run = run_conformal_lattice_pipeline(
         _spec(),
         logical_layer_count=4,
-        extrusion=ExtrusionVolumeModel(bead_cross_section_area_mm2=0.2, e_volume_per_unit_mm3=0.1),
+        extrusion=ExtrusionVolumeModel(
+            bead_cross_section_area_mm2=0.2,
+            e_volume_per_unit_mm3=0.1,
+            preview_line_width_mm=0.6,
+        ),
         fill_samples_per_triangle_side=3,
     )
 
@@ -83,6 +87,13 @@ def test_pipeline_runs_gates_one_to_eight_and_only_enables_paths_with_an_explici
     assert run.path_graph is not None
     assert run.report["path_npz_export_available"] is True
     assert run.preview_payload()["read_only"] is True
+    main_preview = run.main_preview_payload(planning_line_width_mm=0.6)
+    assert main_preview["preview_source"] == "conformal_lattice_external_source_job"
+    assert main_preview["geometry_mode"] == "surface_3d"
+    assert main_preview["line_widths"]["resin"] == pytest.approx(0.6)
+    assert main_preview["conformal_lattice"]["uses_existing_main_canvas"] is True
+    assert len(main_preview["layers"]) == 4
+    assert all(len(layer["resin_paths"]) == len(run.path_graph.edge_ids) for layer in main_preview["layers"])
 
     outputs = write_conformal_lattice_outputs(run, tmp_path)
     assert set(outputs) == {"geometry", "paths"}
@@ -92,6 +103,12 @@ def test_pipeline_runs_gates_one_to_eight_and_only_enables_paths_with_an_explici
         metadata = json.loads(str(archive["meta"]))
     assert metadata["format"] == "external_layer_paths_v1"
     assert metadata["conformal_lattice_path_bridge"]["trail_partition_status"].startswith("not_planned")
+    from kuka_slicer.ui_server import _preview_payload_from_source_npz
+
+    loaded_preview = _preview_payload_from_source_npz(outputs["paths"].read_bytes(), outputs["paths"].name)
+    assert loaded_preview["preview_source"] == "conformal_lattice_external_source_npz"
+    assert loaded_preview["line_widths"]["resin"] == pytest.approx(0.6)
+    assert loaded_preview["conformal_lattice"]["uses_existing_main_canvas"] is True
 
 
 def test_pipeline_keeps_path_export_disabled_without_process_e_conversion(tmp_path):
@@ -103,6 +120,8 @@ def test_pipeline_keeps_path_export_disabled_without_process_e_conversion(tmp_pa
     outputs = write_conformal_lattice_outputs(run, tmp_path)
     assert set(outputs) == {"geometry"}
     assert not (tmp_path / "external_layer_paths_v1.npz").exists()
+    with pytest.raises(ValueError, match="path graph"):
+        run.main_preview_payload(planning_line_width_mm=0.6)
 
 
 @pytest.mark.parametrize(

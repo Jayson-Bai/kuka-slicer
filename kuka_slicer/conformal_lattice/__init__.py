@@ -52,6 +52,7 @@ from .scalar_fields import (
     roi_driver,
 )
 from .pipeline import ConformalLatticeRun, run_conformal_lattice_pipeline, write_conformal_lattice_outputs
+from .main_preview import main_preview_payload_from_conformal_path_graph
 
 __all__ = [
     "ConformalLatticeSpec",
@@ -95,6 +96,7 @@ __all__ = [
     "parameterize_lscm",
     "parameterize_spec_lscm",
     "nonadjacent_triangle_overlap_pairs",
+    "main_preview_payload_from_conformal_path_graph",
     "require_valid_phase",
     "run_conformal_lattice_preview_server",
     "run_conformal_lattice_pipeline",

@@ -4619,6 +4619,9 @@ def test_ui_preview_reuses_canvas_for_surface_3d_tool_direction():
     assert "minimum_sampled_clearance_mm" in html
     assert "coarse_sampling_pitch_mm" in html
     assert "refinement_sampling_pitch_mm" in html
+    assert "conformal_lattice_external_source_npz" in html
+    assert "共形格栅结构边预览不适用旧版峰值曲率碰撞检查" in html
+    assert "导入曲面/共形 NPZ 预览" in html
 
 
 def test_ui_surface_preview_can_overlay_prior_layers_and_always_labels_curvature():
