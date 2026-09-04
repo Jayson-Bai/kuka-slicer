@@ -22,6 +22,9 @@ from .parameterization import (
 )
 from .orientation_field import OrientationField, build_orientation_field
 from .lattice_generator import ConformalLatticeGeometry, generate_conformal_lattice_geometry
+from .layer_embedding import LayerEmbedding, embed_lattice_layers
+from .preview import conformal_lattice_preview_payload
+from .server import conformal_lattice_preview_html, run_conformal_lattice_preview_server
 from .fill_ratio_validation import CellScaleCorrection, FillRatioValidation, derive_fill_ratio_cell_size_override, validate_realized_fill_ratio
 from .phase_coordinates import (
     PhaseAnchor,
@@ -52,6 +55,7 @@ __all__ = [
     "FieldComponent",
     "FillRatioValidation",
     "LSCMParameterization",
+    "LayerEmbedding",
     "OrientationField",
     "PhaseAnchor",
     "PhaseCoordinates",
@@ -60,12 +64,15 @@ __all__ = [
     "build_double_sine_surface_domain",
     "build_orientation_field",
     "compose_design_fields",
+    "conformal_lattice_preview_payload",
+    "conformal_lattice_preview_html",
     "constant_driver",
     "curvature_driver",
     "cut_mesh_along_edges",
     "derive_fill_ratio_cell_size_override",
     "evaluate_conformal_quality",
     "evaluate_phase_quality",
+    "embed_lattice_layers",
     "external_scalar_driver",
     "farthest_boundary_anchors",
     "generate_conformal_lattice_geometry",
@@ -76,6 +83,7 @@ __all__ = [
     "parameterize_spec_lscm",
     "nonadjacent_triangle_overlap_pairs",
     "require_valid_phase",
+    "run_conformal_lattice_preview_server",
     "roi_driver",
     "solve_phase_coordinates",
     "validate_realized_fill_ratio",
