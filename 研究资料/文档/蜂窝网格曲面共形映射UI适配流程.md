@@ -1,0 +1,302 @@
+# 蜂窝网格曲面共形映射 UI 适配流程
+
+> 文档性质：最小 UI 实现规划  
+> 适用仓库：`kuka_slicer`  
+> 当前状态：接口决策已确认，本文不代表 UI 已实现  
+> 关联文档：`蜂窝网格曲面共形映射流程.md`
+
+## 1. 已锁定的产品决策
+
+新共形格栅 UI 第一版只支持以下组合：
+
+1. 承载曲面固定为参数化双正弦曲面，不支持外部真实曲面网格；
+2. 蜂窝 STL 只提供外轮廓、XY 范围、构建高度和旧方案对比依据，不再提供新格栅拓扑；
+3. 新六边形格栅由 UI 中的固定设计墙宽和固定目标单元尺度生成；
+4. 不开放曲率、ROI、应力或外部标量驱动的变密度设计；
+5. 层间形貌只保留旧版对称 `smoothstep` 的“平—曲—平”逻辑；
+6. 用户继续输入“曲面起始层”，回落层、峰值层和各层系数由程序确定性计算；
+7. 旧 `surface_mapping_v1` 及旧曲面映射器继续保留，供结果对比，不被新 UI 覆盖。
+
+## 2. 输入职责
+
+### 2.1 蜂窝 STL
+
+第一版仍由用户导入蜂窝 STL，但新流程只使用以下信息：
+
+- 文件名和 SHA-256；
+- 构建轴；
+- 外轮廓及 `xy_bounds_mm`；
+- 模型高度和由切片参数得到的逻辑层数。
+
+STL 内已有六边形孔壁不作为新格栅的节点、边、墙宽或单元尺度来源。新方法会在同一外轮廓范围内重新生成六边形格栅。
+
+### 2.2 双正弦承载曲面
+
+复用现有曲面参数窗口中的以下输入：
+
+| UI 名称 | 配置字段 | 单位 |
+| --- | --- | --- |
+| 幅值 A | `amplitude_mm` | mm |
+| X 波长 λx | `wavelength_x_mm` | mm |
+| Y 波长 λy | `wavelength_y_mm` | mm |
+| X 相位 φx | `phase_x_rad` | rad |
+| Y 相位 φy | `phase_y_rad` | rad |
+| Z 基准 | `z_reference_mm` | mm |
+
+曲面公式保持为：
+
+\[
+z(x,y)=z_{ref}+A\sin\left(\frac{2\pi x}{\lambda_x}+\phi_x\right)
+                 \sin\left(\frac{2\pi y}{\lambda_y}+\phi_y\right)
+\]
+
+曲面 XY 范围由蜂窝 STL 外轮廓自动给出，不需要用户重复输入。
+
+现有单个“网格密度”输入改为两个高级参数：
+
+- `samples_x`：X 方向曲面三角化采样数；
+- `samples_y`：Y 方向曲面三角化采样数。
+
+这两个值影响后续 LSCM 和格栅结果，不再只是预览清晰度。第一版可以提供确定性默认值并折叠在“高级参数”中。
+
+### 2.3 固定格栅参数
+
+第一版只显示两个主要格栅参数：
+
+| UI 名称 | 配置字段 | 含义 |
+| --- | --- | --- |
+| 设计墙宽 | `wall_width_mm` | 用于格栅几何和填充率估计的名义结构墙宽 |
+| 目标六边形边长 | `base_cell_size_mm` | 沿承载曲面测量的名义六边形边长，决定格栅疏密 |
+
+设计墙宽不自动等同于实际挤出道宽。实际挤出截面积和 E 换算仍属于后续工艺参数。
+
+固定单元尺度表示全域使用同一个目标值。曲面离散、边界裁剪和数值畸变仍可能导致实际单元边长出现小幅偏差，UI 应显示实际范围和质量报告，不应把输入值显示为测量结果。
+
+第一版不让用户同时输入目标填充率。填充率只作为由墙宽、单元尺度和实际生成结果计算出的只读指标。
+
+规则六边形薄壁近似下，UI 可显示名义填充率：
+
+\[
+\eta_{nominal}=\frac{2w}{\sqrt{3}a}
+\]
+
+其中 `w` 为设计墙宽，`a` 为目标六边形边长。若该值不满足 `0 < eta_nominal < 1`，UI 必须拒绝生成。该公式只用于初始设计提示，最终填充率仍以 Gate 6 的实际几何测量为准。
+
+当前 `compose_design_fields` 仍以目标填充率为主输入，再反算 `target_cell_size_mm`。因此，后续实现必须增加一个显式的“固定单元尺度”入口：直接生成全域常量 `target_cell_size_mm=a`，再把上式得到的填充率作为只读目标和报告值。不能在 UI 内填写固定单元尺度后，又在后端静默改回填充率驱动。
+
+为保证结果可复现，以下字段保留默认值，可放入高级参数：
+
+- 边界策略：`clip` 或 `inset`；
+- 相位偏移：`phase_origin=[0,0]`；
+- 全局格栅方向角：`orientation_angle_deg=0`；
+- 随机种子：`random_seed=0`；
+- LSCM 锚点策略：`farthest_boundary_pair`。
+
+### 2.4 路径导出所需工艺值
+
+固定格栅参数属于结构设计，不能代替 Gate 8 的 E 换算参数。路径导出应复用主切片器当前选中的树脂工艺预设，显式提供：
+
+- 实际沉积截面积；
+- 每个 E 单位对应的材料体积。
+
+如果当前工艺预设不能提供这两个值，第一版只允许导出配置和结构几何，路径 NPZ 按钮保持禁用并说明原因，不得根据设计墙宽静默推算 E。
+
+## 3. 层间曲率渐变
+
+### 3.1 UI 输入
+
+层间形貌固定为“对称 smoothstep”，不提供其他策略下拉框。UI 仅增加或保留：
+
+- 逻辑层总数：由 STL 高度和切片层高计算，只读显示；
+- 曲面起始层：`surface_start_layer`，用户输入整数；
+- 曲面回落层：自动镜像计算，只读显示；
+- 峰值层：自动计算，只读显示。
+
+“曲面起始层”的语义与旧版一致：该层本身仍为 `alpha=0`，下一层开始逐渐增加曲率。
+
+### 3.2 系数计算
+
+设：
+
+- `s` 为用户输入的曲面起始层；
+- `L` 为最后一个逻辑层索引；
+- `r=L-s` 为镜像回落层；
+- `k` 为当前逻辑层。
+
+当 `k<s` 或 `k>r` 时：
+
+\[
+\alpha_k=0
+\]
+
+在对称活动区内，令：
+
+\[
+d_k=\min(k-s,r-k)
+\]
+
+\[
+m=\left\lfloor\frac{r-s}{2}\right\rfloor,
+\qquad t_k=\frac{d_k}{m}
+\]
+
+使用唯一允许的平滑函数：
+
+\[
+\alpha_k=3t_k^2-2t_k^3
+\]
+
+若对称活动区只有一层或两层，则这些活动层直接取 `alpha=1`，不执行除法。
+
+奇数层数时一个中间层达到 `alpha=1`；偶数层数时中间两个层共同达到 `alpha=1`。
+
+输入必须满足：
+
+```text
+0 <= surface_start_layer <= final_logical_layer // 2
+```
+
+### 3.3 层几何
+
+新共形格栅先生成目标曲面上的节点 `P_target`，再为相同节点 ID 建立平面参考位置 `P_flat`。各逻辑层使用：
+
+\[
+P_k=P_{flat}+\alpha_k(P_{target}-P_{flat})
+\]
+
+所有层共享相同的节点 ID、边 ID 和格栅拓扑。
+
+该模式保留旧版“平—曲—平”的形貌渐变，但中间过渡层只能标记为形貌插值层，不能声称每一层都严格满足离散共形参数化。
+
+当前 Gate 7 的 `symmetric_shape_morphing` 只接收总层数，会在整个层数范围内自动渐变；它尚未接收 `surface_start_layer`。后续适配必须使用与旧 `LayerProgression` 相同的起始层、镜像回落和峰值层规则，不能只复用现有 `_symmetric_alphas(layer_count)`。
+
+## 4. 最小 UI 布局
+
+现有曲面参数窗口可保留三维预览和主要控件，按以下顺序组成一个页面：
+
+```text
+1. 输入模型
+   - 导入蜂窝 STL
+   - 构建轴
+   - XY 外轮廓、模型高度、逻辑层数摘要
+
+2. 双正弦曲面
+   - A、λx、λy、φx、φy、Zref
+   - 三维承载曲面预览
+
+3. 固定六边形格栅
+   - 设计墙宽
+   - 目标六边形边长
+   - 全局方向角
+
+4. 对称层间渐变
+   - 曲面起始层
+   - 自动显示回落层和峰值层
+   - 各层 alpha 曲线或简化层条预览
+
+5. 结果
+   - 生成并验证
+   - 查看共形畸变、实际单元尺度和实际填充率
+   - 导出配置和结构几何
+   - 工艺 E 参数齐全时才启用路径 NPZ 导出
+```
+
+第一版不增加多页面向导，也不开放外部场、手工切缝、手工锚点和复杂优化器参数。
+
+## 5. 配置输出
+
+UI 输出 `conformal_lattice_spec_v1.json`。下面的 SHA-256 占位符由程序生成，不是用户输入：
+
+```json
+{
+  "format": "conformal_lattice_spec_v1",
+  "units": "mm",
+  "source_surface": {
+    "provider": "double_sine",
+    "source_file": "generated://double-sine",
+    "sha256": "<程序生成的64位小写SHA-256>",
+    "domain": "outer_boundary_only",
+    "reference_stl": {
+      "file_name": "honeycomb.stl",
+      "sha256": "<蜂窝STL的SHA-256>"
+    },
+    "double_sine": {
+      "amplitude_mm": 0.8,
+      "wavelength_x_mm": 40.0,
+      "wavelength_y_mm": 50.0,
+      "phase_x_rad": 0.0,
+      "phase_y_rad": 0.0,
+      "z_reference_mm": 0.0,
+      "xy_bounds_mm": [0.0, 0.0, 150.0, 100.0],
+      "samples": [151, 101]
+    }
+  },
+  "parameterization": {
+    "method": "lscm",
+    "anchor_strategy": "farthest_boundary_pair",
+    "seam_strategy": "none"
+  },
+  "lattice": {
+    "family": "triangular_dual_hex",
+    "wall_width_mm": 2.0,
+    "base_cell_size_mm": 5.0,
+    "boundary_mode": "clip",
+    "phase_origin": [0.0, 0.0]
+  },
+  "fill_field": {
+    "mode": "fixed_cell_size",
+    "drivers": []
+  },
+  "orientation_field": {
+    "mode": "global_axis",
+    "angle_deg": 0.0,
+    "constraints": []
+  },
+  "layer_embedding": {
+    "mode": "symmetric_shape_morphing",
+    "transition": "smoothstep",
+    "surface_start_layer": 3
+  },
+  "quality_limits": {},
+  "random_seed": 0
+}
+```
+
+旧曲面预览器仍可导出 `graded_surface_v1.json`，但该文件只供旧 `surface_mapping_v1` 使用。新共形页面不得把两种 JSON 混用。
+
+## 6. 最小实现顺序
+
+后续代码适配分五个小步骤完成：
+
+1. 复用现有双正弦参数控件和三维预览，新增固定墙宽、固定单元尺度和曲面起始层；
+2. 新增 `conformal_lattice_spec_v1` 配置组装与校验，不改变旧 `graded_surface_v1` 导出；
+3. 为设计场增加固定 `target_cell_size_mm` 入口，并把名义填充率降为只读派生值；
+4. 将旧 `LayerProgression` 的起始层、镜像回落和 `smoothstep` 语义接入新 `symmetric_shape_morphing`；
+5. 串联现有 Gate 1—8，输出只读预览和 `conformal_lattice_geometry_v1.npz`；工艺 E 参数齐全时再输出 `external_layer_paths_v1`。
+
+每一步独立提交和验证，不一次性改完。
+
+## 7. 最小验收条件
+
+- 旧曲面预览、旧曲面映射和旧回归结果不变；
+- 新页面不出现外部曲面网格入口；
+- STL 的旧蜂窝孔壁不会成为新格栅拓扑输入；
+- 用户只能选择固定墙宽和固定单元尺度；
+- 后端实际使用的 `target_cell_size_mm` 在全域等于用户输入值；
+- 名义填充率由墙宽和单元尺度派生，实际填充率由 Gate 6 测量；
+- 用户可以输入曲面起始层，回落层与峰值层自动计算；
+- 新旧模式对相同层数和起始层得到相同的 `alpha_by_layer`；
+- 偶数层中间两层达到完整曲率，顶部和底部按设置恢复平面；
+- 配置保存输入哈希、随机种子和质量阈值；
+- 输出仍能进入现有 External Source NPZ 与下游 Core；
+- UI 不把形貌插值层标记为“严格共形层”。
+
+## 8. 第一版明确不做
+
+- 外部真实曲面网格；
+- 曲率、ROI、应力或外部标量驱动的变密度；
+- 用户直接输入目标填充率；
+- 多种层间渐变函数；
+- 手工切缝、手工 LSCM 锚点；
+- 自动路径一笔画、分区或空走优化；
+- 在 UI 内实现下游 Core 的平滑、姿态或机器人执行逻辑。
