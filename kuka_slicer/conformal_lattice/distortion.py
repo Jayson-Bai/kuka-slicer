@@ -68,7 +68,7 @@ def evaluate_conformal_quality(domain: SurfaceMeshDomain, uv: np.ndarray) -> Con
         angle_error[face_index] = _max_angle_error_deg(local.T, mapped)
 
     flips = int(np.count_nonzero(signed_area < -1e-14))
-    overlaps = tuple(_uv_overlap_pairs(coordinates, domain.faces))
+    overlaps = nonadjacent_triangle_overlap_pairs(coordinates, domain.faces)
     finite_ratio = ratio[np.isfinite(ratio)]
     weights = source_areas[np.isfinite(ratio)]
     summary: dict[str, float | int] = {
@@ -146,7 +146,25 @@ def _triangle_angles_deg(points: np.ndarray) -> np.ndarray:
     return angles
 
 
-def _uv_overlap_pairs(uv: np.ndarray, faces: np.ndarray) -> list[tuple[int, int]]:
+def nonadjacent_triangle_overlap_pairs(coordinates: np.ndarray, faces: np.ndarray) -> tuple[tuple[int, int], ...]:
+    """Return overlapping pairs after excluding triangles that share a vertex.
+
+    This geometric predicate is intentionally independent of UV semantics so
+    later gates can apply the same non-adjacent-overlap rule to phase space.
+    """
+
+    points = np.asarray(coordinates, dtype=np.float64)
+    triangles = np.asarray(faces, dtype=np.int64)
+    if points.ndim != 2 or points.shape[1] != 2 or not np.all(np.isfinite(points)):
+        raise ValueError("coordinates must be a finite (vertex_count, 2) array")
+    if triangles.ndim != 2 or triangles.shape[1] != 3:
+        raise ValueError("faces must be a (face_count, 3) array")
+    if len(triangles) and (np.any(triangles < 0) or np.any(triangles >= len(points))):
+        raise ValueError("faces reference a coordinate outside the array")
+    return tuple(_overlap_pairs_2d(points, triangles))
+
+
+def _overlap_pairs_2d(uv: np.ndarray, faces: np.ndarray) -> list[tuple[int, int]]:
     pairs: list[tuple[int, int]] = []
     for left, face in enumerate(faces):
         first = uv[face]

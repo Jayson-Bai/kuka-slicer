@@ -6,7 +6,7 @@ generation are added by later gates.
 """
 
 from .contracts import ConformalLatticeSpec, load_conformal_lattice_spec
-from .distortion import ConformalQuality, evaluate_conformal_quality
+from .distortion import ConformalQuality, evaluate_conformal_quality, nonadjacent_triangle_overlap_pairs
 from .mesh_domain import (
     SurfaceMeshDomain,
     build_double_sine_surface_domain,
@@ -21,6 +21,14 @@ from .parameterization import (
     parameterize_spec_lscm,
 )
 from .orientation_field import OrientationField, build_orientation_field
+from .phase_coordinates import (
+    PhaseAnchor,
+    PhaseCoordinates,
+    PhaseQuality,
+    evaluate_phase_quality,
+    require_valid_phase,
+    solve_phase_coordinates,
+)
 from .scalar_fields import (
     DesignFieldResult,
     ExternalScalarMetadata,
@@ -40,6 +48,9 @@ __all__ = [
     "FieldComponent",
     "LSCMParameterization",
     "OrientationField",
+    "PhaseAnchor",
+    "PhaseCoordinates",
+    "PhaseQuality",
     "SurfaceMeshDomain",
     "build_double_sine_surface_domain",
     "build_orientation_field",
@@ -48,6 +59,7 @@ __all__ = [
     "curvature_driver",
     "cut_mesh_along_edges",
     "evaluate_conformal_quality",
+    "evaluate_phase_quality",
     "external_scalar_driver",
     "farthest_boundary_anchors",
     "load_conformal_lattice_spec",
@@ -55,5 +67,8 @@ __all__ = [
     "prepare_surface_mesh_domain",
     "parameterize_lscm",
     "parameterize_spec_lscm",
+    "nonadjacent_triangle_overlap_pairs",
+    "require_valid_phase",
     "roi_driver",
+    "solve_phase_coordinates",
 ]
