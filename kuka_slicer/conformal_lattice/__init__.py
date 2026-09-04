@@ -23,6 +23,12 @@ from .parameterization import (
 from .orientation_field import OrientationField, build_orientation_field
 from .lattice_generator import ConformalLatticeGeometry, generate_conformal_lattice_geometry
 from .layer_embedding import LayerEmbedding, embed_lattice_layers
+from .path_bridge import (
+    ConformalLatticePathGraph,
+    ExtrusionVolumeModel,
+    build_conformal_lattice_path_graph,
+    write_conformal_lattice_external_npz,
+)
 from .preview import conformal_lattice_preview_payload
 from .server import conformal_lattice_preview_html, run_conformal_lattice_preview_server
 from .fill_ratio_validation import CellScaleCorrection, FillRatioValidation, derive_fill_ratio_cell_size_override, validate_realized_fill_ratio
@@ -49,9 +55,11 @@ __all__ = [
     "ConformalLatticeSpec",
     "CellScaleCorrection",
     "ConformalLatticeGeometry",
+    "ConformalLatticePathGraph",
     "ConformalQuality",
     "DesignFieldResult",
     "ExternalScalarMetadata",
+    "ExtrusionVolumeModel",
     "FieldComponent",
     "FillRatioValidation",
     "LSCMParameterization",
@@ -63,6 +71,7 @@ __all__ = [
     "SurfaceMeshDomain",
     "build_double_sine_surface_domain",
     "build_orientation_field",
+    "build_conformal_lattice_path_graph",
     "compose_design_fields",
     "conformal_lattice_preview_payload",
     "conformal_lattice_preview_html",
@@ -87,4 +96,5 @@ __all__ = [
     "roi_driver",
     "solve_phase_coordinates",
     "validate_realized_fill_ratio",
+    "write_conformal_lattice_external_npz",
 ]
