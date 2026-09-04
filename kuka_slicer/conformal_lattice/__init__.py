@@ -22,6 +22,7 @@ from .parameterization import (
 )
 from .orientation_field import OrientationField, build_orientation_field
 from .lattice_generator import ConformalLatticeGeometry, generate_conformal_lattice_geometry
+from .fill_ratio_validation import FillRatioValidation, validate_realized_fill_ratio
 from .phase_coordinates import (
     PhaseAnchor,
     PhaseCoordinates,
@@ -48,6 +49,7 @@ __all__ = [
     "DesignFieldResult",
     "ExternalScalarMetadata",
     "FieldComponent",
+    "FillRatioValidation",
     "LSCMParameterization",
     "OrientationField",
     "PhaseAnchor",
@@ -74,4 +76,5 @@ __all__ = [
     "require_valid_phase",
     "roi_driver",
     "solve_phase_coordinates",
+    "validate_realized_fill_ratio",
 ]

@@ -65,13 +65,25 @@ class ConformalLatticeGeometry:
         design_fields: DesignFieldResult,
         orientation: OrientationField,
         phase: PhaseCoordinates,
+        fill_validation: "FillRatioValidation | None" = None,
     ) -> Path:
         """Persist the Gate 5 sidecar without reusing path-layer NPZ contracts."""
 
         destination = Path(path)
         if destination.name != "conformal_lattice_geometry_v1.npz":
             raise ValueError("Gate 5 output filename must be conformal_lattice_geometry_v1.npz")
-        meta = {**self.metadata, "report": self.report}
+        if fill_validation is not None and len(fill_validation.realized_fill_ratio_per_cell) != len(self.cell_valence):
+            raise ValueError("fill validation must contain one realized fill ratio per cell")
+        realized_fill = (
+            np.full(len(self.cell_valence), np.nan, dtype=np.float64)
+            if fill_validation is None
+            else fill_validation.realized_fill_ratio_per_cell
+        )
+        meta = {
+            **self.metadata,
+            "report": self.report,
+            "fill_ratio_validation": None if fill_validation is None else fill_validation.report,
+        }
         np.savez_compressed(
             destination,
             surface_vertices_xyz=domain.vertices,
@@ -82,7 +94,7 @@ class ConformalLatticeGeometry:
             angle_error_deg_per_face=parameterization.quality.angle_error_deg_per_face,
             area_scale_per_face=parameterization.quality.area_scale_per_face,
             target_fill_ratio_per_vertex=design_fields.target_fill_ratio,
-            realized_fill_ratio_per_cell=np.full(len(self.cell_valence), np.nan, dtype=np.float64),
+            realized_fill_ratio_per_cell=realized_fill,
             target_cell_size_mm_per_vertex=design_fields.target_cell_size_mm,
             orientation_rosy6_real=orientation.rosy6_real,
             orientation_rosy6_imag=orientation.rosy6_imag,
