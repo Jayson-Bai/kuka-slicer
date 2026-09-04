@@ -29,6 +29,7 @@ from .external_npz import (
     write_external_source_npz,
 )
 from .cpu_limiter import limit_slicer_task
+from .conformal_lattice.contracts import load_conformal_lattice_spec
 from .fiber_travel import plan_fiber_interpath_travels
 from .gcode_legacy_postprocess import apply_legacy_resin_optimization
 from .honeycomb_pathing import HoneycombPathingConfig
@@ -73,6 +74,38 @@ MAX_SURFACE_PREVIEW_NPZ_BYTES = 256 * 1024 * 1024
 PRINTHEAD_ASSET_DIR = Path(__file__).resolve().parent.parent / "assets" / "printhead"
 
 DEFAULT_UI_RESIN_INFILL_OVERLAP_PERCENT = 0.0
+
+
+def _conformal_spec_ui_summary(payload: bytes, filename: str) -> dict[str, object]:
+    """Validate a design-file selection before any geometry or Core work starts."""
+
+    spec = load_conformal_lattice_spec(payload)
+    if not spec.part or not spec.manufacturing:
+        raise ValueError("请选择由蜂窝网格共形设计器导出的矩形实体 JSON")
+    part = spec.part
+    manufacturing = spec.manufacturing
+    layer_height = float(manufacturing["layer_height_mm"])
+    final_height = float(part["final_height_mm"])
+    return {
+        "format": "conformal_lattice_spec_v1",
+        "file_name": _safe_filename(filename or "conformal_lattice_spec_v1.json"),
+        "part": {
+            "length_mm": float(part["length_mm"]),
+            "width_mm": float(part["width_mm"]),
+            "final_height_mm": final_height,
+            "logical_layer_count": int(np.ceil(final_height / layer_height)),
+        },
+        "manufacturing": {
+            "layer_height_mm": layer_height,
+            "nominal_bead_width_mm": float(manufacturing["nominal_bead_width_mm"]),
+        },
+        "lattice": {
+            "wall_width_mm": float(spec.lattice["wall_width_mm"]),
+            "wall_bead_count": int(spec.lattice["wall_bead_count"]),
+            "base_cell_size_mm": float(spec.lattice["base_cell_size_mm"]),
+        },
+        "source_surface_sha256": spec.source_sha256,
+    }
 
 
 class FiberTemplatePaths(list[list[list[float]]]):
@@ -909,6 +942,25 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                         "preview": _preview_payload_from_source_npz(
                             source_bytes,
                             _safe_filename(source_name or "curved.npz"),
+                        ),
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path == "/inspect-conformal-spec":
+            try:
+                _, files = self._read_slice_request(parsed.query)
+                uploaded = files.get("conformal_spec")
+                if uploaded is None:
+                    raise ValueError("请选择共形蜂窝设计 JSON")
+                name, payload = uploaded
+                self._send_json(
+                    {
+                        "ok": True,
+                        "summary": _conformal_spec_ui_summary(
+                            payload,
+                            name or "conformal_lattice_spec_v1.json",
                         ),
                     }
                 )
@@ -3968,13 +4020,16 @@ def _index_html() -> str:
   <header>
     <h1>机械臂空间复合材料增材制造系统切片器</h1>
     <div class="surfaceTools" aria-label="曲面工具">
-      <button id="surfacePreviewButton" class="surfaceToolButton" type="button">启动曲面预览器</button>
+      <button id="surfacePreviewButton" class="surfaceToolButton" type="button">启动蜂窝网格共形设计器</button>
       <button id="surfaceMapperButton" class="surfaceToolButton" type="button">启动曲面映射器</button>
+      <button id="conformalSpecButton" class="surfaceToolButton" type="button">导入共形设计 JSON</button>
       <button id="coreNpzPreviewButton" class="surfaceToolButton" type="button">导入 Core NPZ 预览</button>
       <button id="surfaceNpzPreviewButton" class="surfaceToolButton" type="button">导入曲面/共形 NPZ 预览</button>
       <button id="surfaceNpzCollisionButton" class="surfaceToolButton" type="button" disabled>检查当前 NPZ 碰撞</button>
       <output id="surfaceNpzCollisionResult" class="surfaceCollisionResult" aria-live="polite">请先导入本地映射 NPZ。</output>
       <input id="surfaceNpzInput" type="file" accept=".npz,application/octet-stream" hidden>
+      <input id="conformalSpecInput" type="file" accept=".json,application/json" hidden>
+      <output id="conformalSpecResult" class="surfaceCollisionResult" aria-live="polite">尚未导入共形蜂窝设计 JSON。</output>
     </div>
   </header>
   <main>
@@ -4720,6 +4775,9 @@ def _index_html() -> str:
     }};
     const surfaceNpzPreviewButton = document.getElementById('surfaceNpzPreviewButton');
     const coreNpzPreviewButton = document.getElementById('coreNpzPreviewButton');
+    const conformalSpecButton = document.getElementById('conformalSpecButton');
+    const conformalSpecInput = document.getElementById('conformalSpecInput');
+    const conformalSpecResult = document.getElementById('conformalSpecResult');
     const surfaceNpzCollisionButton = document.getElementById('surfaceNpzCollisionButton');
     const surfaceNpzCollisionResult = document.getElementById('surfaceNpzCollisionResult');
     const surfaceNpzInput = document.getElementById('surfaceNpzInput');
@@ -4815,6 +4873,41 @@ def _index_html() -> str:
         surfaceNpzPreviewButton.disabled = false;
         surfaceNpzPreviewButton.textContent = originalLabel;
       }}
+    }});
+    async function inspectConformalSpec(file) {{
+      if (!file) return;
+      conformalSpecButton.disabled = true;
+      const originalLabel = conformalSpecButton.textContent;
+      conformalSpecButton.textContent = '正在识别…';
+      conformalSpecResult.className = 'surfaceCollisionResult';
+      conformalSpecResult.textContent = '正在检查共形蜂窝设计参数…';
+      try {{
+        const payload = new FormData();
+        payload.append('conformal_spec', file, file.name);
+        const response = await fetch('/inspect-conformal-spec', {{ method: 'POST', body: payload }});
+        const result = await response.json();
+        if (!response.ok || !result.ok) throw new Error(result.error || '无法识别共形设计 JSON');
+        const summary = result.summary;
+        const part = summary.part;
+        const lattice = summary.lattice;
+        conformalSpecResult.className = 'surfaceCollisionResult ok';
+        conformalSpecResult.textContent = `已识别共形蜂窝模式：${{part.length_mm}} × ${{part.width_mm}} × ${{part.final_height_mm}} mm，${{part.logical_layer_count}} 层；${{lattice.wall_width_mm}} mm 墙体（${{lattice.wall_bead_count}} 条 2 mm 沉积道），单元边长 ${{lattice.base_cell_size_mm}} mm。`;
+        statusEl.className = 'status ok';
+        statusEl.textContent = '共形设计已载入。路径一笔画分区完成后，该文件将直接生成 External Source NPZ 并送入 Core。';
+      }} catch (error) {{
+        conformalSpecResult.className = 'surfaceCollisionResult error';
+        conformalSpecResult.textContent = '共形设计 JSON 无法使用：' + error.message;
+        statusEl.className = 'status error';
+        statusEl.textContent = conformalSpecResult.textContent;
+      }} finally {{
+        conformalSpecButton.disabled = false;
+        conformalSpecButton.textContent = originalLabel;
+        conformalSpecInput.value = '';
+      }}
+    }}
+    conformalSpecButton.addEventListener('click', () => conformalSpecInput.click());
+    conformalSpecInput.addEventListener('change', async () => {{
+      await inspectConformalSpec(conformalSpecInput.files?.[0]);
     }});
     coreNpzPreviewButton.addEventListener('click', async () => {{
       const originalLabel = coreNpzPreviewButton.textContent;

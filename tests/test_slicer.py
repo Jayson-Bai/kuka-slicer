@@ -1,6 +1,7 @@
 ﻿import math
 
 import inspect
+import json
 
 import numpy as np
 import pytest
@@ -62,6 +63,7 @@ from kuka_slicer.slicer import (
 from kuka_slicer.stl_io import Mesh
 from kuka_slicer.ui_server import (
     DEFAULT_UI_RESIN_INFILL_OVERLAP_PERCENT,
+    _conformal_spec_ui_summary,
     _choose_mapped_surface_npz_file,
     _load_surface_preview_last_directory,
     _index_html,
@@ -76,6 +78,7 @@ from kuka_slicer.ui_server import (
     expand_fiber_template_for_resin_layers,
     load_fiber_template_json,
 )
+from kuka_slicer.surface_preview.server import conformal_lattice_config_payload
 
 
 def test_cube_slice_produces_closed_square_path():
@@ -4666,6 +4669,36 @@ def test_ui_remembers_the_last_surface_npz_preview_directory_when_supported():
     assert "fetch('/choose-surface-npz-preview'" in html
     assert "applyMappedSurfacePreview(result.preview, result.file_name, result.collision_check_available === true)" in html
     assert "window.showOpenFilePicker" not in html
+
+
+def test_main_ui_recognizes_rectangular_conformal_design_json_before_slicing():
+    config = conformal_lattice_config_payload(
+        {
+            "part_length_mm": ["150"],
+            "part_width_mm": ["100"],
+            "part_height_mm": ["10"],
+            "layer_height_mm": ["0.5"],
+            "wall_width_mm": ["4"],
+            "base_cell_size_mm": ["8"],
+            "surface_start_layer": ["3"],
+        }
+    )
+
+    summary = _conformal_spec_ui_summary(
+        json.dumps(config).encode("utf-8"), "design.json"
+    )
+
+    assert summary["file_name"] == "design.json"
+    assert summary["part"]["logical_layer_count"] == 20
+    assert summary["lattice"] == {
+        "wall_width_mm": 4.0,
+        "wall_bead_count": 2,
+        "base_cell_size_mm": 8.0,
+    }
+    html = _index_html()
+    assert 'id="conformalSpecButton"' in html
+    assert 'id="conformalSpecInput"' in html
+    assert "fetch('/inspect-conformal-spec'" in html
 
 
 def test_surface_npz_picker_directory_is_persisted_in_local_ui_state(tmp_path):
