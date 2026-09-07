@@ -57,10 +57,11 @@ def test_path_bridge_exports_existing_npz_contract_with_edge_path_provenance(tmp
         assert np.any(np.isclose(np.diff(archive["layer_0000_R_E"], axis=1), 0.0))
         metadata = json.loads(str(archive["meta"]))
     assert metadata["format"] == "external_layer_paths_v1"
+    assert metadata["point_columns"] == ["x", "y", "z", "a", "b", "c"]
     bridge = metadata["conformal_lattice_path_bridge"]
     assert bridge["edge_ids_by_layer"]["0"] == graph.edge_ids.tolist()
     assert bridge["trail_partition_status"] == "planned_from_conformal_structural_graph"
-    assert bridge["core_handoff"].endswith("final XYZABC")
+    assert bridge["core_handoff"].startswith("external_layer_paths_v1 XYZABC")
     assert metadata["extrusion_compensation"]["requires_xy_preservation"] is False
 
 

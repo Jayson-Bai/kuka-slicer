@@ -159,16 +159,24 @@ def run_conformal_lattice_pipeline(
             samples_per_triangle_side=fill_samples_per_triangle_side,
         )
     layer_embedding = _symmetric_layer_embedding(domain, orientation, geometry, spec, logical_layer_count, base_z_by_layer)
-    outer_boundary = _symmetric_outer_boundary(domain, spec, layer_embedding) if spec.part else None
+    target_node_normals = _lattice_node_normals(domain, orientation, geometry)
+    layer_tool_normals = _symmetric_tool_normals(target_node_normals, layer_embedding)
+    outer_boundary, outer_boundary_tool_normals = (
+        _symmetric_outer_boundary(domain, orientation, spec, layer_embedding)
+        if spec.part
+        else (None, None)
+    )
     path_graph = None if extrusion is None else build_conformal_lattice_path_graph(
         geometry,
         extrusion,
         layer_embedding=layer_embedding,
-        node_normals_xyz=_lattice_node_normals(domain, orientation, geometry),
+        node_normals_xyz=target_node_normals,
         wall_bead_count=int(spec.lattice.get("wall_bead_count", 1)),
         nominal_bead_width_mm=float(spec.manufacturing.get("nominal_bead_width_mm", 2.0)),
         config_metadata=spec.metadata(),
         outer_boundary_paths_xyz=outer_boundary,
+        layer_tool_normals_xyz=layer_tool_normals,
+        outer_boundary_tool_normals_xyz=outer_boundary_tool_normals,
     )
     return ConformalLatticeRun(
         spec=spec,
@@ -275,9 +283,10 @@ def _lattice_node_normals(
 
 def _symmetric_outer_boundary(
     domain: SurfaceMeshDomain,
+    orientation: OrientationField,
     spec: ConformalLatticeSpec,
     layer_embedding: LayerEmbedding,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     """Embed the rectangular XY boundary with the same legacy smoothstep law."""
 
     if len(domain.boundary_loops) != 1:
@@ -290,11 +299,36 @@ def _symmetric_outer_boundary(
     if alpha.shape != (len(layer_embedding.node_positions_xyz),) or base_z.shape != alpha.shape:
         raise ValueError("symmetric layer embedding report is missing boundary-compatible layer data")
     boundary_surface = np.asarray(domain.vertices[domain.boundary_loops[0]], dtype=np.float64)
+    boundary_target_normals = np.asarray(orientation.vertex_normals_xyz[domain.boundary_loops[0]], dtype=np.float64)
     boundary_flat = np.array(boundary_surface, copy=True)
     boundary_flat[:, 2] = float(surface["z_reference_mm"])
     paths = boundary_flat[None, :, :] + alpha[:, None, None] * (boundary_surface[None, :, :] - boundary_flat[None, :, :])
     paths[:, :, 2] += base_z[:, None]
-    return np.concatenate((paths, paths[:, :1, :]), axis=1)
+    closed_paths = np.concatenate((paths, paths[:, :1, :]), axis=1)
+    normals = _symmetric_tool_normals(boundary_target_normals, layer_embedding)
+    return closed_paths, np.concatenate((normals, normals[:, :1, :]), axis=1)
+
+
+def _symmetric_tool_normals(target_normals_xyz: np.ndarray, layer_embedding: LayerEmbedding) -> np.ndarray:
+    """Interpolate height-field slopes with the same smoothstep alpha as XYZ."""
+
+    target = np.asarray(target_normals_xyz, dtype=np.float64)
+    if target.ndim != 2 or target.shape[1] != 3 or not np.all(np.isfinite(target)):
+        raise ValueError("target surface normals must be a finite Nx3 array")
+    target = target / np.linalg.norm(target, axis=1, keepdims=True)
+    target[target[:, 2] < 0.0] *= -1.0
+    if np.any(np.abs(target[:, 2]) <= 1e-9):
+        raise ValueError("target surface normals are too close to horizontal for the KUKA height-field ABC convention")
+    alpha = np.asarray(layer_embedding.report.get("alpha_by_layer"), dtype=np.float64)
+    if alpha.shape != (len(layer_embedding.node_positions_xyz),):
+        raise ValueError("symmetric layer embedding report is missing alpha_by_layer")
+    slope_x = -target[:, 0] / target[:, 2]
+    slope_y = -target[:, 1] / target[:, 2]
+    normals = np.stack(
+        (-alpha[:, None] * slope_x[None, :], -alpha[:, None] * slope_y[None, :], np.ones((len(alpha), len(target)))),
+        axis=2,
+    )
+    return normals / np.linalg.norm(normals, axis=2, keepdims=True)
 
 
 def _physical_layer_schedule(

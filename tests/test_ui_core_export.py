@@ -57,7 +57,11 @@ def test_conformal_design_json_generates_external_source_and_core_output(tmp_pat
     assert result["layers"] == 4
     assert result["effective_infill_pattern"] == "共形蜂窝一笔画分区"
     assert result["preview"]["preview_source"] == "conformal_lattice_external_source_job"
-    assert (tmp_path / result["download_url"].split("/")[-2] / "external_layer_paths_v1.npz").is_file()
+    assert result["preview"]["tool_orientation"]["available"] is True
+    job_dir = tmp_path / result["download_url"].split("/")[-2]
+    assert (job_dir / "external_layer_paths_v1.npz").is_file()
+    with np.load(job_dir / "conformal_lattice_core.npz", allow_pickle=False) as core:
+        assert np.linalg.norm(np.column_stack((core["a"], core["b"], core["c"]))) > 1e-3
     assert progress[-1] == 97
 
 

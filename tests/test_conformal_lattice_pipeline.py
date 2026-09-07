@@ -173,6 +173,8 @@ def test_rectangular_physical_part_derives_monotonic_layer_centres_and_requires_
     np.testing.assert_allclose(run.path_graph.outer_boundary_paths_xyz[:, 0], run.path_graph.outer_boundary_paths_xyz[:, -1])
     job = run.path_graph.to_external_source_job()
     assert job.meta["path_roles"]["R"]["0"][0] == "conformal_outer_boundary"
-    assert job.material_paths[0].paths[0].shape == (27, 3)
+    assert job.material_paths[0].paths[0].shape == (27, 6)
+    assert np.allclose(job.material_paths[0].paths[0][:, 3:], 0.0)
+    assert np.linalg.norm(job.material_paths[2].paths[0][:, 3:]) > 1e-3
     with pytest.raises(ValueError, match="logical_layer_count"):
         run_conformal_lattice_pipeline(spec, logical_layer_count=4, physical_layer_height_mm=2.0)

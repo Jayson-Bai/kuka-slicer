@@ -88,6 +88,8 @@ class ConformalLatticePathGraph:
     metadata: dict[str, object]
     # Optional closed, co-shaped part boundary for the rectangular UI flow.
     outer_boundary_paths_xyz: np.ndarray | None = None
+    layer_tool_normals_xyz: np.ndarray | None = None
+    outer_boundary_tool_normals_xyz: np.ndarray | None = None
 
     def to_external_source_job(self, *, material: Literal["R", "F"] = "R") -> ExternalSourceJob:
         """Plan graph edges into non-repeating macro partitions for Core."""
@@ -107,10 +109,12 @@ class ConformalLatticePathGraph:
             self.layer_node_positions_xyz[0],
         )
         for layer_index, positions in enumerate(self.layer_node_positions_xyz):
+            tool_normals = self._tool_normals_for_layer(layer_index)
             paths, extrusion, travels, planning_report = _render_layer_macro_partitions(
                 topology,
                 positions,
                 self.node_normals_xyz,
+                tool_normals,
                 bead_count=self.wall_bead_count,
                 bead_width_mm=self.nominal_bead_width_mm,
                 bead_area_mm2=float(extrusion_config["bead_cross_section_area_mm2"]),
@@ -118,11 +122,13 @@ class ConformalLatticePathGraph:
             )
             outer_boundary = None if self.outer_boundary_paths_xyz is None else self.outer_boundary_paths_xyz[layer_index]
             if outer_boundary is not None:
-                paths.insert(0, np.asarray(outer_boundary, dtype=np.float64).copy())
+                boundary_normals = self._outer_boundary_tool_normals_for_layer(layer_index)
+                boundary_points = _with_kuka_surface_orientation(outer_boundary, boundary_normals)
+                paths.insert(0, boundary_points)
                 extrusion.insert(
                     0,
                     _profile_for_deposition_segments(
-                        paths[0],
+                        outer_boundary,
                         [True] * (len(paths[0]) - 1),
                         bead_area_mm2=float(extrusion_config["bead_cross_section_area_mm2"]),
                         e_volume_per_unit_mm3=float(extrusion_config["e_volume_per_unit_mm3"]),
@@ -149,7 +155,10 @@ class ConformalLatticePathGraph:
             "trail_partition": planning_reports[0] if planning_reports else {},
             "wall_bead_lanes": self.wall_bead_count,
             "nominal_bead_width_mm": self.nominal_bead_width_mm,
-            "core_handoff": "external_layer_paths_v1 XYZ only; downstream Core remains responsible for final XYZABC",
+            "core_handoff": (
+                "external_layer_paths_v1 XYZABC; tool orientation follows the "
+                "interpolated surface normal using the calibrated legacy KUKA convention"
+            ),
         }
         job_metadata: dict[str, object] = {
             "conformal_lattice_path_bridge": bridge_meta,
@@ -180,6 +189,16 @@ class ConformalLatticePathGraph:
             meta=job_metadata,
         )
 
+    def _tool_normals_for_layer(self, layer_index: int) -> np.ndarray:
+        if self.layer_tool_normals_xyz is None:
+            return self.node_normals_xyz
+        return self.layer_tool_normals_xyz[layer_index]
+
+    def _outer_boundary_tool_normals_for_layer(self, layer_index: int) -> np.ndarray:
+        if self.outer_boundary_paths_xyz is None or self.outer_boundary_tool_normals_xyz is None:
+            raise ValueError("outer boundary paths require matching per-layer tool normals")
+        return self.outer_boundary_tool_normals_xyz[layer_index]
+
 
 def build_conformal_lattice_path_graph(
     geometry: ConformalLatticeGeometry,
@@ -191,6 +210,8 @@ def build_conformal_lattice_path_graph(
     nominal_bead_width_mm: float = 2.0,
     config_metadata: Mapping[str, object] | None = None,
     outer_boundary_paths_xyz: np.ndarray | None = None,
+    layer_tool_normals_xyz: np.ndarray | None = None,
+    outer_boundary_tool_normals_xyz: np.ndarray | None = None,
 ) -> ConformalLatticePathGraph:
     """Turn verified structural edges into a deterministic, un-routed graph.
 
@@ -204,6 +225,12 @@ def build_conformal_lattice_path_graph(
     positions, embedding_mode = _layer_positions(geometry, layer_embedding)
     outer_boundary = _outer_boundary_paths(outer_boundary_paths_xyz, layer_count=len(positions))
     normals = _node_normals_for_paths(geometry, node_normals_xyz)
+    layer_tool_normals = _layer_tool_normals(layer_tool_normals_xyz, normals, layer_count=len(positions))
+    outer_boundary_tool_normals = _outer_boundary_tool_normals(
+        outer_boundary_tool_normals_xyz,
+        outer_boundary,
+        layer_count=len(positions),
+    )
     if not isinstance(wall_bead_count, int) or isinstance(wall_bead_count, bool) or wall_bead_count < 1:
         raise ValueError("wall_bead_count must be a positive integer")
     if not np.isfinite(nominal_bead_width_mm) or nominal_bead_width_mm <= 0.0:
@@ -267,6 +294,8 @@ def build_conformal_lattice_path_graph(
         report=report,
         metadata=metadata,
         outer_boundary_paths_xyz=outer_boundary,
+        layer_tool_normals_xyz=layer_tool_normals,
+        outer_boundary_tool_normals_xyz=outer_boundary_tool_normals,
     )
 
 
@@ -336,6 +365,37 @@ def _outer_boundary_paths(value: np.ndarray | None, *, layer_count: int) -> np.n
     if not np.allclose(paths[:, 0], paths[:, -1], rtol=0.0, atol=1e-9):
         raise ValueError("each outer_boundary_paths_xyz path must be closed")
     return _readonly(np.array(paths, copy=True))
+
+
+def _layer_tool_normals(value: np.ndarray | None, fallback: np.ndarray, *, layer_count: int) -> np.ndarray:
+    normals = np.broadcast_to(fallback[None, :, :], (layer_count, *fallback.shape)) if value is None else np.asarray(value, dtype=np.float64)
+    if normals.shape != (layer_count, *fallback.shape) or not np.all(np.isfinite(normals)):
+        raise ValueError("layer_tool_normals_xyz must match every layer and lattice node")
+    lengths = np.linalg.norm(normals, axis=2)
+    if np.any(lengths <= 1e-12):
+        raise ValueError("layer_tool_normals_xyz contains a zero-length normal")
+    return _readonly(normals / lengths[:, :, None])
+
+
+def _outer_boundary_tool_normals(
+    value: np.ndarray | None,
+    paths: np.ndarray | None,
+    *,
+    layer_count: int,
+) -> np.ndarray | None:
+    if paths is None:
+        if value is not None:
+            raise ValueError("outer_boundary_tool_normals_xyz requires outer_boundary_paths_xyz")
+        return None
+    if value is None:
+        raise ValueError("outer_boundary_paths_xyz requires outer_boundary_tool_normals_xyz")
+    normals = np.asarray(value, dtype=np.float64)
+    if normals.shape != paths.shape or normals.shape[0] != layer_count or not np.all(np.isfinite(normals)):
+        raise ValueError("outer_boundary_tool_normals_xyz must match outer_boundary_paths_xyz")
+    lengths = np.linalg.norm(normals, axis=2)
+    if np.any(lengths <= 1e-12):
+        raise ValueError("outer_boundary_tool_normals_xyz contains a zero-length normal")
+    return _readonly(normals / lengths[:, :, None])
 
 
 def _node_normals_for_paths(
@@ -423,6 +483,7 @@ def _render_layer_macro_partitions(
     topology: _MacroPartitionTopology,
     positions: np.ndarray,
     normals: np.ndarray,
+    tool_normals: np.ndarray,
     *,
     bead_count: int,
     bead_width_mm: float,
@@ -440,7 +501,7 @@ def _render_layer_macro_partitions(
     for nodes, deposited in topology.macro_node_paths:
         for offset in lane_offsets:
             lane_points = _offset_lane_points(list(nodes), positions, normals, offset)
-            paths.append(lane_points)
+            paths.append(_with_kuka_surface_orientation(lane_points, tool_normals[np.asarray(nodes, dtype=np.int64)]))
             profiles.append(
                 _profile_for_deposition_segments(
                     lane_points,
@@ -449,7 +510,13 @@ def _render_layer_macro_partitions(
                     e_volume_per_unit_mm3=e_volume_per_unit_mm3,
                 )
             )
-    travels = [positions[np.asarray(nodes, dtype=np.int64)].copy() for nodes in topology.travel_node_paths]
+    travels = [
+        _with_kuka_surface_orientation(
+            positions[np.asarray(nodes, dtype=np.int64)],
+            tool_normals[np.asarray(nodes, dtype=np.int64)],
+        )
+        for nodes in topology.travel_node_paths
+    ]
     return paths, profiles, travels, {
         "strategy": "minimum_non_repeating_trail_cover_with_existing_edge_zero_e_connectors",
         "structural_edge_count": int(topology.structural_edge_count),
@@ -588,9 +655,30 @@ def _profile_for_deposition_segments(
 ) -> np.ndarray:
     if len(deposited) != len(points) - 1:
         raise ValueError("deposition flags must align with planned macro path segments")
-    lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    lengths = np.linalg.norm(np.diff(points[:, :3], axis=0), axis=1)
     increments = np.where(np.asarray(deposited, dtype=bool), lengths * bead_area_mm2 / e_volume_per_unit_mm3, 0.0)
     return np.concatenate(([0.0], np.cumsum(increments)))
+
+
+def _with_kuka_surface_orientation(points_xyz: np.ndarray, upward_normals_xyz: np.ndarray) -> np.ndarray:
+    """Attach the legacy-calibrated KUKA ABC pose to each XYZ path point."""
+
+    points = np.asarray(points_xyz, dtype=np.float64)
+    normals = np.asarray(upward_normals_xyz, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 3 or normals.shape != points.shape:
+        raise ValueError("surface orientation requires matching Nx3 points and normals")
+    # Reuse the established mapper convention rather than introducing a second
+    # interpretation of the robot's calibrated flat pose.
+    from ..surface_mapper.orientation import kuka_abc_for_surface
+
+    safe_normals = np.array(normals, copy=True)
+    safe_normals[safe_normals[:, 2] < 0.0] *= -1.0
+    if np.any(np.abs(safe_normals[:, 2]) <= 1e-9):
+        raise ValueError("surface normal is too close to horizontal for the KUKA height-field ABC convention")
+    dz_dx = -safe_normals[:, 0] / safe_normals[:, 2]
+    dz_dy = -safe_normals[:, 1] / safe_normals[:, 2]
+    a, b, c = kuka_abc_for_surface(dz_dx, dz_dy)
+    return np.column_stack((points, a, b, c))
 
 
 def _readonly(value: np.ndarray) -> np.ndarray:
