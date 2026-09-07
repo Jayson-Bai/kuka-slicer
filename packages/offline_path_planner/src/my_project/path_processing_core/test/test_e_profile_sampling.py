@@ -152,10 +152,6 @@ def test_opted_in_fit_preserves_zero_e_connector_samples_on_the_shared_parameter
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="B 样条尚未保留共形源路径的逐段 E；C4 完成后移除此基线标记。",
-)
 def test_bspline_sampler_keeps_a_zero_e_connector_as_a_constant_e_platform():
     """锁定宏路径 [正 E, 零 E, 正 E] 进入 B 样条后的当前缺陷。"""
     curve = GlobalCurveCommand(
