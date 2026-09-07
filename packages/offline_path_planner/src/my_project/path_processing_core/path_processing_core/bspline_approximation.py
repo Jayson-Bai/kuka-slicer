@@ -14,6 +14,11 @@ from .bspline import parameter_selection as ps
 from .bspline import bspline_curve as bc
 
 from .types import MoveCommand, Position, GlobalCurveCommand
+from .kuka_orientation import (
+    kuka_abc_to_quaternion,
+    quaternion_slerp,
+    quaternion_to_kuka_abc,
+)
 
 
 def compute_angle_deg(v1: tuple, v2: tuple) -> float:
@@ -33,6 +38,15 @@ def _distance_xyz(p1: Position, p2: Position) -> float:
     dy = p2.y - p1.y
     dz = p2.z - p1.z
     return math.sqrt(dx * dx + dy * dy + dz * dz)
+
+
+def _interpolate_kuka_abc(p1: Position, p2: Position, ratio: float) -> tuple[float, float, float]:
+    q = quaternion_slerp(
+        kuka_abc_to_quaternion(p1.a, p1.b, p1.c),
+        kuka_abc_to_quaternion(p2.a, p2.b, p2.c),
+        max(0.0, min(1.0, ratio)),
+    )
+    return quaternion_to_kuka_abc(q, near_deg=(p1.a, p1.b, p1.c))
 
 
 def _generate_fitting_points(
@@ -94,30 +108,32 @@ def _generate_fitting_points(
             u1 = (v1[0] / len1, v1[1] / len1, v1[2] / len1)
 
             # 前侧回退点
-            densified.append(
-                Position(
-                    x=curr_pt.x - u0[0] * retreat0,
-                    y=curr_pt.y - u0[1] * retreat0,
-                    z=curr_pt.z - u0[2] * retreat0,
-                    a=curr_pt.a,
-                    b=curr_pt.b,
-                    c=curr_pt.c,
-                )
+            before_a, before_b, before_c = _interpolate_kuka_abc(
+                prev_pt, curr_pt, 1.0 - retreat_ratio
             )
+            densified.append(Position(
+                x=curr_pt.x - u0[0] * retreat0,
+                y=curr_pt.y - u0[1] * retreat0,
+                z=curr_pt.z - u0[2] * retreat0,
+                a=before_a,
+                b=before_b,
+                c=before_c,
+            ))
 
             densified.append(curr_pt)
 
             # 后侧回退点
-            densified.append(
-                Position(
-                    x=curr_pt.x + u1[0] * retreat1,
-                    y=curr_pt.y + u1[1] * retreat1,
-                    z=curr_pt.z + u1[2] * retreat1,
-                    a=curr_pt.a,
-                    b=curr_pt.b,
-                    c=curr_pt.c,
-                )
+            after_a, after_b, after_c = _interpolate_kuka_abc(
+                curr_pt, next_pt, retreat_ratio
             )
+            densified.append(Position(
+                x=curr_pt.x + u1[0] * retreat1,
+                y=curr_pt.y + u1[1] * retreat1,
+                z=curr_pt.z + u1[2] * retreat1,
+                a=after_a,
+                b=after_b,
+                c=after_c,
+            ))
         else:
             densified.append(curr_pt)
 
@@ -142,18 +158,39 @@ def _subdivide_points(points: List[Position]) -> List[Position]:
         new_points.append(p1)
 
         # 计算中点
+        a, b, c = _interpolate_kuka_abc(p1, p2, 0.5)
         mid_pt = Position(
             x=(p1.x + p2.x) * 0.5,
             y=(p1.y + p2.y) * 0.5,
             z=(p1.z + p2.z) * 0.5,
-            a=(p1.a + p2.a) * 0.5,
-            b=(p1.b + p2.b) * 0.5,
-            c=(p1.c + p2.c) * 0.5
+            a=a,
+            b=b,
+            c=c
         )
         new_points.append(mid_pt)
 
     new_points.append(points[-1])
     return new_points
+
+
+def _build_kuka_orientation_samples(
+    points: List[Position], param
+) -> Optional[Tuple[List[float], List[Tuple[float, float, float, float]]]]:
+    """Keep attitude samples on the same B-spline parameter axis as XYZ.
+
+    A global least-squares B-spline in quaternion-log space can overshoot
+    between closely spaced surface-normal samples.  Local quaternion SLERP
+    preserves the supplied normal field while sharing position's parameter u
+    and downstream seventh-order time law.
+    """
+
+    quaternions = [kuka_abc_to_quaternion(point.a, point.b, point.c) for point in points]
+    for index in range(1, len(quaternions)):
+        if sum(a * b for a, b in zip(quaternions[index - 1], quaternions[index])) < 0.0:
+            quaternions[index] = tuple(-value for value in quaternions[index])
+    if all(abs(sum(a * b for a, b in zip(quaternions[0], q))) > 1.0 - 1e-10 for q in quaternions[1:]):
+        return None
+    return [float(value) for value in param], quaternions
 
 
 class GlobalSplinePlanner:
@@ -175,6 +212,7 @@ class GlobalSplinePlanner:
             "fit_lsq_normal_mat_s": 0.0,
             "fit_lsq_solve_s": 0.0,
             "fit_lsq_total_s": 0.0,
+            "fit_orientation_s": 0.0,
         }
 
     def fit_global_curve(
@@ -238,10 +276,9 @@ class GlobalSplinePlanner:
         D_X = [p.x for p in fit_points]
         D_Y = [p.y for p in fit_points]
         D_Z = [p.z for p in fit_points]
-        D_A = [p.a for p in fit_points]
-        D_B = [p.b for p in fit_points]
-        D_C = [p.c for p in fit_points]
-        D = [D_X, D_Y, D_Z, D_A, D_B, D_C]
+        # The spatial B-spline must be parameterised by XYZ only.  KUKA ABC
+        # is fitted separately as a quaternion curve on the same parameter u.
+        D = [D_X, D_Y, D_Z]
         D_N = n_points
         profile["fit_prepare_data_s"] += time.perf_counter() - t0
 
@@ -284,6 +321,10 @@ class GlobalSplinePlanner:
             if not ctrl_raw or len(ctrl_raw[0]) == 0:
                 return None
 
+            t_orientation = time.perf_counter()
+            orientation_samples = _build_kuka_orientation_samples(fit_points, param)
+            profile["fit_orientation_s"] += time.perf_counter() - t_orientation
+
             # 6. 转换回 Position 列表
             t0 = time.perf_counter()
             res_ctrl_points = []
@@ -293,9 +334,9 @@ class GlobalSplinePlanner:
                     x=ctrl_raw[0][i],
                     y=ctrl_raw[1][i],
                     z=ctrl_raw[2][i],
-                    a=ctrl_raw[3][i],
-                    b=ctrl_raw[4][i],
-                    c=ctrl_raw[5][i]
+                    a=fit_points[0].a,
+                    b=fit_points[0].b,
+                    c=fit_points[0].c
                 ))
             profile["fit_post_ctrl_s"] += time.perf_counter() - t0
 
@@ -321,5 +362,7 @@ class GlobalSplinePlanner:
             line=moves[0].line,
             raw="GLOBAL_BSPLINE_LIB",
             constraints=constraints,
-            original_moves=moves
+            original_moves=moves,
+            orientation_parameters=(orientation_samples[0] if orientation_samples else None),
+            orientation_quaternions=(orientation_samples[1] if orientation_samples else None),
         )

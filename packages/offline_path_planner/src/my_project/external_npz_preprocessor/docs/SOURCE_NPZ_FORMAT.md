@@ -131,6 +131,32 @@ UI 中的树脂层高和纤维层高只作为工艺参数：
 - 纤维起步加速时间只影响外部 NPZ 纤维打印路径的七阶起始加速段。
 - 两者都不改变源文件中的 Z。
 
+## Logical Layer Ownership
+
+`layer_0000_R/F/T` 中的四位编号是**逻辑沉积层号**，不是由某个固定 Z
+平面推导出的物理高度。曲面路径允许同一数组中的每个点拥有不同 Z；读取器
+必须按源 key 的升序和数组内原始路径顺序处理，禁止根据曲面后的 Z 重新分桶、
+排序或生成层号。
+
+新生成的 source NPZ 会在 `meta` 中声明这一契约：
+
+```json
+{
+  "layer_semantics": {
+    "format": "logical_layer_v1",
+    "layer_key": "logical_deposition_layer",
+    "z_coordinate": "per_point_trajectory",
+    "ordering": "ascending_layer_key_then_source_path_order",
+    "reconstruct_layers_from_z": false
+  }
+}
+```
+
+旧 source NPZ 未携带该字段时仍保持兼容；一旦携带该字段，preprocessor 会拒绝
+任何要求按 Z 重建层语义的变体。进入 Core 前，`LayerPaths.index` 继续直接写入
+命令的 `layer` 字段，最终系统 NPZ 的 `layer_index` 与 `preview_layer_index` 因而
+保留相同的逻辑层号。
+
 ## Coordinate Offsets
 
 源 NPZ 中的 `x/y/z/a/b/c` 是源几何坐标。preprocessor 转命令时会先计算整个源零件的 XY 最小点，再把这个左下角对齐到 UI 中设置的位置：

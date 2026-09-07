@@ -11,6 +11,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -22,10 +23,17 @@ import zipfile
 import numpy as np
 
 from .external_npz import (
+    ExternalSourceJob,
     MaterialPaths,
     TravelPaths,
     write_external_source_npz,
 )
+from .cpu_limiter import limit_slicer_task
+from .conformal_lattice.contracts import load_conformal_lattice_spec
+from .fiber_travel import plan_fiber_interpath_travels
+from .gcode_legacy_postprocess import apply_legacy_resin_optimization
+from .honeycomb_pathing import HoneycombPathingConfig
+
 from .slicer import (
     DEFAULT_FIBER_LINE_WIDTH_MM,
     DEFAULT_FIBER_LAYER_HEIGHT_MM,
@@ -59,9 +67,150 @@ from .slicer import (
     slice_mesh_to_job,
 )
 from .stl_io import load_stl
+from .surface_peak_collision import check_peak_surface_collision
 
+
+MAX_SURFACE_PREVIEW_NPZ_BYTES = 256 * 1024 * 1024
+PRINTHEAD_ASSET_DIR = Path(__file__).resolve().parent.parent / "assets" / "printhead"
 
 DEFAULT_UI_RESIN_INFILL_OVERLAP_PERCENT = 0.0
+
+
+def _conformal_spec_ui_summary(payload: bytes, filename: str) -> dict[str, object]:
+    """Validate a design-file selection before any geometry or Core work starts."""
+
+    spec = load_conformal_lattice_spec(payload)
+    if not spec.part or not spec.manufacturing:
+        raise ValueError("请选择由蜂窝网格共形设计器导出的矩形实体 JSON")
+    part = spec.part
+    manufacturing = spec.manufacturing
+    layer_height = float(manufacturing["layer_height_mm"])
+    final_height = float(part["final_height_mm"])
+    return {
+        "format": "conformal_lattice_spec_v1",
+        "file_name": _safe_filename(filename or "conformal_lattice_spec_v1.json"),
+        "part": {
+            "length_mm": float(part["length_mm"]),
+            "width_mm": float(part["width_mm"]),
+            "final_height_mm": final_height,
+            "mapping_reference_layer_count": int(np.ceil(final_height / layer_height)),
+        },
+        "mapping_reference": {
+            "layer_height_mm": layer_height,
+            "nominal_bead_width_mm": float(manufacturing["nominal_bead_width_mm"]),
+        },
+        "lattice": {
+            "wall_width_mm": float(spec.lattice["wall_width_mm"]),
+            "wall_bead_count": int(spec.lattice["wall_bead_count"]),
+            "base_cell_size_mm": float(spec.lattice["base_cell_size_mm"]),
+        },
+        "source_surface_sha256": spec.source_sha256,
+    }
+
+
+class FiberTemplatePaths(list[list[list[float]]]):
+    """Fiber geometry together with the declared XY coordinate semantics."""
+
+    def __init__(
+        self,
+        paths: list[list[list[float]]],
+        *,
+        coordinate_system: str | None,
+    ) -> None:
+        super().__init__(paths)
+        self.coordinate_system = coordinate_system
+
+
+def _surface_preview_picker_state_path(output_dir: Path) -> Path:
+    return output_dir / ".surface_preview_picker.json"
+
+
+def _core_preview_picker_state_path(output_dir: Path) -> Path:
+    return output_dir / ".core_preview_picker.json"
+
+
+def _load_surface_preview_last_directory(state_path: Path) -> Path | None:
+    try:
+        raw = json.loads(state_path.read_text(encoding="utf-8"))
+        directory = raw.get("last_directory") if isinstance(raw, dict) else None
+        candidate = Path(directory) if isinstance(directory, str) else None
+        return candidate if candidate is not None and candidate.is_dir() else None
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _save_surface_preview_last_directory(state_path: Path, directory: Path) -> None:
+    try:
+        state_path.write_text(
+            json.dumps({"last_directory": str(directory)}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError:
+        # Directory recall improves this local UI command but must never make
+        # an otherwise valid NPZ preview fail to load.
+        pass
+
+
+def _choose_mapped_surface_npz_file(initial_directory: Path | None) -> Path | None:
+    """Open the Windows picker for legacy mapped or conformal-path NPZ files."""
+
+    if sys.platform != "win32":
+        raise RuntimeError("native surface/conformal-NPZ picker is available only on Windows")
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except ImportError as exc:
+        raise RuntimeError("无法加载 Windows 原生文件选择组件") from exc
+
+    root = tk.Tk()
+    try:
+        root.withdraw()
+        root.attributes("-topmost", True)
+        root.update()
+        selected = filedialog.askopenfilename(
+            parent=root,
+            title="选择映射曲面或共形格栅 NPZ",
+            initialdir=(
+                str(initial_directory)
+                if initial_directory is not None and initial_directory.is_dir()
+                else None
+            ),
+            filetypes=[("映射曲面或共形格栅 NPZ", "*.npz"), ("所有文件", "*.*")],
+        )
+    finally:
+        root.destroy()
+    return Path(selected) if selected else None
+
+
+def _choose_final_core_npz_file(initial_directory: Path | None) -> Path | None:
+    """Open the Windows picker for a regular final Core trajectory NPZ."""
+
+    if sys.platform != "win32":
+        raise RuntimeError("native Core-NPZ picker is available only on Windows")
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except ImportError as exc:
+        raise RuntimeError("无法加载 Windows 原生文件选择组件") from exc
+
+    root = tk.Tk()
+    try:
+        root.withdraw()
+        root.attributes("-topmost", True)
+        root.update()
+        selected = filedialog.askopenfilename(
+            parent=root,
+            title="选择 Core 导出 NPZ",
+            initialdir=(
+                str(initial_directory)
+                if initial_directory is not None and initial_directory.is_dir()
+                else None
+            ),
+            filetypes=[("Core 导出 NPZ", "*.npz"), ("所有文件", "*.*")],
+        )
+    finally:
+        root.destroy()
+    return Path(selected) if selected else None
 
 
 def _offline_planner_data_root() -> Path:
@@ -101,11 +250,331 @@ def _core_output_download_path(core_npz_path: Path) -> Path:
         core_npz_path.with_name(f"{core_npz_path.stem}.offset.json"),
         core_npz_path.with_name(f"{core_npz_path.stem}.timing.json"),
     ]
-    with zipfile.ZipFile(package_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+    # Core parts are already ``np.savez_compressed`` archives.  Deflating them
+    # a second time burns CPU for negligible size reduction, so the outer ZIP
+    # only bundles the exact same files for browser download.
+    with zipfile.ZipFile(package_path, "w", compression=zipfile.ZIP_STORED) as archive:
         for candidate in [*parts, *sidecars]:
             if candidate.is_file():
                 archive.write(candidate, arcname=candidate.name)
     return package_path
+
+
+def _final_core_npz_parts(core_npz_path: Path) -> list[Path]:
+    """Return the exact final Core files that the runtime would load."""
+
+    if core_npz_path.is_file():
+        part_match = re.fullmatch(r"(.+)_part\d+", core_npz_path.stem)
+        if part_match is not None:
+            parts = sorted(core_npz_path.parent.glob(f"{part_match.group(1)}_part*.npz"))
+            if parts:
+                return parts
+        return [core_npz_path]
+    parts = sorted(core_npz_path.parent.glob(f"{core_npz_path.stem}_part*.npz"))
+    if not parts:
+        raise FileNotFoundError(f"final Core NPZ was not written: {core_npz_path}")
+    return parts
+
+
+def _core_move_type_codes(data) -> set[int]:
+    """Return vocabulary codes that represent deposited Core trajectory rows."""
+
+    keys_name = "move_type_vocab_keys"
+    values_name = "move_type_vocab_vals"
+    if keys_name in data.files and values_name in data.files:
+        def _name(value) -> str:
+            raw = value.item() if hasattr(value, "item") else value
+            return raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
+
+        return {
+            int(value)
+            for key, value in zip(data[keys_name], data[values_name])
+            if _name(key).upper() in {"PRINT", "PRINT_FIT"}
+        }
+    # Legacy Core files use these stable numeric values when no vocabulary is
+    # present.  Keep the fallback local to preview decoding.
+    return {1, 3}
+
+
+def _use_native_prusa_gcode_for_core(
+    config: SliceConfig,
+    native_gcode: bytes | str | None,
+) -> bool:
+    """Return whether Core may consume the native Prusa G-code chain.
+
+    The project-owned G-code postprocess applies Legacy infill continuity and,
+    when selected, Brim one-stroke continuity to the parsed ``SourceJob``.
+    Therefore ordinary Prusa jobs, including Brim jobs, retain G-code as the
+    sole Core input representation.  Honeycomb remains a separate planner.
+    """
+
+    return (
+        config.slicing_kernel == "prusa"
+        and not config.honeycomb_pathing.enabled
+        and isinstance(native_gcode, (bytes, str))
+    )
+
+
+def _planning_mesh_for_gcode_source(mesh, config: SliceConfig):
+    """Return geometry in the same frame as translated native Prusa G-code.
+
+    The Prusa backend slices an oriented mesh and exposes the inverse of its
+    temporary bed placement as ``native_gcode_translation_mm``.  Once that
+    translation has been applied, SourceJob coordinates are in the oriented
+    model frame.  Legacy avoidance geometry must use that frame as well.
+    """
+
+    return orient_mesh_for_build_axis(mesh, config.build_axis)
+
+
+def _preview_payload_from_core_source_job(mesh, config: SliceConfig, source_job) -> dict[str, object]:
+    """Render the exact G-code SourceJob that is handed to Core."""
+
+    material_paths = []
+    travel_paths = []
+    for layer in source_job.layers:
+        if layer.resin_paths:
+            material_paths.append(
+                MaterialPaths(
+                    layer.index,
+                    "R",
+                    [path.points for path in layer.resin_paths],
+                    [path.extrusion for path in layer.resin_paths],
+                )
+            )
+        if layer.fiber_paths:
+            material_paths.append(
+                MaterialPaths(
+                    layer.index,
+                    "F",
+                    [path.points for path in layer.fiber_paths],
+                    [path.extrusion for path in layer.fiber_paths],
+                )
+            )
+        if layer.travel_paths:
+            travel_paths.append(TravelPaths(layer.index, [path.points for path in layer.travel_paths]))
+    return _preview_payload(
+        mesh,
+        config,
+        ExternalSourceJob(material_paths=material_paths, travel_paths=travel_paths, meta=source_job.meta),
+    )
+
+
+def _preview_payload_from_final_core_npz(
+    core_npz_path: Path,
+    config: SliceConfig,
+) -> dict[str, object]:
+    """Build the browser payload from the final Core NPZ, never from its source.
+
+    Only non-event rows are considered because the runtime queue likewise does
+    not emit trajectory points for event rows.  The browser receives direct
+    samples of those final rows; it performs no Core-like fitting, smoothing,
+    offsetting, or interpolation.  Stationary process rows (prime/retract/
+    reset at a fixed XYZ) remain in the NPZ for runtime timing, but are not
+    spatial paths and therefore are not rendered as deposition points.
+    """
+
+    entries_by_layer: dict[int, list[dict[str, object]]] = {}
+    bounds = {
+        "min_x": None,
+        "max_x": None,
+        "min_y": None,
+        "max_y": None,
+        "min_z": None,
+        "max_z": None,
+    }
+    has_curved_deposition = False
+    has_tool_orientation = False
+    order = 0
+
+    for path in _final_core_npz_parts(core_npz_path):
+        with np.load(path, allow_pickle=False) as data:
+            required = {"x", "y", "z", "tool_id", "move_type"}
+            missing = sorted(required.difference(data.files))
+            if missing:
+                raise ValueError(f"final Core NPZ is missing fields: {', '.join(missing)}")
+
+            x = np.asarray(data["x"], dtype=np.float64)
+            y = np.asarray(data["y"], dtype=np.float64)
+            z = np.asarray(data["z"], dtype=np.float64)
+            count = len(x)
+            if count == 0:
+                continue
+            tool_id = np.asarray(data["tool_id"], dtype=np.int64)
+            move_type = np.asarray(data["move_type"], dtype=np.int64)
+            event_flag = (
+                np.asarray(data["event_flag"], dtype=np.int64)
+                if "event_flag" in data.files
+                else np.zeros(count, dtype=np.int64)
+            )
+            layer = np.asarray(
+                data["preview_layer_index"]
+                if "preview_layer_index" in data.files
+                else data["layer_index"]
+                if "layer_index" in data.files
+                else np.zeros(count, dtype=np.int64),
+                dtype=np.int64,
+            )
+            path_id = (
+                np.asarray(data["path_id"], dtype=np.int64)
+                if "path_id" in data.files
+                else np.zeros(count, dtype=np.int64)
+            )
+            path_end = (
+                np.asarray(data["path_end_flag"], dtype=np.int64)
+                if "path_end_flag" in data.files
+                else np.zeros(count, dtype=np.int64)
+            )
+            a = np.asarray(data["a"], dtype=np.float64) if "a" in data.files else None
+            b = np.asarray(data["b"], dtype=np.float64) if "b" in data.files else None
+            c = np.asarray(data["c"], dtype=np.float64) if "c" in data.files else None
+
+            valid = (
+                (event_flag != 1)
+                & np.isfinite(x)
+                & np.isfinite(y)
+                & np.isfinite(z)
+            )
+            if not np.any(valid):
+                continue
+
+            valid_x, valid_y, valid_z = x[valid], y[valid], z[valid]
+            for key, value in (
+                ("min_x", valid_x.min()), ("max_x", valid_x.max()),
+                ("min_y", valid_y.min()), ("max_y", valid_y.max()),
+                ("min_z", valid_z.min()), ("max_z", valid_z.max()),
+            ):
+                bounds[key] = float(value) if bounds[key] is None else (
+                    min(float(bounds[key]), float(value)) if key.startswith("min")
+                    else max(float(bounds[key]), float(value))
+                )
+
+            include_abc = (
+                a is not None
+                and b is not None
+                and c is not None
+                and bool(np.any(np.abs(a[valid]) > 1e-9)
+                         or np.any(np.abs(b[valid]) > 1e-9)
+                         or np.any(np.abs(c[valid]) > 1e-9))
+            )
+            has_tool_orientation = has_tool_orientation or include_abc
+            print_codes = _core_move_type_codes(data)
+            is_print = np.isin(move_type, list(print_codes))
+
+            indices = np.flatnonzero(valid)
+            start = 0
+            while start < len(indices):
+                first = int(indices[start])
+                is_fiber = bool(is_print[first] and tool_id[first] == 1)
+                is_resin = bool(is_print[first] and not is_fiber)
+                role = "fiber" if is_fiber else "final_resin" if is_resin else "travel"
+                end = start + 1
+                while end < len(indices):
+                    previous = int(indices[end - 1])
+                    current = int(indices[end])
+                    current_is_fiber = bool(is_print[current] and tool_id[current] == 1)
+                    current_is_resin = bool(is_print[current] and not current_is_fiber)
+                    current_role = (
+                        "fiber" if current_is_fiber
+                        else "final_resin" if current_is_resin
+                        else "travel"
+                    )
+                    same_path = path_id[current] == path_id[first]
+                    # Final NPZ path IDs describe Core command boundaries,
+                    # not a discontinuity in the RSI point sequence.  For
+                    # adjacent non-event Travel rows, join the browser path
+                    # across those metadata boundaries while retaining every
+                    # final XYZABC point.  This is intentionally display-only:
+                    # no avoidance waypoint, sequence value, or exported NPZ
+                    # row is changed.
+                    adjacent_travel = role == "travel" and current_role == "travel"
+                    if (
+                        current != previous + 1
+                        or layer[current] != layer[first]
+                        or current_role != role
+                        or tool_id[current] != tool_id[first]
+                        or (
+                            not adjacent_travel
+                            and (not same_path or path_end[previous] == 1)
+                        )
+                    ):
+                        break
+                    end += 1
+
+                segment_indices = indices[start:end]
+                is_stationary_process = role != "travel" and bool(
+                    np.ptp(x[segment_indices]) <= 1e-9
+                    and np.ptp(y[segment_indices]) <= 1e-9
+                    and np.ptp(z[segment_indices]) <= 1e-9
+                )
+                point_columns = [x[segment_indices], y[segment_indices], z[segment_indices]]
+                if include_abc:
+                    point_columns.extend((a[segment_indices], b[segment_indices], c[segment_indices]))
+                # For diagnosis the browser receives the complete final Core
+                # point sequence.  No display-side point decimation is allowed:
+                # a sharp corner must be attributable to the NPZ itself.
+                points = np.column_stack(point_columns).tolist()
+                if points and not is_stationary_process:
+                    if role != "travel" and float(np.ptp(z[segment_indices])) > 1e-7:
+                        has_curved_deposition = True
+                    entries_by_layer.setdefault(int(layer[first]), []).append(
+                        {
+                            "kind": "deposit" if role != "travel" else "travel",
+                            "role": role,
+                            "points": points,
+                            "order": order,
+                        }
+                    )
+                    order += 1
+                start = end
+
+    all_entries = [entry for entries in entries_by_layer.values() for entry in entries]
+    if not all_entries:
+        raise ValueError("final Core NPZ contains no displayable trajectory rows")
+    layers = []
+    for layer_index in sorted(entries_by_layer):
+        entries = entries_by_layer[layer_index]
+        resin_paths = [
+            {"role": entry["role"], "points": entry["points"]}
+            for entry in entries if entry["role"] == "final_resin"
+        ]
+        fiber_paths = [
+            entry["points"] for entry in entries if entry["role"] == "fiber"
+        ]
+        travel_paths = [
+            entry["points"] for entry in entries if entry["role"] == "travel"
+        ]
+        layers.append(
+            {
+                "index": layer_index,
+                "resin_paths": resin_paths,
+                "fiber_paths": fiber_paths,
+                "travel_paths": travel_paths,
+                "motion_paths": entries,
+            }
+        )
+
+    planning_line_width = (
+        config.line_width
+        if config.slicing_kernel != "legacy" or config.planning_line_width is None
+        else config.planning_line_width
+    )
+    return {
+        "bounds": bounds,
+        "origin": [0.0, 0.0],
+        "geometry_mode": "surface_3d" if has_curved_deposition else "planar_2d",
+        "tool_orientation": {
+            "available": has_tool_orientation,
+            "fallback": "calibrated_flat_downward",
+        },
+        "line_widths": {
+            "resin": float(planning_line_width),
+            "resin_nominal": float(config.line_width),
+            "fiber": DEFAULT_FIBER_LINE_WIDTH_MM,
+        },
+        "preview_source": "final_core_npz",
+        "layers": layers,
+    }
 
 
 def _preview_position(point, xy_offset: tuple[float, float] = (0.0, 0.0)) -> list[float]:
@@ -340,6 +809,7 @@ _PRUSA_INT_KEYS = {
 _PRUSA_BOOL_KEYS = {
     "prusa_print_perimeters", "prusa_raft_enabled", "prusa_raft_auto_contact",
     "prusa_gap_fill_enabled", "prusa_brim_enabled", "prusa_brim_one_stroke",
+    "honeycomb_centerline_enabled",
 }
 _PRUSA_NULLABLE_FLOAT_KEYS = {
     "prusa_external_perimeter_width", "prusa_perimeter_width", "prusa_infill_width",
@@ -372,6 +842,17 @@ def run_ui_server(host: str, port: int, output_dir: Path) -> None:
         server_output_dir = output_dir.resolve()
         slice_jobs: dict[str, dict[str, object]] = {}
         slice_jobs_lock = threading.Lock()
+        tool_launchers: dict[str, subprocess.Popen[bytes]] = {}
+        tool_launchers_lock = threading.Lock()
+        surface_preview_picker_lock = threading.Lock()
+        surface_preview_picker_state_path = _surface_preview_picker_state_path(server_output_dir)
+        surface_preview_last_directory = _load_surface_preview_last_directory(
+            surface_preview_picker_state_path
+        )
+        core_preview_picker_state_path = _core_preview_picker_state_path(server_output_dir)
+        core_preview_last_directory = _load_surface_preview_last_directory(
+            core_preview_picker_state_path
+        )
 
     server = ThreadingHTTPServer((host, port), SlicerUiHandler)
     print(f"KUKA slicer UI running at http://{host}:{port}")
@@ -387,6 +868,14 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
     server_output_dir: Path
     slice_jobs: dict[str, dict[str, object]] = {}
     slice_jobs_lock = threading.Lock()
+    tool_launchers: dict[str, subprocess.Popen[bytes]] = {}
+    tool_launchers_lock = threading.Lock()
+    surface_preview_picker_lock = threading.Lock()
+    surface_preview_last_directory: Path | None = None
+    surface_preview_picker_state_path: Path | None = None
+    surface_preview_selected_path: Path | None = None
+    core_preview_last_directory: Path | None = None
+    core_preview_picker_state_path: Path | None = None
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -399,10 +888,16 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/outputs/"):
             self._send_output_file(parsed.path.removeprefix("/outputs/"))
             return
+        if parsed.path.startswith("/assets/printhead/"):
+            self._send_printhead_asset(parsed.path.removeprefix("/assets/printhead/"))
+            return
         self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/launch-tool":
+            self._launch_tool(parse_qs(parsed.query))
+            return
         if parsed.path == "/ui-settings":
             try:
                 self._save_ui_settings()
@@ -410,6 +905,78 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
                 return
             self._send_json({"ok": True})
+            return
+        if parsed.path == "/choose-surface-npz-preview":
+            try:
+                self._choose_surface_npz_preview()
+            except Exception as exc:  # noqa: BLE001
+                self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path == "/choose-core-npz-preview":
+            try:
+                self._choose_core_npz_preview()
+            except Exception as exc:  # noqa: BLE001
+                self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path == "/check-surface-npz-collision":
+            try:
+                selected = type(self).surface_preview_selected_path
+                if selected is None:
+                    raise ValueError("请选择本地映射 NPZ 后再执行碰撞检查")
+                self._send_json(check_peak_surface_collision(selected))
+            except Exception as exc:  # noqa: BLE001
+                self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path == "/preview-source-npz":
+            try:
+                _, files = self._read_slice_request(parsed.query)
+                source_upload = files.get("source_npz")
+                if source_upload is None:
+                    raise ValueError("missing mapped source NPZ payload")
+                source_name, source_bytes = source_upload
+                if len(source_bytes) > MAX_SURFACE_PREVIEW_NPZ_BYTES:
+                    raise ValueError("mapped source NPZ exceeds the 256 MB preview limit")
+                self._send_json(
+                    {
+                        "ok": True,
+                        "preview": _preview_payload_from_source_npz(
+                            source_bytes,
+                            _safe_filename(source_name or "curved.npz"),
+                        ),
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path == "/inspect-conformal-spec":
+            try:
+                _, files = self._read_slice_request(parsed.query)
+                uploaded = files.get("conformal_spec")
+                if uploaded is None:
+                    raise ValueError("请选择共形蜂窝设计 JSON")
+                name, payload = uploaded
+                self._send_json(
+                    {
+                        "ok": True,
+                        "summary": _conformal_spec_ui_summary(
+                            payload,
+                            name or "conformal_lattice_spec_v1.json",
+                        ),
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path == "/conformal-slice":
+            try:
+                request_data = self._read_slice_request(parsed.query)
+                job_id = self._start_conformal_slice_job(parsed.query, request_data)
+            except Exception as exc:  # noqa: BLE001
+                self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(
+                {"ok": True, "job_id": job_id, "state": "queued", "progress": 0, "message": "已接收共形蜂窝任务，等待处理"}
+            )
             return
         if parsed.path != "/slice":
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
@@ -430,6 +997,99 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                 "message": "已接收任务，等待处理",
             }
         )
+
+    def _choose_surface_npz_preview(self) -> None:
+        """Choose and load a legacy mapped or conformal-path NPZ."""
+
+        handler_type = type(self)
+        with handler_type.surface_preview_picker_lock:
+            selected = _choose_mapped_surface_npz_file(handler_type.surface_preview_last_directory)
+        if selected is None:
+            self._send_json({"ok": True, "cancelled": True})
+            return
+        selected = selected.resolve()
+        if selected.suffix.lower() != ".npz":
+            raise ValueError("请选择 .npz 映射曲面或共形格栅文件")
+        if not selected.is_file():
+            raise ValueError("所选曲面或共形格栅 NPZ 不存在")
+        if selected.stat().st_size > MAX_SURFACE_PREVIEW_NPZ_BYTES:
+            raise ValueError("mapped source NPZ exceeds the 256 MB preview limit")
+        handler_type.surface_preview_last_directory = selected.parent
+        handler_type.surface_preview_selected_path = selected
+        state_path = handler_type.surface_preview_picker_state_path
+        if state_path is not None:
+            _save_surface_preview_last_directory(state_path, selected.parent)
+        preview = _preview_payload_from_source_npz(selected.read_bytes(), selected.name)
+        self._send_json(
+            {
+                "ok": True,
+                "file_name": selected.name,
+                "collision_check_available": preview.get("preview_source") != "conformal_lattice_external_source_npz",
+                "preview": preview,
+            }
+        )
+
+    def _choose_core_npz_preview(self) -> None:
+        """Choose a final Core NPZ and render its exported trajectory directly."""
+
+        handler_type = type(self)
+        with handler_type.surface_preview_picker_lock:
+            selected = _choose_final_core_npz_file(handler_type.core_preview_last_directory)
+        if selected is None:
+            self._send_json({"ok": True, "cancelled": True})
+            return
+        selected = selected.resolve()
+        if selected.suffix.lower() != ".npz":
+            raise ValueError("请选择 .npz Core 导出文件")
+        if not selected.is_file():
+            raise ValueError("所选 Core NPZ 不存在")
+        core_parts = _final_core_npz_parts(selected)
+        total_size = sum(part.stat().st_size for part in core_parts)
+        if total_size > MAX_SURFACE_PREVIEW_NPZ_BYTES:
+            raise ValueError("Core NPZ exceeds the 256 MB preview limit")
+        handler_type.core_preview_last_directory = selected.parent
+        state_path = handler_type.core_preview_picker_state_path
+        if state_path is not None:
+            _save_surface_preview_last_directory(state_path, selected.parent)
+        self._send_json(
+            {
+                "ok": True,
+                "file_name": selected.name,
+                "preview": _preview_payload_from_final_core_npz(
+                    selected,
+                    SliceConfig(line_width=2.0),
+                ),
+            }
+        )
+
+    def _launch_tool(self, params: dict[str, list[str]]) -> None:
+        tool = params.get("tool", [""])[0]
+        if tool not in {"surface-preview", "surface-map"}:
+            self._send_json({"ok": False, "error": "unknown local tool"}, HTTPStatus.BAD_REQUEST)
+            return
+        with self.tool_launchers_lock:
+            existing = self.tool_launchers.get(tool)
+            if existing is not None and existing.poll() is None:
+                self._send_json({"ok": True, "already_running": True})
+                return
+            from .app_session import spawn_app_session
+
+            process = spawn_app_session(tool)
+            self.tool_launchers[tool] = process
+        watcher = threading.Thread(
+            target=self._clear_finished_tool,
+            args=(tool, process),
+            daemon=True,
+            name=f"slicer-tool-{tool}",
+        )
+        watcher.start()
+        self._send_json({"ok": True, "already_running": False})
+
+    def _clear_finished_tool(self, tool: str, process: subprocess.Popen[bytes]) -> None:
+        process.wait()
+        with self.tool_launchers_lock:
+            if self.tool_launchers.get(tool) is process:
+                self.tool_launchers.pop(tool, None)
 
     def log_message(self, format: str, *args: object) -> None:
         print(f"{self.address_string()} - {format % args}")
@@ -456,6 +1116,22 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         worker.start()
         return job_id
 
+    def _start_conformal_slice_job(
+        self,
+        query: str,
+        request_data: tuple[dict[str, list[str]], dict[str, tuple[str | None, bytes]]],
+    ) -> str:
+        job_id = uuid4().hex
+        self._update_slice_job(job_id, state="queued", progress=0, message="已接收共形蜂窝任务，等待处理", elapsed_s=0.0)
+        worker = threading.Thread(
+            target=self._run_conformal_slice_job,
+            args=(job_id, query, request_data),
+            daemon=True,
+            name=f"slicer-conformal-{job_id[:8]}",
+        )
+        worker.start()
+        return job_id
+
     def _run_slice_job(
         self,
         job_id: str,
@@ -475,11 +1151,16 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             )
 
         try:
-            result = self._handle_slice(
-                query,
-                request_data=request_data,
-                progress_callback=update_progress,
-            )
+            # Limit the whole UI task, including native slicing and the Core
+            # trajectory export.  Nested slice_mesh_to_job calls reuse this
+            # re-entrant guard.
+            with limit_slicer_task() as cpu_limit:
+                result = self._handle_slice(
+                    query,
+                    request_data=request_data,
+                    progress_callback=update_progress,
+                )
+            result["cpu_limit"] = cpu_limit.to_metadata()
             elapsed_s = time.perf_counter() - started_at
             self._update_slice_job(
                 job_id,
@@ -497,6 +1178,49 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                 progress=0,
                 message="导出失败",
                 elapsed_s=elapsed_s,
+                error=str(exc),
+            )
+
+    def _run_conformal_slice_job(
+        self,
+        job_id: str,
+        query: str,
+        request_data: tuple[dict[str, list[str]], dict[str, tuple[str | None, bytes]]],
+    ) -> None:
+        started_at = time.perf_counter()
+
+        def update_progress(progress: int, message: str) -> None:
+            self._update_slice_job(
+                job_id,
+                state="running",
+                progress=max(0, min(99, int(progress))),
+                message=message,
+                elapsed_s=time.perf_counter() - started_at,
+            )
+
+        try:
+            with limit_slicer_task() as cpu_limit:
+                result = self._handle_conformal_slice(
+                    query,
+                    request_data=request_data,
+                    progress_callback=update_progress,
+                )
+            result["cpu_limit"] = cpu_limit.to_metadata()
+            self._update_slice_job(
+                job_id,
+                state="complete",
+                progress=100,
+                message="共形蜂窝已生成并送入 Core",
+                elapsed_s=time.perf_counter() - started_at,
+                result=result,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._update_slice_job(
+                job_id,
+                state="error",
+                progress=0,
+                message="共形蜂窝导出失败",
+                elapsed_s=time.perf_counter() - started_at,
                 error=str(exc),
             )
 
@@ -580,17 +1304,61 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             config = _parse_pyslm_slice_config(params, shared, build_axis)
             raft_layers = []
         job = slice_mesh_to_job(mesh, config)
+        core_source_job = None
+        native_gcode_path = None
+        source_gcode_module = None
+        if _use_native_prusa_gcode_for_core(config, job.native_gcode):
+            _ensure_offline_planner_import_paths()
+            source_gcode_module = importlib.import_module(
+                "external_npz_preprocessor.source_gcode"
+            )
+            native_gcode_path = job_dir / f"{Path(filename).stem}_prusa.gcode"
+            native_gcode_path.write_bytes(
+                job.native_gcode
+                if isinstance(job.native_gcode, bytes)
+                else job.native_gcode.encode("utf-8")
+            )
+            core_source_job = source_gcode_module.translate_source_job(
+                source_gcode_module.load_source_gcode(native_gcode_path),
+                job.native_gcode_translation_mm or (0.0, 0.0, 0.0),
+            )
+            core_source_job = apply_legacy_resin_optimization(
+                core_source_job,
+                _planning_mesh_for_gcode_source(mesh, config),
+                config,
+            )
         progress(35, "Prusa 路径生成完成，正在保留原始预览")
         resolved_config = _resolved_slice_config(config)
         slicing_meta = job.meta.get("slicing")
         if isinstance(slicing_meta, dict):
             slicing_meta["resolved_config"] = resolved_config
         fiber_preview_paths = {}
+        fiber_travel_paths = {}
         if fiber_template_paths:
+            fiber_template_paths = align_fiber_template_paths_to_resin(
+                job,
+                fiber_template_paths,
+            )
             fiber_preview_paths = expand_fiber_template_for_resin_layers(
                 job, fiber_template_paths
             )
-            merge_fiber_paths_into_job(job, fiber_preview_paths)
+            fiber_travel_paths = plan_fiber_interpath_travels(
+                mesh,
+                config,
+                fiber_preview_paths,
+                reference_z_by_layer=job.meta.get("fiber_interpath_reference_z_mm"),
+            )
+            merge_fiber_paths_into_job(
+                job,
+                fiber_preview_paths,
+                fiber_travel_paths,
+            )
+            if core_source_job is not None and source_gcode_module is not None:
+                core_source_job = source_gcode_module.with_fiber_paths(
+                    core_source_job,
+                    fiber_preview_paths,
+                    fiber_travel_paths_by_layer=fiber_travel_paths,
+                )
         if raft_layers:
             z_shift = add_raft_to_job(job, mesh, config, raft_layers, DEFAULT_RAFT_TOP_GAP_MM)
             fiber_preview_paths = _shift_fiber_preview_paths(
@@ -601,6 +1369,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         normalize_job_xy_origin(
             job,
             target_xy=(float(config.start_x_mm), float(config.start_y_mm)),
+            reference_material="R",
         )
         primeline_enabled = _bool_param(params, "core_primeline_enabled", True)
         if slicing_kernel == "prusa":
@@ -613,18 +1382,22 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                     _float_param(params, "core_primeline_y_mm", -10.0),
                 ),
             )
+            if core_source_job is not None and source_gcode_module is not None:
+                core_source_job = source_gcode_module.prepend_prusa_startup_travel(
+                    core_source_job,
+                    start_xy=(float(config.start_x_mm), float(config.start_y_mm)),
+                    primeline_enabled=primeline_enabled,
+                    primeline_xy=(
+                        _float_param(params, "core_primeline_x_mm", 0.0),
+                        _float_param(params, "core_primeline_y_mm", -10.0),
+                    ),
+                )
         fiber_preview_paths = _fiber_preview_paths_from_job(job)
-        write_external_source_npz(job, npz_path)
-        progress(45, "Prusa 预览数据已保留，正在交给 path_processing_core")
+        if core_source_job is None:
+            write_external_source_npz(job, npz_path)
+        progress(45, "Prusa 路径生成完成，正在交给 path_processing_core")
 
         path_count = sum(len(group.paths) for group in job.material_paths)
-        preview = _preview_payload(
-            mesh,
-            config,
-            job,
-            fiber_preview_paths,
-            hide_initial_prusa_travel=(slicing_kernel == "prusa" and primeline_enabled),
-        )
         recommendation = _triangle_infill_recommendation(mesh, config, job)
         slicing_metadata = job.meta.get("slicing", {})
         if not isinstance(slicing_metadata, dict):
@@ -638,7 +1411,6 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             "external_npz_preprocessor.process_params"
         )
         core_params = _parse_core_process_params(params, process_params_module)
-        core_preview_xy_offset = _core_preview_xy_offset(job, core_params)
 
         core_npz_path = job_dir / f"{Path(filename).stem}_core.npz"
 
@@ -649,21 +1421,34 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                 "正在执行 path_processing_core 并写出系统 NPZ",
             )
 
-        def capture_core_preview(commands) -> None:
-            preview["core_overlay"] = _core_preview_overlay_from_commands(
-                commands,
-                xy_offset=core_preview_xy_offset,
+        if core_source_job is None:
+            core_stats = export_runner.convert_external_npz(
+                npz_path,
+                core_npz_path,
+                core_params,
+                progress_callback=core_progress,
+                chunk_size=5_000_000,
             )
-
-        core_stats = export_runner.convert_external_npz(
-            npz_path,
-            core_npz_path,
-            core_params,
-            progress_callback=core_progress,
-            chunk_size=5_000_000,
-            commands_callback=capture_core_preview,
-        )
+        else:
+            core_stats = export_runner.convert_source_job(
+                core_source_job,
+                source_path=native_gcode_path,
+                output_path=core_npz_path,
+                params=core_params,
+                progress_callback=core_progress,
+                chunk_size=5_000_000,
+            )
         progress(98, "正在完成系统 NPZ 和时间元数据写入")
+        # The browser is a source-trajectory inspector: it must show the
+        # exact geometry written to the NPZ handed into Core, not Core's
+        # fitted/resampled output.  In particular, a multi-waypoint travel
+        # remains visibly routed around its avoidance vertices while Core
+        # applies one zero-speed-endpoint profile to that complete route.
+        preview = (
+            _preview_payload_from_core_source_job(mesh, config, core_source_job)
+            if core_source_job is not None
+            else _preview_payload(mesh, config, job, fiber_preview_paths)
+        )
         download_path = _core_output_download_path(core_npz_path)
         return {
             "download_url": f"/outputs/{quote(stamp)}/{quote(download_path.name)}",
@@ -691,6 +1476,106 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                 )
                 else config.planning_line_width
             ),
+            "core_export_seconds": float(core_stats.get("total_s", 0.0)),
+            "core_rows": int(core_stats.get("rows", 0)),
+            "core_parts": int(core_stats.get("parts", 0)),
+        }
+
+    def _handle_conformal_slice(
+        self,
+        query: str,
+        *,
+        request_data=None,
+        progress_callback=None,
+    ) -> dict[str, object]:
+        """Generate the STL-free rectangular conformal workflow and run Core."""
+
+        params, files = request_data or self._read_slice_request(query)
+
+        def progress(value: int, message: str) -> None:
+            if progress_callback is not None:
+                progress_callback(value, message)
+
+        uploaded = files.get("conformal_spec")
+        if uploaded is None:
+            raise ValueError("请选择共形蜂窝设计 JSON")
+        source_name, source_bytes = uploaded
+        source_filename = _safe_filename(source_name or "conformal_lattice_spec_v1.json")
+        progress(3, "正在校验共形蜂窝设计 JSON")
+        spec = load_conformal_lattice_spec(source_bytes)
+        if not spec.part or not spec.manufacturing:
+            raise ValueError("共形蜂窝路径仅支持矩形实体设计 JSON")
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        job_dir = self.server_output_dir / stamp
+        job_dir.mkdir(parents=True, exist_ok=True)
+        (job_dir / source_filename).write_bytes(source_bytes)
+
+        _ensure_offline_planner_import_paths()
+        process_params_module = importlib.import_module("external_npz_preprocessor.process_params")
+        core_params = _parse_core_process_params(params, process_params_module)
+        resin = core_params.resin
+        layer_height = float(resin.layer_height_mm)
+        e_per_mm = float(resin.e_per_mm())
+        if e_per_mm <= 0.0:
+            raise ValueError("当前 Core 树脂 E/mm 必须为正数")
+        bead_area = 2.0 * layer_height * float(resin.extrusion_scale)
+        if bead_area <= 0.0:
+            raise ValueError("当前 Core 树脂挤出倍率必须为正数")
+
+        from .conformal_lattice.path_bridge import ExtrusionVolumeModel
+        from .conformal_lattice.pipeline import run_conformal_lattice_pipeline, write_conformal_lattice_outputs
+
+        progress(12, "正在计算双正弦曲面、共形蜂窝结构与一笔画分区")
+        run = run_conformal_lattice_pipeline(
+            spec,
+            physical_layer_height_mm=layer_height,
+            extrusion=ExtrusionVolumeModel(
+                bead_cross_section_area_mm2=bead_area,
+                # This effective volume/E value makes the authoritative
+                # source profile exactly match the selected Core calibration,
+                # including an explicit E/mm override when one is supplied.
+                e_volume_per_unit_mm3=bead_area / e_per_mm,
+                preview_line_width_mm=2.0,
+            ),
+            # Gate 6 samples every cell against the surface triangles.  It is
+            # a quality-analysis tool, not part of manufacturing generation;
+            # keeping it out of this request lets the prepared one-stroke
+            # conformal paths proceed directly to Core.
+            validate_fill_ratio=False,
+        )
+        progress(55, "正在按一笔画分区生成 External Source NPZ")
+        outputs = write_conformal_lattice_outputs(run, job_dir)
+        source_npz_path = outputs.get("paths")
+        if source_npz_path is None:
+            raise RuntimeError("共形蜂窝路径桥接未生成 External Source NPZ")
+
+        export_runner = importlib.import_module("external_npz_preprocessor.export_runner")
+        core_npz_path = job_dir / "conformal_lattice_core.npz"
+
+        def core_progress(ratio: float) -> None:
+            progress(60 + int(max(0.0, min(1.0, float(ratio))) * 35), "正在执行 path_processing_core 并写出系统 NPZ")
+
+        core_stats = export_runner.convert_external_npz(
+            source_npz_path,
+            core_npz_path,
+            core_params,
+            progress_callback=core_progress,
+            chunk_size=5_000_000,
+        )
+        progress(97, "正在生成主界面三维预览")
+        preview = run.main_preview_payload(planning_line_width_mm=2.0)
+        download_path = _core_output_download_path(core_npz_path)
+        path_count = sum(len(group.paths) for group in run.path_graph.to_external_source_job().material_paths) if run.path_graph else 0
+        return {
+            "download_url": f"/outputs/{quote(stamp)}/{quote(download_path.name)}",
+            "filename": download_path.name,
+            "layers": len(preview["layers"]),
+            "paths": path_count,
+            "preview": preview,
+            "effective_infill_pattern": "共形蜂窝一笔画分区",
+            "infill_pattern_execution": {"applied": False, "mode": "conformal_lattice_macro_partition"},
+            "conformal_lattice": run.report,
             "core_export_seconds": float(core_stats.get("total_s", 0.0)),
             "core_rows": int(core_stats.get("rows", 0)),
             "core_parts": int(core_stats.get("parts", 0)),
@@ -775,6 +1660,28 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Disposition", f'attachment; filename="{html.escape(target.name)}"')
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _send_printhead_asset(self, asset_name: str) -> None:
+        allowed_types = {
+            ".glb": "model/gltf-binary",
+            ".json": "application/json; charset=utf-8",
+        }
+        target = (PRINTHEAD_ASSET_DIR / unquote(asset_name)).resolve()
+        if (
+            target.parent != PRINTHEAD_ASSET_DIR.resolve()
+            or target.suffix.lower() not in allowed_types
+            or not target.is_file()
+        ):
+            self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+            return
+        data = target.read_bytes()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", allowed_types[target.suffix.lower()])
+        cache_control = "no-cache" if target.suffix.lower() == ".json" else "public, max-age=3600"
+        self.send_header("Cache-Control", cache_control)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -1113,6 +2020,13 @@ def _parse_prusa_slice_config(
         print_perimeters=_bool_param(params, "prusa_print_perimeters", True),
         prusa_raft=prusa_raft,
         prusa_geometry=prusa_geometry,
+        honeycomb_pathing=HoneycombPathingConfig(
+            enabled=_bool_param(params, "honeycomb_centerline_enabled", False),
+            # Saved UI states may still contain one of the removed topology
+            # names.  The only supported mode is deliberately selected here
+            # instead of allowing an old setting to make slicing fail.
+            topology="macro_partition_zero_e",
+        ),
         brim_enabled=brim_enabled,
         brim_width_mm=_float_param(params, "prusa_brim_width", 5.0),
         brim_type=params.get("prusa_brim_type", ["outer_only"])[0],  # type: ignore[arg-type]
@@ -1396,7 +2310,13 @@ def resolve_build_axis(mesh, requested_axis: str) -> str:
 
 def load_fiber_template_json(json_path: Path) -> list[list[list[float]]]:
     data = json.loads(json_path.read_text(encoding="utf-8"))
+    coordinate_system: str | None = None
     if isinstance(data, dict):
+        raw_coordinate_system = data.get("coordinate_system")
+        if raw_coordinate_system is not None:
+            if not isinstance(raw_coordinate_system, str):
+                raise ValueError("fiber JSON coordinate_system must be a string")
+            coordinate_system = raw_coordinate_system
         # Canonical fiber paths use one record per trajectory under ``paths``.
         if "paths" in data:
             data = data["paths"]
@@ -1446,7 +2366,54 @@ def load_fiber_template_json(json_path: Path) -> list[list[list[float]]]:
 
     if not paths:
         raise ValueError("fiber JSON contains no valid paths")
-    return paths
+    return FiberTemplatePaths(paths, coordinate_system=coordinate_system)
+
+
+def align_fiber_template_paths_to_resin(
+    job,
+    template_paths: list[list[list[float]]],
+) -> list[list[list[float]]]:
+    """Map declared fiber XY coordinates into the unnormalized resin frame.
+
+    ``project_default`` is the coordinate convention emitted by the fiber
+    planner: (0, 0) is the center of the STL build plane.  Slicer paths retain
+    the STL's local XY translation until the later UI placement step, so map
+    that origin to the resin bounding-box center before fibers are injected.
+    The later normalization then applies the existing UI start/travel offset
+    equally to both materials.
+    """
+
+    coordinate_system = getattr(template_paths, "coordinate_system", None)
+    if coordinate_system is None or coordinate_system == "slicer_xy":
+        return template_paths
+    if coordinate_system != "project_default":
+        raise ValueError(
+            "fiber JSON coordinate_system must be project_default or slicer_xy"
+        )
+
+    resin_paths = [
+        np.asarray(path, dtype=np.float64)
+        for group in job.material_paths
+        if group.material == "R"
+        for path in group.paths
+        if np.asarray(path).size
+    ]
+    if not resin_paths:
+        raise ValueError("cannot align project_default fiber JSON without resin paths")
+    resin_points = np.vstack(resin_paths)
+    translation_x = float((np.min(resin_points[:, 0]) + np.max(resin_points[:, 0])) * 0.5)
+    translation_y = float((np.min(resin_points[:, 1]) + np.max(resin_points[:, 1])) * 0.5)
+    aligned_paths = [
+        [[float(x) + translation_x, float(y) + translation_y, float(z)] for x, y, z in path]
+        for path in template_paths
+    ]
+    job.meta["fiber_coordinate_alignment"] = {
+        "source_coordinate_system": coordinate_system,
+        "reference": "resin_xy_bounds_center",
+        "translation_x_mm": translation_x,
+        "translation_y_mm": translation_y,
+    }
+    return aligned_paths
 
 
 def expand_fiber_template_for_resin_layers(
@@ -1465,6 +2432,10 @@ def expand_fiber_template_for_resin_layers(
             if isinstance(raw_count, int) and raw_count > 0:
                 raft_layer_count = raw_count
     part_resin_groups = resin_groups[raft_layer_count:]
+    fiber_reference_z_by_layer = {
+        int(group.layer_index): _group_layer_z(group)
+        for group in part_resin_groups
+    }
 
     # A brim is printed on the first part resin layer, but fiber should start
     # only above the following resin layer.  Keep the normal resin/fiber
@@ -1522,6 +2493,14 @@ def expand_fiber_template_for_resin_layers(
         slicing_metadata["fiber_layer_height_applied_mm"] = fiber_layer_height
         slicing_metadata["fiber_layers_skipped_for_brim"] = skipped_fiber_layers
 
+    # The physical fiber Z accumulates earlier fiber courses.  Routing must
+    # inspect the same unshifted STL section that produced the resin layer,
+    # while the connector itself retains its raised output Z.
+    job.meta["fiber_interpath_reference_z_mm"] = {
+        str(layer_index): float(z)
+        for layer_index, z in fiber_reference_z_by_layer.items()
+    }
+
     # Fiber is printed between resin layers; the final resin layer is a cap.
     for group in part_resin_groups[skipped_fiber_layers:-1]:
         z = _group_layer_z(group) + fiber_layer_height
@@ -1566,15 +2545,60 @@ def _group_layer_z(group) -> float:
     return float(group.layer_index)
 
 
-def merge_fiber_paths_into_job(job, fiber_paths_by_layer: dict[int, list[list[list[float]]]]) -> None:
+def merge_fiber_paths_into_job(
+    job,
+    fiber_paths_by_layer: dict[int, list[list[list[float]]]],
+    fiber_travel_paths_by_layer: dict[int, list[np.ndarray]] | None = None,
+) -> None:
+    """Attach fiber deposition and only its explicit interpath travels.
+
+    Native resin paths and their Prusa travel order are copied verbatim.  The
+    appended records describe the UI-planned fiber sequence exclusively, so
+    the pre-Core source NPZ and the native-G-code Core adapter share identical
+    fiber travel geometry without changing any resin motion.
+    """
+
+    fiber_travel_paths_by_layer = fiber_travel_paths_by_layer or {}
     existing = {(group.layer_index, group.material) for group in job.material_paths}
     for layer_index in sorted(fiber_paths_by_layer):
         if (layer_index, "F") in existing:
             continue
         paths = [np.asarray(path, dtype=np.float64) for path in fiber_paths_by_layer[layer_index]]
+        connector_paths = [
+            np.asarray(path, dtype=np.float64)
+            for path in fiber_travel_paths_by_layer.get(layer_index, [])
+        ]
+        if len(connector_paths) != max(0, len(paths) - 1):
+            raise ValueError(
+                f"fiber layer {layer_index} needs {max(0, len(paths) - 1)} interpath travels, "
+                f"received {len(connector_paths)}"
+            )
         if paths:
             job.material_paths.append(MaterialPaths(layer_index, "F", paths))
+            travel_group = next(
+                (group for group in job.travel_paths if group.layer_index == layer_index),
+                None,
+            )
+            if travel_group is None:
+                travel_group = TravelPaths(layer_index, [])
+                job.travel_paths.append(travel_group)
+            first_travel_index = len(travel_group.paths)
+            travel_group.paths.extend(connector_paths)
+            motion_root = job.meta.get("motion_order")
+            if isinstance(motion_root, dict):
+                records = motion_root.setdefault(str(layer_index), [])
+                if isinstance(records, list):
+                    for fiber_index in range(len(paths)):
+                        if fiber_index:
+                            records.append(
+                                {
+                                    "kind": "fiber_travel",
+                                    "index": first_travel_index + fiber_index - 1,
+                                }
+                            )
+                        records.append({"kind": "fiber_deposit", "index": fiber_index})
     job.material_paths.sort(key=lambda group: (group.layer_index, 0 if group.material == "R" else 1))
+    job.travel_paths.sort(key=lambda group: group.layer_index)
 
 
 def _fiber_preview_paths_from_job(job) -> dict[int, list[list[list[float]]]]:
@@ -1609,6 +2633,8 @@ def _preview_payload(
         "max_z": None,
     }
     fiber_paths_by_layer = fiber_paths_by_layer or {}
+    has_curved_deposition = False
+    has_tool_orientation = False
     resin_roles_by_layer = (
         job.meta.get("path_roles", {}).get("R", {})
         if isinstance(job.meta.get("path_roles", {}), dict)
@@ -1638,76 +2664,79 @@ def _preview_payload(
 
     for layer_index in sorted(layer_indices):
         resin_paths: list[dict[str, object]] = []
+        preview_resin_indices: dict[int, list[int]] = {}
         group_resin_index = 0
         for group in groups_by_layer.get(layer_index, {}).get("R", []):
             layer_roles = resin_roles_by_layer.get(str(layer_index), [])
             for path_index, path in enumerate(group.paths):
-                raw_points = [
-                    [float(point[0]), float(point[1]), float(point[2])]
-                    for point in path
-                ]
+                raw_points = [_serialize_preview_point(point) for point in path]
+                has_curved_deposition = has_curved_deposition or _preview_path_varies_in_z(raw_points)
+                has_tool_orientation = has_tool_orientation or _preview_path_has_orientation(raw_points)
                 raw_extrusion = (
                     group.extrusion[path_index]
                     if group.extrusion is not None and path_index < len(group.extrusion)
                     else None
                 )
-                if raw_extrusion is not None and len(raw_extrusion) == len(raw_points):
-                    sample_count = min(len(raw_points), 2000)
-                    step = (len(raw_points) - 1) / max(sample_count - 1, 1)
-                    sample_indices = [round(index * step) for index in range(sample_count)]
-                    sample_indices[-1] = len(raw_points) - 1
-                    points = [raw_points[index] for index in sample_indices]
-                    extrusion = [float(raw_extrusion[index]) for index in sample_indices]
-                else:
-                    points = _simplify_preview_path(raw_points, max_points=2000)
-                    extrusion = None
+                source_resin_index = group_resin_index
                 role = (
-                    layer_roles[group_resin_index]
-                    if isinstance(layer_roles, list) and group_resin_index < len(layer_roles)
+                    layer_roles[source_resin_index]
+                    if isinstance(layer_roles, list) and source_resin_index < len(layer_roles)
                     else None
                 )
                 group_resin_index += 1
-                if role in ("outer_contour", "inner_contour", "infill", "raft", "brim"):
-                    entry: dict[str, object] = {"role": role, "points": points}
-                elif path.shape[0] > 2:
-                    entry = {"role": "outer_contour", "points": points}
-                else:
-                    entry = {"role": "infill", "points": points}
-                if extrusion is not None:
-                    entry["extrusion"] = extrusion
-                resin_paths.append(entry)
-                for x, y, z in points:
-                    _expand_bounds(bounds, x, y, z)
+                preview_role = role if role in ("outer_contour", "inner_contour", "infill", "raft", "brim") else (
+                    "outer_contour" if path.shape[0] > 2 else "infill"
+                )
+                # Rendering must never uniformly decimate a long polyline:
+                # that joins unrelated honeycomb nodes with false chords.
+                # Honeycomb macro partitions must remain one logical preview
+                # path so the slider and playback show the actual full
+                # execution flow.  Other very long paths keep their bounded
+                # transport chunks to protect general preview responsiveness.
+                preview_chunk_size = 16_000 if role == "honeycomb_wall" else 2_000
+                chunk_indices: list[int] = []
+                for points, extrusion in _preview_path_chunks(
+                    raw_points,
+                    raw_extrusion,
+                    max_points=preview_chunk_size,
+                ):
+                    entry: dict[str, object] = {"role": preview_role, "points": points}
+                    if extrusion is not None:
+                        entry["extrusion"] = extrusion
+                    chunk_indices.append(len(resin_paths))
+                    resin_paths.append(entry)
+                    for point in points:
+                        _expand_bounds(bounds, point[0], point[1], point[2])
+                preview_resin_indices[source_resin_index] = chunk_indices
 
+        # The preview is a source-NPZ geometry inspector.  Never decimate a
+        # deposited or travel route: a skipped point can turn a hole-avoiding
+        # path into a false chord on the Canvas.
         serialized_fiber_paths = [
-            _simplify_preview_path(path, max_points=2000)
+            [list(point) for point in path]
             for path in fiber_paths_by_layer.get(layer_index, [])
         ]
         if not serialized_fiber_paths:
             for group in groups_by_layer.get(layer_index, {}).get("F", []):
                 serialized_fiber_paths.extend(
-                    _simplify_preview_path(
-                        [[float(point[0]), float(point[1]), float(point[2])] for point in path],
-                        max_points=2000,
-                    )
+                    [_serialize_preview_point(point) for point in path]
                     for path in group.paths
                 )
         for fiber_path in serialized_fiber_paths:
-            for x, y, z in fiber_path:
-                _expand_bounds(bounds, x, y, z)
+            has_curved_deposition = has_curved_deposition or _preview_path_varies_in_z(fiber_path)
+            has_tool_orientation = has_tool_orientation or _preview_path_has_orientation(fiber_path)
+            for point in fiber_path:
+                _expand_bounds(bounds, point[0], point[1], point[2])
 
         serialized_travel_paths: list[list[list[float]]] = []
         for group in travel_groups_by_layer.get(layer_index, []):
             serialized_travel_paths.extend(
-                _simplify_preview_path(
-                    [[float(point[0]), float(point[1]), float(point[2])] for point in path],
-                    max_points=2000,
-                )
+                [_serialize_preview_point(point) for point in path]
                 for path in group.paths
             )
         for travel_path in serialized_travel_paths:
-            for x, y, z in travel_path:
-                _expand_bounds(bounds, x, y, z)
+            for point in travel_path:
+                _expand_bounds(bounds, point[0], point[1], point[2])
 
         motion_paths: list[dict[str, object]] = []
         motion_order = motion_order_by_layer.get(str(layer_index), [])
@@ -1719,16 +2748,17 @@ def _preview_payload(
                 index = motion.get("index")
                 if not isinstance(index, int):
                     continue
-                if kind == "deposit" and 0 <= index < len(resin_paths):
-                    source = resin_paths[index]
-                    motion_paths.append(
-                        {
-                            "kind": "deposit",
-                            "role": source["role"],
-                            "points": source["points"],
-                            "extrusion": source.get("extrusion"),
-                        }
-                    )
+                if kind == "deposit" and index in preview_resin_indices:
+                    for preview_index in preview_resin_indices[index]:
+                        source = resin_paths[preview_index]
+                        motion_paths.append(
+                            {
+                                "kind": "deposit",
+                                "role": source["role"],
+                                "points": source["points"],
+                                "extrusion": source.get("extrusion"),
+                            }
+                        )
                 elif kind == "fiber_deposit" and 0 <= index < len(serialized_fiber_paths):
                     motion_paths.append(
                         {
@@ -1790,13 +2820,88 @@ def _preview_payload(
     return {
         "bounds": bounds,
         "origin": [0.0, 0.0],
+        # A flat job may span many layers in Z.  The view changes only when a
+        # depositing path itself varies in Z, which is the signature of a
+        # mapped surface rather than ordinary planar slicing.
+        "geometry_mode": "surface_3d" if has_curved_deposition else "planar_2d",
+        "tool_orientation": {
+            "available": has_tool_orientation,
+            "fallback": "calibrated_flat_downward",
+        },
         "line_widths": {
             "resin": float(planning_line_width),
             "resin_nominal": float(config.line_width),
             "fiber": DEFAULT_FIBER_LINE_WIDTH_MM,
         },
+        "preview_source": "pre_core_source_npz",
         "layers": list(layers_by_index.values()),
     }
+
+
+def _preview_payload_from_source_npz(source_bytes: bytes, source_name: str) -> dict[str, object]:
+    """Adapt a legacy mapped or conformal external NPZ to the main preview schema."""
+
+    # The mapper contract remains the authority for validation.  This adapter
+    # only removes NaN padding and forwards XYZABC to the shared Canvas view;
+    # it does not perform mapping, interpolation, or any Core processing.
+    from .surface_mapper.contracts import read_source_npz
+
+    source = read_source_npz(source_bytes, source_name=source_name)
+    material_paths: list[MaterialPaths] = []
+    travel_paths: list[TravelPaths] = []
+    key_pattern = re.compile(r"^layer_(\d{4,})_([RFT])$")
+    for key in source.path_keys:
+        match = key_pattern.match(key)
+        if match is None:
+            continue
+        layer_index = int(match.group(1))
+        material = match.group(2)
+        paths = [
+            np.asarray(path[np.isfinite(path[:, 0])], dtype=np.float64)
+            for path in np.asarray(source.arrays[key])
+            if np.isfinite(path[:, 0]).any()
+        ]
+        if material == "T":
+            if paths:
+                travel_paths.append(TravelPaths(layer_index, paths))
+            continue
+        extrusion_key = f"{key}_E"
+        extrusion = None
+        if extrusion_key in source.arrays:
+            extrusion = [
+                np.asarray(values[np.isfinite(values)], dtype=np.float64)
+                for values in np.asarray(source.arrays[extrusion_key])
+                if np.isfinite(values).any()
+            ]
+        if paths:
+            material_paths.append(MaterialPaths(layer_index, material, paths, extrusion))
+
+    slicing_meta = source.meta.get("slicing")
+    resolved_config = slicing_meta.get("resolved_config", {}) if isinstance(slicing_meta, dict) else {}
+    line_width = resolved_config.get("line_width", DEFAULT_RESIN_LINE_WIDTH_MM)
+    try:
+        config = SliceConfig(line_width=float(line_width))
+    except (TypeError, ValueError):
+        config = SliceConfig(line_width=DEFAULT_RESIN_LINE_WIDTH_MM)
+    preview = _preview_payload(
+        None,
+        config,
+        ExternalSourceJob(
+            material_paths=material_paths,
+            travel_paths=travel_paths,
+            meta=source.meta,
+        ),
+    )
+    bridge = source.meta.get("conformal_lattice_path_bridge")
+    if isinstance(bridge, dict):
+        preview["preview_source"] = "conformal_lattice_external_source_npz"
+        preview["conformal_lattice"] = {
+            "edge_count_per_layer": int(bridge.get("edge_count_per_layer", len(material_paths[0].paths) if material_paths else 0)),
+            "path_order": bridge.get("path_order"),
+            "uses_existing_main_canvas": True,
+            "planning_line_width_mm": float(config.line_width),
+        }
+    return preview
 
 
 def _triangle_infill_recommendation(mesh, config: SliceConfig, current_job) -> dict[str, object] | None:
@@ -1880,6 +2985,56 @@ def _simplify_preview_path(
     simplified = [points[round(index * step)] for index in range(max_points)]
     simplified[-1] = points[-1]
     return simplified
+
+
+def _preview_path_chunks(
+    points: list[list[float]],
+    extrusion_values,
+    *,
+    max_points: int,
+) -> list[tuple[list[list[float]], list[float] | None]]:
+    """Split a display-only path without dropping or reordering source points."""
+
+    if max_points < 2:
+        raise ValueError("preview chunk size must be at least two")
+    values = (
+        [float(value) for value in extrusion_values]
+        if extrusion_values is not None and len(extrusion_values) == len(points)
+        else None
+    )
+    chunks = []
+    start = 0
+    while start < len(points):
+        end = min(start + max_points, len(points))
+        chunks.append((points[start:end], None if values is None else values[start:end]))
+        if end == len(points):
+            break
+        start = end - 1
+    return chunks
+
+
+def _serialize_preview_point(point: object) -> list[float]:
+    """Keep XYZABC when a mapped source path supplies a KUKA orientation."""
+
+    values = [float(point[index]) for index in range(3)]
+    try:
+        orientation = [float(point[index]) for index in range(3, 6)]
+    except (IndexError, TypeError):
+        return values
+    if all(np.isfinite(value) for value in orientation):
+        values.extend(orientation)
+    return values
+
+
+def _preview_path_varies_in_z(points: list[list[float]]) -> bool:
+    if len(points) < 2:
+        return False
+    z_values = [point[2] for point in points]
+    return max(z_values) - min(z_values) > 1e-5
+
+
+def _preview_path_has_orientation(points: list[list[float]]) -> bool:
+    return any(len(point) >= 6 for point in points)
 
 
 def _load_fiber_preview_paths(npz_path: Path) -> dict[int, list[list[list[float]]]]:
@@ -2014,6 +3169,8 @@ def _index_html() -> str:
       min-height: 68px;
       display: flex;
       align-items: center;
+      justify-content: space-between;
+      gap: var(--space-4);
       padding: 14px max(20px, calc((100vw - 960px) / 2));
       border-bottom: 1px solid var(--line);
       background: #ffffff;
@@ -2206,6 +3363,34 @@ def _index_html() -> str:
       outline-offset: 2px;
       border-color: var(--accent);
     }}
+    .surfaceTools {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--space-2);
+      justify-content: flex-end;
+    }}
+    .surfaceToolButton {{
+      min-height: 34px;
+      padding: 6px 10px;
+      border: 1px solid #8aa0b8;
+      border-radius: var(--radius-sm);
+      color: #084f96;
+      background: #ffffff;
+      font: inherit;
+      font-size: 13px;
+      cursor: pointer;
+    }}
+      .surfaceToolButton:hover {{ background: #eef6ff; }}
+      .surfaceToolButton:disabled {{ cursor: wait; opacity: 0.7; }}
+      .surfaceCollisionResult {{
+        flex: 1 1 100%;
+        min-height: 18px;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.35;
+      }}
+      .surfaceCollisionResult.ok {{ color: var(--ok); }}
+      .surfaceCollisionResult.error {{ color: var(--error); }}
     .inputBand input[type="file"] {{
       padding: 0;
       line-height: calc(var(--control-height) - 2px);
@@ -2784,6 +3969,29 @@ def _index_html() -> str:
       font-size: 13px;
       color: var(--muted);
     }}
+    .pathPlaybackControls {{
+      margin-top: var(--space-2);
+      display: grid;
+      grid-template-columns: auto auto minmax(110px, 1fr) auto;
+      gap: var(--space-2);
+      align-items: center;
+    }}
+    .pathPlaybackControls button {{
+      min-height: 30px;
+      height: 30px;
+      padding: 0 10px;
+      font-size: 13px;
+    }}
+    .pathPlaybackControls label {{
+      margin: 0;
+      font-size: 13px;
+      color: var(--muted);
+      white-space: nowrap;
+    }}
+    .pathPlaybackControls input {{
+      min-width: 0;
+      padding: 0;
+    }}
     .legend {{
       margin-top: var(--space-4);
       display: flex;
@@ -2972,12 +4180,28 @@ def _index_html() -> str:
         grid-template-columns: 1fr;
       }}
       h1 {{ font-size: 18px; }}
+      header {{ align-items: flex-start; flex-direction: column; }}
+      .surfaceTools {{ justify-content: flex-start; }}
       .preview {{ height: 380px; min-height: 340px; }}
     }}
   </style>
 </head>
 <body>
-  <header><h1>机械臂空间复合材料增材制造系统切片器</h1></header>
+  <header>
+    <h1>机械臂空间复合材料增材制造系统切片器</h1>
+    <div class="surfaceTools" aria-label="曲面工具">
+      <button id="surfacePreviewButton" class="surfaceToolButton" type="button">启动蜂窝网格共形设计器</button>
+      <button id="conformalSpecButton" class="surfaceToolButton" type="button">导入共形设计 JSON</button>
+      <button id="conformalSliceButton" class="surfaceToolButton" type="button" disabled>生成共形蜂窝并送入 Core</button>
+      <button id="coreNpzPreviewButton" class="surfaceToolButton" type="button">导入 Core NPZ 预览</button>
+      <button id="surfaceNpzPreviewButton" class="surfaceToolButton" type="button">导入曲面/共形 NPZ 预览</button>
+      <button id="surfaceNpzCollisionButton" class="surfaceToolButton" type="button" disabled>检查当前 NPZ 碰撞</button>
+      <output id="surfaceNpzCollisionResult" class="surfaceCollisionResult" aria-live="polite">请先导入本地映射 NPZ。</output>
+      <input id="surfaceNpzInput" type="file" accept=".npz,application/octet-stream" hidden>
+      <input id="conformalSpecInput" type="file" accept=".json,application/json" hidden>
+      <output id="conformalSpecResult" class="surfaceCollisionResult" aria-live="polite">尚未导入共形蜂窝设计 JSON。</output>
+    </div>
+  </header>
   <main>
     <section class="resultsColumn">
       <div class="summary">
@@ -3000,6 +4224,12 @@ def _index_html() -> str:
             <input id="pathProgressSlider" type="range" min="0" max="0" value="0" disabled>
             <output id="pathProgressLabel">-</output>
           </div>
+          <div id="pathPlaybackControl" class="pathPlaybackControls" hidden>
+            <button id="playCurrentPath" type="button" disabled aria-pressed="false">播放当前路径</button>
+            <label for="pathPlaybackRate">播放速率</label>
+            <input id="pathPlaybackRate" type="range" min="0" max="1" step="0.05" value="1" aria-label="当前路径播放速率">
+            <output id="pathPlaybackRateLabel">1.00</output>
+          </div>
         </div>
       </div>
       <div class="legend" aria-label="预览图例">
@@ -3014,11 +4244,13 @@ def _index_html() -> str:
         <span class="legendItem"><span class="swatch originSwatch"></span>打印平面原点 (0, 0)</span>
       </div>
       <div class="viewOptions" aria-label="显示选项">
+        <label title="开启后同时绘制当前层及此前各层的完整路径；每层保留自身实际 Z 高度。"><input id="showLayerOverlay" type="checkbox">叠加层显示</label>
         <label title="仅改变预览笔触宽度，不改变轨迹中心线或挤出倍率"><input id="showLineWidth" type="checkbox">按实际规划线宽显示（当前 <span id="previewLineWidthValue">2.2 mm</span>）</label>
         <label title="仅对包含 Prusa E 数据的树脂路径按绝对单位长度挤出量着色；关闭时保持轮廓/填充原有配色。"><input id="showExtrusion" type="checkbox">显示绝对挤出量（E/mm）</label>
         <span id="extrusionColorLegend" class="extrusionColorLegend" hidden>0.00 E/mm <span class="extrusionColorRamp"></span> 0.50 E/mm</span>
+        <span title="连续蜂窝路径中，灰蓝虚线只移动喷头，不增加 E。">灰蓝虚线：零挤出安全连接</span>
         <label><input id="showPathPoints" type="checkbox">显示当前路径点</label>
-        <label><input id="showDirection" type="checkbox" checked>显示打印方向</label>
+        <label><input id="showDirection" type="checkbox" checked><span id="showDirectionLabel">显示打印方向</span></label>
         <span id="printSizeLabel">打印范围 -</span>
       </div>
       <div id="previewSurface" class="preview"><canvas id="previewCanvas" title="滚轮缩放；鼠标左键、右键或中键拖动视图"></canvas></div>
@@ -3200,6 +4432,15 @@ def _index_html() -> str:
                 <input id="prusaBrimSeparation" type="number" min="0" step="0.1" value="0">
               </div>
               <label for="prusaBrimOneStroke" class="tooltipLabel checkboxLabel" data-tooltip="尝试复用 Core 的安全边界连接策略，将 Prusa Brim 连接为一条连续挤出路径；无法安全连接时保留原生多路径。"><input id="prusaBrimOneStroke" type="checkbox"> Brim 一笔画</label>
+            </div>
+            <div class="prusaFeatureToggle">
+              <label for="honeycombCenterlineEnabled" class="tooltipLabel checkboxLabel" data-tooltip="附加于完整 Prusa 切片之后：每层先打印正式 150×100 外框，再生成原始 STL 孔壁的蜂窝路径。每个宏观分区内以不跨孔的零挤出安全换段连接，分区之间采用最短安全空走；所有沉积蜂窝壁均不重走。区内连接转角不超过 90°，三岔节点在一个线宽内渐降/渐升挤出。启用后 Core 使用该附加路径，不使用原生 Prusa G-code。"><input id="honeycombCenterlineEnabled" type="checkbox"{prusa_checked('honeycomb_centerline_enabled', False)}> 蜂窝连续路径（每层外框）</label>
+              <div class="fieldGroup">
+                <label for="honeycombTopology" class="tooltipLabel" data-tooltip="从原始 STL 的蜂窝孔壁生成不重走轨迹；通过多起点安全连接搜索，优先减少宏观分区数。分区内以不跨孔、转角不超过 90° 的零挤出安全换段连接；分区之间为最短安全空走。三岔节点以 1/3 挤出量平滑过渡。">蜂窝拓扑</label>
+                <select id="honeycombTopology">
+                  <option value="macro_partition_zero_e"{prusa_selected('honeycomb_topology', 'macro_partition_zero_e', 'macro_partition_zero_e')}>原始 STL 孔壁（最少宏观分区，区内零挤出安全换段）</option>
+                </select>
+              </div>
             </div>
             <details id="prusaAdvancedSettings" class="advancedSettings">
               <summary>Prusa 高级几何与路径设置</summary>
@@ -3698,7 +4939,285 @@ def _index_html() -> str:
   <script>
     const form = document.getElementById('sliceForm');
     const button = document.getElementById('sliceButton');
+    const surfaceToolButtons = {{
+      'surface-preview': document.getElementById('surfacePreviewButton')
+    }};
+    const surfaceNpzPreviewButton = document.getElementById('surfaceNpzPreviewButton');
+    const coreNpzPreviewButton = document.getElementById('coreNpzPreviewButton');
+    const conformalSpecButton = document.getElementById('conformalSpecButton');
+    const conformalSliceButton = document.getElementById('conformalSliceButton');
+    const conformalSpecInput = document.getElementById('conformalSpecInput');
+    const conformalSpecResult = document.getElementById('conformalSpecResult');
+    const surfaceNpzCollisionButton = document.getElementById('surfaceNpzCollisionButton');
+    const surfaceNpzCollisionResult = document.getElementById('surfaceNpzCollisionResult');
+    const surfaceNpzInput = document.getElementById('surfaceNpzInput');
     const statusEl = document.getElementById('status');
+    let selectedConformalSpec = null;
+    async function launchSurfaceTool(tool) {{
+      const toolButton = surfaceToolButtons[tool];
+      const originalLabel = toolButton.textContent;
+      toolButton.disabled = true;
+      toolButton.textContent = '正在启动…';
+      try {{
+        const response = await fetch('/launch-tool?tool=' + encodeURIComponent(tool), {{ method: 'POST' }});
+        const result = await response.json();
+        if (!response.ok || !result.ok) throw new Error(result.error || '启动失败');
+        statusEl.className = 'status ok';
+        statusEl.textContent = result.already_running
+          ? '该曲面工具窗口已打开。'
+          : '曲面工具已在独立窗口打开；关闭该窗口后服务会自动停止。';
+      }} catch (error) {{
+        statusEl.className = 'status error';
+        statusEl.textContent = '无法启动曲面工具：' + error.message;
+      }} finally {{
+        toolButton.disabled = false;
+        toolButton.textContent = originalLabel;
+      }}
+    }}
+    surfaceToolButtons['surface-preview'].addEventListener('click', () => launchSurfaceTool('surface-preview'));
+    function applyMappedSurfacePreview(preview, fileName, collisionCheckAvailable = false) {{
+      const isConformalLattice = preview?.preview_source === 'conformal_lattice_external_source_npz';
+      previewData = preview;
+      configureViewer();
+      layersEl.textContent = String(previewData.layers?.length || 0);
+      outputNameEl.textContent = fileName;
+      downloadEl.removeAttribute('href');
+      downloadEl.textContent = '已载入曲面预览（未导出）';
+      statusEl.className = 'status ok';
+      statusEl.textContent = isConformalLattice
+        ? '已载入共形格栅 NPZ：复用主三维预览的图层、路径播放和打印头显示。'
+        : '已载入映射曲面 NPZ：左键旋转，箭头尖端为当前打印点。';
+      surfaceNpzCollisionButton.disabled = !collisionCheckAvailable;
+      surfaceNpzCollisionResult.className = 'surfaceCollisionResult';
+      surfaceNpzCollisionResult.textContent = isConformalLattice
+        ? '共形格栅结构边预览不适用旧版峰值曲率碰撞检查。'
+        : collisionCheckAvailable
+        ? '已就绪：可检查峰值曲率层的加热块实体碰撞。'
+        : '浏览器上传的 NPZ 仅供预览；请通过“导入曲面/共形 NPZ 预览”选择本地文件后检查。';
+      drawPreview();
+    }}
+    function applyFinalCorePreview(preview, fileName) {{
+      previewData = preview;
+      configureViewer();
+      layersEl.textContent = String(previewData.layers?.length || 0);
+      outputNameEl.textContent = fileName;
+      executedInfillPatternEl.textContent = '最终 Core 轨迹';
+      downloadEl.removeAttribute('href');
+      downloadEl.textContent = '已载入 Core 轨迹预览（未导出）';
+      statusEl.className = 'status ok';
+      statusEl.textContent = '已载入 Core NPZ：预览显示最终导出的 print 与 travel 实际采样轨迹。';
+      surfaceNpzCollisionButton.disabled = true;
+      surfaceNpzCollisionResult.className = 'surfaceCollisionResult';
+      surfaceNpzCollisionResult.textContent = '当前为普通 Core NPZ 预览，不适用曲面碰撞检查。';
+      drawPreview();
+    }}
+    async function loadMappedSurfaceNpz(file) {{
+      if (!file) return;
+      try {{
+        const payload = new FormData();
+        payload.append('source_npz', file, file.name);
+        const response = await fetch('/preview-source-npz', {{ method: 'POST', body: payload }});
+        const result = await response.json();
+        if (!response.ok || !result.ok) throw new Error(result.error || '曲面 NPZ 预览载入失败');
+        applyMappedSurfacePreview(result.preview, file.name, false);
+      }} catch (error) {{
+        statusEl.className = 'status error';
+        statusEl.textContent = '无法载入曲面 NPZ：' + error.message;
+      }} finally {{
+        surfaceNpzInput.value = '';
+      }}
+    }}
+    surfaceNpzPreviewButton.addEventListener('click', async () => {{
+      const originalLabel = surfaceNpzPreviewButton.textContent;
+      surfaceNpzPreviewButton.disabled = true;
+      surfaceNpzPreviewButton.textContent = '正在选择文件…';
+      try {{
+        const response = await fetch('/choose-surface-npz-preview', {{ method: 'POST' }});
+        const result = await response.json();
+        if (!response.ok || !result.ok) throw new Error(result.error || '曲面 NPZ 选择失败');
+        if (!result.cancelled) applyMappedSurfacePreview(result.preview, result.file_name, result.collision_check_available === true);
+      }} catch (error) {{
+        statusEl.className = 'status error';
+        statusEl.textContent = '无法选择曲面 NPZ：' + error.message;
+      }} finally {{
+        surfaceNpzPreviewButton.disabled = false;
+        surfaceNpzPreviewButton.textContent = originalLabel;
+      }}
+    }});
+    async function inspectConformalSpec(file) {{
+      if (!file) return;
+      conformalSpecButton.disabled = true;
+      const originalLabel = conformalSpecButton.textContent;
+      conformalSpecButton.textContent = '正在识别…';
+      conformalSpecResult.className = 'surfaceCollisionResult';
+      conformalSpecResult.textContent = '正在检查共形蜂窝设计参数…';
+      try {{
+        const payload = new FormData();
+        payload.append('conformal_spec', file, file.name);
+        const response = await fetch('/inspect-conformal-spec', {{ method: 'POST', body: payload }});
+        const result = await response.json();
+        if (!response.ok || !result.ok) throw new Error(result.error || '无法识别共形设计 JSON');
+        const summary = result.summary;
+        const part = summary.part;
+        const lattice = summary.lattice;
+        conformalSpecResult.className = 'surfaceCollisionResult ok';
+        conformalSpecResult.textContent = `已识别共形蜂窝模式：${{part.length_mm}} × ${{part.width_mm}} × ${{part.final_height_mm}} mm；${{lattice.wall_width_mm}} mm 墙体（${{lattice.wall_bead_count}} 条 2 mm 沉积道），单元边长 ${{lattice.base_cell_size_mm}} mm。实际切片层高由当前 Core 树脂工艺参数决定。`;
+        selectedConformalSpec = file;
+        conformalSliceButton.disabled = false;
+        statusEl.className = 'status ok';
+        statusEl.textContent = '共形设计已载入。可直接生成一笔画分区路径，并写入 Core NPZ。';
+      }} catch (error) {{
+        selectedConformalSpec = null;
+        conformalSliceButton.disabled = true;
+        conformalSpecResult.className = 'surfaceCollisionResult error';
+        conformalSpecResult.textContent = '共形设计 JSON 无法使用：' + error.message;
+        statusEl.className = 'status error';
+        statusEl.textContent = conformalSpecResult.textContent;
+      }} finally {{
+        conformalSpecButton.disabled = false;
+        conformalSpecButton.textContent = originalLabel;
+        conformalSpecInput.value = '';
+      }}
+    }}
+    conformalSpecButton.addEventListener('click', () => conformalSpecInput.click());
+    conformalSpecInput.addEventListener('change', async () => {{
+      await inspectConformalSpec(conformalSpecInput.files?.[0]);
+    }});
+    function appendCurrentCoreSettings(formData) {{
+      const coreFieldIds = [
+        'coreResinLayerHeight', 'coreResinExtrusionScale', 'coreResinFeed',
+        'coreResinFirstLayerFeed', 'coreResinTemp', 'coreResinPrimeLength',
+        'coreResinPrimeSpeed', 'coreResinRetractLength', 'coreResinRetractSpeed',
+        'coreResinEOverride', 'coreFiberLayerHeight', 'coreFiberExtrusionScale',
+        'coreFiberFeed', 'coreFiberFirstLayerFeed', 'coreFiberTemp',
+        'coreFiberPrimeLength', 'coreFiberPrimeSpeed', 'coreFiberRetractLength',
+        'coreFiberRetractSpeed', 'coreFiberStartAccel', 'coreTravelFeed',
+        'coreFirstLayerTravelFeed', 'corePrimeSettle', 'coreDefaultA',
+        'coreDefaultB', 'coreDefaultC', 'corePrimelineX', 'corePrimelineY',
+        'corePrimelineLength', 'coreDt', 'coreCornerAngle',
+        'coreCornerRetreatRatio', 'coreSplineMaxError', 'coreSplineMaxAngle',
+        'coreSourceMergeDistance', 'coreCornerRetreatMax', 'coreCornerBlendSegments',
+        'coreDensity', 'coreDegree', 'coreMaxFitPoints', 'coreFiberOffsetX',
+        'coreFiberOffsetY', 'coreFiberOffsetZ', 'coreResinZComp',
+        'coreToolSafeLift', 'coreCutLift', 'coreCutWait', 'coreFiberRetractOverride',
+        'coreInitialTool'
+      ];
+      for (const id of coreFieldIds) {{
+        const input = document.getElementById(id);
+        const name = 'core_' + id.slice(4).replace(/[A-Z]/g, m => '_' + m.toLowerCase());
+        formData.append(name, input.value);
+      }}
+      formData.append('core_primeline_enabled', corePrimelineEnabledInput.checked ? 'true' : 'false');
+      for (const [id, name] of [
+        ['coreEnableExtrudeWait', 'core_enable_extrude_wait'],
+        ['coreTravelExtrudeOverlap', 'core_enable_travel_extrude_overlap'],
+        ['coreCutAbsoluteE', 'core_external_npz_cut_absolute_e']
+      ]) {{
+        formData.append(name, document.getElementById(id).checked ? 'true' : 'false');
+      }}
+    }}
+    conformalSliceButton.addEventListener('click', async () => {{
+      if (!selectedConformalSpec) return;
+      const originalLabel = conformalSliceButton.textContent;
+      conformalSliceButton.disabled = true;
+      conformalSliceButton.textContent = '处理中…';
+      statusEl.className = 'status';
+      statusEl.textContent = '正在生成共形蜂窝并送入 Core…';
+      downloadEl.className = 'download';
+      updateExportProgress({{ progress: 0, message: '正在提交共形蜂窝任务', elapsed_s: 0 }});
+      try {{
+        const formData = new FormData();
+        formData.append('conformal_spec', selectedConformalSpec, selectedConformalSpec.name);
+        appendCurrentCoreSettings(formData);
+        const response = await fetch('/conformal-slice', {{ method: 'POST', body: formData }});
+        const queued = await response.json();
+        if (!response.ok || !queued.ok) throw new Error(queued.error || '共形蜂窝任务提交失败');
+        const result = await waitForSliceJob(queued.job_id);
+        layersEl.textContent = result.layers;
+        outputNameEl.textContent = result.filename;
+        executedInfillPatternEl.textContent = '共形蜂窝一笔画分区';
+        previewData = result.preview;
+        updatePreviewLineWidthValue();
+        configureViewer();
+        drawPreview();
+        downloadEl.href = result.download_url;
+        downloadEl.textContent = '下载 ' + result.filename;
+        downloadEl.className = 'download visible';
+        statusEl.className = 'status ok';
+        statusEl.textContent = '完成：共形蜂窝路径已按图分区规划，并已生成 Core NPZ。';
+        const coreSeconds = Number(result.core_export_seconds);
+        if (Number.isFinite(coreSeconds)) exportElapsedEl.textContent = 'core 最终 NPZ 处理耗时 ' + coreSeconds.toFixed(1) + ' 秒';
+      }} catch (error) {{
+        statusEl.className = 'status error';
+        statusEl.textContent = error.message;
+      }} finally {{
+        conformalSliceButton.disabled = selectedConformalSpec === null;
+        conformalSliceButton.textContent = originalLabel;
+      }}
+    }});
+    coreNpzPreviewButton.addEventListener('click', async () => {{
+      const originalLabel = coreNpzPreviewButton.textContent;
+      coreNpzPreviewButton.disabled = true;
+      coreNpzPreviewButton.textContent = '正在选择文件…';
+      try {{
+        const response = await fetch('/choose-core-npz-preview', {{ method: 'POST' }});
+        const result = await response.json();
+        if (!response.ok || !result.ok) throw new Error(result.error || 'Core NPZ 选择失败');
+        if (!result.cancelled) applyFinalCorePreview(result.preview, result.file_name);
+      }} catch (error) {{
+        statusEl.className = 'status error';
+        statusEl.textContent = '无法载入 Core NPZ：' + error.message;
+      }} finally {{
+        coreNpzPreviewButton.disabled = false;
+        coreNpzPreviewButton.textContent = originalLabel;
+      }}
+    }});
+    surfaceNpzCollisionButton.addEventListener('click', async () => {{
+      const originalLabel = surfaceNpzCollisionButton.textContent;
+      surfaceNpzCollisionButton.disabled = true;
+      surfaceNpzCollisionButton.textContent = '正在检查峰值层…';
+      surfaceNpzCollisionResult.className = 'surfaceCollisionResult';
+      surfaceNpzCollisionResult.textContent = '正在检查峰值曲率层，请稍候…';
+      statusEl.className = 'status';
+      statusEl.textContent = '正在以加热块实体和蜂窝 STL 孔洞截面检查最大曲率打印层…';
+      try {{
+        const response = await fetch('/check-surface-npz-collision', {{ method: 'POST' }});
+        const result = await response.json();
+        if (!response.ok || !result.ok) throw new Error(result.error || '碰撞检查失败');
+        if (result.passed) {{
+          statusEl.className = 'status ok';
+          const clearance = Number(result.minimum_sampled_clearance_mm);
+          const clearanceText = Number.isFinite(clearance) ? clearance.toFixed(3) + ' mm' : '无有效候选点';
+          const coarsePitch = Number(result.coarse_sampling_pitch_mm);
+          const finePitch = Number(result.refinement_sampling_pitch_mm);
+          const refinedPoses = Number(result.refinement?.tested_pose_count);
+          const refinementText = Number.isFinite(finePitch) && Number.isFinite(refinedPoses)
+            ? `；${{coarsePitch.toFixed(1)}} mm 全路径初筛后，以 ${{finePitch.toFixed(1)}} mm 复核最小净空附近 ${{refinedPoses}} 个姿态`
+            : '';
+          const message = `通过：峰值层 ${{result.peak_layers.join('、')}} 未发现加热块实体相交；最小采样净空 ${{clearanceText}}（最终采样 ${{result.sampling_pitch_mm}} mm）${{refinementText}}。`;
+          statusEl.textContent = message;
+          surfaceNpzCollisionResult.className = 'surfaceCollisionResult ok';
+          surfaceNpzCollisionResult.textContent = message;
+        }} else {{
+          const hit = result.collision;
+          statusEl.className = 'status error';
+          statusEl.textContent = `检测到碰撞：第 ${{hit.layer}} 层，峰值层路径姿态 #${{hit.pose_index + 1}}。已停止检查；加热块实体与蜂窝材料区域相交。`;
+          surfaceNpzCollisionResult.className = 'surfaceCollisionResult error';
+          surfaceNpzCollisionResult.textContent = statusEl.textContent;
+        }}
+      }} catch (error) {{
+        statusEl.className = 'status error';
+        statusEl.textContent = '碰撞检查无法完成：' + error.message;
+        surfaceNpzCollisionResult.className = 'surfaceCollisionResult error';
+        surfaceNpzCollisionResult.textContent = statusEl.textContent;
+      }} finally {{
+        surfaceNpzCollisionButton.disabled = false;
+        surfaceNpzCollisionButton.textContent = originalLabel;
+      }}
+    }});
+    surfaceNpzInput.addEventListener('change', async () => {{
+      await loadMappedSurfaceNpz(surfaceNpzInput.files?.[0]);
+    }});
     const exportProgressEl = document.getElementById('exportProgress');
     const exportProgressBarEl = document.getElementById('exportProgressBar');
     const exportProgressMessageEl = document.getElementById('exportProgressMessage');
@@ -3715,16 +5234,34 @@ def _index_html() -> str:
     const pathProgressSlider = document.getElementById('pathProgressSlider');
     const layerLabel = document.getElementById('layerLabel');
     const pathProgressLabel = document.getElementById('pathProgressLabel');
+    const pathPlaybackControl = document.getElementById('pathPlaybackControl');
+    const playCurrentPathButton = document.getElementById('playCurrentPath');
+    const pathPlaybackRateInput = document.getElementById('pathPlaybackRate');
+    const pathPlaybackRateLabel = document.getElementById('pathPlaybackRateLabel');
     const printSizeLabel = document.getElementById('printSizeLabel');
     const stlFileInput = document.getElementById('stlFile');
     const fiberJsonInput = document.getElementById('fiberJsonFile');
     const fiberNotice = document.getElementById('fiberNotice');
+    const showLayerOverlayInput = document.getElementById('showLayerOverlay');
+    const surfaceCurvatureTextCache = new WeakMap();
+    let historicalOverlayCache = {{ preview: null, key: '', entries: [] }};
+    let pendingPreviewFrame = null;
+    const pathPlayback = {{
+      entry: null,
+      timeline: null,
+      distanceMm: 0,
+      running: false,
+      frame: null,
+      previousTimestamp: null,
+    }};
+    const PLAYBACK_MAX_SPEED_MM_PER_S = 8;
     const showLineWidthInput = document.getElementById('showLineWidth');
     const showExtrusionInput = document.getElementById('showExtrusion');
     const extrusionColorLegend = document.getElementById('extrusionColorLegend');
     const previewLineWidthValueEl = document.getElementById('previewLineWidthValue');
     const showPathPointsInput = document.getElementById('showPathPoints');
     const showDirectionInput = document.getElementById('showDirection');
+    const showDirectionLabel = document.getElementById('showDirectionLabel');
     const showOuterContourInput = document.getElementById('showOuterContour');
     const showInnerContourInput = document.getElementById('showInnerContour');
     const showResinInfillInput = document.getElementById('showResinInfill');
@@ -3874,16 +5411,21 @@ def _index_html() -> str:
       ['prusaPrintPerimeters', 'prusa_print_perimeters'], ['prusaRaftEnabled', 'prusa_raft_enabled'],
       ['prusaRaftAutoContact', 'prusa_raft_auto_contact'],
       ['prusaGapFillEnabled', 'prusa_gap_fill_enabled'],
-      ['prusaBrimEnabled', 'prusa_brim_enabled'], ['prusaBrimOneStroke', 'prusa_brim_one_stroke']
+      ['prusaBrimEnabled', 'prusa_brim_enabled'], ['prusaBrimOneStroke', 'prusa_brim_one_stroke'],
+      ['honeycombCenterlineEnabled', 'honeycomb_centerline_enabled']
     ];
     const prusaSelectSettings = [
       ['slicingKernel', 'slicing_kernel'], ['buildAxis', 'build_axis'],
       ['prusaInfillPattern', 'prusa_infill_pattern'], ['prusaPerimeterGenerator', 'prusa_perimeter_generator'],
-      ['prusaSeamPosition', 'prusa_seam_position'], ['prusaBrimType', 'prusa_brim_type']
+      ['prusaSeamPosition', 'prusa_seam_position'], ['prusaBrimType', 'prusa_brim_type'],
+      ['honeycombTopology', 'honeycomb_topology']
     ];
     function setInitialValue(id, value) {{
       const input = document.getElementById(id);
-      if (input && value !== null && value !== undefined && value !== '') input.value = String(value);
+      if (!input || value === null || value === undefined || value === '') return;
+      const normalized = String(value);
+      if (input instanceof HTMLSelectElement && !Array.from(input.options).some((option) => option.value === normalized)) return;
+      input.value = normalized;
     }}
     function applyInitialSavedSettings() {{
       const core = initialCoreParams || {{}};
@@ -4337,11 +5879,31 @@ def _index_html() -> str:
       zoom: 1.0,
       centerX: null,
       centerY: null,
+      centerZ: null,
+      surfaceYaw: -0.72,
+      surfacePitch: -0.58,
+      surfacePanX: 0,
+      surfacePanY: 0,
       dragging: false,
+      dragMode: null,
       pointerId: null,
       lastX: 0,
       lastY: 0
     }};
+    const printHeadAsset = {{ data: null, error: null }};
+    fetch('/assets/printhead/printhead_interference_check.preview.json?v=mesh-preflight-v6')
+      .then((response) => {{
+        if (!response.ok) throw new Error(`HTTP ${{response.status}}`);
+        return response.json();
+      }})
+      .then((data) => {{
+        printHeadAsset.data = data;
+        drawPreview();
+      }})
+      .catch((error) => {{
+        printHeadAsset.error = error;
+        console.warn('Printhead preview asset unavailable:', error);
+      }});
     function updatePyslmStrategyDefaults() {{
       if (!pyslmPatternAutoInput.checked) return;
       const layerHeight = Number(layerHeightInput.value);
@@ -4537,6 +6099,8 @@ def _index_html() -> str:
       if (slicingKernelInput.value === 'prusa') {{
         formData.append('prusa_perimeter_count', document.getElementById('prusaPerimeterCount').value);
         formData.append('prusa_print_perimeters', document.getElementById('prusaPrintPerimeters').checked ? 'true' : 'false');
+        formData.append('honeycomb_centerline_enabled', document.getElementById('honeycombCenterlineEnabled').checked ? 'true' : 'false');
+        formData.append('honeycomb_topology', document.getElementById('honeycombTopology').value);
         formData.append('prusa_infill_pattern', document.getElementById('prusaInfillPattern').value);
         formData.append('prusa_infill_density', document.getElementById('prusaInfillDensity').value);
         formData.append('prusa_contour_infill_overlap', document.getElementById('prusaContourInfillOverlap').value);
@@ -4637,9 +6201,14 @@ def _index_html() -> str:
         downloadEl.href = result.download_url;
         downloadEl.textContent = '下载 ' + result.filename;
         downloadEl.className = 'download visible';
+        const previewLabel = result.preview?.preview_source === 'pre_core_source_npz'
+          ? '完成（预览：送入 Core 前的源 NPZ；travel 保留全部避障点，连续段仅在首尾速度为 0）。'
+          : result.preview?.preview_source === 'final_core_npz'
+            ? '完成（预览：最终 Core NPZ）。'
+            : '完成。';
         statusEl.textContent = result.recommendation?.message
-          ? '完成。' + result.recommendation.message
-          : '完成';
+          ? previewLabel + result.recommendation.message
+          : previewLabel;
         statusEl.className = 'status ok';
         const coreSeconds = Number(result.core_export_seconds);
         if (Number.isFinite(coreSeconds)) {{
@@ -4656,11 +6225,18 @@ def _index_html() -> str:
 
     function configureViewer() {{
       const layers = previewData?.layers || [];
+      stopPathPlayback();
       layerSlider.disabled = layers.length === 0;
       layerSlider.max = Math.max(0, layers.length - 1);
       layerSlider.value = 0;
       resetPreviewView();
+      const isSurface = isSurfacePreview();
+      showDirectionLabel.textContent = isSurface ? '显示路径方向/打印头' : '显示打印方向';
+      previewCanvas.title = isSurface
+        ? '滚轮缩放；左键旋转；右键或中键平移；双击复位'
+        : '滚轮缩放；鼠标左键、右键或中键拖动视图；双击复位';
       updatePrintSizeLabel();
+      updatePathPlaybackRateLabel();
       updatePathSlider(true);
     }}
 
@@ -4668,11 +6244,20 @@ def _index_html() -> str:
       viewerState.zoom = 1.0;
       viewerState.centerX = null;
       viewerState.centerY = null;
+      viewerState.centerZ = null;
+      viewerState.surfaceYaw = -0.72;
+      viewerState.surfacePitch = -0.58;
+      viewerState.surfacePanX = 0;
+      viewerState.surfacePanY = 0;
     }}
 
     function currentLayer() {{
       const layers = previewData?.layers || [];
       return layers[Number(layerSlider.value)] || null;
+    }}
+
+    function isSurfacePreview() {{
+      return previewData?.geometry_mode === 'surface_3d';
     }}
 
     function roleIsSelected(role) {{
@@ -4700,12 +6285,17 @@ def _index_html() -> str:
         const kind = rawEntry.kind === 'travel' ? 'travel' : 'deposit';
         const role = kind === 'travel' ? 'travel' : (rawEntry.role || 'infill');
         const points = rawEntry.points || rawEntry;
-        if (points && points.length >= 2) {{
+        if (points && points.length >= 1) {{
           entries.push({{ kind, role, points, extrusion: rawEntry.extrusion || null }});
         }}
       }}
-      for (const points of layer.fiber_paths || []) {{
-        if (points && points.length >= 2) entries.push({{ kind: 'deposit', role: 'fiber', points }});
+      const hasOrderedFiber = motionEntries.some((entry) =>
+        entry?.kind !== 'travel' && entry?.role === 'fiber'
+      );
+      if (!hasOrderedFiber) {{
+        for (const points of layer.fiber_paths || []) {{
+          if (points && points.length >= 1) entries.push({{ kind: 'deposit', role: 'fiber', points }});
+        }}
       }}
       const additions = (previewData?.core_overlay?.sequence || [])
         .filter((entry) => Number(entry.layer) === Number(layer.index))
@@ -4731,7 +6321,7 @@ def _index_html() -> str:
           orderedEntries.push(entries[baseIndex++]);
         }}
         const points = addition.points;
-        if (points && points.length >= 2) {{
+        if (points && points.length >= 1) {{
           orderedEntries.push({{
             kind: addition.kind === 'travel' ? 'travel' : 'deposit',
             role: addition.role || 'travel',
@@ -4742,6 +6332,90 @@ def _index_html() -> str:
       }}
       while (baseIndex < entries.length) orderedEntries.push(entries[baseIndex++]);
       return orderedEntries.filter((entry) => roleIsSelected(entry.role));
+    }}
+
+    function historicalOverlayEntries() {{
+      const layers = previewData?.layers || [];
+      const currentLayerPosition = Number(layerSlider.value);
+      const visibilityKey = [
+        showOuterContourInput,
+        showInnerContourInput,
+        showResinInfillInput,
+        showRaftPathsInput,
+        showFiberPathsInput,
+        showTravelPathsInput,
+        showCoreTravelPathsInput,
+        showPrimelineInput,
+      ].map((input) => input.checked ? '1' : '0').join('');
+      const key = `${{currentLayerPosition}}:${{visibilityKey}}`;
+      if (historicalOverlayCache.preview === previewData && historicalOverlayCache.key === key) {{
+        return historicalOverlayCache.entries;
+      }}
+      const entries = [];
+      for (let layerPosition = 0; layerPosition < currentLayerPosition; layerPosition++) {{
+        entries.push(...selectedPrintEntries(layers[layerPosition]));
+      }}
+      historicalOverlayCache = {{ preview: previewData, key, entries }};
+      return entries;
+    }}
+
+    function currentPlaybackEntry() {{
+      const entries = selectedPrintEntries(currentLayer());
+      const visibleCount = Math.min(Number(pathProgressSlider.value), entries.length);
+      for (let index = visibleCount - 1; index >= 0; index--) {{
+        const entry = entries[index];
+        if (entry.kind === 'deposit' && entry.points?.length >= 2) return entry;
+      }}
+      return null;
+    }}
+
+    function buildPathPlaybackTimeline(path, extrusion) {{
+      const cumulative = [0];
+      for (let index = 1; index < path.length; index++) {{
+        const previous = path[index - 1];
+        const point = path[index];
+        cumulative.push(cumulative[index - 1] + Math.hypot(
+          Number(point[0]) - Number(previous[0]),
+          Number(point[1]) - Number(previous[1]),
+          Number(point[2]) - Number(previous[2]),
+        ));
+      }}
+      const eProfile = Array.isArray(extrusion) && extrusion.length === path.length
+        ? extrusion.map(Number)
+        : null;
+      return {{ path, eProfile, cumulative, totalMm: cumulative[cumulative.length - 1] }};
+    }}
+
+    function stopPathPlayback({{ keepArrow = false }} = {{}}) {{
+      if (pathPlayback.frame !== null) cancelAnimationFrame(pathPlayback.frame);
+      pathPlayback.frame = null;
+      pathPlayback.running = false;
+      pathPlayback.previousTimestamp = null;
+      if (!keepArrow) {{
+        pathPlayback.entry = null;
+        pathPlayback.timeline = null;
+        pathPlayback.distanceMm = 0;
+      }}
+      playCurrentPathButton.textContent = '播放当前路径';
+      playCurrentPathButton.setAttribute('aria-pressed', 'false');
+    }}
+
+    function updatePathPlaybackControl() {{
+      const entry = currentPlaybackEntry();
+      const selectedEntryChanged = pathPlayback.entry && (
+        !entry
+        || pathPlayback.entry.points !== entry.points
+        || pathPlayback.entry.role !== entry.role
+      );
+      if (selectedEntryChanged) stopPathPlayback();
+      pathPlaybackControl.hidden = !entry;
+      playCurrentPathButton.disabled = !entry;
+      pathPlaybackRateInput.disabled = !entry;
+      if (!entry) stopPathPlayback();
+    }}
+
+    function updatePathPlaybackRateLabel() {{
+      pathPlaybackRateLabel.textContent = Number(pathPlaybackRateInput.value).toFixed(2);
     }}
 
     function updatePathSlider(resetToEnd = false) {{
@@ -4755,6 +6429,7 @@ def _index_html() -> str:
       pathProgressSlider.value = resetToEnd || wasAtEnd
         ? pathCount
         : Math.min(previousValue, pathCount);
+      updatePathPlaybackControl();
       updateViewerLabels();
     }}
 
@@ -4766,6 +6441,7 @@ def _index_html() -> str:
       pathProgressLabel.textContent = pathCount
         ? `${{pathProgressSlider.value}} / ${{pathCount}}`
         : '-';
+      updatePathPlaybackControl();
     }}
 
     function updatePrintSizeLabel() {{
@@ -4819,6 +6495,202 @@ def _index_html() -> str:
         viewerState.centerY - (y - plotCenterY) / pixelsPerMm
       ];
       return {{ plot, baseScale, pixelsPerMm, plotCenterX, plotCenterY, project, unproject }};
+    }}
+
+    function buildSurfaceViewport(rect, bounds) {{
+      const plot = {{
+        left: 40,
+        top: 18,
+        right: Math.max(80, rect.width - 18),
+        bottom: Math.max(80, rect.height - 28)
+      }};
+      plot.width = Math.max(1, plot.right - plot.left);
+      plot.height = Math.max(1, plot.bottom - plot.top);
+      const minimum = [Number(bounds.min_x), Number(bounds.min_y), Number(bounds.min_z)];
+      const maximum = [Number(bounds.max_x), Number(bounds.max_y), Number(bounds.max_z)];
+      if (viewerState.centerX === null || viewerState.centerY === null || viewerState.centerZ === null) {{
+        viewerState.centerX = (minimum[0] + maximum[0]) * 0.5;
+        viewerState.centerY = (minimum[1] + maximum[1]) * 0.5;
+        viewerState.centerZ = (minimum[2] + maximum[2]) * 0.5;
+      }}
+      const yaw = viewerState.surfaceYaw;
+      const pitch = viewerState.surfacePitch;
+      const cosYaw = Math.cos(yaw);
+      const sinYaw = Math.sin(yaw);
+      const cosPitch = Math.cos(pitch);
+      const sinPitch = Math.sin(pitch);
+      const rotate = (point) => {{
+        const x = Number(point[0]) - viewerState.centerX;
+        const y = Number(point[1]) - viewerState.centerY;
+        const z = Number(point[2]) - viewerState.centerZ;
+        const yawX = cosYaw * x - sinYaw * y;
+        const yawY = sinYaw * x + cosYaw * y;
+        return [
+          yawX,
+          cosPitch * yawY - sinPitch * z,
+          sinPitch * yawY + cosPitch * z,
+        ];
+      }};
+      // Keep the camera distance independent of yaw and pitch.  Fitting the
+      // rotated bounding box here made the preview appear to zoom in or out
+      // whenever the user turned the model.  The unrotated 3D bounding-sphere
+      // diameter safely contains every orientation while leaving zoom solely
+      // under explicit user control.
+      const partSpan = Math.max(
+        0.001,
+        Math.hypot(
+          maximum[0] - minimum[0],
+          maximum[1] - minimum[1],
+          maximum[2] - minimum[2]
+        )
+      );
+      const headBoxSize = printHeadAsset.data?.model_bounds?.size_mm || [0, 0, 0];
+      const headReach = Math.max(0, ...headBoxSize.map(Number));
+      const modelSpan = partSpan + headReach;
+      const baseScale = Math.max(
+        1e-6,
+        Math.min(
+          Math.max(1, plot.width - 36) / modelSpan,
+          Math.max(1, plot.height - 36) / modelSpan
+        )
+      );
+      const pixelsPerMm = baseScale * viewerState.zoom;
+      const plotCenterX = (plot.left + plot.right) * 0.5;
+      const plotCenterY = (plot.top + plot.bottom) * 0.5;
+      const project = (point) => {{
+        const rotated = rotate(point);
+        return [
+          plotCenterX + rotated[0] * pixelsPerMm + viewerState.surfacePanX,
+          plotCenterY - rotated[1] * pixelsPerMm + viewerState.surfacePanY,
+          rotated[2],
+        ];
+      }};
+      return {{ plot, baseScale, pixelsPerMm, plotCenterX, plotCenterY, project, minimum, maximum, isSurface: true }};
+    }}
+
+    function drawSurfaceReference(ctx, viewport) {{
+      const {{ plot, minimum, maximum, project }} = viewport;
+      const z = minimum[2];
+      const corners = [
+        [minimum[0], minimum[1], z],
+        [maximum[0], minimum[1], z],
+        [maximum[0], maximum[1], z],
+        [minimum[0], maximum[1], z],
+      ].map(project);
+      ctx.fillStyle = 'rgba(232, 239, 244, 0.64)';
+      ctx.beginPath();
+      ctx.moveTo(corners[0][0], corners[0][1]);
+      for (let index = 1; index < corners.length; index++) ctx.lineTo(corners[index][0], corners[index][1]);
+      ctx.closePath();
+      ctx.fill();
+      ctx.strokeStyle = '#d5dbe0';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      const axisOrigin = [minimum[0], minimum[1], z];
+      const axisLength = Math.max(8, Math.min(30, Math.max(
+        maximum[0] - minimum[0],
+        maximum[1] - minimum[1],
+        maximum[2] - minimum[2]
+      ) * 0.18));
+      const axes = [
+        {{ end: [axisOrigin[0] + axisLength, axisOrigin[1], axisOrigin[2]], color: '#b91c1c', label: 'X' }},
+        {{ end: [axisOrigin[0], axisOrigin[1] + axisLength, axisOrigin[2]], color: '#0f766e', label: 'Y' }},
+        {{ end: [axisOrigin[0], axisOrigin[1], axisOrigin[2] + axisLength], color: '#1d4ed8', label: 'Z' }},
+      ];
+      const start = project(axisOrigin);
+      ctx.font = '600 11px Segoe UI, Arial, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      for (const axis of axes) {{
+        const end = project(axis.end);
+        ctx.strokeStyle = axis.color;
+        ctx.fillStyle = axis.color;
+        ctx.lineWidth = 2.4;
+        ctx.beginPath();
+        ctx.moveTo(start[0], start[1]);
+        ctx.lineTo(end[0], end[1]);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(end[0], end[1], 2.8, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillText(axis.label, end[0] + 9, end[1] - 6);
+      }}
+      ctx.strokeStyle = '#aeb8c0';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(plot.left + 0.5, plot.top + 0.5, plot.width - 1, plot.height - 1);
+      ctx.fillStyle = '#5c6972';
+      ctx.textAlign = 'right';
+      ctx.textBaseline = 'top';
+      ctx.fillText('三维曲面预览 · 左键旋转', plot.right - 7, plot.top + 7);
+    }}
+
+    function surfaceLayerCurvatureText(layer) {{
+      // This is the geometric curvature of the deposited 3D centerlines, not
+      // a fit or a remapping result.  It intentionally reads the raw preview
+      // layer, so visibility and path-progress controls cannot change it.
+      if (layer && surfaceCurvatureTextCache.has(layer)) {{
+        return surfaceCurvatureTextCache.get(layer);
+      }}
+      const paths = [
+        ...(layer?.resin_paths || []).map((entry) => entry.points),
+        ...(layer?.fiber_paths || []),
+      ].filter((path) => Array.isArray(path) && path.length >= 3);
+      let curvatureCount = 0;
+      let curvatureTotal = 0;
+      let minimumCurvature = Infinity;
+      let maximumCurvature = -Infinity;
+      for (const path of paths) {{
+        for (let index = 1; index < path.length - 1; index++) {{
+          const a = path[index - 1];
+          const b = path[index];
+          const c = path[index + 1];
+          const ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+          const bc = [c[0] - b[0], c[1] - b[1], c[2] - b[2]];
+          const ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+          const abLength = Math.hypot(...ab);
+          const bcLength = Math.hypot(...bc);
+          const acLength = Math.hypot(...ac);
+          if (abLength <= 1e-9 || bcLength <= 1e-9 || acLength <= 1e-9) continue;
+          const crossLength = Math.hypot(
+            ab[1] * bc[2] - ab[2] * bc[1],
+            ab[2] * bc[0] - ab[0] * bc[2],
+            ab[0] * bc[1] - ab[1] * bc[0],
+          );
+          const curvature = 2 * crossLength / (abLength * bcLength * acLength);
+          if (Number.isFinite(curvature)) {{
+            curvatureCount += 1;
+            curvatureTotal += curvature;
+            minimumCurvature = Math.min(minimumCurvature, curvature);
+            maximumCurvature = Math.max(maximumCurvature, curvature);
+          }}
+        }}
+      }}
+      const displayLayer = Number(layerSlider.value) + 1;
+      const text = curvatureCount
+        ? `第${{displayLayer}}层 · κ min/avg/max: ${{minimumCurvature.toFixed(4)}} / ${{(curvatureTotal / curvatureCount).toFixed(4)}} / ${{maximumCurvature.toFixed(4)}} mm⁻¹`
+        : `第${{displayLayer}}层 · κ = 0.0000 mm⁻¹（直线段/采样不足）`;
+      if (layer) surfaceCurvatureTextCache.set(layer, text);
+      return text;
+    }}
+
+    function drawSurfaceLayerCurvature(ctx, viewport, layer) {{
+      const text = surfaceLayerCurvatureText(layer);
+      const {{ plot }} = viewport;
+      ctx.save();
+      ctx.font = '600 11px Segoe UI, Arial, sans-serif';
+      const x = plot.left + 8;
+      const y = plot.top + 8;
+      const width = Math.min(plot.width - 16, ctx.measureText(text).width + 16);
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.88)';
+      ctx.fillRect(x - 5, y - 4, width, 21);
+      ctx.strokeStyle = 'rgba(174, 184, 192, 0.88)';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(x - 4.5, y - 3.5, width - 1, 20);
+      ctx.fillStyle = '#31414d';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(text, x, y + 6);
+      ctx.restore();
     }}
 
     function niceGridStep(pixelsPerMm) {{
@@ -5029,10 +6901,10 @@ def _index_html() -> str:
       return `rgb(${{channel(0)}}, ${{channel(1)}}, ${{channel(2)}})`;
     }}
 
-    function drawPreview() {{
+    function drawPreviewNow() {{
       const canvas = previewCanvas;
       const rect = canvas.getBoundingClientRect();
-      const deviceScale = window.devicePixelRatio || 1;
+      const deviceScale = Math.min(window.devicePixelRatio || 1, 2);
       canvas.width = Math.max(1, Math.floor(rect.width * deviceScale));
       canvas.height = Math.max(1, Math.floor(rect.height * deviceScale));
       const ctx = canvas.getContext('2d');
@@ -5049,8 +6921,15 @@ def _index_html() -> str:
         return;
       }}
 
-      const viewport = buildViewport(rect, bounds);
-      drawMeasurementGrid(ctx, viewport, rect);
+      const surfacePreview = isSurfacePreview();
+      const viewport = surfacePreview
+        ? buildSurfaceViewport(rect, bounds)
+        : buildViewport(rect, bounds);
+      if (surfacePreview) {{
+        drawSurfaceReference(ctx, viewport);
+      }} else {{
+        drawMeasurementGrid(ctx, viewport, rect);
+      }}
       const entries = selectedPrintEntries(layer);
       const visibleCount = Math.min(Number(pathProgressSlider.value), entries.length);
       const currentEntry = visibleCount > 0 ? entries[visibleCount - 1] : null;
@@ -5066,6 +6945,13 @@ def _index_html() -> str:
 
       function drawPath(path) {{
         const first = viewport.project(path[0]);
+        if (path.length === 1) {{
+          ctx.beginPath();
+          ctx.arc(first[0], first[1], Math.max(1.2, ctx.lineWidth * 0.5), 0, Math.PI * 2);
+          ctx.fillStyle = ctx.strokeStyle;
+          ctx.fill();
+          return;
+        }}
         ctx.beginPath();
         ctx.moveTo(first[0], first[1]);
         for (let pointIndex = 1; pointIndex < path.length; pointIndex++) {{
@@ -5083,8 +6969,21 @@ def _index_html() -> str:
 
       function drawExtrusionPath(path, extrusion, fallbackColor) {{
         for (let pointIndex = 0; pointIndex < path.length - 1; pointIndex++) {{
+          const deltaE = Number(extrusion[pointIndex + 1]) - Number(extrusion[pointIndex]);
+          const zeroExtrusion = Number.isFinite(deltaE) && Math.abs(deltaE) <= 1e-9;
           const density = extrusionDensity(path, extrusion, pointIndex);
-          if (density === null || extrusionRange === null) {{
+          const activeLineWidth = ctx.lineWidth;
+          const activeAlpha = ctx.globalAlpha;
+          if (zeroExtrusion) {{
+            // A continuous honeycomb motion has connector segments with
+            // exactly constant E.  Draw them distinctly even when the
+            // extrusion heat map is disabled, so they cannot be mistaken for
+            // deposited walls in the preview.
+            ctx.strokeStyle = '#526f8c';
+            ctx.globalAlpha = activeAlpha * 0.95;
+            ctx.lineWidth = Math.min(activeLineWidth, 1.5);
+            ctx.setLineDash([7, 5]);
+          }} else if (density === null || extrusionRange === null) {{
             ctx.strokeStyle = fallbackColor;
           }} else {{
             ctx.strokeStyle = extrusionColorForSegment(density, extrusionRange);
@@ -5095,7 +6994,158 @@ def _index_html() -> str:
           ctx.moveTo(first[0], first[1]);
           ctx.lineTo(last[0], last[1]);
           ctx.stroke();
+          if (zeroExtrusion) {{
+            ctx.setLineDash([]);
+            ctx.lineWidth = activeLineWidth;
+            ctx.globalAlpha = activeAlpha;
+          }}
         }}
+      }}
+
+      function drawEntry(entry, opacity = 1) {{
+        ctx.save();
+        ctx.globalAlpha = opacity;
+        if (entry.kind === 'travel') {{
+          ctx.strokeStyle = entry.role === 'core_travel'
+            ? '#c2410c'
+            : entry.role === 'layer_lift'
+              ? '#f59e0b'
+              : '#526f8c';
+          ctx.globalAlpha = opacity * 0.95;
+          ctx.lineWidth = entry.role === 'layer_lift' ? 2.2 : entry.role === 'core_travel' ? 2.0 : 1.5;
+          ctx.setLineDash(
+            entry.role === 'layer_lift' ? [2, 3]
+              : entry.role === 'core_travel' ? [5, 4]
+              : [7, 5]
+          );
+          drawPath(entry.points);
+          ctx.restore();
+          return;
+        }}
+        const physicalWidth = entry.role === 'fiber'
+          ? Number(lineWidths.fiber || 1.0)
+          : Number(lineWidths.resin || 2.0);
+        ctx.lineWidth = usePhysicalWidth
+          ? Math.max(1.0, physicalWidth * viewport.pixelsPerMm)
+          : entry.role === 'fiber' ? 2.0 : 1.7;
+        if (
+          entry.role !== 'fiber'
+          && Array.isArray(entry.extrusion)
+          && entry.extrusion.length === entry.points.length
+        ) {{
+          drawExtrusionPath(entry.points, entry.extrusion, pathColor(entry.role));
+        }} else {{
+          ctx.strokeStyle = pathColor(entry.role);
+          drawPath(entry.points);
+        }}
+        ctx.restore();
+      }}
+
+      function drawHistoricalOverlay(entries) {{
+        // Historical layers share one opacity and are immutable until the
+        // layer or role filters change.  Batch their Canvas strokes by style
+        // to avoid a beginPath/stroke pair for every individual path.
+        const batches = new Map();
+        const historicalPathStride = (path) => viewerState.dragging
+          ? Math.max(1, Math.ceil(path.length / 240))
+          : 1;
+        const addToBatch = (key, style, path = null, segment = null) => {{
+          let batch = batches.get(key);
+          if (!batch) {{
+            batch = {{ ...style, paths: [], segments: [] }};
+            batches.set(key, batch);
+          }}
+          if (path) batch.paths.push({{ points: path, stride: historicalPathStride(path) }});
+          if (segment) batch.segments.push(segment);
+        }};
+        const depositionStyle = (role) => {{
+          const physicalWidth = role === 'fiber'
+            ? Number(lineWidths.fiber || 1.0)
+            : Number(lineWidths.resin || 2.0);
+          return {{
+            color: pathColor(role),
+            width: usePhysicalWidth
+              ? Math.max(1.0, physicalWidth * viewport.pixelsPerMm)
+              : role === 'fiber' ? 2.0 : 1.7,
+            dash: [],
+          }};
+        }};
+        for (const entry of entries) {{
+          if (entry.kind === 'travel') {{
+            const style = entry.role === 'core_travel'
+              ? {{ color: '#c2410c', width: 2.0, dash: [5, 4], alpha: 0.95 }}
+              : entry.role === 'layer_lift'
+                ? {{ color: '#f59e0b', width: 2.2, dash: [2, 3], alpha: 0.95 }}
+                : {{ color: '#526f8c', width: 1.5, dash: [7, 5], alpha: 0.95 }};
+            addToBatch(`travel:${{entry.role}}`, style, entry.points);
+            continue;
+          }}
+          const fallback = depositionStyle(entry.role);
+          const extrusion = entry.extrusion;
+          // Rotating a dense overlay is projection-bound, not data-bound.
+          // During the gesture, sample only historical paths and use their
+          // role color; the complete E-aware view is restored on release.
+          if (viewerState.dragging) {{
+            addToBatch(`deposit:${{entry.role}}`, fallback, entry.points);
+            continue;
+          }}
+          if (!Array.isArray(extrusion) || extrusion.length !== entry.points.length || entry.role === 'fiber') {{
+            addToBatch(`deposit:${{entry.role}}`, fallback, entry.points);
+            continue;
+          }}
+          for (let pointIndex = 0; pointIndex < entry.points.length - 1; pointIndex++) {{
+            const deltaE = Number(extrusion[pointIndex + 1]) - Number(extrusion[pointIndex]);
+            const zeroExtrusion = Number.isFinite(deltaE) && Math.abs(deltaE) <= 1e-9;
+            if (zeroExtrusion) {{
+              const connectorStyle = {{
+                color: '#526f8c',
+                width: Math.min(fallback.width, 1.5),
+                dash: [7, 5],
+                alpha: 0.95,
+              }};
+              addToBatch('connector', connectorStyle, null, [entry.points[pointIndex], entry.points[pointIndex + 1]]);
+              continue;
+            }}
+            const density = extrusionDensity(entry.points, extrusion, pointIndex);
+            const color = showExtrusionInput.checked && density !== null && extrusionRange !== null
+              ? extrusionColorForSegment(density, extrusionRange)
+              : fallback.color;
+            addToBatch(
+              `deposit-segment:${{fallback.width}}:${{color}}`,
+              {{ color, width: fallback.width, dash: [] }},
+              null,
+              [entry.points[pointIndex], entry.points[pointIndex + 1]],
+            );
+          }}
+        }}
+        ctx.save();
+        for (const batch of batches.values()) {{
+          ctx.globalAlpha = 0.32 * (batch.alpha ?? 1);
+          ctx.strokeStyle = batch.color;
+          ctx.lineWidth = batch.width;
+          ctx.setLineDash(batch.dash);
+          ctx.beginPath();
+          for (const {{ points: path, stride }} of batch.paths) {{
+            const first = viewport.project(path[0]);
+            ctx.moveTo(first[0], first[1]);
+            for (let pointIndex = stride; pointIndex < path.length - 1; pointIndex += stride) {{
+              const point = viewport.project(path[pointIndex]);
+              ctx.lineTo(point[0], point[1]);
+            }}
+            if (path.length > 1) {{
+              const last = viewport.project(path[path.length - 1]);
+              ctx.lineTo(last[0], last[1]);
+            }}
+          }}
+          for (const [start, end] of batch.segments) {{
+            const projectedStart = viewport.project(start);
+            const projectedEnd = viewport.project(end);
+            ctx.moveTo(projectedStart[0], projectedStart[1]);
+            ctx.lineTo(projectedEnd[0], projectedEnd[1]);
+          }}
+          ctx.stroke();
+        }}
+        ctx.restore();
       }}
 
       ctx.save();
@@ -5109,53 +7159,91 @@ def _index_html() -> str:
       ctx.clip();
       ctx.lineCap = 'round';
       ctx.lineJoin = 'round';
+      if (showLayerOverlayInput.checked) {{
+        drawHistoricalOverlay(historicalOverlayEntries());
+      }}
       for (let index = 0; index < visibleCount; index++) {{
-        const entry = entries[index];
-        if (entry.kind === 'travel') {{
-          ctx.strokeStyle = entry.role === 'core_travel'
-            ? '#c2410c'
-            : entry.role === 'layer_lift'
-              ? '#f59e0b'
-              : '#526f8c';
-          ctx.globalAlpha = 0.95;
-          ctx.lineWidth = entry.role === 'layer_lift' ? 2.2 : entry.role === 'core_travel' ? 2.0 : 1.5;
-          ctx.setLineDash(
-            entry.role === 'layer_lift' ? [2, 3]
-              : entry.role === 'core_travel' ? [5, 4]
-              : [7, 5]
-          );
-          drawPath(entry.points);
-          ctx.setLineDash([]);
-          ctx.globalAlpha = 1;
-          continue;
-        }}
-        const physicalWidth = entry.role === 'fiber'
-          ? Number(lineWidths.fiber || 1.0)
-          : Number(lineWidths.resin || 2.0);
-        ctx.lineWidth = usePhysicalWidth
-          ? Math.max(1.0, physicalWidth * viewport.pixelsPerMm)
-          : entry.role === 'fiber' ? 2.0 : 1.7;
-        if (
-          extrusionRange !== null
-          && entry.role !== 'fiber'
-          && Array.isArray(entry.extrusion)
-          && entry.extrusion.length === entry.points.length
-        ) {{
-          drawExtrusionPath(entry.points, entry.extrusion, pathColor(entry.role));
-        }} else {{
-          ctx.strokeStyle = pathColor(entry.role);
-          drawPath(entry.points);
-        }}
+        drawEntry(entries[index]);
       }}
       if (currentEntry && showPathPointsInput.checked) {{
         drawPathPoints(ctx, currentEntry.points, pathColor(currentEntry.role), viewport.project);
       }}
-      if (currentEntry && showDirectionInput.checked) {{
+      if (surfacePreview && showDirectionInput.checked && !pathPlayback.running) {{
+        const currentDeposit = entries
+          .slice(0, visibleCount)
+          .reverse()
+          .find((entry) => entry.kind === 'deposit' && entry.points?.length);
+        if (currentDeposit) {{
+          drawPrintHeadModel(
+            ctx,
+            currentDeposit.points[currentDeposit.points.length - 1],
+            viewport,
+          );
+        }}
+      }} else if (!surfacePreview && currentEntry && showDirectionInput.checked) {{
         drawDirection(ctx, currentEntry.points, pathColor(currentEntry.role), viewport.project);
       }}
+      if (pathPlayback.running && pathPlayback.timeline) {{
+        drawPlaybackPathArrow(
+          ctx,
+          pathPlayback.timeline,
+          pathPlayback.distanceMm,
+          viewport,
+        );
+      }}
       ctx.restore();
-      drawOriginMarker(ctx, viewport);
+      if (surfacePreview) drawSurfaceLayerCurvature(ctx, viewport, layer);
+      if (!surfacePreview) drawOriginMarker(ctx, viewport);
       updateViewerLabels();
+    }}
+
+    function drawPreview() {{
+      if (pendingPreviewFrame !== null) return;
+      pendingPreviewFrame = requestAnimationFrame(() => {{
+        pendingPreviewFrame = null;
+        drawPreviewNow();
+      }});
+    }}
+
+    function playCurrentPath(timestamp) {{
+      if (!pathPlayback.running || !pathPlayback.timeline) return;
+      if (pathPlayback.previousTimestamp === null) pathPlayback.previousTimestamp = timestamp;
+      const elapsedSeconds = Math.min(0.1, (timestamp - pathPlayback.previousTimestamp) / 1000);
+      pathPlayback.previousTimestamp = timestamp;
+      const rate = Math.max(0, Number(pathPlaybackRateInput.value));
+      pathPlayback.distanceMm = Math.min(
+        pathPlayback.timeline.totalMm,
+        pathPlayback.distanceMm + elapsedSeconds * PLAYBACK_MAX_SPEED_MM_PER_S * rate,
+      );
+      drawPreviewNow();
+      if (pathPlayback.distanceMm >= pathPlayback.timeline.totalMm || rate <= 0) {{
+        stopPathPlayback();
+        drawPreview();
+        return;
+      }}
+      pathPlayback.frame = requestAnimationFrame(playCurrentPath);
+    }}
+
+    function startPathPlayback() {{
+      const entry = currentPlaybackEntry();
+      if (!entry) return;
+      if (pathPlayback.running) {{
+        stopPathPlayback();
+        drawPreview();
+        return;
+      }}
+      pathPlayback.entry = entry;
+      pathPlayback.timeline = buildPathPlaybackTimeline(entry.points, entry.extrusion);
+      pathPlayback.distanceMm = 0;
+      pathPlayback.previousTimestamp = null;
+      if (pathPlayback.timeline.totalMm <= 1e-9 || Number(pathPlaybackRateInput.value) <= 0) {{
+        drawPreview();
+        return;
+      }}
+      pathPlayback.running = true;
+      playCurrentPathButton.textContent = '停止播放';
+      playCurrentPathButton.setAttribute('aria-pressed', 'true');
+      pathPlayback.frame = requestAnimationFrame(playCurrentPath);
     }}
 
     function drawPathPoints(ctx, path, color, project) {{
@@ -5242,6 +7330,280 @@ def _index_html() -> str:
       ctx.restore();
     }}
 
+    function pathPointAtDistance(timeline, distanceMm) {{
+      const distance = Math.max(0, Math.min(distanceMm, timeline.totalMm));
+      const cumulative = timeline.cumulative;
+      let index = 1;
+      while (index < cumulative.length && cumulative[index] < distance) index++;
+      const endIndex = Math.min(index, timeline.path.length - 1);
+      const startIndex = Math.max(0, endIndex - 1);
+      const startDistance = cumulative[startIndex];
+      const endDistance = cumulative[endIndex];
+      const segmentLength = endDistance - startDistance;
+      const t = segmentLength > 1e-9 ? (distance - startDistance) / segmentLength : 0;
+      const start = timeline.path[startIndex];
+      const end = timeline.path[endIndex];
+      return {{
+        point: start.map((value, axis) => Number(value) + (Number(end[axis]) - Number(value)) * t),
+        previous: start,
+        ahead: end,
+        segmentIndex: startIndex,
+        atEnd: distance >= timeline.totalMm,
+      }};
+    }}
+
+    function drawPlaybackPathArrow(
+      ctx,
+      timeline,
+      distanceMm,
+      viewport,
+    ) {{
+      const {{ point, previous, ahead, segmentIndex, atEnd }} = pathPointAtDistance(timeline, distanceMm);
+      if (viewport?.isSurface) {{
+        drawPrintHeadModel(ctx, point, viewport);
+        return;
+      }}
+      const current = viewport.project(point);
+      const neighboringPoint = viewport.project(atEnd ? previous : ahead);
+      const angle = atEnd
+        ? Math.atan2(current[1] - neighboringPoint[1], current[0] - neighboringPoint[0])
+        : Math.atan2(neighboringPoint[1] - current[1], neighboringPoint[0] - current[0]);
+      const arrowLength = 22;
+      const tip = [
+        current[0] + Math.cos(angle) * arrowLength * 0.55,
+        current[1] + Math.sin(angle) * arrowLength * 0.55,
+      ];
+      const tail = [
+        current[0] - Math.cos(angle) * arrowLength * 0.45,
+        current[1] - Math.sin(angle) * arrowLength * 0.45,
+      ];
+      const deltaE = timeline.eProfile
+        ? Number(timeline.eProfile[segmentIndex + 1]) - Number(timeline.eProfile[segmentIndex])
+        : Number.NaN;
+      const color = Number.isFinite(deltaE) && deltaE <= 1e-9 ? '#2563eb' : '#dc2626';
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.fillStyle = color;
+      ctx.lineWidth = 4;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.beginPath();
+      ctx.moveTo(tail[0], tail[1]);
+      ctx.lineTo(tip[0], tip[1]);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(tip[0], tip[1]);
+      ctx.lineTo(tip[0] - Math.cos(angle - 0.58) * 11, tip[1] - Math.sin(angle - 0.58) * 11);
+      ctx.lineTo(tip[0] - Math.cos(angle + 0.58) * 11, tip[1] - Math.sin(angle + 0.58) * 11);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+    }}
+
+    function normalizeVector(vector) {{
+      const length = Math.hypot(vector[0], vector[1], vector[2]);
+      return length > 1e-9 ? vector.map((value) => value / length) : [0, 0, -1];
+    }}
+
+    function crossVector(left, right) {{
+      return [
+        left[1] * right[2] - left[2] * right[1],
+        left[2] * right[0] - left[0] * right[2],
+        left[0] * right[1] - left[1] * right[0],
+      ];
+    }}
+
+    function kukaToolDirection(point) {{
+      if (!Array.isArray(point) || point.length < 6) {{
+        return {{ direction: [0, 0, -1], exact: false }};
+      }}
+      const [a, b, c] = point.slice(3, 6).map(Number);
+      if (![a, b, c].every(Number.isFinite)) {{
+        return {{ direction: [0, 0, -1], exact: false }};
+      }}
+      // Surface mapping defines ABC as Rz(A) * Ry(B) * Rx(C), relative to
+      // the calibrated flat pose whose +X_TOOL work axis is -Z_BASE.
+      const radians = Math.PI / 180;
+      const cosA = Math.cos(a * radians);
+      const sinA = Math.sin(a * radians);
+      const cosB = Math.cos(b * radians);
+      const sinB = Math.sin(b * radians);
+      const cosC = Math.cos(c * radians);
+      const sinC = Math.sin(c * radians);
+      const afterX = [0, sinC, -cosC];
+      const afterY = [
+        cosB * afterX[0] + sinB * afterX[2],
+        afterX[1],
+        -sinB * afterX[0] + cosB * afterX[2],
+      ];
+      return {{
+        direction: normalizeVector([
+          cosA * afterY[0] - sinA * afterY[1],
+          sinA * afterY[0] + cosA * afterY[1],
+          afterY[2],
+        ]),
+        exact: true,
+      }};
+    }}
+
+    function kukaToolFrame(point) {{
+      const flatFrame = {{
+        xAxis: [0, 0, -1],
+        yAxis: [0, 1, 0],
+        zAxis: [1, 0, 0],
+        exact: false,
+      }};
+      if (!Array.isArray(point) || point.length < 6) return flatFrame;
+      const [a, b, c] = point.slice(3, 6).map(Number);
+      if (![a, b, c].every(Number.isFinite)) return flatFrame;
+      const radians = Math.PI / 180;
+      const cosA = Math.cos(a * radians);
+      const sinA = Math.sin(a * radians);
+      const cosB = Math.cos(b * radians);
+      const sinB = Math.sin(b * radians);
+      const cosC = Math.cos(c * radians);
+      const sinC = Math.sin(c * radians);
+      const rotate = (vector) => {{
+        const afterX = [
+          vector[0],
+          cosC * vector[1] - sinC * vector[2],
+          sinC * vector[1] + cosC * vector[2],
+        ];
+        const afterY = [
+          cosB * afterX[0] + sinB * afterX[2],
+          afterX[1],
+          -sinB * afterX[0] + cosB * afterX[2],
+        ];
+        return normalizeVector([
+          cosA * afterY[0] - sinA * afterY[1],
+          sinA * afterY[0] + cosA * afterY[1],
+          afterY[2],
+        ]);
+      }};
+      return {{
+        xAxis: rotate(flatFrame.xAxis),
+        yAxis: rotate(flatFrame.yAxis),
+        zAxis: rotate(flatFrame.zAxis),
+        exact: true,
+      }};
+    }}
+
+    function toolPointToBase(toolPoint, tcpPoint, frame) {{
+      return [0, 1, 2].map((axis) => Number(tcpPoint[axis])
+        + Number(toolPoint[0]) * frame.xAxis[axis]
+        + Number(toolPoint[1]) * frame.yAxis[axis]
+        + Number(toolPoint[2]) * frame.zAxis[axis]);
+    }}
+
+    function drawPrintHeadModel(ctx, point, viewport) {{
+      const asset = printHeadAsset.data;
+      if (!point || !viewport?.isSurface) return;
+      if (!asset?.positions?.length || !asset?.triangles?.length) {{
+        drawPrintHeadArrow(ctx, point, viewport);
+        return;
+      }}
+      const frame = kukaToolFrame(point);
+      const projected = asset.positions.map((toolPoint) =>
+        viewport.project(toolPointToBase(toolPoint, point, frame))
+      );
+      const faces = [];
+      for (let index = 0; index < asset.triangles.length; index++) {{
+        const triangle = asset.triangles[index];
+        const vertices = triangle.map((vertexIndex) => projected[vertexIndex]);
+        const screenArea = (vertices[1][0] - vertices[0][0]) * (vertices[2][1] - vertices[0][1])
+          - (vertices[1][1] - vertices[0][1]) * (vertices[2][0] - vertices[0][0]);
+        if (Math.abs(screenArea) < 0.035) continue;
+        faces.push({{
+          vertices,
+          depth: (vertices[0][2] + vertices[1][2] + vertices[2][2]) / 3,
+          facing: screenArea,
+        }});
+      }}
+      faces.sort((left, right) => left.depth - right.depth);
+      ctx.save();
+      ctx.lineJoin = 'round';
+      for (const face of faces) {{
+        const front = face.facing < 0;
+        ctx.fillStyle = front ? 'rgba(91, 111, 124, 0.88)' : 'rgba(149, 163, 173, 0.62)';
+        ctx.beginPath();
+        ctx.moveTo(face.vertices[0][0], face.vertices[0][1]);
+        ctx.lineTo(face.vertices[1][0], face.vertices[1][1]);
+        ctx.lineTo(face.vertices[2][0], face.vertices[2][1]);
+        ctx.closePath();
+        ctx.fill();
+      }}
+      ctx.restore();
+    }}
+
+    function drawPrintHeadArrow(ctx, point, viewport) {{
+      if (!point || !viewport?.isSurface) return;
+      const {{ direction, exact }} = kukaToolDirection(point);
+      const sceneSpan = Math.max(
+        viewport.maximum[0] - viewport.minimum[0],
+        viewport.maximum[1] - viewport.minimum[1],
+        viewport.maximum[2] - viewport.minimum[2]
+      );
+      const length = Math.max(8, Math.min(28, sceneSpan * 0.16));
+      const coneLength = length * 0.30;
+      const shaftBase = point.slice(0, 3).map((value, index) => value - direction[index] * length);
+      const coneBase = point.slice(0, 3).map((value, index) => value - direction[index] * coneLength);
+      const side = normalizeVector(crossVector(
+        direction,
+        Math.abs(direction[2]) < 0.85 ? [0, 0, 1] : [0, 1, 0]
+      ));
+      const up = normalizeVector(crossVector(side, direction));
+      const radius = Math.max(1.5, length * 0.12);
+      const coneRing = Array.from({{ length: 6 }}, (_, index) => {{
+        const angle = index * Math.PI * 2 / 6;
+        return coneBase.map((value, axis) => value + radius * (
+          side[axis] * Math.cos(angle) + up[axis] * Math.sin(angle)
+        ));
+      }});
+      const faces = coneRing.map((vertex, index) => {{
+        const next = coneRing[(index + 1) % coneRing.length];
+        const projected = [viewport.project(point), viewport.project(vertex), viewport.project(next)];
+        return {{ projected, depth: (projected[0][2] + projected[1][2] + projected[2][2]) / 3 }};
+      }}).sort((left, right) => left.depth - right.depth);
+      const projectedBase = viewport.project(shaftBase);
+      const projectedConeBase = viewport.project(coneBase);
+      const projectedTip = viewport.project(point);
+      const color = exact ? '#0f4c81' : '#4b6475';
+      ctx.save();
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 5;
+      ctx.beginPath();
+      ctx.moveTo(projectedBase[0], projectedBase[1]);
+      ctx.lineTo(projectedConeBase[0], projectedConeBase[1]);
+      ctx.stroke();
+      for (const face of faces) {{
+        ctx.fillStyle = exact ? 'rgba(15, 76, 129, 0.86)' : 'rgba(75, 100, 117, 0.82)';
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 0.8;
+        ctx.beginPath();
+        ctx.moveTo(face.projected[0][0], face.projected[0][1]);
+        ctx.lineTo(face.projected[1][0], face.projected[1][1]);
+        ctx.lineTo(face.projected[2][0], face.projected[2][1]);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+      }}
+      ctx.fillStyle = '#ffffff';
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(projectedTip[0], projectedTip[1], 3.8, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      ctx.font = '600 11px Segoe UI, Arial, sans-serif';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'bottom';
+      ctx.fillStyle = color;
+      ctx.fillText(exact ? '打印头 +X_TOOL' : '打印头（默认朝下）', projectedBase[0] + 7, projectedBase[1] - 6);
+      ctx.restore();
+    }}
+
     function drawEmptyPreview(ctx, width, height) {{
       ctx.fillStyle = '#ffffff';
       ctx.fillRect(0, 0, width, height);
@@ -5255,7 +7617,12 @@ def _index_html() -> str:
         return null;
       }}
       const rect = previewCanvas.getBoundingClientRect();
-      return {{ rect, viewport: buildViewport(rect, bounds) }};
+      return {{
+        rect,
+        viewport: isSurfacePreview()
+          ? buildSurfaceViewport(rect, bounds)
+          : buildViewport(rect, bounds),
+      }};
     }}
 
     previewCanvas.addEventListener('wheel', (event) => {{
@@ -5266,10 +7633,15 @@ def _index_html() -> str:
       const y = event.clientY - current.rect.top;
       const {{ plot }} = current.viewport;
       if (x < plot.left || x > plot.right || y < plot.top || y > plot.bottom) return;
-      const worldPoint = current.viewport.unproject(x, y);
       const zoomFactor = Math.exp(-event.deltaY * 0.0015);
       const nextZoom = Math.min(40.0, Math.max(0.2, viewerState.zoom * zoomFactor));
       if (Math.abs(nextZoom - viewerState.zoom) < 1e-9) return;
+      if (isSurfacePreview()) {{
+        viewerState.zoom = nextZoom;
+        drawPreview();
+        return;
+      }}
+      const worldPoint = current.viewport.unproject(x, y);
       viewerState.zoom = nextZoom;
       const nextScale = current.viewport.baseScale * nextZoom;
       viewerState.centerX = worldPoint[0]
@@ -5283,6 +7655,7 @@ def _index_html() -> str:
       if (![0, 1, 2].includes(event.button) || !currentViewportForInteraction()) return;
       event.preventDefault();
       viewerState.dragging = true;
+      viewerState.dragMode = isSurfacePreview() && event.button === 0 ? 'rotate' : 'pan';
       viewerState.pointerId = event.pointerId;
       viewerState.lastX = event.clientX;
       viewerState.lastY = event.clientY;
@@ -5298,19 +7671,33 @@ def _index_html() -> str:
       const deltaY = event.clientY - viewerState.lastY;
       viewerState.lastX = event.clientX;
       viewerState.lastY = event.clientY;
-      viewerState.centerX -= deltaX / current.viewport.pixelsPerMm;
-      viewerState.centerY += deltaY / current.viewport.pixelsPerMm;
+      if (isSurfacePreview()) {{
+        if (viewerState.dragMode === 'rotate') {{
+          viewerState.surfaceYaw += deltaX * 0.009;
+          viewerState.surfacePitch = Math.max(-1.35, Math.min(1.35,
+            viewerState.surfacePitch + deltaY * 0.009
+          ));
+        }} else {{
+          viewerState.surfacePanX += deltaX;
+          viewerState.surfacePanY += deltaY;
+        }}
+      }} else {{
+        viewerState.centerX -= deltaX / current.viewport.pixelsPerMm;
+        viewerState.centerY += deltaY / current.viewport.pixelsPerMm;
+      }}
       drawPreview();
     }});
 
     function finishPreviewDrag(event) {{
       if (!viewerState.dragging || viewerState.pointerId !== event.pointerId) return;
       viewerState.dragging = false;
+      viewerState.dragMode = null;
       viewerState.pointerId = null;
       previewSurface.classList.remove('dragging');
       if (previewCanvas.hasPointerCapture(event.pointerId)) {{
         previewCanvas.releasePointerCapture(event.pointerId);
       }}
+      drawPreview();
     }}
 
     previewCanvas.addEventListener('pointerup', finishPreviewDrag);
@@ -5325,7 +7712,18 @@ def _index_html() -> str:
       updatePathSlider(true);
       drawPreview();
     }});
-    pathProgressSlider.addEventListener('input', drawPreview);
+    pathProgressSlider.addEventListener('input', () => {{
+      updatePathPlaybackControl();
+      drawPreview();
+    }});
+    playCurrentPathButton.addEventListener('click', startPathPlayback);
+    pathPlaybackRateInput.addEventListener('input', () => {{
+      updatePathPlaybackRateLabel();
+      if (pathPlayback.running && Number(pathPlaybackRateInput.value) <= 0) {{
+        stopPathPlayback();
+        drawPreview();
+      }}
+    }});
     for (const input of [
       showOuterContourInput,
       showInnerContourInput,
@@ -5341,6 +7739,7 @@ def _index_html() -> str:
     }}
     showCoreTravelPathsInput.addEventListener('change', drawPreview);
     showPrimelineInput.addEventListener('change', drawPreview);
+    showLayerOverlayInput.addEventListener('change', drawPreview);
     showLineWidthInput.addEventListener('change', drawPreview);
     showExtrusionInput.addEventListener('change', drawPreview);
     showPathPointsInput.addEventListener('change', drawPreview);

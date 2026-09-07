@@ -35,7 +35,12 @@ def load_stl(path: str | Path) -> Mesh:
     if not stl_path.exists():
         raise FileNotFoundError(stl_path)
 
-    data = stl_path.read_bytes()
+    return load_stl_bytes(stl_path.read_bytes())
+
+
+def load_stl_bytes(data: bytes) -> Mesh:
+    """Load binary or ASCII STL data already held in memory."""
+
     if _looks_like_binary_stl(data):
         return _load_binary_stl(data)
     return _load_ascii_stl(data.decode("utf-8", errors="ignore"))
@@ -75,4 +80,3 @@ def _load_ascii_stl(text: str) -> Mesh:
     if not triangles:
         raise ValueError("STL file contains no triangles")
     return Mesh(np.asarray(triangles, dtype=np.float32))
-

@@ -35,3 +35,7 @@ build/
 *.zip
 
 .playwright-cli/*
+
+# Local agent-analysis artifacts; regenerate them as needed.
+graphify-out/
+RTK.md

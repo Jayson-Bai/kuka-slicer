@@ -14,6 +14,22 @@ import math
 import time
 
 from .types import Position, GlobalCurveCommand
+from .kuka_orientation import (
+    kuka_abc_to_quaternion,
+    quaternion_slerp,
+    quaternion_to_kuka_abc,
+)
+
+
+_MAX_ORIENTATION_STEP_DEG = 0.1
+# A density-6 fit can contain more than one thousand control points.  Ten
+# uniform parameter samples per point were insufficient around tight fitted
+# turns: the arc map understated local Cartesian distance, so a nominal
+# 20 mm/s sample could exceed the RSI step limit.  This refines the *internal*
+# arc-length estimate only; it neither inserts trajectory rows nor changes the
+# user-selected feedrate/time profile.
+_ARC_LENGTH_MAP_SAMPLES_PER_CONTROL_POINT = 24
+_ARC_LENGTH_MAP_MIN_SAMPLES = 800
 
 
 # -------------------------- 基础工具 --------------------------
@@ -28,68 +44,6 @@ class InterpolatedPoint:
     cmd_type: str
     line: Optional[int]
     raw: Optional[str]
-
-
-def _euler_xyz_to_quat(roll: float, pitch: float, yaw: float):
-    """欧拉角(弧度) -> 四元数，顺序 XYZ."""
-    cr = math.cos(roll * 0.5)
-    sr = math.sin(roll * 0.5)
-    cp = math.cos(pitch * 0.5)
-    sp = math.sin(pitch * 0.5)
-    cy = math.cos(yaw * 0.5)
-    sy = math.sin(yaw * 0.5)
-    w = cr * cp * cy + sr * sp * sy
-    x = sr * cp * cy - cr * sp * sy
-    y = cr * sp * cy + sr * cp * sy
-    z = cr * cp * sy - sr * sp * cy
-    return (w, x, y, z)
-
-
-def _quat_to_euler_xyz(q):
-    """四元数 -> 欧拉角(弧度)，顺序 XYZ."""
-    w, x, y, z = q
-    sinr_cosp = 2 * (w * x + y * z)
-    cosr_cosp = 1 - 2 * (x * x + y * y)
-    roll = math.atan2(sinr_cosp, cosr_cosp)
-
-    sinp = 2 * (w * y - z * x)
-    if abs(sinp) >= 1:
-        pitch = math.copysign(math.pi / 2, sinp)
-    else:
-        pitch = math.asin(sinp)
-
-    siny_cosp = 2 * (w * z + x * y)
-    cosy_cosp = 1 - 2 * (y * y + z * z)
-    yaw = math.atan2(siny_cosp, cosy_cosp)
-    return roll, pitch, yaw
-
-
-def _quat_slerp(q0, q1, t: float):
-    """球面插值，q0/q1 均为 (w,x,y,z)."""
-    w0, x0, y0, z0 = q0
-    w1, x1, y1, z1 = q1
-    dot = w0 * w1 + x0 * x1 + y0 * y1 + z0 * z1
-    if dot < 0.0:
-        w1, x1, y1, z1 = -w1, -x1, -y1, -z1
-        dot = -dot
-    if dot > 0.9995:
-        w = w0 + t * (w1 - w0)
-        x = x0 + t * (x1 - x0)
-        y = y0 + t * (y1 - y0)
-        z = z0 + t * (z1 - z0)
-        norm = math.sqrt(w * w + x * x + y * y + z * z)
-        return (w / norm, x / norm, y / norm, z / norm)
-    theta_0 = math.acos(dot)
-    sin_theta_0 = math.sin(theta_0)
-    theta = theta_0 * t
-    sin_theta = math.sin(theta)
-    s0 = math.cos(theta) - dot * sin_theta / sin_theta_0
-    s1 = sin_theta / sin_theta_0
-    w = s0 * w0 + s1 * w1
-    x = s0 * x0 + s1 * x1
-    y = s0 * y0 + s1 * y1
-    z = s0 * z0 + s1 * z1
-    return (w, x, y, z)
 
 
 # -------------------------- B 样条评估（仅用于已生成的控制点） --------------------------
@@ -193,6 +147,23 @@ def _eval_bspline_point(
     return Position(x=x, y=y, z=z, a=a, b=b, c=c), span
 
 
+def _sample_kuka_orientation(
+    normalized_u: float, parameters, quaternions
+):
+    """Evaluate local KUKA quaternion SLERP on the shared position parameter."""
+
+    if normalized_u <= parameters[0]:
+        return quaternions[0]
+    if normalized_u >= parameters[-1]:
+        return quaternions[-1]
+    right = bisect.bisect_right(parameters, normalized_u)
+    left = max(0, right - 1)
+    right = min(len(parameters) - 1, right)
+    span = parameters[right] - parameters[left]
+    local = 0.0 if span <= 1e-12 else (normalized_u - parameters[left]) / span
+    return quaternion_slerp(quaternions[left], quaternions[right], local)
+
+
 def _build_arc_length_map(ctrl: List[Position], degree: int = 3, samples: int = 400):
     knots = _make_open_uniform_knots(len(ctrl), degree)
     u_min = knots[degree]
@@ -223,6 +194,15 @@ def _build_arc_length_map(ctrl: List[Position], degree: int = 3, samples: int = 
 
     total_length = len_list[-1]
     return u_list, len_list, total_length, knots
+
+
+def _arc_length_map_sample_count(control_point_count: int) -> int:
+    """Return a conservative uniform budget for a fitted spline's arc map."""
+
+    return max(
+        _ARC_LENGTH_MAP_MIN_SAMPLES,
+        max(2, int(control_point_count)) * _ARC_LENGTH_MAP_SAMPLES_PER_CONTROL_POINT,
+    )
 
 
 def _is_linear_fallback_curve(curve: GlobalCurveCommand) -> bool:
@@ -359,6 +339,55 @@ def _compute_time_profile(length: float, target_v: float, t_acc: float, t_dec: f
     return total_time, t_flat
 
 
+def _orientation_only_samples(
+    curve: GlobalCurveCommand, ctrl: List[Position], dt: float
+):
+    """Sample an in-place KUKA rotation with the seventh-order S curve.
+
+    Core previously collapsed a zero-XYZ move to a single row even when its
+    ABC changed.  That makes a layer-dependent surface normal an RSI jump.
+    """
+
+    start = curve.start_pos
+    end = ctrl[-1]
+    start_q = kuka_abc_to_quaternion(start.a, start.b, start.c)
+    end_q = kuka_abc_to_quaternion(end.a, end.b, end.c)
+    dot = min(1.0, max(-1.0, abs(sum(a * b for a, b in zip(start_q, end_q)))))
+    angle_deg = math.degrees(2.0 * math.acos(dot))
+    if angle_deg <= 1e-9:
+        yield InterpolatedPoint(
+            t=0.0, pos=start, e=curve.e_val, extrude_speed=0.0,
+            feedrate_mm_min=curve.feedrate, cmd_type=curve.type,
+            line=curve.line, raw=curve.raw,
+        )
+        return
+
+    # The largest derivative of the seventh-order base curve is 2.1875.
+    # Account for it so every emitted RSI frame remains below the angle step.
+    steps = max(1, int(math.ceil(angle_deg * 2.1875 / _MAX_ORIENTATION_STEP_DEG)))
+    start_e = curve.e_val - curve.delta_e
+    previous_e = start_e
+    previous_abc = (start.a, start.b, start.c)
+    for index in range(steps + 1):
+        ratio = _sept_poly_base(index / steps)
+        q = quaternion_slerp(start_q, end_q, ratio)
+        a, b, c = quaternion_to_kuka_abc(q, near_deg=previous_abc)
+        current_e = start_e + curve.delta_e * ratio
+        delta_e = current_e - previous_e
+        yield InterpolatedPoint(
+            t=index * dt,
+            pos=Position(start.x, start.y, start.z, a, b, c),
+            e=current_e,
+            extrude_speed=delta_e / dt if dt > 0.0 else 0.0,
+            feedrate_mm_min=0.0,
+            cmd_type=curve.type,
+            line=curve.line,
+            raw=curve.raw,
+        )
+        previous_e = current_e
+        previous_abc = (a, b, c)
+
+
 # -------------------------- 采样主逻辑 --------------------------
 
 def sample_global_curve_iter(
@@ -390,6 +419,15 @@ def sample_global_curve_iter(
         profile.setdefault("sample_deboor_s", 0.0)
         profile.setdefault("sample_pose_s", 0.0)
         profile.setdefault("sample_extrude_s", 0.0)
+
+    if all(
+        abs(point.x - curve.start_pos.x) <= 1e-9
+        and abs(point.y - curve.start_pos.y) <= 1e-9
+        and abs(point.z - curve.start_pos.z) <= 1e-9
+        for point in ctrl[1:]
+    ):
+        yield from _orientation_only_samples(curve, ctrl, dt)
+        return
 
     if (curve.cmd or "").upper() == "POLYLINE":
         points = [curve.start_pos] + list(curve.control_points)
@@ -427,6 +465,7 @@ def sample_global_curve_iter(
         prev_s = 0.0
         seg_idx = 0
         seg_start_s = 0.0
+        previous_abc = (points[0].a, points[0].b, points[0].c)
 
         for i in range(num_steps + 1):
             t = i * dt
@@ -452,10 +491,17 @@ def sample_global_curve_iter(
                 x=start.x + (end.x - start.x) * local,
                 y=start.y + (end.y - start.y) * local,
                 z=start.z + (end.z - start.z) * local,
-                a=start.a + (end.a - start.a) * local,
-                b=start.b + (end.b - start.b) * local,
-                c=start.c + (end.c - start.c) * local,
+                a=start.a,
+                b=start.b,
+                c=start.c,
             )
+            q = quaternion_slerp(
+                kuka_abc_to_quaternion(start.a, start.b, start.c),
+                kuka_abc_to_quaternion(end.a, end.b, end.c),
+                local,
+            )
+            pos.a, pos.b, pos.c = quaternion_to_kuka_abc(q, near_deg=previous_abc)
+            previous_abc = (pos.a, pos.b, pos.c)
 
             delta_s = curr_s - prev_s
             if e_profile is None:
@@ -519,17 +565,12 @@ def sample_global_curve_iter(
         )
 
         start_q = end_q = None
+        previous_abc = (curve.start_pos.a, curve.start_pos.b, curve.start_pos.c)
         if not same_orientation:
-            start_q = _euler_xyz_to_quat(
-                math.radians(curve.start_pos.a),
-                math.radians(curve.start_pos.b),
-                math.radians(curve.start_pos.c),
+            start_q = kuka_abc_to_quaternion(
+                curve.start_pos.a, curve.start_pos.b, curve.start_pos.c,
             )
-            end_q = _euler_xyz_to_quat(
-                math.radians(end_pos.a),
-                math.radians(end_pos.b),
-                math.radians(end_pos.c),
-            )
+            end_q = kuka_abc_to_quaternion(end_pos.a, end_pos.b, end_pos.c)
 
         for i in range(num_steps + 1):
             t = i * dt
@@ -552,11 +593,9 @@ def sample_global_curve_iter(
                 pos.b = curve.start_pos.b
                 pos.c = curve.start_pos.c
             else:
-                qs = _quat_slerp(start_q, end_q, s_norm_clamped)
-                a_rad, b_rad, c_rad = _quat_to_euler_xyz(qs)
-                pos.a = math.degrees(a_rad)
-                pos.b = math.degrees(b_rad)
-                pos.c = math.degrees(c_rad)
+                q = quaternion_slerp(start_q, end_q, s_norm_clamped)
+                pos.a, pos.b, pos.c = quaternion_to_kuka_abc(q, near_deg=previous_abc)
+            previous_abc = (pos.a, pos.b, pos.c)
 
             curr_s = s_norm_clamped * total_length
             delta_s = curr_s - prev_s
@@ -582,7 +621,10 @@ def sample_global_curve_iter(
     # 构建弧长映射
     t0 = time.perf_counter()
     u_list, len_list, total_length, knots = _build_arc_length_map(
-        ctrl, degree=degree, samples=max(400, len(ctrl) * 10))
+        ctrl,
+        degree=degree,
+        samples=_arc_length_map_sample_count(len(ctrl)),
+    )
     if profile is not None:
         profile["sample_arc_map_s"] += time.perf_counter() - t0
     if total_length <= 1e-9:
@@ -610,17 +652,13 @@ def sample_global_curve_iter(
     current_e = start_e
 
     # 姿态：仅用起点/终点做 slerp
+    # Planner-generated curves carry KUKA samples on the position parameter.
+    # Curves created by older callers retain a KUKA quaternion endpoint fallback.
     end_pos = ctrl[-1]
-    start_q = _euler_xyz_to_quat(
-        math.radians(curve.start_pos.a),
-        math.radians(curve.start_pos.b),
-        math.radians(curve.start_pos.c),
+    start_q = kuka_abc_to_quaternion(
+        curve.start_pos.a, curve.start_pos.b, curve.start_pos.c,
     )
-    end_q = _euler_xyz_to_quat(
-        math.radians(end_pos.a),
-        math.radians(end_pos.b),
-        math.radians(end_pos.c),
-    )
+    end_q = kuka_abc_to_quaternion(end_pos.a, end_pos.b, end_pos.c)
     constant_orientation = (
         abs(curve.start_pos.a - end_pos.a) < 1e-9
         and abs(curve.start_pos.b - end_pos.b) < 1e-9
@@ -629,6 +667,9 @@ def sample_global_curve_iter(
     fixed_a = curve.start_pos.a
     fixed_b = curve.start_pos.b
     fixed_c = curve.start_pos.c
+    orientation_parameters = curve.orientation_parameters
+    orientation_quaternions = curve.orientation_quaternions
+    previous_abc = (fixed_a, fixed_b, fixed_c)
 
     prev_s = 0.0
     lookup_idx = 0
@@ -655,16 +696,18 @@ def sample_global_curve_iter(
 
         # 姿态插值
         t_pose0 = time.perf_counter()
-        if constant_orientation:
+        if orientation_parameters and orientation_quaternions:
+            normalized_u = u / knots[n_ctrl] if knots[n_ctrl] > 1e-12 else 0.0
+            q = _sample_kuka_orientation(normalized_u, orientation_parameters, orientation_quaternions)
+            p.a, p.b, p.c = quaternion_to_kuka_abc(q, near_deg=previous_abc)
+        elif constant_orientation:
             p.a = fixed_a
             p.b = fixed_b
             p.c = fixed_c
         else:
-            qs = _quat_slerp(start_q, end_q, s_norm_clamped)
-            a_rad, b_rad, c_rad = _quat_to_euler_xyz(qs)
-            p.a = math.degrees(a_rad)
-            p.b = math.degrees(b_rad)
-            p.c = math.degrees(c_rad)
+            q = quaternion_slerp(start_q, end_q, s_norm_clamped)
+            p.a, p.b, p.c = quaternion_to_kuka_abc(q, near_deg=previous_abc)
+        previous_abc = (p.a, p.b, p.c)
         if profile is not None:
             profile["sample_pose_s"] += time.perf_counter() - t_pose0
 

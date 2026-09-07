@@ -324,6 +324,81 @@ Open:
 http://127.0.0.1:8765
 ```
 
+## Standalone surface preview
+
+The initial surface-preview package is intentionally separate from the slicer.
+It previews the documented `graded_surface_v1` double-sine height field,
+reports its sampled Z range and maximum slope, and can import an STL to clip
+the preview to its printable XY projection.  After an STL is imported, it can
+download a `graded_surface_v1.json` sidecar containing the surface parameters,
+STL projection domain and an STL fingerprint. It does not define layer
+progression, alter a slice job, or write an NPZ file.
+
+```powershell
+python -m kuka_slicer surface-preview
+```
+
+Open `http://127.0.0.1:8766` and adjust amplitude, wavelengths, phases, and
+the preview domain.  The implementation lives in `kuka_slicer.surface_preview`
+so a later slicer-UI integration can reuse its API without coupling the preview
+to the slicing core.
+
+## Standalone surface mapper
+
+`kuka_slicer.surface_mapper` is a second, independent package. It imports a
+planar `external_layer_paths_v1` NPZ and the geometry-only
+`graded_surface_v1.json` export, then applies a mapper-owned logical-layer
+progression to Z and generates KUKA ABC from the analytical surface normal. It
+preserves XY, `layer_XXXX_R/F/T` grouping, logical-layer identity, path order,
+and point order. Deposited R/F paths are resampled before analytical mapping,
+and every existing E array is recalculated from the curved-to-flat 3D arc-length
+ratio. The resulting `curved.npz` remains a valid input for the existing Core
+preprocessor.
+
+```powershell
+python -m kuka_slicer surface-map
+```
+
+Open `http://127.0.0.1:8767`. The page accepts one surface-start layer and
+automatically mirrors the completion and return-to-flat regions about the
+middle logical layer, then rejects any mapped result containing negative Z.
+Preview and export report the resampling, E compensation, Z range, and surface
+normal orientation contract.
+
+### Surface mapping modes
+
+The current `surface-map` page is explicitly the **Legacy** mode.  It emits
+`surface_mapping_v1` and implements an analytical `double_sine_product`
+height-field Z mapping; it is not a discrete conformal parameterization and
+must continue to preserve its XY, path-order, and logical-layer contracts.
+
+**Conformal** is a separate, currently unavailable structure-generation mode.
+It will begin with `conformal_lattice_spec_v1`, a triangular surface domain,
+and an independently validated UV parameterization.  It must not be added as
+a conditional branch to the Legacy mapper, and no UI label may describe a
+Legacy export as conformal before that pipeline exists.
+
+## Production honeycomb surface reference
+
+The production honeycomb planner is `macro_partition_zero_e`, introduced by
+commit `08fc814`. It reconstructs the wall graph from the real STL section,
+deposits every wall edge once, joins safe sub-trails inside each tested minimum
+macro partition with constant-E print motion, and emits explicit T travel only
+between macro partitions. The later `cc23961` commit adds an isolated regular-
+grid visualization prototype; it is not a replacement production planner.
+
+The fixed local regression sample is the 150 x 100 x 10 mm, side-5-mm model
+under `C:\Users\caRRot\Desktop\print_test\曲面测试\蜂窝-150x100x10mm-08-11`.
+The reference NPZ is
+`02_曲面参数与预览\honeycomb_minimum_no_u_turn_partitions_surface_preview.npz`.
+It must be paired with the STL in `01_模型` and the **phase-45-degree**
+`蜂窝-150x100x10mm-08-11-相位45度-全边界曲面参数.json`; the zero-phase JSON is
+not the matching surface definition. On another machine, set
+`KUKA_SLICER_HONEYCOMB_REFERENCE_ROOT` to the corresponding dataset root.
+`tests/test_honeycomb_surface_reference.py` locks this sample to the Legacy
+`surface_mapping_v1` production contract; it is a comparison baseline, not a
+conformal-lattice acceptance result.
+
 The UI groups adjustable inputs into:
 
 | Group | Parameters |

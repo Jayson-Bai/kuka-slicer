@@ -19,6 +19,8 @@ from shapely.ops import linemerge, nearest_points, unary_union
 from shapely.strtree import STRtree
 
 from .external_npz import ExternalSourceJob, Material, MaterialPaths, TravelPaths
+from .cpu_limiter import limit_slicer_task
+from .honeycomb_pathing.config import HoneycombPathingConfig
 from .stl_io import Mesh
 
 CurveMode = Literal["flat", "sinusoidal"]
@@ -362,6 +364,9 @@ class SliceConfig:
     pyslm: PySLMConfig = field(default_factory=PySLMConfig)
     prusa_raft: PrusaRaftConfig = field(default_factory=PrusaRaftConfig)
     prusa_geometry: PrusaGeometryConfig = field(default_factory=PrusaGeometryConfig)
+    # Optional post-Prusa planner for regular honeycomb wall networks. The
+    # native backend remains untouched; this transforms its completed job.
+    honeycomb_pathing: HoneycombPathingConfig = field(default_factory=HoneycombPathingConfig)
     # Native Prusa brim controls.  The checkbox is kept separate from the
     # width so a saved test value does not re-enable the brim by accident.
     brim_enabled: bool = False
@@ -452,6 +457,10 @@ class SliceConfig:
             raise ValueError("build_axis must be x, y, or z")
         if self.slicing_kernel not in ("legacy", "pyslm", "prusa"):
             raise ValueError("slicing_kernel must be legacy, pyslm, or prusa")
+        if self.honeycomb_pathing.enabled and (
+            self.slicing_kernel != "prusa" or self.material != "R"
+        ):
+            raise ValueError("honeycomb centreline planning currently requires Prusa resin slicing")
         if self.perimeter_count < 1:
             raise ValueError("perimeter_count must be at least 1")
         if self.brim_type not in ("outer_only", "outer_and_inner", "no_brim"):
@@ -525,6 +534,13 @@ class RaftLayerConfig:
 
 
 def slice_mesh_to_job(mesh: Mesh, config: SliceConfig) -> ExternalSourceJob:
+    # Covers direct Python and command-line slicing.  The UI adds an outer
+    # guard so its Core export phase is limited too; the limiter is re-entrant.
+    with limit_slicer_task():
+        return _slice_mesh_to_job_limited(mesh, config)
+
+
+def _slice_mesh_to_job_limited(mesh: Mesh, config: SliceConfig) -> ExternalSourceJob:
     if config.infill_pattern == "isotropic":
         _validate_isotropic_infill_schedule(mesh, config)
     if config.slicing_kernel == "pyslm":
@@ -539,8 +555,20 @@ def slice_mesh_to_job(mesh: Mesh, config: SliceConfig) -> ExternalSourceJob:
         return job
     if config.slicing_kernel == "prusa":
         from .prusa_backend import slice_mesh_to_job_with_prusa
+        from .honeycomb_pathing import apply_honeycomb_centerline_pathing
 
-        return slice_mesh_to_job_with_prusa(mesh, config)
+        job = slice_mesh_to_job_with_prusa(mesh, config)
+        if config.honeycomb_pathing.enabled:
+            # This stays after the native boundary: the add-on consumes a
+            # completed Prusa job but never changes the native bridge itself.
+            return apply_honeycomb_centerline_pathing(
+                job,
+                orient_mesh_for_build_axis(mesh, config.build_axis),
+                line_width_mm=float(config.line_width),
+                tolerance_mm=float(config.tolerance),
+                topology=config.honeycomb_pathing.topology,
+            )
+        return job
     job = _slice_mesh_to_job_legacy(mesh, config)
     _record_line_width_contract(job, config, planning_applied=True)
     return job
@@ -1096,10 +1124,11 @@ def normalize_job_xy_origin(
     job: ExternalSourceJob,
     *,
     target_xy: tuple[float, float] = (0.0, 0.0),
+    reference_material: str | None = None,
 ) -> tuple[float, float]:
-    """Translate all exported paths so the lower-left XY bound reaches target_xy."""
+    """Translate all paths so a material bound's lower-left reaches target_xy."""
 
-    bounds = _job_xy_bounds(job)
+    bounds = _job_xy_bounds(job, material=reference_material)
     if bounds is None:
         return (0.0, 0.0)
     min_x, min_y, _, _ = bounds
@@ -1130,13 +1159,19 @@ def normalize_job_xy_origin(
     return (float(translation_x), float(translation_y))
 
 
-def _job_xy_bounds(job: ExternalSourceJob) -> tuple[float, float, float, float] | None:
+def _job_xy_bounds(
+    job: ExternalSourceJob,
+    *,
+    material: str | None = None,
+) -> tuple[float, float, float, float] | None:
     min_x = math.inf
     min_y = math.inf
     max_x = -math.inf
     max_y = -math.inf
     found = False
     for group in job.material_paths:
+        if material is not None and group.material != material:
+            continue
         for path in group.paths:
             if path.size == 0:
                 continue
@@ -1168,6 +1203,37 @@ def orient_mesh_for_build_axis(mesh: Mesh, build_axis: BuildAxis) -> Mesh:
 
 def _raft_footprint_geometry(mesh: Mesh, config: SliceConfig):
     return _part_projection_geometry(mesh, config)
+
+
+def mesh_xy_projection(
+    mesh: Mesh,
+    *,
+    build_axis: BuildAxis = "z",
+    layer_height: float = DEFAULT_RESIN_LAYER_HEIGHT_MM,
+    tolerance: float = 1e-5,
+):
+    """Return the union of printable XY cross-sections for an STL mesh.
+
+    This is a geometry-domain operation, not path planning.  It is shared by
+    surface-preview tooling so an exported surface configuration and the
+    eventual slicer use the same projection semantics.
+    """
+
+    if build_axis not in ("x", "y", "z"):
+        raise ValueError("build_axis must be x, y, or z")
+    if not math.isfinite(layer_height) or layer_height <= 0.0:
+        raise ValueError("layer_height must be positive")
+    if not math.isfinite(tolerance) or tolerance <= 0.0:
+        raise ValueError("tolerance must be positive")
+    oriented_mesh = orient_mesh_for_build_axis(mesh, build_axis)
+    return _part_projection_geometry(
+        oriented_mesh,
+        SliceConfig(
+            layer_height=layer_height,
+            tolerance=tolerance,
+            build_axis="z",
+        ),
+    )
 
 
 def _part_projection_geometry(mesh: Mesh, config: SliceConfig):

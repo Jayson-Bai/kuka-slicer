@@ -79,6 +79,154 @@ def test_convert_uses_shared_head_calibration_offsets(tmp_path, monkeypatch):
     assert captured["kwargs"]["external_npz_cut_absolute_e"] is True
 
 
+def test_convert_passes_curved_source_in_logical_layer_order_to_core(tmp_path, monkeypatch):
+    import json
+    import numpy as np
+
+    import external_npz_preprocessor.export_runner as runner
+    from external_npz_preprocessor.process_params import ProcessParams
+    from path_processing_core.types import MoveCommand
+
+    source = tmp_path / "curved_layers.npz"
+    semantics = {
+        "format": "logical_layer_v1",
+        "layer_key": "logical_deposition_layer",
+        "z_coordinate": "per_point_trajectory",
+        "ordering": "ascending_layer_key_then_source_path_order",
+        "reconstruct_layers_from_z": False,
+    }
+    np.savez(
+        source,
+        meta=np.array(json.dumps({"format": "external_layer_paths_v1", "layer_semantics": semantics})),
+        layer_0000_R=np.asarray([[[0.0, 0.0, 1.4], [2.0, 0.0, 0.9]]], dtype=np.float64),
+        layer_0001_R=np.asarray([[[2.0, 1.0, 0.6], [4.0, 1.0, 1.8]]], dtype=np.float64),
+    )
+    calibration_path = tmp_path / "head_offsets.json"
+    calibration_path.write_text(
+        json.dumps({"resin": {}, "fiber": {}}), encoding="utf-8"
+    )
+    captured = {}
+
+    def fake_export_npz(commands, output_path, **kwargs):
+        captured["commands"] = commands
+        return {"rows": 0, "parts": 0, "total_s": 0.0}
+
+    monkeypatch.setattr(runner, "export_npz", fake_export_npz)
+
+    runner.convert_external_npz(
+        source,
+        tmp_path / "out.npz",
+        ProcessParams(primeline_enabled=False),
+        calibration_path=calibration_path,
+    )
+
+    moves = [
+        command
+        for command in captured["commands"]
+        if isinstance(command, MoveCommand) and command.type == "PRINT"
+    ]
+    assert [move.layer for move in moves] == [0, 1]
+    assert [move.start_pos.z for move in moves] == [1.4, 0.6]
+
+
+def test_surface_mapped_job_uses_density_four_when_the_saved_value_is_zero(tmp_path, monkeypatch):
+    import external_npz_preprocessor.export_runner as runner
+    import numpy as np
+
+    from external_npz_preprocessor.process_params import ProcessParams
+    from external_npz_preprocessor.source_npz import LayerPaths, MaterialPath, SourceJob
+
+    captured = {}
+
+    def fake_export_npz(commands, output_path, **kwargs):
+        captured["density"] = kwargs["density"]
+        return {"rows": 0, "parts": 0, "total_s": 0.0}
+
+    calibration = tmp_path / "head_offsets.json"
+    calibration.write_text('{"resin": {}, "fiber": {}}', encoding="utf-8")
+    job = SourceJob(
+        meta={"surface_mapping": {"format": "surface_mapping_v1"}},
+        layers=[
+            LayerPaths(
+                index=0,
+                resin_paths=[
+                    MaterialPath(
+                        "R",
+                        0,
+                        np.asarray(
+                            [
+                                [0.0, 0.0, 0.5, 0.0, 0.0, 0.0],
+                                [1.0, 0.0, 0.6, 0.0, 0.0, 0.0],
+                            ],
+                            dtype=np.float64,
+                        ),
+                    )
+                ],
+            )
+        ],
+    )
+    monkeypatch.setattr(runner, "export_npz", fake_export_npz)
+
+    runner.convert_source_job(
+        job,
+        source_path=tmp_path / "mapped.npz",
+        output_path=tmp_path / "core.npz",
+        params=ProcessParams(density=0),
+        calibration_path=calibration,
+    )
+
+    assert captured["density"] == 4
+
+
+def test_surface_mapped_job_preserves_nonzero_density(tmp_path, monkeypatch):
+    import external_npz_preprocessor.export_runner as runner
+    import numpy as np
+
+    from external_npz_preprocessor.process_params import ProcessParams
+    from external_npz_preprocessor.source_npz import LayerPaths, MaterialPath, SourceJob
+
+    captured = {}
+
+    def fake_export_npz(commands, output_path, **kwargs):
+        captured["density"] = kwargs["density"]
+        return {"rows": 0, "parts": 0, "total_s": 0.0}
+
+    calibration = tmp_path / "head_offsets.json"
+    calibration.write_text('{"resin": {}, "fiber": {}}', encoding="utf-8")
+    job = SourceJob(
+        meta={"surface_mapping": {"format": "surface_mapping_v1"}},
+        layers=[
+            LayerPaths(
+                index=0,
+                resin_paths=[
+                    MaterialPath(
+                        "R",
+                        0,
+                        np.asarray(
+                            [
+                                [0.0, 0.0, 0.5, 0.0, 0.0, 0.0],
+                                [1.0, 0.0, 0.6, 0.0, 0.0, 0.0],
+                            ],
+                            dtype=np.float64,
+                        ),
+                    )
+                ],
+            )
+        ],
+    )
+    monkeypatch.setattr(runner, "export_npz", fake_export_npz)
+
+    runner.convert_source_job(
+        job,
+        source_path=tmp_path / "mapped.npz",
+        output_path=tmp_path / "core.npz",
+        params=ProcessParams(density=3),
+        calibration_path=calibration,
+    )
+
+    assert captured["density"] == 3
+
+
 def test_exporter_uses_curve_start_acceleration_without_changing_default(tmp_path, monkeypatch):
     import path_processing_core.npz_exporter as exporter
     from path_processing_core.polynomial_interpolator import InterpolatedPoint
@@ -232,8 +380,8 @@ def test_final_resin_layer_end_travel_is_last_runtime_trajectory_before_auto_abo
 
         assert travel_rows
         assert travel_rows[-1] == len(data["seq"]) - 1
-        assert np.isclose(data["x"][travel_rows[-1]], 30.0)
-        assert np.isclose(data["y"][travel_rows[-1]], 0.0)
+        assert np.isclose(data["x"][travel_rows[-1]], layer_end_travel.pos.x)
+        assert np.isclose(data["y"][travel_rows[-1]], layer_end_travel.pos.y)
         assert np.allclose(data["z"][travel_rows], 0.5)
         assert np.allclose(data["e"][travel_rows], 0.0)
 
@@ -318,8 +466,8 @@ def test_resin_layer_end_travel_is_exported_before_tool_change_safe_lift(tmp_pat
         assert travel_rows
         assert tool_change_rows
         assert max(travel_rows) < min(tool_change_rows)
-        assert np.isclose(data["x"][travel_rows[-1]], 30.0)
-        assert np.isclose(data["y"][travel_rows[-1]], 0.0)
+        assert np.isclose(data["x"][travel_rows[-1]], layer_end_travel.pos.x)
+        assert np.isclose(data["y"][travel_rows[-1]], layer_end_travel.pos.y)
         assert np.allclose(data["z"][travel_rows], 0.5)
         assert np.allclose(data["e"][travel_rows], 0.0)
         assert np.isclose(np.max(data["z"][tool_change_rows]), 20.5)
@@ -699,9 +847,9 @@ def test_fiber_cut_and_ui_actions_use_independent_absolute_e_boundaries(tmp_path
     assert np.allclose(data["e"][travel_idx], 0.0)
     assert np.isclose(data["z"][travel_idx[0]], cut_z + 20.0)
     assert np.isclose(data["z"][travel_idx[-1]], cut_z)
-    assert np.isclose(data["x"][travel_idx[0]], 10.0)
-    assert np.isclose(data["x"][travel_idx[-1]], 30.0)
-    assert np.allclose(data["y"][travel_idx], 0.0)
+    assert np.isclose(data["x"][travel_idx[0]], 20.0)
+    assert np.isclose(data["x"][travel_idx[-1]], 40.0)
+    assert np.allclose(data["y"][travel_idx], 10.0)
 
     second_cut_idx = event_types.index("cut", cut_idx + 1)
     second_pre_cut_reset_idx = second_cut_idx - 2

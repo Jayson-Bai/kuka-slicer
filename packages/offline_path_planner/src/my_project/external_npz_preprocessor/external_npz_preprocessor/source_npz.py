@@ -14,6 +14,14 @@ import numpy as np
 _LAYER_KEY_RE = re.compile(r"^layer_(\d{4})_([RFT])$")
 SOURCE_NPZ_CONTRACT_ID = "external_layer_paths_v1"
 SUPPORTED_SOURCE_NPZ_CONTRACTS = frozenset({SOURCE_NPZ_CONTRACT_ID})
+LOGICAL_LAYER_SEMANTICS_FORMAT = "logical_layer_v1"
+_LOGICAL_LAYER_SEMANTICS_V1 = {
+    "format": LOGICAL_LAYER_SEMANTICS_FORMAT,
+    "layer_key": "logical_deposition_layer",
+    "z_coordinate": "per_point_trajectory",
+    "ordering": "ascending_layer_key_then_source_path_order",
+    "reconstruct_layers_from_z": False,
+}
 
 
 @dataclass(frozen=True)
@@ -35,10 +43,20 @@ class TravelPath:
 
 @dataclass(frozen=True)
 class LayerPaths:
+    """Ordered source paths for one logical deposition layer.
+
+    ``index`` comes from the ``layer_xxxx_*`` key. It is intentionally not
+    inferred from the per-point Z values, which may vary for curved paths.
+    """
+
     index: int
     resin_paths: list[MaterialPath] = field(default_factory=list)
     fiber_paths: list[MaterialPath] = field(default_factory=list)
     travel_paths: list[TravelPath] = field(default_factory=list)
+
+    @property
+    def logical_layer_index(self) -> int:
+        return self.index
 
 
 @dataclass(frozen=True)
@@ -108,16 +126,37 @@ def load_source_npz(path: str | Path, default_abc: tuple[float, float, float] = 
 def _validate_source_contract(meta: dict[str, Any]) -> None:
     """Accept the documented v1 contract and unversioned legacy source files."""
     contract_id = meta.get("format")
-    if contract_id is None:
+    if contract_id is not None:
+        if (
+            not isinstance(contract_id, str)
+            or contract_id not in SUPPORTED_SOURCE_NPZ_CONTRACTS
+        ):
+            supported = ", ".join(sorted(SUPPORTED_SOURCE_NPZ_CONTRACTS))
+            raise ValueError(
+                f"unsupported source NPZ format {contract_id!r}; supported: {supported}"
+            )
+    validate_layer_semantics(meta)
+
+
+def validate_layer_semantics(meta: dict[str, Any]) -> None:
+    """Validate the optional curved-path logical-layer contract.
+
+    Files without the field remain valid legacy ``external_layer_paths_v1``
+    input. When the field is supplied, reject any contract that could lead a
+    consumer to rebuild layer grouping from curved Z coordinates.
+    """
+
+    semantics = meta.get("layer_semantics")
+    if semantics is None:
         return
-    if (
-        not isinstance(contract_id, str)
-        or contract_id not in SUPPORTED_SOURCE_NPZ_CONTRACTS
-    ):
-        supported = ", ".join(sorted(SUPPORTED_SOURCE_NPZ_CONTRACTS))
-        raise ValueError(
-            f"unsupported source NPZ format {contract_id!r}; supported: {supported}"
-        )
+    if not isinstance(semantics, dict):
+        raise ValueError("layer_semantics must be an object")
+    for field, expected in _LOGICAL_LAYER_SEMANTICS_V1.items():
+        if semantics.get(field) != expected:
+            raise ValueError(
+                "unsupported layer_semantics: "
+                f"{field} must be {expected!r} for {LOGICAL_LAYER_SEMANTICS_FORMAT}"
+            )
 
 
 def _read_meta(npz) -> dict[str, Any]:

@@ -10,6 +10,13 @@ import numpy as np
 Material = Literal["R", "F"]
 DEFAULT_EXPORT_CHORD_TOLERANCE_MM = 0.05
 SOURCE_NPZ_CONTRACT_ID = "external_layer_paths_v1"
+LOGICAL_LAYER_SEMANTICS_V1 = {
+    "format": "logical_layer_v1",
+    "layer_key": "logical_deposition_layer",
+    "z_coordinate": "per_point_trajectory",
+    "ordering": "ascending_layer_key_then_source_path_order",
+    "reconstruct_layers_from_z": False,
+}
 
 
 @dataclass
@@ -34,6 +41,13 @@ class ExternalSourceJob:
     material_paths: list[MaterialPaths]
     meta: dict[str, object] = field(default_factory=dict)
     travel_paths: list[TravelPaths] = field(default_factory=list)
+    # Kept outside ``meta`` so legacy external-NPZ serialization never embeds
+    # the large native Prusa G-code payload.
+    native_gcode: bytes | str | None = field(default=None, repr=False)
+    native_gcode_translation_mm: tuple[float, float, float] | None = field(
+        default=None,
+        repr=False,
+    )
 
 
 def write_external_source_npz(job: ExternalSourceJob, output_path: str | Path) -> None:
@@ -291,6 +305,10 @@ def _defaulted_meta(meta: dict[str, object]) -> dict[str, object]:
             "preserves_path_count_and_order": True,
             "preserves_point_count_and_order": True,
         },
+        # ``layer_xxxx_R/F/T`` is a logical deposition grouping. Z remains
+        # per-point trajectory geometry and may vary within one logical layer
+        # after a future surface-map stage.
+        "layer_semantics": dict(LOGICAL_LAYER_SEMANTICS_V1),
     }
     base.update(meta)
     return base

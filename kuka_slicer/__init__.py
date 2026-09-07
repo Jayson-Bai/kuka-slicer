@@ -1,5 +1,11 @@
 """STL to external source NPZ conversion tools."""
 
+# This must happen before importing NumPy/Shapely so their native thread pools
+# inherit the slicer's conservative default.
+from .cpu_limiter import configure_numeric_thread_environment
+
+configure_numeric_thread_environment()
+
 from .external_npz import (
     DEFAULT_EXPORT_CHORD_TOLERANCE_MM,
     ExternalSourceJob,

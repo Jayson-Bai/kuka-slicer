@@ -129,6 +129,30 @@ def test_prusa_backend_forwards_native_detachable_raft_configuration(monkeypatch
     }
 
 
+def test_prusa_backend_keeps_native_gcode_outside_legacy_npz_metadata(monkeypatch):
+    class Native:
+        def slice_print_paths(self, vertices, faces, **kwargs):
+            return {
+                "gcode": "G90\nM82\n",
+                "layers": [],
+            }
+
+    monkeypatch.setattr("kuka_slicer.prusa_backend.require_native", lambda: Native())
+    job = slice_mesh_to_job_with_prusa(
+        Mesh(_cube_triangles(10.0)),
+        SliceConfig(
+            slicing_kernel="prusa",
+            layer_height=0.5,
+            first_layer_height=0.5,
+            line_width=2.0,
+        ),
+    )
+
+    assert job.native_gcode == "G90\nM82\n"
+    assert job.native_gcode_translation_mm == (-10.0, -10.0, 0.0)
+    assert "gcode" not in job.meta
+
+
 def test_prusa_backend_can_merge_brim_with_project_connector(monkeypatch):
     class Native:
         def slice_print_paths(self, vertices, faces, **kwargs):

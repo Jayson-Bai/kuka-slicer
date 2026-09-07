@@ -1,5 +1,8 @@
 ﻿import math
 
+import inspect
+import json
+
 import numpy as np
 import pytest
 from shapely import maximum_inscribed_circle
@@ -7,7 +10,12 @@ from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import unary_union
 
 import kuka_slicer.slicer as slicer_module
-from kuka_slicer.external_npz import ExternalSourceJob, MaterialPaths, TravelPaths
+from kuka_slicer.external_npz import (
+    ExternalSourceJob,
+    MaterialPaths,
+    TravelPaths,
+    write_external_source_npz,
+)
 from kuka_slicer.slicer import (
     DEFAULT_FIBER_LAYER_HEIGHT_MM,
     DEFAULT_FIBER_LINE_WIDTH_MM,
@@ -55,15 +63,22 @@ from kuka_slicer.slicer import (
 from kuka_slicer.stl_io import Mesh
 from kuka_slicer.ui_server import (
     DEFAULT_UI_RESIN_INFILL_OVERLAP_PERCENT,
+    _conformal_spec_ui_summary,
+    _choose_mapped_surface_npz_file,
+    _load_surface_preview_last_directory,
     _index_html,
     _parse_prusa_slice_config,
     _resolved_slice_config,
     _preview_payload,
+    _preview_payload_from_source_npz,
     _raft_layers_from_params,
     _simplify_preview_path,
+    _save_surface_preview_last_directory,
+    align_fiber_template_paths_to_resin,
     expand_fiber_template_for_resin_layers,
     load_fiber_template_json,
 )
+from kuka_slicer.surface_preview.server import conformal_lattice_config_payload
 
 
 def test_cube_slice_produces_closed_square_path():
@@ -380,6 +395,59 @@ def test_fiber_json_loads_canonical_one_record_per_path_format(tmp_path):
         [[1.0, 2.0, 0.0], [3.0, 4.0, 0.0]],
         [[5.0, 6.0, 0.0], [7.0, 8.0, 0.0]],
     ]
+
+
+def test_project_default_fiber_json_aligns_to_resin_before_ui_placement(tmp_path):
+    json_path = tmp_path / "project_default_fiber.json"
+    json_path.write_text(
+        """
+        {
+          "coordinate_system": "project_default",
+          "paths": [[[-2.0, -1.0], [2.0, 1.0]]]
+        }
+        """,
+        encoding="utf-8",
+    )
+    template_paths = load_fiber_template_json(json_path)
+    job = ExternalSourceJob(
+        material_paths=[
+            MaterialPaths(
+                0,
+                "R",
+                [np.asarray([[20.0, 30.0, 0.5], [30.0, 50.0, 0.5]])],
+            )
+        ]
+    )
+
+    aligned = align_fiber_template_paths_to_resin(job, template_paths)
+
+    assert aligned == [[[23.0, 39.0, 0.0], [27.0, 41.0, 0.0]]]
+    assert job.meta["fiber_coordinate_alignment"] == {
+        "source_coordinate_system": "project_default",
+        "reference": "resin_xy_bounds_center",
+        "translation_x_mm": 25.0,
+        "translation_y_mm": 40.0,
+    }
+
+
+def test_fiber_paths_do_not_change_resin_ui_origin_normalization():
+    resin_path = np.asarray([[20.0, 30.0, 0.5], [30.0, 50.0, 0.5]])
+    job = ExternalSourceJob(
+        material_paths=[
+            MaterialPaths(0, "R", [resin_path.copy()]),
+            MaterialPaths(0, "F", [np.asarray([[-100.0, -100.0, 0.6], [0.0, 0.0, 0.6]])]),
+        ]
+    )
+
+    translation = normalize_job_xy_origin(
+        job,
+        target_xy=(10.0, 15.0),
+        reference_material="R",
+    )
+
+    assert translation == pytest.approx((-10.0, -15.0))
+    assert np.min(job.material_paths[0].paths[0][:, :2], axis=0) == pytest.approx((10.0, 15.0))
+    assert job.material_paths[1].paths[0][0, :2] == pytest.approx((-110.0, -115.0))
 
 
 def test_fiber_template_paths_preserve_input_vertices_before_export():
@@ -869,7 +937,21 @@ def test_preview_payload_uses_slim_role_aware_layer_schema_and_complete_bounds()
         job,
     )
 
-    assert set(preview) == {"bounds", "line_widths", "layers"}
+    assert set(preview) == {
+        "bounds",
+        "geometry_mode",
+        "line_widths",
+        "layers",
+        "origin",
+        "preview_source",
+        "tool_orientation",
+    }
+    assert preview["preview_source"] == "pre_core_source_npz"
+    assert preview["geometry_mode"] == "planar_2d"
+    assert preview["tool_orientation"] == {
+        "available": False,
+        "fallback": "calibrated_flat_downward",
+    }
     assert preview["line_widths"] == {
         "resin": 2.2,
         "resin_nominal": 2.0,
@@ -928,6 +1010,71 @@ def test_preview_keeps_prusa_extrusion_values_aligned_with_resin_paths():
     entry = preview["layers"][0]["resin_paths"][0]
     assert entry["points"] == resin_path.tolist()
     assert entry["extrusion"] == [10.0, 11.0, 12.5]
+
+
+def test_preview_marks_mapped_xyzabc_paths_as_a_surface_and_preserves_orientation():
+    mapped_path = np.asarray(
+        [
+            [0.0, 0.0, 0.5, 0.0, 0.0, 0.0],
+            [4.0, 0.0, 1.0, 10.0, -5.0, 2.0],
+            [4.0, 3.0, 1.4, 12.0, -7.0, 3.0],
+        ],
+        dtype=np.float64,
+    )
+    job = ExternalSourceJob(material_paths=[MaterialPaths(0, "R", [mapped_path])])
+
+    preview = _preview_payload(
+        Mesh(_cube_triangles(size=10.0)),
+        SliceConfig(line_width=2.0),
+        job,
+    )
+
+    assert preview["geometry_mode"] == "surface_3d"
+    assert preview["tool_orientation"]["available"] is True
+    assert preview["layers"][0]["resin_paths"][0]["points"] == mapped_path.tolist()
+
+
+def test_preview_keeps_a_long_honeycomb_macro_partition_as_one_path():
+    frame = np.asarray(
+        [[0.0, 0.0, 0.5], [10.0, 0.0, 0.5], [10.0, 8.0, 0.5], [0.0, 0.0, 0.5]],
+        dtype=np.float64,
+    )
+    x = np.linspace(0.0, 10.0, 7_201)
+    macro = np.column_stack((x, np.sin(x), np.full_like(x, 0.5)))
+    macro_e = np.concatenate(([0.0], np.cumsum(np.where(np.arange(7_200) % 7 == 0, 0.0, 1.0))))
+    job = ExternalSourceJob(
+        material_paths=[MaterialPaths(0, "R", [frame, macro], extrusion=[np.arange(4.0), macro_e])],
+        meta={
+            "path_roles": {"R": {"0": ["outer_contour", "honeycomb_wall"]}},
+            "motion_order": {"0": [{"kind": "deposit", "index": 0}, {"kind": "deposit", "index": 1}]},
+        },
+    )
+
+    preview = _preview_payload(Mesh(_cube_triangles(size=10.0)), SliceConfig(line_width=2.0), job)
+    layer = preview["layers"][0]
+
+    assert len(layer["resin_paths"]) == 2
+    assert len(layer["motion_paths"]) == 2
+    assert len(layer["resin_paths"][1]["points"]) == 7_201
+    assert layer["resin_paths"][1]["extrusion"] == macro_e.tolist()
+
+
+def test_preview_import_adapter_reads_mapped_external_npz(tmp_path):
+    mapped_path = np.asarray(
+        [[0.0, 0.0, 0.5, 0.0, 0.0, 0.0], [3.0, 1.0, 1.2, 8.0, -4.0, 2.0]],
+        dtype=np.float64,
+    )
+    source_path = tmp_path / "curved.npz"
+    write_external_source_npz(
+        ExternalSourceJob(material_paths=[MaterialPaths(0, "R", [mapped_path])]),
+        source_path,
+    )
+
+    preview = _preview_payload_from_source_npz(source_path.read_bytes(), source_path.name)
+
+    assert preview["geometry_mode"] == "surface_3d"
+    assert preview["tool_orientation"]["available"] is True
+    assert preview["layers"][0]["resin_paths"][0]["points"] == mapped_path.tolist()
 
 
 def test_isotropic_infill_explicit_z_bounds_keep_four_direction_schedule():
@@ -4439,6 +4586,138 @@ def test_ui_preview_supports_filtered_ordered_progress_pan_zoom_and_rulers():
         assert interaction in html
     assert "const isContour" not in html
     assert "pathIndex >= visiblePaths" not in html
+
+
+def test_ui_preview_reuses_canvas_for_surface_3d_tool_direction():
+    html = _index_html()
+
+    for feature in (
+        "geometry_mode === 'surface_3d'",
+        "buildSurfaceViewport",
+        "drawSurfaceReference",
+        "drawPrintHeadModel",
+        "kukaToolDirection",
+        "kukaToolFrame",
+        "/assets/printhead/printhead_interference_check.preview.json",
+        "showDirectionLabel",
+        "Math.min(window.devicePixelRatio || 1, 2)",
+        "左键旋转；右键或中键平移",
+    ):
+        assert feature in html
+    for removed_collision_feature in (
+        "printHeadInterferenceAt",
+        "segmentIntersectsBox",
+        "drawPrintHeadBoxes",
+        "collision_boxes",
+        "printHeadClearanceAt",
+        "clearance_cone",
+    ):
+        assert removed_collision_feature not in html
+
+    assert "safety_clearance_mm" not in html
+    assert "drawPrintHeadModel(ctx, point, viewport)" in html
+    assert 'id="surfaceNpzCollisionButton"' in html
+    assert 'id="surfaceNpzCollisionResult"' in html
+    assert "/check-surface-npz-collision" in html
+    assert "minimum_sampled_clearance_mm" in html
+    assert "coarse_sampling_pitch_mm" in html
+    assert "refinement_sampling_pitch_mm" in html
+    assert "conformal_lattice_external_source_npz" in html
+    assert "共形格栅结构边预览不适用旧版峰值曲率碰撞检查" in html
+    assert "导入曲面/共形 NPZ 预览" in html
+
+
+def test_ui_surface_preview_can_overlay_prior_layers_and_always_labels_curvature():
+    html = _index_html()
+
+    assert 'id="showLayerOverlay" type="checkbox"' in html
+    assert 'id="showLayerOverlay" type="checkbox" checked' not in html
+    assert "showLayerOverlayInput.checked" in html
+    assert "historicalOverlayEntries" in html
+    assert "drawHistoricalOverlay(historicalOverlayEntries())" in html
+    assert "const batches = new Map()" in html
+    assert "requestAnimationFrame" in html
+    assert "drawPreviewNow" in html
+    assert "historicalPathStride" in html
+    assert "Math.ceil(path.length / 240)" in html
+    assert "the complete E-aware view is restored on release" in html
+    assert "surfaceLayerCurvatureText" in html
+    assert "drawSurfaceLayerCurvature(ctx, viewport, layer)" in html
+    assert "κ min/avg/max" in html
+
+
+def test_ui_can_play_the_selected_print_path_with_direction_markers():
+    html = _index_html()
+
+    assert 'id="playCurrentPath" type="button"' in html
+    assert "播放当前路径" in html
+    assert 'id="pathPlaybackRate" type="range" min="0" max="1"' in html
+    assert 'value="1" aria-label="当前路径播放速率"' in html
+    assert "PLAYBACK_MAX_SPEED_MM_PER_S = 8" in html
+    assert "buildPathPlaybackTimeline" in html
+    assert "drawPlaybackPathArrow" in html
+    assert "buildPathPlaybackTimeline(entry.points, entry.extrusion)" in html
+    assert "deltaE <= 1e-9 ? '#2563eb' : '#dc2626'" in html
+    assert "drawPathDirectionMarkers" not in html
+    assert "pathPlayback.running && pathPlayback.timeline" in html
+    assert "stopPathPlayback();" in html
+
+
+def test_ui_remembers_the_last_surface_npz_preview_directory_when_supported():
+    html = _index_html()
+
+    assert "fetch('/choose-surface-npz-preview'" in html
+    assert "applyMappedSurfacePreview(result.preview, result.file_name, result.collision_check_available === true)" in html
+    assert "window.showOpenFilePicker" not in html
+
+
+def test_main_ui_recognizes_rectangular_conformal_design_json_before_slicing():
+    config = conformal_lattice_config_payload(
+        {
+            "part_length_mm": ["150"],
+            "part_width_mm": ["100"],
+            "part_height_mm": ["10"],
+            "layer_height_mm": ["0.5"],
+            "wall_width_mm": ["4"],
+            "base_cell_size_mm": ["8"],
+            "surface_start_layer": ["3"],
+        }
+    )
+
+    summary = _conformal_spec_ui_summary(
+        json.dumps(config).encode("utf-8"), "design.json"
+    )
+
+    assert summary["file_name"] == "design.json"
+    assert summary["part"]["mapping_reference_layer_count"] == 20
+    assert summary["lattice"] == {
+        "wall_width_mm": 4.0,
+        "wall_bead_count": 2,
+        "base_cell_size_mm": 8.0,
+    }
+    html = _index_html()
+    assert 'id="conformalSpecButton"' in html
+    assert 'id="conformalSpecInput"' in html
+    assert 'id="conformalSliceButton"' in html
+    assert "fetch('/inspect-conformal-spec'" in html
+    assert "fetch('/conformal-slice'" in html
+
+
+def test_surface_npz_picker_directory_is_persisted_in_local_ui_state(tmp_path):
+    selected_directory = tmp_path / "mapped"
+    selected_directory.mkdir()
+    state_path = tmp_path / ".surface_preview_picker.json"
+
+    _save_surface_preview_last_directory(state_path, selected_directory)
+
+    assert _load_surface_preview_last_directory(state_path) == selected_directory
+
+
+def test_surface_npz_picker_uses_a_native_dialog_without_launching_powershell():
+    picker_source = inspect.getsource(_choose_mapped_surface_npz_file)
+
+    assert "filedialog.askopenfilename" in picker_source
+    assert '"powershell"' not in picker_source
 
 
 def test_preview_simplification_keeps_contour_corners():

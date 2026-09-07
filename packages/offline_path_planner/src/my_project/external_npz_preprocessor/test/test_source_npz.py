@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from external_npz_preprocessor.source_npz import (
+    LOGICAL_LAYER_SEMANTICS_FORMAT,
     SOURCE_NPZ_CONTRACT_ID,
     load_source_npz,
 )
@@ -170,4 +171,57 @@ def test_rejects_explicit_unknown_source_contract(tmp_path):
     )
 
     with pytest.raises(ValueError, match="unsupported source NPZ format"):
+        load_source_npz(source)
+
+
+def test_loads_curved_paths_by_logical_layer_key_not_by_z(tmp_path):
+    source = tmp_path / "curved_logical_layers.npz"
+    layer_zero = np.asarray(
+        [[[0.0, 0.0, 1.4], [5.0, 0.0, 0.9]]], dtype=np.float64
+    )
+    layer_one = np.asarray(
+        [[[0.0, 1.0, 0.6], [5.0, 1.0, 1.8]]], dtype=np.float64
+    )
+    semantics = {
+        "format": LOGICAL_LAYER_SEMANTICS_FORMAT,
+        "layer_key": "logical_deposition_layer",
+        "z_coordinate": "per_point_trajectory",
+        "ordering": "ascending_layer_key_then_source_path_order",
+        "reconstruct_layers_from_z": False,
+    }
+    np.savez(
+        source,
+        meta=np.array(json.dumps({"format": SOURCE_NPZ_CONTRACT_ID, "layer_semantics": semantics})),
+        layer_0000_R=layer_zero,
+        layer_0001_R=layer_one,
+    )
+
+    job = load_source_npz(source)
+
+    assert [layer.logical_layer_index for layer in job.layers] == [0, 1]
+    np.testing.assert_allclose(job.layers[0].resin_paths[0].points[:, 2], [1.4, 0.9])
+    np.testing.assert_allclose(job.layers[1].resin_paths[0].points[:, 2], [0.6, 1.8])
+
+
+def test_rejects_layer_semantics_that_reconstructs_layers_from_z(tmp_path):
+    source = tmp_path / "bad_layer_semantics.npz"
+    resin_paths = np.asarray(
+        [[[0.0, 0.0, 0.5], [1.0, 0.0, 0.7]]], dtype=np.float64
+    )
+    np.savez(
+        source,
+        meta=np.array(json.dumps({
+            "format": SOURCE_NPZ_CONTRACT_ID,
+            "layer_semantics": {
+                "format": LOGICAL_LAYER_SEMANTICS_FORMAT,
+                "layer_key": "logical_deposition_layer",
+                "z_coordinate": "per_point_trajectory",
+                "ordering": "ascending_layer_key_then_source_path_order",
+                "reconstruct_layers_from_z": True,
+            },
+        })),
+        layer_0000_R=resin_paths,
+    )
+
+    with pytest.raises(ValueError, match="reconstruct_layers_from_z must be False"):
         load_source_npz(source)
