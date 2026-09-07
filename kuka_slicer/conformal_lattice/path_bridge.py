@@ -97,9 +97,16 @@ class ConformalLatticePathGraph:
         edge_ids_by_layer: dict[str, list[int]] = {}
         planning_reports: list[dict[str, object]] = []
         extrusion_config = self.metadata["config"]["extrusion"]
+        # Topology is invariant under layer embedding.  Plan the exact
+        # non-repeating trail cover once, then only render that node sequence
+        # at each physical layer instead of re-running graph search per layer.
+        topology = _plan_macro_partition_topology(
+            self.edge_node_ids,
+            self.layer_node_positions_xyz[0],
+        )
         for layer_index, positions in enumerate(self.layer_node_positions_xyz):
-            paths, extrusion, travels, planning_report = _plan_layer_macro_partitions(
-                self.edge_node_ids,
+            paths, extrusion, travels, planning_report = _render_layer_macro_partitions(
+                topology,
                 positions,
                 self.node_normals_xyz,
                 bead_count=self.wall_bead_count,
@@ -327,8 +334,52 @@ def _stable_edges(
     return edge_ids[order], nodes[order], parent[order], segment[order], faces[order]
 
 
-def _plan_layer_macro_partitions(
+@dataclass(frozen=True, slots=True)
+class _MacroPartitionTopology:
+    macro_node_paths: tuple[tuple[tuple[int, ...], tuple[bool, ...]], ...]
+    travel_node_paths: tuple[tuple[int, ...], ...]
+    minimum_trail_count: int
+    structural_edge_count: int
+
+
+def _plan_macro_partition_topology(
     edge_nodes: np.ndarray,
+    reference_positions: np.ndarray,
+) -> _MacroPartitionTopology:
+    """Plan a layer-invariant exact edge-once cover on stable node IDs."""
+
+    graph_edges = [
+        _Edge((float(first), 0.0), (float(second), 0.0), float(np.linalg.norm(reference_positions[first] - reference_positions[second])))
+        for first, second in np.asarray(edge_nodes, dtype=np.int64)
+    ]
+    trails = [
+        [int(round(node[0])) for node in trail]
+        for trail in _minimum_trail_cover(graph_edges)
+    ]
+    adjacency = _node_adjacency(edge_nodes, reference_positions)
+    components = _trails_by_graph_component(trails, adjacency)
+    macro_node_paths: list[tuple[list[int], list[bool]]] = []
+    travel_node_paths: list[list[int]] = []
+    previous_end: int | None = None
+    for component in components:
+        node_path, deposited = _join_component_trails(component, adjacency, reference_positions)
+        if previous_end is not None:
+            # Separate components have no structural-edge route.  Preserve the
+            # old macro-partition meaning with an explicit zero-E T motion.
+            travel_node_paths.append([previous_end, node_path[0]])
+        macro_node_paths.append((node_path, deposited))
+        previous_end = node_path[-1]
+
+    return _MacroPartitionTopology(
+        macro_node_paths=tuple((tuple(nodes), tuple(deposited)) for nodes, deposited in macro_node_paths),
+        travel_node_paths=tuple(tuple(nodes) for nodes in travel_node_paths),
+        minimum_trail_count=len(trails),
+        structural_edge_count=len(edge_nodes),
+    )
+
+
+def _render_layer_macro_partitions(
+    topology: _MacroPartitionTopology,
     positions: np.ndarray,
     normals: np.ndarray,
     *,
@@ -337,29 +388,7 @@ def _plan_layer_macro_partitions(
     bead_area_mm2: float,
     e_volume_per_unit_mm3: float,
 ) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], dict[str, object]]:
-    """Reuse the legacy exact trail cover on stable node IDs, not STL holes."""
-
-    graph_edges = [
-        _Edge((float(first), 0.0), (float(second), 0.0), float(np.linalg.norm(positions[first] - positions[second])))
-        for first, second in np.asarray(edge_nodes, dtype=np.int64)
-    ]
-    trails = [
-        [int(round(node[0])) for node in trail]
-        for trail in _minimum_trail_cover(graph_edges)
-    ]
-    adjacency = _node_adjacency(edge_nodes, positions)
-    components = _ordered_trail_components(trails, adjacency)
-    macro_node_paths: list[tuple[list[int], list[bool]]] = []
-    travel_node_paths: list[list[int]] = []
-    previous_end: int | None = None
-    for component in components:
-        node_path, deposited = _join_component_trails(component, adjacency)
-        if previous_end is not None:
-            # Separate components have no structural-edge route.  Preserve the
-            # old macro-partition meaning with an explicit zero-E T motion.
-            travel_node_paths.append([previous_end, node_path[0]])
-        macro_node_paths.append((node_path, deposited))
-        previous_end = node_path[-1]
+    """Render the already planned structural node paths at one layer."""
 
     paths: list[np.ndarray] = []
     profiles: list[np.ndarray] = []
@@ -367,9 +396,9 @@ def _plan_layer_macro_partitions(
         (lane - (bead_count - 1) / 2.0) * bead_width_mm
         for lane in range(bead_count)
     ]
-    for nodes, deposited in macro_node_paths:
+    for nodes, deposited in topology.macro_node_paths:
         for offset in lane_offsets:
-            lane_points = _offset_lane_points(nodes, positions, normals, offset)
+            lane_points = _offset_lane_points(list(nodes), positions, normals, offset)
             paths.append(lane_points)
             profiles.append(
                 _profile_for_deposition_segments(
@@ -379,14 +408,14 @@ def _plan_layer_macro_partitions(
                     e_volume_per_unit_mm3=e_volume_per_unit_mm3,
                 )
             )
-    travels = [positions[np.asarray(nodes, dtype=np.int64)].copy() for nodes in travel_node_paths]
+    travels = [positions[np.asarray(nodes, dtype=np.int64)].copy() for nodes in topology.travel_node_paths]
     return paths, profiles, travels, {
         "strategy": "minimum_non_repeating_trail_cover_with_existing_edge_zero_e_connectors",
-        "structural_edge_count": int(len(edge_nodes)),
-        "minimum_non_repeating_trail_count": int(len(trails)),
-        "macro_partition_count": int(len(macro_node_paths)),
-        "intra_partition_zero_e_connector_count": int(max(0, len(trails) - len(macro_node_paths))),
-        "inter_partition_travel_count": int(len(travel_node_paths)),
+        "structural_edge_count": int(topology.structural_edge_count),
+        "minimum_non_repeating_trail_count": int(topology.minimum_trail_count),
+        "macro_partition_count": int(len(topology.macro_node_paths)),
+        "intra_partition_zero_e_connector_count": int(max(0, topology.minimum_trail_count - len(topology.macro_node_paths))),
+        "inter_partition_travel_count": int(len(topology.travel_node_paths)),
         "wall_bead_count": int(bead_count),
         "bead_lane_offsets_mm": lane_offsets,
         "structural_edge_deposition": "each edge is deposited once per 2 mm bead lane; graph-route connector segments keep E unchanged",
@@ -404,49 +433,38 @@ def _node_adjacency(edge_nodes: np.ndarray, positions: np.ndarray) -> dict[int, 
     return adjacency
 
 
-def _ordered_trail_components(
+def _trails_by_graph_component(
     trails: list[list[int]], adjacency: dict[int, list[tuple[int, float]]]
 ) -> list[list[list[int]]]:
-    remaining = list(enumerate(trails))
-    components: list[list[list[int]]] = []
-    while remaining:
-        _index, first = remaining.pop(0)
-        nodes = set(first)
-        group = [first]
-        changed = True
-        while changed:
-            changed = False
-            kept: list[tuple[int, list[int]]] = []
-            for index, trail in remaining:
-                if any(_node_reachable(node, nodes, adjacency) for node in (trail[0], trail[-1])):
-                    group.append(trail)
-                    nodes.update(trail)
-                    changed = True
-                else:
-                    kept.append((index, trail))
-            remaining = kept
-        components.append(group)
-    return components
-
-
-def _node_reachable(source: int, targets: set[int], adjacency: dict[int, list[tuple[int, float]]]) -> bool:
-    frontier = [source]
-    seen = {source}
-    while frontier:
-        node = frontier.pop()
-        if node in targets:
-            return True
-        for other, _length in adjacency.get(node, []):
-            if other not in seen:
-                seen.add(other)
-                frontier.append(other)
-    return False
+    component_for_node: dict[int, int] = {}
+    component_id = 0
+    for start in sorted(adjacency):
+        if start in component_for_node:
+            continue
+        component_for_node[start] = component_id
+        pending = [start]
+        while pending:
+            node = pending.pop()
+            for other, _length in adjacency[node]:
+                if other not in component_for_node:
+                    component_for_node[other] = component_id
+                    pending.append(other)
+        component_id += 1
+    grouped: dict[int, list[list[int]]] = {}
+    for trail in trails:
+        component = component_for_node.get(trail[0])
+        if component is None or any(component_for_node.get(node) != component for node in trail):
+            raise ValueError("trail contains a node outside the structural graph component")
+        grouped.setdefault(component, []).append(trail)
+    return [grouped[index] for index in sorted(grouped)]
 
 
 def _join_component_trails(
-    trails: list[list[int]], adjacency: dict[int, list[tuple[int, float]]]
+    trails: list[list[int]],
+    adjacency: dict[int, list[tuple[int, float]]],
+    reference_positions: np.ndarray,
 ) -> tuple[list[int], list[bool]]:
-    """Deterministically pick shortest graph connectors without redeposition."""
+    """Join the exact cover with one shortest structural connector per trail."""
 
     remaining = [list(trail) for trail in trails]
     current = min(remaining, key=lambda trail: (min(trail[0], trail[-1]), tuple(trail)))
@@ -456,17 +474,17 @@ def _join_component_trails(
     nodes = list(current)
     deposited = [True] * (len(current) - 1)
     while remaining:
-        choices: list[tuple[float, tuple[int, ...], int, list[int], list[int]]] = []
+        choices: list[tuple[float, tuple[int, ...], int, list[int]]] = []
         for index, trail in enumerate(remaining):
             for oriented in (trail, list(reversed(trail))):
-                connector = _shortest_node_route(nodes[-1], oriented[0], adjacency)
-                if connector is not None:
-                    choices.append((
-                        _node_route_length(connector, adjacency), tuple(oriented), index, oriented, connector
-                    ))
+                distance = float(np.linalg.norm(reference_positions[nodes[-1]] - reference_positions[oriented[0]]))
+                choices.append((distance, tuple(oriented), index, oriented))
         if not choices:
             raise ValueError("connected conformal lattice trails have no existing-edge connector")
-        _length, _tie, index, trail, connector = min(choices, key=lambda item: item[:2])
+        _distance, _tie, index, trail = min(choices, key=lambda item: item[:2])
+        connector = _shortest_node_route(nodes[-1], trail[0], adjacency)
+        if connector is None:
+            raise ValueError("connected conformal lattice trails have no existing-edge connector")
         nodes.extend(connector[1:])
         deposited.extend([False] * (len(connector) - 1))
         nodes.extend(trail[1:])

@@ -43,13 +43,16 @@ def prepare_surface_mesh_domain(
     input_sha256: str | None = None,
     merge_tolerance_mm: float = 1e-9,
     area_tolerance_mm2: float = 1e-12,
+    validate_self_intersections: bool = True,
 ) -> SurfaceMeshDomain:
     """Clean, orient, and validate an external indexed triangle mesh.
 
     Duplicate vertices within ``merge_tolerance_mm`` are merged, zero-area
     faces are removed, and every later topology decision is recorded in the
     returned report.  Non-manifold vertices/edges, duplicate faces and
-    self-intersections are hard failures rather than silent repairs.
+    self-intersections are hard failures rather than silent repairs.  An
+    analytical height-field producer may opt out only when its construction
+    itself proves that non-adjacent faces cannot overlap.
     """
 
     source_vertices = _vertices(vertices)
@@ -70,7 +73,7 @@ def prepare_surface_mesh_domain(
     oriented_faces, orientation_flips = _orient_faces(cleaned_faces)
     topology = _topology(oriented_faces, len(cleaned_vertices))
     _reject_nonmanifold(topology)
-    intersections = _self_intersection_pairs(cleaned_vertices, oriented_faces)
+    intersections = _self_intersection_pairs(cleaned_vertices, oriented_faces) if validate_self_intersections else []
     if intersections:
         preview = ", ".join(f"({left},{right})" for left, right in intersections[:5])
         raise ValueError(f"mesh has self-intersecting non-adjacent triangles: {preview}")
@@ -97,6 +100,7 @@ def prepare_surface_mesh_domain(
             "nonmanifold_vertex_count": 0,
             "duplicate_face_count": 0,
             "self_intersection_count": 0,
+            "self_intersection_validation": "full_pairwise" if validate_self_intersections else "analytical_height_field_guarantee",
             "seam_edge_count": 0,
         },
     )
@@ -204,7 +208,17 @@ def build_double_sine_surface_domain(spec: ConformalLatticeSpec) -> SurfaceMeshD
             top_left = bottom_left + samples_x
             top_right = top_left + 1
             faces.extend(([bottom_left, bottom_right, top_right], [bottom_left, top_right, top_left]))
-    domain = prepare_surface_mesh_domain(vertices, np.asarray(faces, dtype=np.int64), input_sha256=spec.source_sha256)
+    # A rectangular double-sine surface is the graph z=f(x,y), triangulated
+    # over a non-overlapping rectangular XY grid.  Thus two non-adjacent
+    # triangles cannot intersect in 3D without first overlapping in XY.  The
+    # generic O(face^2) intersection scan remains mandatory for imported
+    # triangle meshes, but is redundant for this analytical source.
+    domain = prepare_surface_mesh_domain(
+        vertices,
+        np.asarray(faces, dtype=np.int64),
+        input_sha256=spec.source_sha256,
+        validate_self_intersections=False,
+    )
     return _with_report(domain, {"provider": "double_sine", "source_file": spec.source_file, "generated": True})
 
 
@@ -441,21 +455,26 @@ def _nonmanifold_vertices(
     for face_index, face in enumerate(faces):
         for vertex in face:
             incident[int(vertex)].append(face_index)
+    neighboring: list[dict[int, list[int]]] = [
+        {face: [] for face in face_indices} for face_indices in incident
+    ]
+    for (left_vertex, right_vertex), shared_faces in edge_faces.items():
+        if len(shared_faces) != 2:
+            continue
+        left_face, right_face = shared_faces
+        for vertex in (left_vertex, right_vertex):
+            neighboring[vertex][left_face].append(right_face)
+            neighboring[vertex][right_face].append(left_face)
     bad: list[int] = []
     for vertex, face_indices in enumerate(incident):
         if len(face_indices) <= 1:
             continue
-        neighboring: dict[int, list[int]] = {face: [] for face in face_indices}
-        for key, shared_faces in edge_faces.items():
-            if vertex in key and len(shared_faces) == 2:
-                left, right = shared_faces
-                neighboring[left].append(right)
-                neighboring[right].append(left)
+        adjacency = neighboring[vertex]
         seen = {face_indices[0]}
         pending = [face_indices[0]]
         while pending:
             current = pending.pop()
-            for neighbor in neighboring[current]:
+            for neighbor in adjacency[current]:
                 if neighbor not in seen:
                     seen.add(neighbor)
                     pending.append(neighbor)

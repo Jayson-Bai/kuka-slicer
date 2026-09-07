@@ -33,7 +33,9 @@ class ConformalLatticeRun:
     orientation: OrientationField
     phase: PhaseCoordinates
     geometry: ConformalLatticeGeometry
-    fill_validation: FillRatioValidation
+    # Gate 6 is an expensive diagnostic.  It is intentionally absent from
+    # normal production exports, where it must not delay path planning/Core.
+    fill_validation: FillRatioValidation | None
     layer_embedding: LayerEmbedding
     path_graph: ConformalLatticePathGraph | None
 
@@ -76,7 +78,14 @@ class ConformalLatticeRun:
             if self.path_graph is not None
             else "provide explicit bead_cross_section_area_mm2 and e_volume_per_unit_mm3 from a process preset",
             "layer_embedding": self.layer_embedding.report,
-            "fill_ratio": self.fill_validation.report,
+            "fill_ratio": (
+                self.fill_validation.report
+                if self.fill_validation is not None
+                else {
+                    "status": "skipped",
+                    "reason": "Gate 6 实际填充率测量仅用于质量诊断，未在生产导出中执行",
+                }
+            ),
         }
 
 
@@ -86,13 +95,16 @@ def run_conformal_lattice_pipeline(
     logical_layer_count: int | None = None,
     physical_layer_height_mm: float | None = None,
     extrusion: ExtrusionVolumeModel | None = None,
+    validate_fill_ratio: bool = False,
     fill_samples_per_triangle_side: int = 6,
 ) -> ConformalLatticeRun:
     """Run Gates 1--8 in order for the supported double-sine UI workflow.
 
     ``logical_layer_count`` belongs to the slicer/process side of the interface,
     not to the analytical surface definition.  Path export stays unavailable
-    until its explicit physical E conversion is supplied.
+    until its explicit physical E conversion is supplied.  Gate 6 actual-fill
+    measurement is opt-in because its per-cell/per-triangle sampling is a
+    quality diagnostic, not an input to the one-stroke path or Core export.
     """
 
     spec = config if isinstance(config, ConformalLatticeSpec) else load_conformal_lattice_spec(config)
@@ -113,6 +125,8 @@ def run_conformal_lattice_pipeline(
         raise ValueError("logical_layer_count must be an integer >= 1")
     if not isinstance(fill_samples_per_triangle_side, int) or fill_samples_per_triangle_side < 2:
         raise ValueError("fill_samples_per_triangle_side must be an integer >= 2")
+    if not isinstance(validate_fill_ratio, bool):
+        raise ValueError("validate_fill_ratio must be a boolean")
 
     domain = build_double_sine_surface_domain(spec)
     parameterization = parameterize_spec_lscm(spec, domain)
@@ -133,15 +147,17 @@ def run_conformal_lattice_pipeline(
         random_seed=spec.random_seed,
         config_metadata=spec.metadata(),
     )
-    fill_validation = validate_realized_fill_ratio(
-        domain,
-        parameterization,
-        design_fields,
-        phase,
-        geometry,
-        wall_width_mm=float(spec.lattice["wall_width_mm"]),
-        samples_per_triangle_side=fill_samples_per_triangle_side,
-    )
+    fill_validation = None
+    if validate_fill_ratio:
+        fill_validation = validate_realized_fill_ratio(
+            domain,
+            parameterization,
+            design_fields,
+            phase,
+            geometry,
+            wall_width_mm=float(spec.lattice["wall_width_mm"]),
+            samples_per_triangle_side=fill_samples_per_triangle_side,
+        )
     layer_embedding = _symmetric_layer_embedding(domain, orientation, geometry, spec, logical_layer_count, base_z_by_layer)
     path_graph = None if extrusion is None else build_conformal_lattice_path_graph(
         geometry,

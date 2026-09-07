@@ -69,7 +69,7 @@ def _spec(*, surface_start_layer: int = 0):
     )
 
 
-def test_pipeline_runs_gates_one_to_eight_and_only_enables_paths_with_an_explicit_e_model(tmp_path):
+def test_pipeline_skips_expensive_fill_diagnostic_for_production_path_export(tmp_path):
     run = run_conformal_lattice_pipeline(
         _spec(),
         logical_layer_count=4,
@@ -87,6 +87,8 @@ def test_pipeline_runs_gates_one_to_eight_and_only_enables_paths_with_an_explici
     assert run.layer_embedding.report["alpha_by_layer"] == [0.0, 1.0, 1.0, 0.0]
     assert run.path_graph is not None
     assert run.report["path_npz_export_available"] is True
+    assert run.fill_validation is None
+    assert run.report["fill_ratio"]["status"] == "skipped"
     assert run.preview_payload()["read_only"] is True
     main_preview = run.main_preview_payload(planning_line_width_mm=0.6)
     assert main_preview["preview_source"] == "conformal_lattice_external_source_job"
@@ -100,6 +102,8 @@ def test_pipeline_runs_gates_one_to_eight_and_only_enables_paths_with_an_explici
     assert set(outputs) == {"geometry", "paths"}
     with np.load(outputs["geometry"], allow_pickle=False) as archive:
         assert archive["target_cell_size_mm_per_vertex"] == pytest.approx(2.0)
+        geometry_metadata = json.loads(str(archive["meta"]))
+    assert geometry_metadata["fill_ratio_validation"] is None
     with np.load(outputs["paths"], allow_pickle=False) as archive:
         metadata = json.loads(str(archive["meta"]))
     assert metadata["format"] == "external_layer_paths_v1"
@@ -110,6 +114,18 @@ def test_pipeline_runs_gates_one_to_eight_and_only_enables_paths_with_an_explici
     assert loaded_preview["preview_source"] == "conformal_lattice_external_source_npz"
     assert loaded_preview["line_widths"]["resin"] == pytest.approx(0.6)
     assert loaded_preview["conformal_lattice"]["uses_existing_main_canvas"] is True
+
+
+def test_pipeline_runs_actual_fill_diagnostic_only_when_explicitly_requested():
+    run = run_conformal_lattice_pipeline(
+        _spec(),
+        logical_layer_count=4,
+        validate_fill_ratio=True,
+        fill_samples_per_triangle_side=3,
+    )
+
+    assert run.fill_validation is not None
+    assert run.report["fill_ratio"]["evaluated_cell_count"] > 0
 
 
 def test_pipeline_keeps_path_export_disabled_without_process_e_conversion(tmp_path):

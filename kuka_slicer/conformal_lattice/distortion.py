@@ -166,18 +166,49 @@ def nonadjacent_triangle_overlap_pairs(coordinates: np.ndarray, faces: np.ndarra
 
 def _overlap_pairs_2d(uv: np.ndarray, faces: np.ndarray) -> list[tuple[int, int]]:
     pairs: list[tuple[int, int]] = []
-    for left, face in enumerate(faces):
+    for left, right in _overlap_candidate_pairs(uv, faces):
+        face = faces[left]
+        if set(face).intersection(faces[right]):
+            continue
         first = uv[face]
-        first_min, first_max = np.min(first, axis=0), np.max(first, axis=0)
-        for right in range(left + 1, len(faces)):
-            if set(face).intersection(faces[right]):
-                continue
-            second = uv[faces[right]]
-            if np.any(first_max < np.min(second, axis=0)) or np.any(np.max(second, axis=0) < first_min):
-                continue
-            if _triangles_overlap_2d(first, second):
-                pairs.append((left, right))
+        second = uv[faces[right]]
+        if _triangles_overlap_2d(first, second):
+            pairs.append((left, right))
     return pairs
+
+
+def _overlap_candidate_pairs(uv: np.ndarray, faces: np.ndarray) -> list[tuple[int, int]]:
+    """Return face pairs whose 2D bounding boxes overlap.
+
+    The exact triangle predicate remains below.  This uniform spatial index
+    only avoids visiting the overwhelming majority of clearly distant pairs;
+    unlike the former all-pairs loop it remains practical for the 48 x 48
+    analytical surface used by the UI.
+    """
+
+    triangles = uv[faces]
+    lower = np.min(triangles, axis=1)
+    upper = np.max(triangles, axis=1)
+    origin = np.min(lower, axis=0)
+    extent = np.max(upper, axis=0) - origin
+    resolution = max(1, int(math.ceil(math.sqrt(len(faces)))))
+    # Degenerate global ranges are still checked safely in one grid column.
+    scaled_extent = np.where(extent > 1e-14, extent, 1.0)
+    first_cell = np.floor((lower - origin) * resolution / scaled_extent).astype(np.int64)
+    last_cell = np.floor((upper - origin) * resolution / scaled_extent).astype(np.int64)
+    first_cell = np.clip(first_cell, 0, resolution - 1)
+    last_cell = np.clip(last_cell, 0, resolution - 1)
+    buckets: dict[tuple[int, int], list[int]] = {}
+    for face_id, (start, end) in enumerate(zip(first_cell, last_cell)):
+        for x in range(int(start[0]), int(end[0]) + 1):
+            for y in range(int(start[1]), int(end[1]) + 1):
+                buckets.setdefault((x, y), []).append(face_id)
+    candidates: set[tuple[int, int]] = set()
+    for members in buckets.values():
+        for offset, left in enumerate(members):
+            for right in members[offset + 1 :]:
+                candidates.add((left, right) if left < right else (right, left))
+    return sorted(candidates)
 
 
 def _triangles_overlap_2d(first: np.ndarray, second: np.ndarray, tolerance: float = 1e-12) -> bool:

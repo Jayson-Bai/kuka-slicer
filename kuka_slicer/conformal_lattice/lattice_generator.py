@@ -16,7 +16,7 @@ from typing import Literal, Mapping
 import numpy as np
 
 from .mesh_domain import SurfaceMeshDomain
-from .inverse_mapping import PhaseSurfaceInverseMapper, locate_phase_point, phase_point_key, phase_segment_intervals
+from .inverse_mapping import PhaseSurfaceInverseMapper, locate_phase_point, phase_point_key
 from .orientation_field import OrientationField
 from .parameterization import LSCMParameterization
 from .phase_coordinates import PhaseCoordinates
@@ -149,8 +149,8 @@ def generate_conformal_lattice_geometry(
     centers = _triangular_lattice_centers(phase_vertices, origin)
     polygons = centers[:, None, :] + _HEXAGON_OFFSETS[None, :, :]
     abstract_vertices, abstract_edges, cell_abstract_nodes = _dual_hex_topology(polygons)
-    edge_intervals = [phase_segment_intervals(abstract_vertices[left], abstract_vertices[right], phase_vertices, domain.faces) for left, right in abstract_edges]
     nodes = PhaseSurfaceInverseMapper(domain, parameterization.uv, phase_vertices)
+    edge_intervals = [nodes.segment_intervals(abstract_vertices[left], abstract_vertices[right]) for left, right in abstract_edges]
     abstract_edge_index = {tuple(edge): index for index, edge in enumerate(abstract_edges)}
     edges, edge_parent, edge_segment, edge_face = _map_clipped_edges(abstract_vertices, abstract_edges, edge_intervals, nodes)
     cell_rows: list[list[int]] = []
@@ -163,7 +163,9 @@ def generate_conformal_lattice_geometry(
             cell_parent.append(parent_id)
             cell_boundary.append(False)
         elif boundary_mode == "clip":
-            for fragment in _clipped_cell_fragments(polygons[parent_id], phase_vertices, domain.faces):
+            polygon = polygons[parent_id]
+            candidates = nodes.candidate_faces_for_bounds(np.min(polygon, axis=0), np.max(polygon, axis=0))
+            for fragment in _clipped_cell_fragments(polygon, phase_vertices, domain.faces, candidate_face_ids=candidates):
                 cell_rows.append([nodes.add(point) for point in fragment])
                 cell_parent.append(parent_id)
                 cell_boundary.append(True)
@@ -316,9 +318,16 @@ def _merged_coverage(intervals: list[tuple[float, float, int]]) -> list[tuple[fl
     return result
 
 
-def _clipped_cell_fragments(polygon: np.ndarray, phase_vertices: np.ndarray, faces: np.ndarray) -> list[np.ndarray]:
+def _clipped_cell_fragments(
+    polygon: np.ndarray,
+    phase_vertices: np.ndarray,
+    faces: np.ndarray,
+    *,
+    candidate_face_ids: np.ndarray | None = None,
+) -> list[np.ndarray]:
     fragments: list[np.ndarray] = []
-    for face in faces:
+    selected_faces = faces if candidate_face_ids is None else faces[candidate_face_ids]
+    for face in selected_faces:
         fragment = _clip_polygon_to_ccw_triangle(polygon, phase_vertices[face])
         if len(fragment) >= 3 and abs(_polygon_area(fragment)) > _EPSILON:
             fragments.append(fragment)

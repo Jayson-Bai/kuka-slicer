@@ -12,6 +12,7 @@ from kuka_slicer.conformal_lattice import (
     generate_conformal_lattice_geometry,
     write_conformal_lattice_external_npz,
 )
+from kuka_slicer.conformal_lattice import path_bridge
 from tests.test_conformal_lattice_lattice_generator import _inputs
 
 
@@ -97,3 +98,27 @@ def test_path_bridge_expands_a_4mm_wall_into_two_2mm_bead_lanes():
     assert bridge["wall_bead_lanes"] == 2
     assert bridge["trail_partition"]["bead_lane_offsets_mm"] == [-1.0, 1.0]
     assert len(job.material_paths[0].paths) == bridge["trail_partition"]["macro_partition_count"] * 2
+
+
+def test_path_bridge_reuses_one_topology_plan_for_all_embedded_layers(monkeypatch):
+    domain, parameterization, fields, orientation, phase = _inputs()
+    geometry = generate_conformal_lattice_geometry(domain, parameterization, fields, orientation, phase, boundary_mode="inset")
+    stack = embed_lattice_layers(domain, orientation, geometry, layer_offsets_mm=(0.0, 0.2, 0.4))
+    graph = build_conformal_lattice_path_graph(
+        geometry,
+        ExtrusionVolumeModel(bead_cross_section_area_mm2=0.2, e_volume_per_unit_mm3=0.1),
+        layer_embedding=stack,
+    )
+    calls = 0
+    original = path_bridge._minimum_trail_cover
+
+    def counted(edges):
+        nonlocal calls
+        calls += 1
+        return original(edges)
+
+    monkeypatch.setattr(path_bridge, "_minimum_trail_cover", counted)
+    job = graph.to_external_source_job()
+
+    assert calls == 1
+    assert len(job.material_paths) == 3

@@ -1526,7 +1526,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         from .conformal_lattice.path_bridge import ExtrusionVolumeModel
         from .conformal_lattice.pipeline import run_conformal_lattice_pipeline, write_conformal_lattice_outputs
 
-        progress(12, "正在计算双正弦曲面、共形参数化和蜂窝结构")
+        progress(12, "正在计算双正弦曲面、共形蜂窝结构与一笔画分区")
         run = run_conformal_lattice_pipeline(
             spec,
             physical_layer_height_mm=layer_height,
@@ -1538,6 +1538,11 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                 e_volume_per_unit_mm3=bead_area / e_per_mm,
                 preview_line_width_mm=2.0,
             ),
+            # Gate 6 samples every cell against the surface triangles.  It is
+            # a quality-analysis tool, not part of manufacturing generation;
+            # keeping it out of this request lets the prepared one-stroke
+            # conformal paths proceed directly to Core.
+            validate_fill_ratio=False,
         )
         progress(55, "正在按一笔画分区生成 External Source NPZ")
         outputs = write_conformal_lattice_outputs(run, job_dir)
