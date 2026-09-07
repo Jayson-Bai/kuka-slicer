@@ -48,13 +48,13 @@ def test_conformal_design_json_generates_external_source_and_core_output(tmp_pat
     result = handler._handle_conformal_slice(
         "",
         request_data=(
-            {},
+            {"core_resin_layer_height": ["0.25"]},
             {"conformal_spec": ("small_design.json", json.dumps(config).encode("utf-8"))},
         ),
         progress_callback=lambda value, _message: progress.append(value),
     )
 
-    assert result["layers"] == 2
+    assert result["layers"] == 4
     assert result["effective_infill_pattern"] == "共形蜂窝一笔画分区"
     assert result["preview"]["preview_source"] == "conformal_lattice_external_source_job"
     assert (tmp_path / result["download_url"].split("/")[-2] / "external_layer_paths_v1.npz").is_file()

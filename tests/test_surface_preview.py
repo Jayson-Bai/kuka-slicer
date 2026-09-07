@@ -112,7 +112,7 @@ def test_surface_preview_html_has_an_independent_surface_api_and_controls():
     assert 'id="part_length_mm"' in html
     assert 'id="part_width_mm"' in html
     assert 'id="part_height_mm"' in html
-    assert 'id="layer_height_mm"' in html
+    assert 'id="layer_height_mm"' not in html
     assert 'id="wall_width_mm"' in html
     assert 'id="base_cell_size_mm"' in html
     assert 'id="surface_start_layer"' in html
@@ -192,7 +192,7 @@ def test_conformal_lattice_export_binds_double_sine_to_a_rectangular_physical_pa
             "part_length_mm": ["150"],
             "part_width_mm": ["100"],
             "part_height_mm": ["10"],
-            "layer_height_mm": ["0.5"],
+            "layer_height_mm": ["0.25"],
             "amplitude_mm": ["1.5"],
             "wavelength_x_mm": ["30"],
             "wavelength_y_mm": ["40"],

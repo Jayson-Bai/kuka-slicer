@@ -93,9 +93,9 @@ def _conformal_spec_ui_summary(payload: bytes, filename: str) -> dict[str, objec
             "length_mm": float(part["length_mm"]),
             "width_mm": float(part["width_mm"]),
             "final_height_mm": final_height,
-            "logical_layer_count": int(np.ceil(final_height / layer_height)),
+            "mapping_reference_layer_count": int(np.ceil(final_height / layer_height)),
         },
-        "manufacturing": {
+        "mapping_reference": {
             "layer_height_mm": layer_height,
             "nominal_bead_width_mm": float(manufacturing["nominal_bead_width_mm"]),
         },
@@ -1513,14 +1513,9 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
 
         _ensure_offline_planner_import_paths()
         process_params_module = importlib.import_module("external_npz_preprocessor.process_params")
-        core_params_input = dict(params)
-        layer_height = float(spec.manufacturing["layer_height_mm"])
-        # The design JSON is the authority for the physical build height and
-        # its layer schedule; prevent an unrelated regular-STL form value from
-        # silently changing conformal extrusion density.
-        core_params_input["core_resin_layer_height"] = [str(layer_height)]
-        core_params = _parse_core_process_params(core_params_input, process_params_module)
+        core_params = _parse_core_process_params(params, process_params_module)
         resin = core_params.resin
+        layer_height = float(resin.layer_height_mm)
         e_per_mm = float(resin.e_per_mm())
         if e_per_mm <= 0.0:
             raise ValueError("当前 Core 树脂 E/mm 必须为正数")
@@ -1534,6 +1529,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         progress(12, "正在计算双正弦曲面、共形参数化和蜂窝结构")
         run = run_conformal_lattice_pipeline(
             spec,
+            physical_layer_height_mm=layer_height,
             extrusion=ExtrusionVolumeModel(
                 bead_cross_section_area_mm2=bead_area,
                 # This effective volume/E value makes the authoritative
@@ -5060,7 +5056,7 @@ def _index_html() -> str:
         const part = summary.part;
         const lattice = summary.lattice;
         conformalSpecResult.className = 'surfaceCollisionResult ok';
-        conformalSpecResult.textContent = `已识别共形蜂窝模式：${{part.length_mm}} × ${{part.width_mm}} × ${{part.final_height_mm}} mm，${{part.logical_layer_count}} 层；${{lattice.wall_width_mm}} mm 墙体（${{lattice.wall_bead_count}} 条 2 mm 沉积道），单元边长 ${{lattice.base_cell_size_mm}} mm。`;
+        conformalSpecResult.textContent = `已识别共形蜂窝模式：${{part.length_mm}} × ${{part.width_mm}} × ${{part.final_height_mm}} mm；${{lattice.wall_width_mm}} mm 墙体（${{lattice.wall_bead_count}} 条 2 mm 沉积道），单元边长 ${{lattice.base_cell_size_mm}} mm。实际切片层高由当前 Core 树脂工艺参数决定。`;
         selectedConformalSpec = file;
         conformalSliceButton.disabled = false;
         statusEl.className = 'status ok';

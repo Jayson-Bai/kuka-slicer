@@ -138,14 +138,18 @@ def test_rectangular_physical_part_derives_monotonic_layer_centres_and_requires_
     spec = conformal_lattice_config_payload(
         {
             "part_length_mm": ["8"], "part_width_mm": ["7"], "part_height_mm": ["10"],
-            "layer_height_mm": ["2"], "samples_x": ["8"], "samples_y": ["7"],
+            "samples_x": ["8"], "samples_y": ["7"],
             "wall_width_mm": ["2"], "base_cell_size_mm": ["5"], "surface_start_layer": ["1"],
         }
     )
 
-    run = run_conformal_lattice_pipeline(spec, extrusion=ExtrusionVolumeModel(0.2, 0.1))
+    run = run_conformal_lattice_pipeline(
+        spec,
+        physical_layer_height_mm=2.0,
+        extrusion=ExtrusionVolumeModel(0.2, 0.1),
+    )
 
     assert run.layer_embedding.report["base_z_by_layer_mm"] == pytest.approx([1.0, 3.0, 5.0, 7.0, 9.0])
     assert run.layer_embedding.report["surface_start_layer"] == 1
     with pytest.raises(ValueError, match="logical_layer_count"):
-        run_conformal_lattice_pipeline(spec, logical_layer_count=4)
+        run_conformal_lattice_pipeline(spec, logical_layer_count=4, physical_layer_height_mm=2.0)

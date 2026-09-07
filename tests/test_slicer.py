@@ -4689,7 +4689,7 @@ def test_main_ui_recognizes_rectangular_conformal_design_json_before_slicing():
     )
 
     assert summary["file_name"] == "design.json"
-    assert summary["part"]["logical_layer_count"] == 20
+    assert summary["part"]["mapping_reference_layer_count"] == 20
     assert summary["lattice"] == {
         "wall_width_mm": 4.0,
         "wall_bead_count": 2,

@@ -84,6 +84,7 @@ def run_conformal_lattice_pipeline(
     config: ConformalLatticeSpec | bytes | str | Mapping[str, object],
     *,
     logical_layer_count: int | None = None,
+    physical_layer_height_mm: float | None = None,
     extrusion: ExtrusionVolumeModel | None = None,
     fill_samples_per_triangle_side: int = 6,
 ) -> ConformalLatticeRun:
@@ -99,7 +100,11 @@ def run_conformal_lattice_pipeline(
         raise ValueError("first-version UI pipeline supports only source_surface.provider=double_sine")
     reference = spec.source_surface.get("reference_stl")
     if spec.part:
-        logical_layer_count, base_z_by_layer = _physical_layer_schedule(spec, logical_layer_count)
+        logical_layer_count, base_z_by_layer = _physical_layer_schedule(
+            spec,
+            logical_layer_count,
+            physical_layer_height_mm=physical_layer_height_mm,
+        )
     elif not isinstance(reference, Mapping) or reference.get("build_axis") != "z":
         raise ValueError("first-version double-sine conformal workflow requires reference_stl.build_axis=z")
     else:
@@ -250,14 +255,21 @@ def _lattice_node_normals(
     return normals
 
 
-def _physical_layer_schedule(spec: ConformalLatticeSpec, requested_count: int | None) -> tuple[int, np.ndarray]:
+def _physical_layer_schedule(
+    spec: ConformalLatticeSpec,
+    requested_count: int | None,
+    *,
+    physical_layer_height_mm: float | None = None,
+) -> tuple[int, np.ndarray]:
     """Return monotonic layer-centre Z values whose printed extent is the requested part height."""
 
     final_height = float(spec.part["final_height_mm"])
-    nominal_height = float(spec.manufacturing["layer_height_mm"])
+    nominal_height = float(spec.manufacturing["layer_height_mm"] if physical_layer_height_mm is None else physical_layer_height_mm)
+    if not math.isfinite(nominal_height) or nominal_height <= 0.0:
+        raise ValueError("physical_layer_height_mm must be positive and finite")
     count = int(math.ceil(final_height / nominal_height))
     if requested_count is not None and requested_count != count:
-        raise ValueError("logical_layer_count must match the rectangular part final_height_mm and layer_height_mm")
+        raise ValueError("logical_layer_count must match the rectangular part final_height_mm and active physical layer height")
     thicknesses = np.full(count, nominal_height, dtype=np.float64)
     thicknesses[-1] = final_height - nominal_height * (count - 1)
     centres = np.cumsum(thicknesses) - thicknesses * 0.5

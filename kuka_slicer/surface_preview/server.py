@@ -24,6 +24,7 @@ DEFAULT_PREVIEW_SAMPLES = 48
 MAX_PREVIEW_SAMPLES = 120
 MAX_CONFORMAL_SAMPLES = 512
 MAX_STL_BYTES = 64 * 1024 * 1024
+CONFORMAL_MAPPING_REFERENCE_LAYER_HEIGHT_MM = 0.5
 
 
 def _query_float(
@@ -162,7 +163,10 @@ def conformal_lattice_config_payload(params: dict[str, list[str]]) -> dict[str, 
     length_mm = _query_float(params, "part_length_mm", 150.0, positive=True)
     width_mm = _query_float(params, "part_width_mm", 100.0, positive=True)
     final_height_mm = _query_float(params, "part_height_mm", 10.0, positive=True)
-    layer_height_mm = _query_float(params, "layer_height_mm", 0.5, positive=True)
+    # The design page describes surface morphology, not process settings.
+    # Keep one stable reference for validating a layer-index start value; the
+    # actual physical layer height is supplied later by the slicer/Core UI.
+    layer_height_mm = CONFORMAL_MAPPING_REFERENCE_LAYER_HEIGHT_MM
     surface_params = {**params, "width_mm": [str(length_mm)], "height_mm": [str(width_mm)]}
     surface = surface_payload(surface_params, include_projection_geometry=False)["surface"]
     wall_width_mm = _query_float(params, "wall_width_mm", 2.0, positive=True)
@@ -445,7 +449,6 @@ def surface_preview_html() -> str:
         <div class="field"><label for="part_length_mm">零件长度 X（mm）</label><input id="part_length_mm" type="number" min="0.001" step="1" value="150"></div>
         <div class="field"><label for="part_width_mm">零件宽度 Y（mm）</label><input id="part_width_mm" type="number" min="0.001" step="1" value="100"></div>
         <div class="field"><label for="part_height_mm">最终物理高度 Z（mm）</label><input id="part_height_mm" type="number" min="0.001" step="0.1" value="10"></div>
-        <div class="field"><label for="layer_height_mm">切片层高（mm）</label><input id="layer_height_mm" type="number" min="0.001" step="0.01" value="0.5"></div>
         <p class="modelMeta" id="modelMeta">外边界固定为矩形；新共形流程不读取 STL，也不继承 STL 中的蜂窝孔壁。</p>
         <div class="divider"></div>
         <h2>曲面参数</h2>
@@ -496,7 +499,8 @@ def surface_preview_html() -> str:
   </main>
   <script>
     const surfaceIds = ['amplitude_mm', 'wavelength_x_mm', 'wavelength_y_mm', 'phase_x_rad', 'phase_y_rad', 'z_reference_mm', 'samples'];
-    const conformalDesignIds = ['part_length_mm', 'part_width_mm', 'part_height_mm', 'layer_height_mm', 'wall_width_mm', 'base_cell_size_mm', 'orientation_angle_deg', 'surface_start_layer', 'samples_x', 'samples_y', 'boundary_mode', 'phase_origin_x_mm', 'phase_origin_y_mm', 'random_seed'];
+    const mappingReferenceLayerHeightMm = 0.5;
+    const conformalDesignIds = ['part_length_mm', 'part_width_mm', 'part_height_mm', 'wall_width_mm', 'base_cell_size_mm', 'orientation_angle_deg', 'surface_start_layer', 'samples_x', 'samples_y', 'boundary_mode', 'phase_origin_x_mm', 'phase_origin_y_mm', 'random_seed'];
     const canvas = document.getElementById('canvas');
     const statusEl = document.getElementById('status');
     const statsEl = document.getElementById('stats');
@@ -544,19 +548,18 @@ def surface_preview_html() -> str:
       const samplesX = nonNegativeInteger('samples_x');
       const samplesY = nonNegativeInteger('samples_y');
       const partHeight = positiveNumber('part_height_mm');
-      const layerHeight = positiveNumber('layer_height_mm');
       const progressionSummary = document.getElementById('layerProgressionSummary');
       if (startLayer === null) {
         progressionSummary.className = 'designSummary error';
         progressionSummary.textContent = '曲面起始层必须是非负整数。';
-      } else if (partHeight === null || layerHeight === null) {
+      } else if (partHeight === null) {
         progressionSummary.className = 'designSummary error';
-        progressionSummary.textContent = '最终物理高度和切片层高都必须是正数。';
+        progressionSummary.textContent = '最终物理高度必须是正数。';
       } else if (samplesX === null || samplesX < 2 || samplesY === null || samplesY < 2) {
         progressionSummary.className = 'designSummary error';
         progressionSummary.textContent = '曲面采样 X 和 Y 都必须是不小于 2 的整数。';
       } else {
-        const layerCount = Math.ceil(partHeight / layerHeight);
+        const layerCount = Math.ceil(partHeight / mappingReferenceLayerHeightMm);
         const maxStart = Math.floor((layerCount - 1) / 2);
         if (startLayer > maxStart) {
           progressionSummary.className = 'designSummary error';
@@ -565,7 +568,7 @@ def surface_preview_html() -> str:
           const returnLayer = layerCount - 1 - startLayer;
           const peakLayers = layerCount % 2 === 1 ? `${Math.floor(layerCount / 2)}` : `${layerCount / 2 - 1}、${layerCount / 2}`;
           progressionSummary.className = 'designSummary';
-          progressionSummary.textContent = `逻辑层数：${layerCount}；曲面起始层：${startLayer}；镜像回落层：${returnLayer}；完整曲率层：${peakLayers}；共形采样：${samplesX} × ${samplesY}。`;
+          progressionSummary.textContent = `映射参考层数：${layerCount}；曲面起始层：${startLayer}；镜像回落层：${returnLayer}；完整曲率层：${peakLayers}；共形采样：${samplesX} × ${samplesY}。实际切片层高在主界面 Core 工艺参数中设置。`;
         }
       }
     }
@@ -800,7 +803,7 @@ def surface_preview_html() -> str:
       render();
     });
     document.getElementById('reset').addEventListener('click', () => {
-      const defaults = { part_length_mm: 150, part_width_mm: 100, part_height_mm: 10, layer_height_mm: 0.5, amplitude_mm: 0.8, wavelength_x_mm: 40, wavelength_y_mm: 50, phase_x_rad: 0, phase_y_rad: 0, z_reference_mm: 0, wall_width_mm: 2, base_cell_size_mm: 5, orientation_angle_deg: 0, surface_start_layer: 3, samples_x: 48, samples_y: 48, boundary_mode: 'clip', phase_origin_x_mm: 0, phase_origin_y_mm: 0, random_seed: 0, samples: 48 };
+      const defaults = { part_length_mm: 150, part_width_mm: 100, part_height_mm: 10, amplitude_mm: 0.8, wavelength_x_mm: 40, wavelength_y_mm: 50, phase_x_rad: 0, phase_y_rad: 0, z_reference_mm: 0, wall_width_mm: 2, base_cell_size_mm: 5, orientation_angle_deg: 0, surface_start_layer: 3, samples_x: 48, samples_y: 48, boundary_mode: 'clip', phase_origin_x_mm: 0, phase_origin_y_mm: 0, random_seed: 0, samples: 48 };
       Object.entries(defaults).forEach(([id, value]) => {
         document.getElementById(id).value = value;
       });

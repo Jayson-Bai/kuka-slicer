@@ -22,7 +22,7 @@
 
 ### 2.1 矩形实体
 
-新设计器不再接收 STL。用户直接输入固定矩形实体的 `length_mm`、`width_mm` 和最终物理高度 `final_height_mm`，并输入切片层高 `layer_height_mm`。程序以 `ceil(final_height_mm / layer_height_mm)` 得到逻辑层数，最后一层使用剩余的实际厚度；这四项写入 `part` 和 `manufacturing`，是后续路径与 Core 的唯一尺寸来源。
+新设计器不再接收 STL。用户只输入固定矩形实体的 `length_mm`、`width_mm` 和最终物理高度 `final_height_mm`。设计器内部固定 0.5 mm 仅用于曲面起始层的映射参考和设计期提示，不显示为可编辑工艺参数。实际层高由主切片器/Core 树脂工艺参数提供，程序以 `ceil(final_height_mm / actual_layer_height_mm)` 生成物理层位，最后一层使用剩余的实际厚度。
 
 旧版 `graded_surface_v1`、STL 和曲面映射器原样保留在独立入口，不能与新 JSON 混用。
 
@@ -90,7 +90,7 @@ z(x,y)=z_{ref}+A\sin\left(\frac{2\pi x}{\lambda_x}+\phi_x\right)
 
 ### 2.4 路径导出所需工艺值
 
-固定格栅参数属于结构设计，不能代替 E 换算。路径导出复用主切片器当前的树脂 Core 参数：共形 JSON 的层高是权威值，路径桥接以固定 2 mm 喷嘴宽度、该层高、当前挤出倍率和当前 E/mm 标定构造显式的截面积—E 换算，并把换算写入 External Source NPZ 元数据。设计墙宽不会被静默当作单条沉积线宽。
+固定格栅参数属于结构设计，不能代替 E 换算。路径导出复用主切片器当前的树脂 Core 参数：实际层高、当前挤出倍率和当前 E/mm 标定与固定 2 mm 喷嘴宽度共同构造显式的截面积—E 换算，并把换算写入 External Source NPZ 元数据。设计墙宽不会被静默当作单条沉积线宽。
 
 ## 3. 层间曲率渐变
 
@@ -98,7 +98,7 @@ z(x,y)=z_{ref}+A\sin\left(\frac{2\pi x}{\lambda_x}+\phi_x\right)
 
 层间形貌固定为“对称 smoothstep”，不提供其他策略下拉框。UI 仅增加或保留：
 
-- 逻辑层总数：由 STL 高度和切片层高计算，只读显示；
+- 设计期映射参考层数：由最终物理高度和固定 0.5 mm 参考值计算，只读显示；实际逻辑层数由主界面 Core 层高决定；
 - 曲面起始层：`surface_start_layer`，用户输入整数；
 - 曲面回落层：自动镜像计算，只读显示；
 - 峰值层：自动计算，只读显示。
@@ -167,8 +167,8 @@ P_k=P_{flat}+\alpha_k(P_{target}-P_{flat})
 
 ```text
 1. 矩形实体
-   - 长、宽、最终物理高度、切片层高
-   - 固定矩形外轮廓与逻辑层数摘要
+   - 长、宽、最终物理高度
+   - 固定矩形外轮廓与映射参考层数摘要；实际层高在主界面 Core 工艺参数中设置
 
 2. 双正弦曲面
    - A、λx、λy、φx、φy、Zref
