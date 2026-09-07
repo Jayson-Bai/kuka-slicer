@@ -91,7 +91,7 @@ def test_main_ui_exposes_surface_tool_launchers() -> None:
     html = _index_html()
 
     assert 'id="surfacePreviewButton"' in html
-    assert 'id="surfaceMapperButton"' in html
+    assert 'id="surfaceMapperButton"' not in html
     assert "surfaceToolButtons['surface-preview'].addEventListener" in html
-    assert "surfaceToolButtons['surface-map'].addEventListener" in html
+    assert "surfaceToolButtons['surface-map'].addEventListener" not in html
     assert "/launch-tool?tool=" in html

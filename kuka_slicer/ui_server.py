@@ -4190,7 +4190,6 @@ def _index_html() -> str:
     <h1>机械臂空间复合材料增材制造系统切片器</h1>
     <div class="surfaceTools" aria-label="曲面工具">
       <button id="surfacePreviewButton" class="surfaceToolButton" type="button">启动蜂窝网格共形设计器</button>
-      <button id="surfaceMapperButton" class="surfaceToolButton" type="button">启动曲面映射器</button>
       <button id="conformalSpecButton" class="surfaceToolButton" type="button">导入共形设计 JSON</button>
       <button id="conformalSliceButton" class="surfaceToolButton" type="button" disabled>生成共形蜂窝并送入 Core</button>
       <button id="coreNpzPreviewButton" class="surfaceToolButton" type="button">导入 Core NPZ 预览</button>
@@ -4940,8 +4939,7 @@ def _index_html() -> str:
     const form = document.getElementById('sliceForm');
     const button = document.getElementById('sliceButton');
     const surfaceToolButtons = {{
-      'surface-preview': document.getElementById('surfacePreviewButton'),
-      'surface-map': document.getElementById('surfaceMapperButton')
+      'surface-preview': document.getElementById('surfacePreviewButton')
     }};
     const surfaceNpzPreviewButton = document.getElementById('surfaceNpzPreviewButton');
     const coreNpzPreviewButton = document.getElementById('coreNpzPreviewButton');
@@ -4976,7 +4974,6 @@ def _index_html() -> str:
       }}
     }}
     surfaceToolButtons['surface-preview'].addEventListener('click', () => launchSurfaceTool('surface-preview'));
-    surfaceToolButtons['surface-map'].addEventListener('click', () => launchSurfaceTool('surface-map'));
     function applyMappedSurfacePreview(preview, fileName, collisionCheckAvailable = false) {{
       const isConformalLattice = preview?.preview_source === 'conformal_lattice_external_source_npz';
       previewData = preview;
