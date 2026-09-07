@@ -1,8 +1,10 @@
 import pytest
 
+from path_processing_core.bspline_approximation import GlobalSplinePlanner
 from path_processing_core.polynomial_interpolator import sample_global_curve_iter
 from path_processing_core.types import (
     GlobalCurveCommand,
+    MoveCommand,
     Position,
     validate_source_e_profile,
 )
@@ -104,6 +106,50 @@ def test_absent_source_e_profile_keeps_the_legacy_arc_length_distribution():
 def test_source_e_profile_contract_rejects_invalid_samples(parameters, values, message):
     with pytest.raises(ValueError, match=message):
         validate_source_e_profile(parameters, values, start_e=0.0, end_e=2.0)
+
+
+def test_opted_in_fit_preserves_zero_e_connector_samples_on_the_shared_parameter_axis():
+    positions = [
+        Position(0.0, 0.0, 0.5, 0.0, 0.0, 0.0),
+        Position(1.0, 0.0, 0.5, 0.0, 0.0, 0.0),
+        Position(1.0, 1.0, 0.5, 0.0, 0.0, 0.0),
+        Position(2.0, 1.0, 0.5, 0.0, 0.0, 0.0),
+        Position(2.0, 2.0, 0.5, 0.0, 0.0, 0.0),
+    ]
+    e_values = [0.0, 3.0, 3.0, 7.0, 9.0]
+    moves = [
+        MoveCommand(
+            type="PRINT",
+            cmd="G1",
+            start_pos=start,
+            pos=end,
+            e_val=e_end,
+            delta_e=e_end - e_start,
+            feedrate=60.0,
+            line=index,
+        )
+        for index, (start, end, e_start, e_end) in enumerate(
+            zip(positions, positions[1:], e_values, e_values[1:])
+        )
+    ]
+
+    curve = GlobalSplinePlanner().fit_global_curve(
+        moves,
+        density=1,
+        preserve_source_e=True,
+    )
+
+    assert curve is not None
+    assert curve.source_e_parameters is not None
+    assert curve.source_e_values is not None
+    assert curve.source_e_parameters[0] == pytest.approx(0.0)
+    assert curve.source_e_parameters[-1] == pytest.approx(1.0)
+    assert curve.source_e_values[0] == pytest.approx(0.0)
+    assert curve.source_e_values[-1] == pytest.approx(9.0)
+    assert any(
+        first == pytest.approx(3.0) and second == pytest.approx(3.0)
+        for first, second in zip(curve.source_e_values, curve.source_e_values[1:])
+    )
 
 
 @pytest.mark.xfail(
