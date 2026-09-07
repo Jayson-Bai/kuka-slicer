@@ -63,3 +63,45 @@ def test_polyline_sampler_preserves_source_e_at_four_ms_distance_samples():
     assert [sample.extrude_speed for sample in samples] == pytest.approx(
         [0.0, 250.0, 500.0, 500.0]
     )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="B 样条尚未保留共形源路径的逐段 E；C4 完成后移除此基线标记。",
+)
+def test_bspline_sampler_keeps_a_zero_e_connector_as_a_constant_e_platform():
+    """锁定宏路径 [正 E, 零 E, 正 E] 进入 B 样条后的当前缺陷。"""
+    curve = GlobalCurveCommand(
+        type="PRINT_FIT",
+        cmd="SPLINE",
+        start_pos=Position(0.0, 0.0, 0.5, 0.0, 0.0, 0.0),
+        control_points=[
+            Position(1.0, 0.0, 0.5, 0.0, 0.0, 0.0),
+            Position(2.0, 0.0, 0.5, 0.0, 0.0, 0.0),
+            Position(3.0, 0.0, 0.5, 0.0, 0.0, 0.0),
+        ],
+        e_val=7.0,
+        delta_e=7.0,
+        feedrate=60.0,
+        line=1,
+        source_e_parameters=[0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0],
+        source_e_values=[0.0, 3.0, 3.0, 7.0],
+    )
+
+    samples = list(
+        sample_global_curve_iter(
+            curve,
+            dt=0.05,
+            target_velocity=20.0,
+            t_acc=0.0,
+            t_dec=0.0,
+        )
+    )
+
+    platform_samples = [
+        sample.e
+        for sample in samples
+        if 1.0 / 3.0 <= sample.t / samples[-1].t <= 2.0 / 3.0
+    ]
+    assert len(platform_samples) >= 2
+    assert platform_samples == pytest.approx([3.0] * len(platform_samples), abs=1e-9)
