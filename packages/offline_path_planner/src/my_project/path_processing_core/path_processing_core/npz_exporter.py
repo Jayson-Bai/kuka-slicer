@@ -95,6 +95,7 @@ def export_npz(
     cut_wait_s: float = 15.0,
     fiber_retract_length_mm: float | None = None,
     external_npz_cut_absolute_e: bool = False,
+    preserve_source_e_profile: bool = False,
     collect_detailed_timing: bool = False,
 ) -> dict:
     """
@@ -1280,7 +1281,7 @@ def export_npz(
         def _make_polyline_gc(moves, raw_suffix):
             first = moves[0]
             last = moves[-1]
-            return GlobalCurveCommand(
+            curve = GlobalCurveCommand(
                 type=first.type,
                 cmd="POLYLINE",
                 start_pos=first.start_pos,
@@ -1293,6 +1294,9 @@ def export_npz(
                 constraints=[],
                 original_moves=list(moves),
             )
+            if preserve_source_e_profile and first.type == "PRINT":
+                curve.e_profile = [first.e_val - first.delta_e, *(move.e_val for move in moves)]
+            return curve
 
         work_buffer = _merge_collinear_wall_moves(
             _rebuild_solid_infill_core(_sanitize_solid_infill_endpoints(buffer))
@@ -1314,6 +1318,7 @@ def export_npz(
                 density=density,
                 degree=degree,
                 max_fit_points=max_fit_points_per_segment,
+                preserve_source_e=preserve_source_e_profile,
             )
             timings["fit_s"] += time.perf_counter() - t0
             _accumulate_fit_profile(planner.last_fit_profile)
@@ -1339,6 +1344,7 @@ def export_npz(
                     density=density,
                     degree=degree,
                     max_fit_points=max_fit_points_per_segment,
+                    preserve_source_e=preserve_source_e_profile,
                 )
                 timings["fit_s"] += time.perf_counter() - t0
                 _accumulate_fit_profile(planner.last_fit_profile)

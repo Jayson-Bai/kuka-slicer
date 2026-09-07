@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
+
 from path_processing_core.head_calibration import (
     DEFAULT_DATA_ROOT,
     DEFAULT_HEAD_CALIBRATION_PATH,
@@ -19,6 +21,37 @@ from .source_npz import SourceJob, load_source_npz
 
 
 _SURFACE_MAPPED_DEFAULT_DENSITY = 4
+_SOURCE_E_PROFILE_MODE = "piecewise_preserve_v1"
+_ZERO_E_CONNECTOR_SEMANTICS = "print_context_constant_e"
+
+
+def _uses_preserved_source_e_profile(job: SourceJob) -> bool:
+    """Resolve the explicit conformal-only Core E preservation contract."""
+    core_processing = job.meta.get("core_processing")
+    if core_processing is None:
+        return False
+    if not isinstance(core_processing, dict):
+        raise ValueError("core_processing metadata must be an object")
+    mode = core_processing.get("source_e_profile_mode")
+    if mode != _SOURCE_E_PROFILE_MODE:
+        raise ValueError(
+            "unsupported core source_e_profile_mode "
+            f"{mode!r}; expected {_SOURCE_E_PROFILE_MODE!r}"
+        )
+    if core_processing.get("zero_e_connector_semantics") != _ZERO_E_CONNECTOR_SEMANTICS:
+        raise ValueError(
+            "piecewise_preserve_v1 requires "
+            f"zero_e_connector_semantics={_ZERO_E_CONNECTOR_SEMANTICS!r}"
+        )
+
+    for layer in job.layers:
+        for material_path in (*layer.resin_paths, *layer.fiber_paths):
+            extrusion = material_path.extrusion
+            if extrusion is None or np.asarray(extrusion).ndim != 1:
+                raise ValueError("piecewise_preserve_v1 requires an explicit E array for every material path")
+            if len(extrusion) != len(material_path.points):
+                raise ValueError("piecewise_preserve_v1 E array length must match its path point count")
+    return True
 
 
 def default_source_npz_template_dir(data_root: str | Path | None = None) -> Path:
@@ -140,6 +173,7 @@ def convert_source_job(
 ) -> dict:
     """Export one normalized source job through the sole Core consumer path."""
 
+    preserve_source_e_profile = _uses_preserved_source_e_profile(job)
     if job.meta.get("surface_mapping") is not None and int(params.density) == 0:
         # A mapped path needs enough fitting samples to follow its Z curvature.
         # A non-zero caller value is deliberate and always takes precedence.
@@ -195,6 +229,7 @@ def convert_source_job(
             export_params.cut_wait_s if cut_wait_s is None else float(cut_wait_s)
         ),
         "external_npz_cut_absolute_e": export_params.external_npz_cut_absolute_e,
+        "preserve_source_e_profile": preserve_source_e_profile,
     }
     if export_params.fiber_retract_length_mm is not None:
         export_kwargs["fiber_retract_length_mm"] = export_params.fiber_retract_length_mm

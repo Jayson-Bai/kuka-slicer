@@ -162,6 +162,10 @@ class ConformalLatticePathGraph:
         }
         job_metadata: dict[str, object] = {
             "conformal_lattice_path_bridge": bridge_meta,
+            "core_processing": {
+                "source_e_profile_mode": "piecewise_preserve_v1",
+                "zero_e_connector_semantics": "print_context_constant_e",
+            },
             "path_roles": {
                 material: {
                     str(layer): (
