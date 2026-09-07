@@ -35,7 +35,7 @@ def main_preview_payload_from_conformal_path_graph(
     preview["preview_source"] = "conformal_lattice_external_source_job"
     preview["conformal_lattice"] = {
         "edge_count_per_layer": int(len(graph.edge_ids)),
-        "path_order": "ascending stable edge ID; one two-point path per structural edge",
+        "path_order": "closed rectangular outer boundary followed by deterministic non-repeating honeycomb macro partitions",
         "uses_existing_main_canvas": True,
         "planning_line_width_mm": float(planning_line_width_mm),
     }

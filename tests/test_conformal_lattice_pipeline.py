@@ -167,5 +167,12 @@ def test_rectangular_physical_part_derives_monotonic_layer_centres_and_requires_
 
     assert run.layer_embedding.report["base_z_by_layer_mm"] == pytest.approx([1.0, 3.0, 5.0, 7.0, 9.0])
     assert run.layer_embedding.report["surface_start_layer"] == 1
+    assert run.path_graph is not None
+    assert run.path_graph.outer_boundary_paths_xyz is not None
+    assert run.path_graph.outer_boundary_paths_xyz.shape == (5, 27, 3)
+    np.testing.assert_allclose(run.path_graph.outer_boundary_paths_xyz[:, 0], run.path_graph.outer_boundary_paths_xyz[:, -1])
+    job = run.path_graph.to_external_source_job()
+    assert job.meta["path_roles"]["R"]["0"][0] == "conformal_outer_boundary"
+    assert job.material_paths[0].paths[0].shape == (27, 3)
     with pytest.raises(ValueError, match="logical_layer_count"):
         run_conformal_lattice_pipeline(spec, logical_layer_count=4, physical_layer_height_mm=2.0)

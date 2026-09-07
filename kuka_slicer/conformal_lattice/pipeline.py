@@ -159,6 +159,7 @@ def run_conformal_lattice_pipeline(
             samples_per_triangle_side=fill_samples_per_triangle_side,
         )
     layer_embedding = _symmetric_layer_embedding(domain, orientation, geometry, spec, logical_layer_count, base_z_by_layer)
+    outer_boundary = _symmetric_outer_boundary(domain, spec, layer_embedding) if spec.part else None
     path_graph = None if extrusion is None else build_conformal_lattice_path_graph(
         geometry,
         extrusion,
@@ -167,6 +168,7 @@ def run_conformal_lattice_pipeline(
         wall_bead_count=int(spec.lattice.get("wall_bead_count", 1)),
         nominal_bead_width_mm=float(spec.manufacturing.get("nominal_bead_width_mm", 2.0)),
         config_metadata=spec.metadata(),
+        outer_boundary_paths_xyz=outer_boundary,
     )
     return ConformalLatticeRun(
         spec=spec,
@@ -269,6 +271,30 @@ def _lattice_node_normals(
             raise ValueError("conformal lattice node has an undefined surface normal")
         normals[index] = normal / length
     return normals
+
+
+def _symmetric_outer_boundary(
+    domain: SurfaceMeshDomain,
+    spec: ConformalLatticeSpec,
+    layer_embedding: LayerEmbedding,
+) -> np.ndarray:
+    """Embed the rectangular XY boundary with the same legacy smoothstep law."""
+
+    if len(domain.boundary_loops) != 1:
+        raise ValueError("rectangular conformal production requires exactly one surface boundary loop")
+    surface = spec.source_surface.get("double_sine")
+    if not isinstance(surface, Mapping):
+        raise ValueError("double-sine source metadata is malformed")
+    alpha = np.asarray(layer_embedding.report.get("alpha_by_layer"), dtype=np.float64)
+    base_z = np.asarray(layer_embedding.report.get("base_z_by_layer_mm"), dtype=np.float64)
+    if alpha.shape != (len(layer_embedding.node_positions_xyz),) or base_z.shape != alpha.shape:
+        raise ValueError("symmetric layer embedding report is missing boundary-compatible layer data")
+    boundary_surface = np.asarray(domain.vertices[domain.boundary_loops[0]], dtype=np.float64)
+    boundary_flat = np.array(boundary_surface, copy=True)
+    boundary_flat[:, 2] = float(surface["z_reference_mm"])
+    paths = boundary_flat[None, :, :] + alpha[:, None, None] * (boundary_surface[None, :, :] - boundary_flat[None, :, :])
+    paths[:, :, 2] += base_z[:, None]
+    return np.concatenate((paths, paths[:, :1, :]), axis=1)
 
 
 def _physical_layer_schedule(

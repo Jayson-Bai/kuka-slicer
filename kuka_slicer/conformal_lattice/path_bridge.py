@@ -86,6 +86,8 @@ class ConformalLatticePathGraph:
     nominal_bead_width_mm: float
     report: dict[str, object]
     metadata: dict[str, object]
+    # Optional closed, co-shaped part boundary for the rectangular UI flow.
+    outer_boundary_paths_xyz: np.ndarray | None = None
 
     def to_external_source_job(self, *, material: Literal["R", "F"] = "R") -> ExternalSourceJob:
         """Plan graph edges into non-repeating macro partitions for Core."""
@@ -114,6 +116,25 @@ class ConformalLatticePathGraph:
                 bead_area_mm2=float(extrusion_config["bead_cross_section_area_mm2"]),
                 e_volume_per_unit_mm3=float(extrusion_config["e_volume_per_unit_mm3"]),
             )
+            outer_boundary = None if self.outer_boundary_paths_xyz is None else self.outer_boundary_paths_xyz[layer_index]
+            if outer_boundary is not None:
+                paths.insert(0, np.asarray(outer_boundary, dtype=np.float64).copy())
+                extrusion.insert(
+                    0,
+                    _profile_for_deposition_segments(
+                        paths[0],
+                        [True] * (len(paths[0]) - 1),
+                        bead_area_mm2=float(extrusion_config["bead_cross_section_area_mm2"]),
+                        e_volume_per_unit_mm3=float(extrusion_config["e_volume_per_unit_mm3"]),
+                    ),
+                )
+                planning_report = {
+                    **planning_report,
+                    "outer_boundary_path_count": 1,
+                    "outer_boundary": "closed conformal rectangular part boundary, deposited before honeycomb macro partitions",
+                }
+            else:
+                planning_report = {**planning_report, "outer_boundary_path_count": 0}
             material_paths.append(MaterialPaths(layer_index, material, paths, extrusion))
             travel_paths.append(TravelPaths(layer_index, travels))
             edge_ids_by_layer[str(layer_index)] = [int(value) for value in self.edge_ids]
@@ -134,7 +155,11 @@ class ConformalLatticePathGraph:
             "conformal_lattice_path_bridge": bridge_meta,
             "path_roles": {
                 material: {
-                    str(layer): ["conformal_honeycomb_macro_partition"] * len(material_paths[layer].paths)
+                    str(layer): (
+                        (["conformal_outer_boundary"] if self.outer_boundary_paths_xyz is not None else [])
+                        + ["conformal_honeycomb_macro_partition"]
+                        * (len(material_paths[layer].paths) - (1 if self.outer_boundary_paths_xyz is not None else 0))
+                    )
                     for layer in range(len(self.layer_node_positions_xyz))
                 }
             },
@@ -165,6 +190,7 @@ def build_conformal_lattice_path_graph(
     wall_bead_count: int = 1,
     nominal_bead_width_mm: float = 2.0,
     config_metadata: Mapping[str, object] | None = None,
+    outer_boundary_paths_xyz: np.ndarray | None = None,
 ) -> ConformalLatticePathGraph:
     """Turn verified structural edges into a deterministic, un-routed graph.
 
@@ -176,6 +202,7 @@ def build_conformal_lattice_path_graph(
     _validate_geometry(geometry)
     source_surface_sha256, solver_seed = _required_geometry_provenance(geometry)
     positions, embedding_mode = _layer_positions(geometry, layer_embedding)
+    outer_boundary = _outer_boundary_paths(outer_boundary_paths_xyz, layer_count=len(positions))
     normals = _node_normals_for_paths(geometry, node_normals_xyz)
     if not isinstance(wall_bead_count, int) or isinstance(wall_bead_count, bool) or wall_bead_count < 1:
         raise ValueError("wall_bead_count must be a positive integer")
@@ -239,6 +266,7 @@ def build_conformal_lattice_path_graph(
         nominal_bead_width_mm=float(nominal_bead_width_mm),
         report=report,
         metadata=metadata,
+        outer_boundary_paths_xyz=outer_boundary,
     )
 
 
@@ -295,6 +323,19 @@ def _layer_positions(
     if not np.array_equal(layer_embedding.lattice_edges, geometry.lattice_edges):
         raise ValueError("layer embedding must preserve the exact validated lattice edge topology")
     return positions, layer_embedding.mode
+
+
+def _outer_boundary_paths(value: np.ndarray | None, *, layer_count: int) -> np.ndarray | None:
+    if value is None:
+        return None
+    paths = np.asarray(value, dtype=np.float64)
+    if paths.ndim != 3 or paths.shape[0] != layer_count or paths.shape[1] < 4 or paths.shape[2] != 3:
+        raise ValueError("outer_boundary_paths_xyz must contain one closed XYZ path with at least three sides per layer")
+    if not np.all(np.isfinite(paths)):
+        raise ValueError("outer_boundary_paths_xyz must be finite")
+    if not np.allclose(paths[:, 0], paths[:, -1], rtol=0.0, atol=1e-9):
+        raise ValueError("each outer_boundary_paths_xyz path must be closed")
+    return _readonly(np.array(paths, copy=True))
 
 
 def _node_normals_for_paths(
