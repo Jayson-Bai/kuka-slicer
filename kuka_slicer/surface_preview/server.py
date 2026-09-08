@@ -90,9 +90,19 @@ def _query_nonnegative_int(
 
 
 def surface_payload(
-    params: dict[str, list[str]], domain: STLProjectionDomain | None = None, *, include_projection_geometry: bool = True
+    params: dict[str, list[str]],
+    domain: STLProjectionDomain | None = None,
+    *,
+    include_projection_geometry: bool = True,
+    rectangle_origin_lower_left: bool = False,
 ) -> dict[str, object]:
-    """Create browser-safe sampled geometry from URL query parameters."""
+    """Create browser-safe sampled geometry from URL query parameters.
+
+    ``rectangle_origin_lower_left`` is specific to the STL-free conformal
+    designer.  Its exported part contract fixes the rectangle at
+    ``[0, 0] → [length, width]``; the preview must evaluate the same points
+    rather than the legacy centered demonstration grid.
+    """
 
     surface = DoubleSineSurface(
         amplitude_mm=_query_float(params, "amplitude_mm", 0.8),
@@ -121,8 +131,8 @@ def surface_payload(
         width_mm=width_mm,
         height_mm=height_mm,
         samples=samples,
-        x_min_mm=0.0 if domain else None,
-        y_min_mm=0.0 if domain else None,
+        x_min_mm=0.0 if domain or rectangle_origin_lower_left else None,
+        y_min_mm=0.0 if domain or rectangle_origin_lower_left else None,
     )
     grid_payload: dict[str, object] = {"x": grid.x.tolist(), "y": grid.y.tolist(), "z": grid.z.tolist()}
     if domain:
@@ -302,10 +312,12 @@ class SurfacePreviewHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/surface":
             try:
                 params = parse_qs(parsed.query)
+                domain = self._domain_from_params(params)
                 payload = surface_payload(
                     params,
-                    self._domain_from_params(params),
+                    domain,
                     include_projection_geometry=params.get("compact", [""])[0] != "1",
+                    rectangle_origin_lower_left=domain is None,
                 )
             except ValueError as exc:
                 self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
@@ -722,7 +734,10 @@ def surface_preview_html() -> str:
       drawProjectionBoundaries(ctx, projection, zMid, yaw, pitch, scale, cx, cy);
       ctx.fillStyle = 'rgba(21,32,51,.68)';
       ctx.font = '12px Segoe UI, Microsoft YaHei, sans-serif';
-      ctx.fillText('X / Y：mm   Z：mm', 14, height - 16);
+      const originLabel = payload.domain.mode === 'rectangle'
+        ? '矩形左下角 (0, 0)'
+        : 'STL 投影左下基准 (0, 0)';
+      ctx.fillText(`X / Y：mm，原点：${{originLabel}}   Z：mm`, 14, height - 16);
     }
 
     function showStats(statistics) {

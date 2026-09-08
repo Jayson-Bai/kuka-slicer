@@ -88,6 +88,23 @@ def test_surface_payload_contains_surface_grid_and_diagnostics():
     assert payload["statistics"]["z_range_mm"] > 0.0
 
 
+def test_conformal_rectangle_preview_uses_the_exported_lower_left_origin():
+    payload = surface_payload(
+        {
+            "width_mm": ["90"],
+            "height_mm": ["60"],
+            "samples": ["9"],
+        },
+        rectangle_origin_lower_left=True,
+    )
+
+    assert payload["domain"]["mode"] == "rectangle"
+    assert payload["grid"]["x"][0][0] == pytest.approx(0.0)
+    assert payload["grid"]["x"][0][-1] == pytest.approx(90.0)
+    assert payload["grid"]["y"][0][0] == pytest.approx(0.0)
+    assert payload["grid"]["y"][-1][0] == pytest.approx(60.0)
+
+
 def test_surface_payload_converts_designer_pi_multiples_to_internal_radians():
     payload = surface_payload(
         {
@@ -137,6 +154,7 @@ def test_surface_preview_html_has_an_independent_surface_api_and_controls():
     assert '输入 π 的倍数：1 表示 π，0.5 表示 π/2，1.5 表示 3π/2' in html
     assert 'id="phase_x_rad"' not in html
     assert 'surface.phase_x_rad' in html
+    assert '矩形左下角 (0, 0)' in html
     assert 'id="canvas"' in html
     assert 'id="exportConformalConfig"' in html
     assert 'id="part_length_mm"' in html
