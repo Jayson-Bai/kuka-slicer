@@ -46,6 +46,24 @@ def _query_float(
     return value
 
 
+def _query_phase_radians(
+    params: dict[str, list[str]],
+    *,
+    pi_multiple_name: str,
+    legacy_radians_name: str,
+) -> float:
+    """Read a designer-facing π multiple while preserving the rad contract.
+
+    The current designer submits the short, human-friendly multiple of π.
+    Existing query clients and all exported JSON remain in radians, so a
+    legacy ``*_rad`` value is still accepted when the new UI value is absent.
+    """
+
+    if pi_multiple_name in params:
+        return math.pi * _query_float(params, pi_multiple_name, 0.0)
+    return _query_float(params, legacy_radians_name, 0.0)
+
+
 def _query_samples(params: dict[str, list[str]]) -> int:
     raw = params.get("samples", [str(DEFAULT_PREVIEW_SAMPLES)])[0]
     try:
@@ -80,8 +98,16 @@ def surface_payload(
         amplitude_mm=_query_float(params, "amplitude_mm", 0.8),
         wavelength_x_mm=_query_float(params, "wavelength_x_mm", 40.0, positive=True),
         wavelength_y_mm=_query_float(params, "wavelength_y_mm", 50.0, positive=True),
-        phase_x_rad=_query_float(params, "phase_x_rad", 0.0),
-        phase_y_rad=_query_float(params, "phase_y_rad", 0.0),
+        phase_x_rad=_query_phase_radians(
+            params,
+            pi_multiple_name="phase_x_pi",
+            legacy_radians_name="phase_x_rad",
+        ),
+        phase_y_rad=_query_phase_radians(
+            params,
+            pi_multiple_name="phase_y_pi",
+            legacy_radians_name="phase_y_rad",
+        ),
         z_reference_mm=_query_float(params, "z_reference_mm", 0.0),
     )
     width_mm = domain.width_mm if domain else _query_float(
@@ -455,8 +481,9 @@ def surface_preview_html() -> str:
         <div class="field"><label for="amplitude_mm">幅值 A（mm）</label><input id="amplitude_mm" type="number" step="0.01" value="0.8"></div>
         <div class="field"><label for="wavelength_x_mm">X 波长 λx（mm）</label><input id="wavelength_x_mm" type="number" min="0.001" step="0.1" value="40"></div>
         <div class="field"><label for="wavelength_y_mm">Y 波长 λy（mm）</label><input id="wavelength_y_mm" type="number" min="0.001" step="0.1" value="50"></div>
-        <div class="field"><label for="phase_x_rad">X 相位 φx（rad）</label><input id="phase_x_rad" type="number" step="0.01" value="0"></div>
-        <div class="field"><label for="phase_y_rad">Y 相位 φy（rad）</label><input id="phase_y_rad" type="number" step="0.01" value="0"></div>
+        <div class="field"><label for="phase_x_pi">X 相位 φx（π）</label><input id="phase_x_pi" type="number" step="0.25" value="0" aria-describedby="phasePiHint"></div>
+        <div class="field"><label for="phase_y_pi">Y 相位 φy（π）</label><input id="phase_y_pi" type="number" step="0.25" value="0" aria-describedby="phasePiHint"></div>
+        <p class="hint" id="phasePiHint">输入 π 的倍数：1 表示 π，0.5 表示 π/2，1.5 表示 3π/2；导出的设计 JSON 仍以 rad 保存。</p>
         <div class="field"><label for="z_reference_mm">Z 基准（mm）</label><input id="z_reference_mm" type="number" step="0.01" value="0"></div>
         <div class="divider"></div>
         <h2>固定六边形格栅</h2>
@@ -498,7 +525,7 @@ def surface_preview_html() -> str:
     </section>
   </main>
   <script>
-    const surfaceIds = ['amplitude_mm', 'wavelength_x_mm', 'wavelength_y_mm', 'phase_x_rad', 'phase_y_rad', 'z_reference_mm', 'samples'];
+    const surfaceIds = ['amplitude_mm', 'wavelength_x_mm', 'wavelength_y_mm', 'phase_x_pi', 'phase_y_pi', 'z_reference_mm', 'samples'];
     const mappingReferenceLayerHeightMm = 0.5;
     const conformalDesignIds = ['part_length_mm', 'part_width_mm', 'part_height_mm', 'wall_width_mm', 'base_cell_size_mm', 'orientation_angle_deg', 'surface_start_layer', 'samples_x', 'samples_y', 'boundary_mode', 'phase_origin_x_mm', 'phase_origin_y_mm', 'random_seed'];
     const canvas = document.getElementById('canvas');
@@ -803,7 +830,7 @@ def surface_preview_html() -> str:
       render();
     });
     document.getElementById('reset').addEventListener('click', () => {
-      const defaults = { part_length_mm: 150, part_width_mm: 100, part_height_mm: 10, amplitude_mm: 0.8, wavelength_x_mm: 40, wavelength_y_mm: 50, phase_x_rad: 0, phase_y_rad: 0, z_reference_mm: 0, wall_width_mm: 2, base_cell_size_mm: 5, orientation_angle_deg: 0, surface_start_layer: 3, samples_x: 48, samples_y: 48, boundary_mode: 'clip', phase_origin_x_mm: 0, phase_origin_y_mm: 0, random_seed: 0, samples: 48 };
+      const defaults = { part_length_mm: 150, part_width_mm: 100, part_height_mm: 10, amplitude_mm: 0.8, wavelength_x_mm: 40, wavelength_y_mm: 50, phase_x_pi: 0, phase_y_pi: 0, z_reference_mm: 0, wall_width_mm: 2, base_cell_size_mm: 5, orientation_angle_deg: 0, surface_start_layer: 3, samples_x: 48, samples_y: 48, boundary_mode: 'clip', phase_origin_x_mm: 0, phase_origin_y_mm: 0, random_seed: 0, samples: 48 };
       Object.entries(defaults).forEach(([id, value]) => {
         document.getElementById(id).value = value;
       });

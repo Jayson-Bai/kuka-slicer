@@ -88,6 +88,30 @@ def test_surface_payload_contains_surface_grid_and_diagnostics():
     assert payload["statistics"]["z_range_mm"] > 0.0
 
 
+def test_surface_payload_converts_designer_pi_multiples_to_internal_radians():
+    payload = surface_payload(
+        {
+            "phase_x_pi": ["1"],
+            "phase_y_pi": ["0.5"],
+        }
+    )
+
+    assert payload["surface"]["phase_x_rad"] == pytest.approx(math.pi)
+    assert payload["surface"]["phase_y_rad"] == pytest.approx(math.pi / 2.0)
+
+
+def test_surface_payload_keeps_legacy_radian_query_compatibility():
+    payload = surface_payload(
+        {
+            "phase_x_rad": [str(math.pi / 4.0)],
+            "phase_y_rad": [str(-math.pi / 2.0)],
+        }
+    )
+
+    assert payload["surface"]["phase_x_rad"] == pytest.approx(math.pi / 4.0)
+    assert payload["surface"]["phase_y_rad"] == pytest.approx(-math.pi / 2.0)
+
+
 @pytest.mark.parametrize(
     "params, error",
     [
@@ -107,6 +131,12 @@ def test_surface_preview_html_has_an_independent_surface_api_and_controls():
     assert 'fetch(`/api/surface?' in html
     assert 'id="amplitude_mm"' in html
     assert 'id="wavelength_x_mm"' in html
+    assert 'id="phase_x_pi"' in html
+    assert 'id="phase_y_pi"' in html
+    assert 'aria-describedby="phasePiHint"' in html
+    assert '输入 π 的倍数：1 表示 π，0.5 表示 π/2，1.5 表示 3π/2' in html
+    assert 'id="phase_x_rad"' not in html
+    assert 'surface.phase_x_rad' in html
     assert 'id="canvas"' in html
     assert 'id="exportConformalConfig"' in html
     assert 'id="part_length_mm"' in html
@@ -196,6 +226,8 @@ def test_conformal_lattice_export_binds_double_sine_to_a_rectangular_physical_pa
             "amplitude_mm": ["1.5"],
             "wavelength_x_mm": ["30"],
             "wavelength_y_mm": ["40"],
+            "phase_x_pi": ["1"],
+            "phase_y_pi": ["0.5"],
             "wall_width_mm": ["2.0"],
             "base_cell_size_mm": ["5.0"],
             "surface_start_layer": ["3"],
@@ -217,6 +249,8 @@ def test_conformal_lattice_export_binds_double_sine_to_a_rectangular_physical_pa
     assert "reference_stl" not in source
     assert source["double_sine"]["xy_bounds_mm"] == [0.0, 0.0, 150.0, 100.0]
     assert source["double_sine"]["samples"] == [31, 29]
+    assert source["double_sine"]["phase_x_rad"] == pytest.approx(math.pi)
+    assert source["double_sine"]["phase_y_rad"] == pytest.approx(math.pi / 2.0)
     assert config["part"] == {"boundary": "rectangle", "length_mm": 150.0, "width_mm": 100.0, "final_height_mm": 10.0}
     assert config["manufacturing"] == {"layer_height_mm": 0.5, "nominal_bead_width_mm": 2.0}
     assert config["lattice"]["wall_width_mm"] == pytest.approx(2.0)
