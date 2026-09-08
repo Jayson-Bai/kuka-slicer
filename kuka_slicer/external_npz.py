@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import importlib
 import json
 from pathlib import Path
 from typing import Literal
@@ -47,6 +48,97 @@ class ExternalSourceJob:
     native_gcode_translation_mm: tuple[float, float, float] | None = field(
         default=None,
         repr=False,
+    )
+
+
+def external_source_job_to_core_source_job(
+    job: ExternalSourceJob,
+    *,
+    default_abc: tuple[float, float, float] = (0.0, 0.0, 0.0),
+):
+    """Adapt an in-memory slicer path job to Core's existing ``SourceJob``.
+
+    This is the non-serialized counterpart of ``write_external_source_npz``
+    followed by ``load_source_npz``.  It deliberately keeps source order,
+    XYZABC and per-point absolute E intact, so conformal paths do not need an
+    NPZ round trip before Core.  The import remains local because the Core
+    packages are configured only for the export path.
+    """
+    # Keep the packages independently installable: ui_server establishes this
+    # optional Core runtime at the export boundary before calling this adapter.
+    source_npz = importlib.import_module("external_npz_preprocessor.source_npz")
+    CoreLayerPaths = source_npz.LayerPaths
+    CoreMaterialPath = source_npz.MaterialPath
+    CoreSourceJob = source_npz.SourceJob
+    CoreTravelPath = source_npz.TravelPath
+
+    meta = _defaulted_meta(job.meta)
+    meta["point_columns"] = _point_columns_for_job(job)
+    materials_by_layer: dict[int, dict[str, list[CoreMaterialPath]]] = {}
+    extrusion_mode: dict[tuple[int, str], bool] = {}
+
+    for group in job.material_paths:
+        if group.material not in ("R", "F"):
+            raise ValueError(f"unsupported source material {group.material!r}")
+        layer_index = int(group.layer_index)
+        paths = [_normalize_path(path) for path in group.paths]
+        if group.extrusion is not None and len(group.extrusion) != len(paths):
+            raise ValueError("each material path group must have one E array per path")
+        key = (layer_index, group.material)
+        has_extrusion = group.extrusion is not None
+        previous_mode = extrusion_mode.setdefault(key, has_extrusion)
+        if previous_mode != has_extrusion:
+            raise ValueError("material groups with the same layer must consistently provide E arrays")
+
+        material_paths = materials_by_layer.setdefault(layer_index, {"R": [], "F": []})[group.material]
+        start_order = len(material_paths)
+        for offset, path in enumerate(paths):
+            if path.shape[1] == 3:
+                abc = np.tile(np.asarray(default_abc, dtype=np.float64), (path.shape[0], 1))
+                path = np.hstack((path, abc))
+            extrusion = None
+            if group.extrusion is not None:
+                extrusion = np.asarray(group.extrusion[offset], dtype=np.float64)
+                if extrusion.ndim != 1 or extrusion.shape[0] != path.shape[0]:
+                    raise ValueError("each extrusion array must match its path point count")
+                if not np.isfinite(extrusion).all():
+                    raise ValueError("extrusion values must be finite")
+            material_paths.append(
+                CoreMaterialPath(
+                    material=group.material,
+                    order=start_order + offset,
+                    points=path,
+                    extrusion=extrusion,
+                )
+            )
+
+    travels_by_layer: dict[int, list[CoreTravelPath]] = {}
+    for group in job.travel_paths:
+        layer_index = int(group.layer_index)
+        paths = travels_by_layer.setdefault(layer_index, [])
+        start_order = len(paths)
+        for offset, raw_path in enumerate(group.paths):
+            path = _normalize_path(raw_path)
+            if path.shape[1] == 3:
+                abc = np.tile(np.asarray(default_abc, dtype=np.float64), (path.shape[0], 1))
+                path = np.hstack((path, abc))
+            paths.append(CoreTravelPath(order=start_order + offset, points=path))
+
+    layer_indexes = set(materials_by_layer)
+    layer_indexes.update(travels_by_layer)
+    if not layer_indexes:
+        raise ValueError("cannot adapt an empty source job for Core")
+    return CoreSourceJob(
+        meta=meta,
+        layers=[
+            CoreLayerPaths(
+                index=layer_index,
+                resin_paths=materials_by_layer.get(layer_index, {}).get("R", []),
+                fiber_paths=materials_by_layer.get(layer_index, {}).get("F", []),
+                travel_paths=travels_by_layer.get(layer_index, []),
+            )
+            for layer_index in range(max(layer_indexes) + 1)
+        ],
     )
 
 

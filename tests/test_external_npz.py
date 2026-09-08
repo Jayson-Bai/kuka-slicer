@@ -7,6 +7,7 @@ from kuka_slicer.external_npz import (
     ExternalSourceJob,
     MaterialPaths,
     TravelPaths,
+    external_source_job_to_core_source_job,
     paths_to_padded_array,
     simplify_path_for_export,
     write_external_source_npz,
@@ -93,6 +94,89 @@ def test_write_source_preserves_float64_points_and_point_count(tmp_path):
         assert written.dtype == np.float64
         assert written.shape == path.shape
         assert np.array_equal(written, path)
+
+
+def test_in_memory_core_source_job_matches_external_source_npz_loader(tmp_path):
+    # The production conformal route must not serialize then reload this job.
+    # This fixture locks its direct Core input to the documented debug-NPZ
+    # representation so the two paths remain semantically interchangeable.
+    from kuka_slicer.ui_server import _ensure_offline_planner_import_paths
+
+    _ensure_offline_planner_import_paths()
+    from external_npz_preprocessor.source_npz import load_source_npz
+
+    output = tmp_path / "debug_source.npz"
+    job = ExternalSourceJob(
+        material_paths=[
+            MaterialPaths(
+                0,
+                "R",
+                [
+                    np.asarray(
+                        [[0.0, 0.0, 0.5, 1.0, 2.0, 3.0], [1.0, 0.0, 0.7, 4.0, 5.0, 6.0]],
+                        dtype=np.float64,
+                    )
+                ],
+                extrusion=[np.asarray([0.0, 0.25], dtype=np.float64)],
+            ),
+            MaterialPaths(
+                0,
+                "F",
+                [
+                    np.asarray(
+                        [[1.0, 0.0, 0.7, 7.0, 8.0, 9.0], [2.0, 0.0, 0.8, 10.0, 11.0, 12.0]],
+                        dtype=np.float64,
+                    )
+                ],
+                extrusion=[np.asarray([0.0, 0.5], dtype=np.float64)],
+            ),
+            MaterialPaths(
+                2,
+                "R",
+                [
+                    np.asarray(
+                        [[2.0, 0.0, 0.8, 13.0, 14.0, 15.0], [3.0, 0.0, 0.9, 16.0, 17.0, 18.0]],
+                        dtype=np.float64,
+                    )
+                ],
+            ),
+        ],
+        travel_paths=[
+            TravelPaths(
+                0,
+                [
+                    np.asarray(
+                        [[2.0, 0.0, 0.8, 19.0, 20.0, 21.0], [2.0, 1.0, 0.8, 22.0, 23.0, 24.0]],
+                        dtype=np.float64,
+                    )
+                ],
+            ),
+        ],
+        meta={"core_processing": {"source_e_profile_mode": "piecewise_preserve_v1"}},
+    )
+
+    write_external_source_npz(job, output)
+    direct = external_source_job_to_core_source_job(job, default_abc=(7.0, 8.0, 9.0))
+    serialized = load_source_npz(output, default_abc=(7.0, 8.0, 9.0))
+
+    assert direct.meta == serialized.meta
+    assert [layer.index for layer in direct.layers] == [layer.index for layer in serialized.layers]
+    for direct_layer, serialized_layer in zip(direct.layers, serialized.layers, strict=True):
+        for direct_paths, serialized_paths in (
+            (direct_layer.resin_paths, serialized_layer.resin_paths),
+            (direct_layer.fiber_paths, serialized_layer.fiber_paths),
+            (direct_layer.travel_paths, serialized_layer.travel_paths),
+        ):
+            assert [(path.order, getattr(path, "material", None)) for path in direct_paths] == [
+                (path.order, getattr(path, "material", None)) for path in serialized_paths
+            ]
+            for direct_path, serialized_path in zip(direct_paths, serialized_paths, strict=True):
+                assert direct_path.points.dtype == serialized_path.points.dtype == np.float64
+                assert direct_path.points.tobytes() == serialized_path.points.tobytes()
+                if hasattr(direct_path, "extrusion"):
+                    assert (direct_path.extrusion is None) == (serialized_path.extrusion is None)
+                    if direct_path.extrusion is not None:
+                        assert direct_path.extrusion.tobytes() == serialized_path.extrusion.tobytes()
 
 
 def test_export_sampling_keeps_only_straight_endpoints():

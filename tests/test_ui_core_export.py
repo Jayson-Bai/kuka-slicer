@@ -27,7 +27,7 @@ from kuka_slicer.external_npz import ExternalSourceJob, MaterialPaths
 from kuka_slicer.surface_preview.server import conformal_lattice_config_payload
 
 
-def test_conformal_design_json_generates_external_source_and_core_output(tmp_path: Path):
+def test_conformal_design_json_generates_core_output_without_source_npz_round_trip(tmp_path: Path):
     config = conformal_lattice_config_payload(
         {
             "part_length_mm": ["10"],
@@ -59,10 +59,72 @@ def test_conformal_design_json_generates_external_source_and_core_output(tmp_pat
     assert result["preview"]["preview_source"] == "conformal_lattice_external_source_job"
     assert result["preview"]["tool_orientation"]["available"] is True
     job_dir = tmp_path / result["download_url"].split("/")[-2]
-    assert (job_dir / "external_layer_paths_v1.npz").is_file()
+    assert not (job_dir / "external_layer_paths_v1.npz").exists()
+    assert not (job_dir / "conformal_lattice_geometry_v1.npz").exists()
     with np.load(job_dir / "conformal_lattice_core.npz", allow_pickle=False) as core:
         assert np.linalg.norm(np.column_stack((core["a"], core["b"], core["c"]))) > 1e-3
     assert progress[-1] == 97
+
+
+def test_conformal_debug_export_is_opt_in_and_never_becomes_core_input(tmp_path: Path):
+    config = conformal_lattice_config_payload(
+        {
+            "part_length_mm": ["10"],
+            "part_width_mm": ["8"],
+            "part_height_mm": ["1"],
+            "layer_height_mm": ["0.5"],
+            "wall_width_mm": ["2"],
+            "base_cell_size_mm": ["3"],
+            "surface_start_layer": ["0"],
+            "samples_x": ["8"],
+            "samples_y": ["8"],
+        }
+    )
+    handler = object.__new__(_SlicerUiHandler)
+    handler.server_output_dir = tmp_path
+
+    result = handler._handle_conformal_slice(
+        "",
+        request_data=(
+            {"core_resin_layer_height": ["0.25"], "conformal_debug_export": ["true"]},
+            {"conformal_spec": ("small_design.json", json.dumps(config).encode("utf-8"))},
+        ),
+    )
+
+    job_dir = tmp_path / result["download_url"].split("/")[-2]
+    assert result["debug_filename"] == "conformal_lattice_debug.zip"
+    assert result["debug_download_url"].endswith("/conformal_lattice_debug.zip")
+    with zipfile.ZipFile(job_dir / result["debug_filename"]) as archive:
+        assert set(archive.namelist()) == {
+            "conformal_lattice_geometry_v1.npz",
+            "external_layer_paths_v1.npz",
+        }
+
+    # The debug source NPZ remains a reference artifact only.  Its legacy
+    # serialized route must nevertheless produce byte-identical trajectory
+    # arrays to the production in-memory SourceJob route.
+    _ensure_offline_planner_import_paths()
+    process_params_module = importlib.import_module("external_npz_preprocessor.process_params")
+    export_runner = importlib.import_module("external_npz_preprocessor.export_runner")
+    legacy_core = job_dir / "legacy_debug_reference_core.npz"
+    export_runner.convert_external_npz(
+        job_dir / "external_layer_paths_v1.npz",
+        legacy_core,
+        _parse_core_process_params(
+            {"core_resin_layer_height": ["0.25"], "conformal_debug_export": ["true"]},
+            process_params_module,
+        ),
+        chunk_size=5_000_000,
+    )
+    with (
+        np.load(job_dir / "conformal_lattice_core.npz", allow_pickle=False) as direct,
+        np.load(legacy_core, allow_pickle=False) as serialized,
+    ):
+        assert direct.files == serialized.files
+        for key in direct.files:
+            assert direct[key].dtype == serialized[key].dtype
+            assert direct[key].shape == serialized[key].shape
+            assert direct[key].tobytes() == serialized[key].tobytes()
 
 
 def test_core_download_keeps_single_part_npz_as_npz(tmp_path: Path):
@@ -172,6 +234,10 @@ def test_ui_uses_pre_core_source_preview_and_exposes_core_export_progress():
     assert "coreMaterialColumns" in html
     assert "coreTravelPanel" in html
     assert 'id="coreNpzPreviewButton"' in html
+    assert 'id="conformalDebugExportButton"' in html
+    assert 'aria-pressed="false">共形调试导出：关' in html
+    assert "formData.append('conformal_debug_export'" in html
+    assert 'id="conformalDebugDownload"' in html
     assert "/choose-core-npz-preview" in html
     assert "applyFinalCorePreview" in html
     assert 'id="paths"' not in html
