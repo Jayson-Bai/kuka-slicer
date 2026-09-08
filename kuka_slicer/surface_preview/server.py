@@ -425,6 +425,7 @@ def conformal_lattice_config_payload(params: dict[str, list[str]]) -> dict[str, 
             "base_cell_size_mm": base_cell_size_mm,
             "boundary_mode": boundary_mode,
             "phase_origin": phase_origin,
+            "boundary_phase_policy": "auto_avoid_outer_boundary_coincidence",
         },
         "fill_field": {"mode": "fixed_cell_size", "drivers": []},
         "orientation_field": {"mode": "global_axis", "angle_deg": orientation_angle_deg, "constraints": []},
@@ -643,10 +644,10 @@ def surface_preview_html() -> str:
         <p class="modelMeta" id="modelMeta">外边界固定为矩形；新共形流程不读取 STL，也不继承 STL 中的蜂窝孔壁。</p>
         <div class="divider"></div>
         <h2>曲面参数</h2>
-        <div class="field"><label for="amplitude_mm">幅值 A（mm）</label><input id="amplitude_mm" type="number" step="0.01" value="0.8"></div>
-        <div class="field"><label for="wavelength_x_mm">X 波长 λx（mm）</label><input id="wavelength_x_mm" type="number" min="0.001" step="0.1" value="40"></div>
-        <div class="field"><label for="wavelength_y_mm">Y 波长 λy（mm）</label><input id="wavelength_y_mm" type="number" min="0.001" step="0.1" value="50"></div>
-        <div class="field"><label for="phase_x_pi">X 相位 φx（π）</label><input id="phase_x_pi" type="number" step="0.25" value="0" aria-describedby="phasePiHint"></div>
+        <div class="field"><label for="amplitude_mm">幅值 A（mm）</label><input id="amplitude_mm" type="number" step="0.01" value="1.5"></div>
+        <div class="field"><label for="wavelength_x_mm">X 波长 λx（mm）</label><input id="wavelength_x_mm" type="number" min="0.001" step="0.1" value="100"></div>
+        <div class="field"><label for="wavelength_y_mm">Y 波长 λy（mm）</label><input id="wavelength_y_mm" type="number" min="0.001" step="0.1" value="200"></div>
+        <div class="field"><label for="phase_x_pi">X 相位 φx（π）</label><input id="phase_x_pi" type="number" step="0.25" value="1" aria-describedby="phasePiHint"></div>
         <div class="field"><label for="phase_y_pi">Y 相位 φy（π）</label><input id="phase_y_pi" type="number" step="0.25" value="0" aria-describedby="phasePiHint"></div>
         <p class="hint" id="phasePiHint">输入 π 的倍数：1 表示 π，0.5 表示 π/2，1.5 表示 3π/2；导出的设计 JSON 仍以 rad 保存。</p>
         <div class="field"><label for="z_reference_mm">Z 基准（mm）</label><input id="z_reference_mm" type="number" step="0.01" value="0"></div>
@@ -671,11 +672,9 @@ def surface_preview_html() -> str:
             <div class="field"><label for="samples_x">曲面采样 X</label><input id="samples_x" type="number" min="2" max="512" step="1" value="49"></div>
             <div class="field"><label for="samples_y">曲面采样 Y</label><input id="samples_y" type="number" min="2" max="512" step="1" value="49"></div>
             <div class="field"><label for="boundary_mode">边界策略</label><select id="boundary_mode"><option value="clip" selected>裁剪至矩形</option><option value="inset">向内缩进</option></select></div>
-            <div class="field"><label for="phase_origin_x_mm">格栅相位 X（mm）</label><input id="phase_origin_x_mm" type="number" step="0.01" value="0"></div>
-            <div class="field"><label for="phase_origin_y_mm">格栅相位 Y（mm）</label><input id="phase_origin_y_mm" type="number" step="0.01" value="0"></div>
             <div class="field"><label for="random_seed">随机种子</label><input id="random_seed" type="number" min="0" step="1" value="0"></div>
             <div class="field"><label for="samples">预览网格密度</label><input id="samples" type="number" min="8" max="120" step="1" value="49"></div>
-            <p class="hint">曲面采样 X/Y 参与共形计算；预览网格密度只影响本页显示。参数化固定使用 LSCM、最远边界锚点和无切缝。</p>
+            <p class="hint">曲面采样 X/Y 参与共形计算；预览网格密度只影响本页显示。格栅相位由导出流程在实际曲面相位域自动避让，避免蜂窝墙与矩形外边界重合；参数化固定使用 LSCM、最远边界锚点和无切缝。</p>
           </div>
         </details>
         <div class="divider"></div>
@@ -687,6 +686,9 @@ def surface_preview_html() -> str:
       <section class="panel preview">
         <div class="previewHead"><h2 id="previewTitle">三维承载曲面</h2><div class="stats" id="stats"></div></div>
         <div class="field"><label for="previewMode">预览模式</label><select id="previewMode"><option value="surface" selected>承载双正弦曲面</option><option value="solid_xz">实体层叠 / XZ 剖面</option></select></div>
+        <div class="field"><label for="surfaceZScale">三维视觉 Z 放大</label><select id="surfaceZScale"><option value="1">真实比例 ×1</option><option value="3">形态观察 ×3</option><option value="5" selected>形态观察 ×5</option><option value="10">形态观察 ×10</option></select></div>
+        <div class="field"><label for="sectionZScale">XZ 剖面视觉 Z 放大</label><select id="sectionZScale"><option value="1">真实比例 ×1</option><option value="3" selected>辅助观察 ×3</option><option value="5">辅助观察 ×5</option></select></div>
+        <p class="hint">视觉 Z 放大只影响画布，不改变参数、检验值、导出的 JSON 或实际零件尺寸。XZ 剖面采用统一 X/Z 比例后再按所选倍率放大 Z，避免隐藏的纵向拉伸。</p>
         <canvas id="canvas" aria-label="双正弦曲面预览"></canvas>
         <p class="navigationHint">左键拖拽旋转；中键拖拽平移；右键上下拖拽缩放；滚轮缩放；双击恢复视角。</p>
         <div class="status" id="status">正在生成曲面…</div>
@@ -696,15 +698,27 @@ def surface_preview_html() -> str:
   <script>
     const surfaceIds = ['amplitude_mm', 'wavelength_x_mm', 'wavelength_y_mm', 'phase_x_pi', 'phase_y_pi', 'z_reference_mm', 'check_x_mm', 'check_y_mm', 'samples'];
     const mappingReferenceLayerHeightMm = 0.5;
-    const conformalDesignIds = ['part_length_mm', 'part_width_mm', 'part_height_mm', 'wall_width_mm', 'base_cell_size_mm', 'orientation_angle_deg', 'surface_start_layer', 'samples_x', 'samples_y', 'boundary_mode', 'phase_origin_x_mm', 'phase_origin_y_mm', 'random_seed'];
+    const conformalDesignIds = ['part_length_mm', 'part_width_mm', 'part_height_mm', 'wall_width_mm', 'base_cell_size_mm', 'orientation_angle_deg', 'surface_start_layer', 'samples_x', 'samples_y', 'boundary_mode', 'random_seed'];
     const canvas = document.getElementById('canvas');
     const statusEl = document.getElementById('status');
     const statsEl = document.getElementById('stats');
     const exportConformalConfigButton = document.getElementById('exportConformalConfig');
     const previewMode = document.getElementById('previewMode');
+    const surfaceZScale = document.getElementById('surfaceZScale');
+    const sectionZScale = document.getElementById('sectionZScale');
     const previewTitle = document.getElementById('previewTitle');
+    const designerStateKey = 'kuka-slicer.conformal-designer-state.v1';
+    const latticePreviewLimit = 1600;
+    const persistedInputIds = [...new Set([
+      ...surfaceIds,
+      ...conformalDesignIds,
+      'surfaceZScale',
+      'sectionZScale',
+      'previewMode',
+    ])];
     let payload = null;
     let queued = 0;
+    let latticePreviewCache = null;
     const initialView = { yaw: -42 * Math.PI / 180, pitch: 54 * Math.PI / 180, zoom: 1, panX: 0, panY: 0 };
     const view = { ...initialView };
     let drag = null;
@@ -717,6 +731,27 @@ def surface_preview_html() -> str:
     function nonNegativeInteger(id) {
       const value = Number(document.getElementById(id).value);
       return Number.isInteger(value) && value >= 0 ? value : null;
+    }
+
+    function saveDesignerState() {
+      try {
+        const state = Object.fromEntries(persistedInputIds.map((id) => [id, document.getElementById(id).value]));
+        localStorage.setItem(designerStateKey, JSON.stringify(state));
+      } catch (_) {
+        // Local preview remains usable when browser storage is unavailable.
+      }
+    }
+
+    function restoreDesignerState() {
+      try {
+        const state = JSON.parse(localStorage.getItem(designerStateKey) || 'null');
+        if (!state || typeof state !== 'object') return;
+        persistedInputIds.forEach((id) => {
+          if (typeof state[id] === 'string') document.getElementById(id).value = state[id];
+        });
+      } catch (_) {
+        // Ignore malformed or unavailable browser-local state.
+      }
     }
 
     function updateConformalDesignSummary() {
@@ -787,16 +822,140 @@ def surface_preview_html() -> str:
       return query;
     }
 
-    function colour(fraction) {
+    function colour(fraction, lighting = 1) {
       const value = Math.max(0, Math.min(1, fraction));
-      return `hsl(204, 68%, ${86 - value * 42}%)`;
+      const luminance = Math.max(28, Math.min(91, (88 - value * 38) * lighting));
+      return `hsl(204, 68%, ${luminance}%)`;
+    }
+
+    function surfaceLighting(x, y) {
+      const surface = payload.surface;
+      const xPhase = (2 * Math.PI * x) / surface.wavelength_x_mm + surface.phase_x_rad;
+      const yPhase = (2 * Math.PI * y) / surface.wavelength_y_mm + surface.phase_y_rad;
+      const dx = surface.amplitude_mm * (2 * Math.PI / surface.wavelength_x_mm) * Math.cos(xPhase) * Math.sin(yPhase);
+      const dy = surface.amplitude_mm * (2 * Math.PI / surface.wavelength_y_mm) * Math.sin(xPhase) * Math.cos(yPhase);
+      const normalLength = Math.hypot(dx, dy, 1);
+      const normal = [-dx / normalLength, -dy / normalLength, 1 / normalLength];
+      const light = [-0.38, -0.46, 0.8];
+      const diffuse = Math.max(0, normal[0] * light[0] + normal[1] * light[1] + normal[2] * light[2]);
+      return 0.62 + 0.48 * diffuse;
+    }
+
+    function rotateVector(x, y, angle) {
+      return [x * Math.cos(angle) - y * Math.sin(angle), x * Math.sin(angle) + y * Math.cos(angle)];
+    }
+
+    function clipSegmentToBounds(start, end, bounds) {
+      const [xMin, yMin, xMax, yMax] = bounds;
+      const dx = end[0] - start[0];
+      const dy = end[1] - start[1];
+      const limits = [
+        [-dx, start[0] - xMin], [dx, xMax - start[0]],
+        [-dy, start[1] - yMin], [dy, yMax - start[1]],
+      ];
+      let lower = 0;
+      let upper = 1;
+      for (const [p, q] of limits) {
+        if (Math.abs(p) < 1e-12) {
+          if (q < 0) return null;
+          continue;
+        }
+        const ratio = q / p;
+        if (p < 0) lower = Math.max(lower, ratio);
+        else upper = Math.min(upper, ratio);
+        if (lower > upper) return null;
+      }
+      return [
+        [start[0] + lower * dx, start[1] + lower * dy],
+        [start[0] + upper * dx, start[1] + upper * dy],
+      ];
+    }
+
+    function latticePreviewParameters() {
+      const edgeLength = positiveNumber('base_cell_size_mm');
+      const wallWidth = positiveNumber('wall_width_mm');
+      if (edgeLength === null || wallWidth === null || !payload) return null;
+      const bounds = payload.coordinate_system.xy_bounds_mm;
+      const angle = Number(document.getElementById('orientation_angle_deg').value) * Math.PI / 180;
+      if (!Number.isFinite(angle)) return null;
+      // The production pipeline chooses the final offset in the solved phase
+      // domain.  This inexpensive canvas equivalent keeps the initial lattice
+      // away from the rectangular axes as the requested cell size changes.
+      const phaseSeed = [0.37, 0.23];
+      const localOrigin = [
+        Math.sqrt(3.0) * edgeLength * (phaseSeed[0] + 0.5 * phaseSeed[1]),
+        1.5 * edgeLength * phaseSeed[1],
+      ];
+      const rotatedOrigin = rotateVector(localOrigin[0], localOrigin[1], angle);
+      const origin = [bounds[0] + rotatedOrigin[0], bounds[1] + rotatedOrigin[1]];
+      const boundaryMode = document.getElementById('boundary_mode').value;
+      return { edgeLength, wallWidth, angle, origin, bounds, boundaryMode };
+    }
+
+    function latticePreviewSegments() {
+      const settings = latticePreviewParameters();
+      if (!settings) return { segments: [], sampled: false, edgeLength: 0, wallWidth: 0 };
+      const { edgeLength, wallWidth, angle, origin, bounds, boundaryMode } = settings;
+      const key = JSON.stringify({ edgeLength, wallWidth, angle, origin, bounds, boundaryMode });
+      if (latticePreviewCache?.key === key) return latticePreviewCache.value;
+      const area = (bounds[2] - bounds[0]) * (bounds[3] - bounds[1]);
+      const exactCellEstimate = area / (1.5 * Math.sqrt(3.0) * edgeLength * edgeLength);
+      const previewEdgeLength = exactCellEstimate > latticePreviewLimit
+        ? edgeLength * Math.sqrt(exactCellEstimate / latticePreviewLimit)
+        : edgeLength;
+      const sampled = previewEdgeLength > edgeLength * (1 + 1e-9);
+      const inverseAngle = -angle;
+      const localCorners = [
+        [bounds[0], bounds[1]], [bounds[0], bounds[3]], [bounds[2], bounds[1]], [bounds[2], bounds[3]],
+      ].map(([x, y]) => rotateVector(x - origin[0], y - origin[1], inverseAngle));
+      const localX = localCorners.map((point) => point[0]);
+      const localY = localCorners.map((point) => point[1]);
+      const radius = previewEdgeLength;
+      const centerStepX = Math.sqrt(3.0) * radius;
+      const centerStepY = 1.5 * radius;
+      const jMin = Math.floor(Math.min(...localY) / centerStepY) - 3;
+      const jMax = Math.ceil(Math.max(...localY) / centerStepY) + 3;
+      const segments = [];
+      const seen = new Set();
+      for (let j = jMin; j <= jMax; j += 1) {
+        const iMin = Math.floor(Math.min(...localX) / centerStepX - 0.5 * j) - 3;
+        const iMax = Math.ceil(Math.max(...localX) / centerStepX - 0.5 * j) + 3;
+        for (let i = iMin; i <= iMax; i += 1) {
+          const localCenter = [centerStepX * (i + 0.5 * j), centerStepY * j];
+          const rotatedCenter = rotateVector(localCenter[0], localCenter[1], angle);
+          const center = [origin[0] + rotatedCenter[0], origin[1] + rotatedCenter[1]];
+          const vertices = Array.from({ length: 6 }, (_, index) => {
+            const vertex = rotateVector(radius * Math.cos(Math.PI / 6 + index * Math.PI / 3), radius * Math.sin(Math.PI / 6 + index * Math.PI / 3), angle);
+            return [center[0] + vertex[0], center[1] + vertex[1]];
+          });
+          if (boundaryMode === 'inset' && !vertices.every(([x, y]) => x >= bounds[0] && x <= bounds[2] && y >= bounds[1] && y <= bounds[3])) continue;
+          vertices.forEach((start, index) => {
+            const clipped = clipSegmentToBounds(start, vertices[(index + 1) % vertices.length], bounds);
+            if (!clipped) return;
+            const keyPart = (point) => `${point[0].toFixed(4)},${point[1].toFixed(4)}`;
+            const first = keyPart(clipped[0]);
+            const second = keyPart(clipped[1]);
+            const edgeKey = first < second ? `${first}|${second}` : `${second}|${first}`;
+            if (seen.has(edgeKey)) return;
+            seen.add(edgeKey);
+            segments.push(clipped);
+          });
+        }
+      }
+      const value = { segments, sampled, edgeLength, previewEdgeLength, wallWidth };
+      latticePreviewCache = { key, value };
+      return value;
     }
 
     function project(x, y, z, yaw, pitch, scale, cx, cy) {
-      const xr = x * Math.cos(yaw) - y * Math.sin(yaw);
-      const yr = x * Math.sin(yaw) + y * Math.cos(yaw);
-      const yp = yr * Math.cos(pitch) - z * Math.sin(pitch);
-      const depth = yr * Math.sin(pitch) + z * Math.cos(pitch);
+      const bounds = payload.coordinate_system.xy_bounds_mm;
+      const centeredX = x - (bounds[0] + bounds[2]) * 0.5;
+      const centeredY = y - (bounds[1] + bounds[3]) * 0.5;
+      const displayZ = z * Number(surfaceZScale.value);
+      const xr = centeredX * Math.cos(yaw) - centeredY * Math.sin(yaw);
+      const yr = centeredX * Math.sin(yaw) + centeredY * Math.cos(yaw);
+      const yp = yr * Math.cos(pitch) - displayZ * Math.sin(pitch);
+      const depth = yr * Math.sin(pitch) + displayZ * Math.cos(pitch);
       return { x: cx + xr * scale, y: cy - yp * scale, depth };
     }
 
@@ -857,6 +1016,102 @@ def surface_preview_html() -> str:
       ctx.fillText(`检验点 (${point.x_mm.toFixed(1)}, ${point.y_mm.toFixed(1)})`, projected.x + 7, projected.y - 7);
     }
 
+    function drawSurfaceReferenceFrame(ctx, zMid, yaw, pitch, scale, cx, cy, stats) {
+      const bounds = payload.coordinate_system.xy_bounds_mm;
+      const baseZ = stats.z_min_mm - Math.max(0.25, stats.z_range_mm * 0.16);
+      const corners = [
+        [bounds[0], bounds[1]], [bounds[2], bounds[1]], [bounds[2], bounds[3]], [bounds[0], bounds[3]],
+      ].map(([x, y]) => project(x, y, baseZ - zMid, yaw, pitch, scale, cx, cy));
+      ctx.save();
+      ctx.fillStyle = 'rgba(216, 230, 239, .48)';
+      ctx.strokeStyle = 'rgba(112, 142, 159, .65)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      ctx.moveTo(corners[0].x, corners[0].y);
+      corners.slice(1).forEach((point) => ctx.lineTo(point.x, point.y));
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+      const origin = project(bounds[0], bounds[1], baseZ - zMid, yaw, pitch, scale, cx, cy);
+      const axisLength = Math.min(30, Math.max(10, Math.min(bounds[2] - bounds[0], bounds[3] - bounds[1]) * 0.22));
+      const axes = [
+        { end: project(bounds[0] + axisLength, bounds[1], baseZ - zMid, yaw, pitch, scale, cx, cy), color: '#b91c1c', label: 'X' },
+        { end: project(bounds[0], bounds[1] + axisLength, baseZ - zMid, yaw, pitch, scale, cx, cy), color: '#0f766e', label: 'Y' },
+        { end: project(bounds[0], bounds[1], baseZ + axisLength - zMid, yaw, pitch, scale, cx, cy), color: '#1d4ed8', label: 'Z' },
+      ];
+      ctx.setLineDash([]);
+      ctx.font = '600 11px Segoe UI, Microsoft YaHei, sans-serif';
+      axes.forEach((axis) => {
+        ctx.strokeStyle = axis.color;
+        ctx.fillStyle = axis.color;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(origin.x, origin.y);
+        ctx.lineTo(axis.end.x, axis.end.y);
+        ctx.stroke();
+        ctx.fillText(axis.label, axis.end.x + 6, axis.end.y - 4);
+      });
+      ctx.restore();
+    }
+
+    function drawSurfaceGuideMesh(ctx, x, y, z, zMid, yaw, pitch, scale, cx, cy) {
+      const rowStride = Math.max(1, Math.floor((z.length - 1) / 8));
+      const colStride = Math.max(1, Math.floor((z[0].length - 1) / 8));
+      const centerRow = Math.floor((z.length - 1) * 0.5);
+      const centerCol = Math.floor((z[0].length - 1) * 0.5);
+      const drawCurve = (points, emphasis) => {
+        ctx.beginPath();
+        points.forEach(([xMm, yMm, zMm], index) => {
+          const point = project(xMm, yMm, zMm - zMid, yaw, pitch, scale, cx, cy);
+          if (index === 0) ctx.moveTo(point.x, point.y);
+          else ctx.lineTo(point.x, point.y);
+        });
+        ctx.strokeStyle = emphasis ? 'rgba(27, 73, 105, .75)' : 'rgba(44, 103, 139, .3)';
+        ctx.lineWidth = emphasis ? 1.05 : 0.55;
+        ctx.stroke();
+      };
+      ctx.save();
+      for (let row = 0; row < z.length; row += rowStride) {
+        drawCurve(x[row].map((xMm, col) => [xMm, y[row][col], z[row][col]]), row === centerRow);
+      }
+      if ((z.length - 1) % rowStride !== 0) drawCurve(x[z.length - 1].map((xMm, col) => [xMm, y[z.length - 1][col], z[z.length - 1][col]]), false);
+      for (let col = 0; col < z[0].length; col += colStride) {
+        drawCurve(z.map((row, rowIndex) => [x[rowIndex][col], y[rowIndex][col], row[col]]), col === centerCol);
+      }
+      if ((z[0].length - 1) % colStride !== 0) drawCurve(z.map((row, rowIndex) => [x[rowIndex][z[0].length - 1], y[rowIndex][z[0].length - 1], row[z[0].length - 1]]), false);
+      ctx.restore();
+    }
+
+    function drawLatticePreview(ctx, zMid, yaw, pitch, scale, cx, cy) {
+      const lattice = latticePreviewSegments();
+      if (!lattice.segments.length) return;
+      const wavelength = Math.min(payload.surface.wavelength_x_mm, payload.surface.wavelength_y_mm);
+      const subdivisions = drag ? 1 : Math.max(2, Math.min(6, Math.ceil(lattice.previewEdgeLength / Math.max(wavelength / 8, 0.1))));
+      ctx.save();
+      ctx.beginPath();
+      lattice.segments.forEach(([start, end]) => {
+        for (let index = 0; index <= subdivisions; index += 1) {
+          const ratio = index / subdivisions;
+          const x = start[0] + (end[0] - start[0]) * ratio;
+          const y = start[1] + (end[1] - start[1]) * ratio;
+          const point = project(x, y, heightAt(x, y) - zMid, yaw, pitch, scale, cx, cy);
+          if (index === 0) ctx.moveTo(point.x, point.y);
+          else ctx.lineTo(point.x, point.y);
+        }
+      });
+      ctx.strokeStyle = 'rgba(7, 91, 76, .88)';
+      ctx.lineWidth = Math.max(0.8, Math.min(12, lattice.wallWidth * scale * 0.72));
+      ctx.lineJoin = 'round';
+      ctx.lineCap = 'round';
+      ctx.stroke();
+      ctx.restore();
+      ctx.fillStyle = 'rgba(7, 71, 62, .78)';
+      ctx.font = '12px Segoe UI, Microsoft YaHei, sans-serif';
+      const sampling = lattice.sampled ? `；显示降采样边长 ${lattice.previewEdgeLength.toFixed(2)} mm` : '';
+      ctx.fillText(`蜂窝格栅：墙宽 ${lattice.wallWidth.toFixed(2)} mm；目标边长 ${lattice.edgeLength.toFixed(2)} mm；${lattice.segments.length} 条墙${sampling}`, 14, 20);
+    }
+
     function renderSolidStack(ctx, width, height) {
       const stack = payload.solid_stack;
       if (!stack) return;
@@ -870,14 +1125,26 @@ def surface_preview_html() -> str:
       const margin = { left: 54, right: 20, top: 28, bottom: 42 };
       const plotWidth = Math.max(1, width - margin.left - margin.right);
       const plotHeight = Math.max(1, height - margin.top - margin.bottom);
-      const mapX = (x) => margin.left + (x - xMin) * plotWidth / Math.max(xMax - xMin, 1e-9);
-      const mapZ = (z) => height - margin.bottom - (z - zMin) * plotHeight / Math.max(zMax - zMin, 1e-9);
+      const visualZScale = Number(sectionZScale.value);
+      const zMid = (zMin + zMax) * 0.5;
+      const displayZMin = zMid + (zMin - zMid) * visualZScale;
+      const displayZMax = zMid + (zMax - zMid) * visualZScale;
+      const uniformScale = Math.min(
+        plotWidth / Math.max(xMax - xMin, 1e-9),
+        plotHeight / Math.max(displayZMax - displayZMin, 1e-9),
+      );
+      const renderedWidth = (xMax - xMin) * uniformScale;
+      const renderedHeight = (displayZMax - displayZMin) * uniformScale;
+      const offsetX = margin.left + (plotWidth - renderedWidth) * 0.5;
+      const offsetY = margin.top + (plotHeight - renderedHeight) * 0.5;
+      const mapX = (x) => offsetX + (x - xMin) * uniformScale;
+      const mapZ = (z) => offsetY + renderedHeight - (zMid + (z - zMid) * visualZScale - displayZMin) * uniformScale;
       ctx.strokeStyle = '#a9b9ca';
       ctx.lineWidth = 1;
       ctx.beginPath();
-      ctx.moveTo(margin.left, margin.top);
-      ctx.lineTo(margin.left, height - margin.bottom);
-      ctx.lineTo(width - margin.right, height - margin.bottom);
+      ctx.moveTo(offsetX, offsetY);
+      ctx.lineTo(offsetX, offsetY + renderedHeight);
+      ctx.lineTo(offsetX + renderedWidth, offsetY + renderedHeight);
       ctx.stroke();
       layers.forEach((layer) => {
         ctx.beginPath();
@@ -897,9 +1164,9 @@ def surface_preview_html() -> str:
       });
       ctx.fillStyle = 'rgba(21,32,51,.78)';
       ctx.font = '12px Segoe UI, Microsoft YaHei, sans-serif';
-      ctx.fillText(`XZ 剖面：Y = ${stack.section_y_mm.toFixed(2)} mm；参考层高 ${stack.reference_layer_height_mm.toFixed(2)} mm；α 为旧版对称 smoothstep`, margin.left, 17);
-      ctx.fillText(`X：${xMin.toFixed(1)} ～ ${xMax.toFixed(1)} mm`, margin.left, height - 16);
-      ctx.fillText(`Z：${zMin.toFixed(2)} ～ ${zMax.toFixed(2)} mm`, width - 148, height - 16);
+      ctx.fillText(`XZ 剖面：Y = ${stack.section_y_mm.toFixed(2)} mm；参考层高 ${stack.reference_layer_height_mm.toFixed(2)} mm；视觉 Z ×${visualZScale}；α 为旧版对称 smoothstep`, margin.left, 17);
+      ctx.fillText(`X：${xMin.toFixed(1)} ～ ${xMax.toFixed(1)} mm`, offsetX, height - 16);
+      ctx.fillText(`物理 Z：${zMin.toFixed(2)} ～ ${zMax.toFixed(2)} mm`, width - 178, height - 16);
     }
 
     function render() {
@@ -922,7 +1189,7 @@ def surface_preview_html() -> str:
       const projection = payload.domain.projection;
       const materialMask = payload.grid.material_mask;
       const { yaw, pitch } = view;
-      const span = Math.max(payload.domain.width_mm, payload.domain.height_mm, stats.z_range_mm * 2, 1);
+      const span = Math.max(payload.domain.width_mm, payload.domain.height_mm, stats.z_range_mm * 2 * Number(surfaceZScale.value), 1);
       const scale = Math.min(width, height) * 0.72 * view.zoom / span;
       const cx = width / 2 + view.panX;
       const cy = height / 2 + 8 + view.panY;
@@ -939,32 +1206,40 @@ def surface_preview_html() -> str:
             project(x[row + 1][col], y[row + 1][col], z[row + 1][col] - zMid, yaw, pitch, scale, cx, cy),
           ];
           const averageZ = (z[row][col] + z[row][col + 1] + z[row + 1][col + 1] + z[row + 1][col]) / 4;
-          cells.push({ p, depth: p.reduce((sum, point) => sum + point.depth, 0) / 4, averageZ });
+          const centerX = (x[row][col] + x[row][col + 1] + x[row + 1][col + 1] + x[row + 1][col]) / 4;
+          const centerY = (y[row][col] + y[row][col + 1] + y[row + 1][col + 1] + y[row + 1][col]) / 4;
+          cells.push({ p, depth: p.reduce((sum, point) => sum + point.depth, 0) / 4, averageZ, centerX, centerY });
         }
       }
       cells.sort((a, b) => a.depth - b.depth);
+      drawSurfaceReferenceFrame(ctx, zMid, yaw, pitch, scale, cx, cy, stats);
       if (exactProjectionClip) {
         ctx.save();
         clipToProjection(ctx, projection, zMid, yaw, pitch, scale, cx, cy);
       }
+      ctx.save();
+      ctx.globalAlpha = 0.72;
       cells.forEach((cell) => {
         const fraction = stats.z_range_mm === 0 ? 0.5 : (cell.averageZ - stats.z_min_mm) / stats.z_range_mm;
         ctx.beginPath();
         ctx.moveTo(cell.p[0].x, cell.p[0].y);
         cell.p.slice(1).forEach((point) => ctx.lineTo(point.x, point.y));
         ctx.closePath();
-        ctx.fillStyle = colour(fraction);
+        ctx.fillStyle = colour(fraction, surfaceLighting(cell.centerX, cell.centerY));
         ctx.fill();
       });
+      ctx.restore();
       if (exactProjectionClip) ctx.restore();
       drawProjectionBoundaries(ctx, projection, zMid, yaw, pitch, scale, cx, cy);
+      drawSurfaceGuideMesh(ctx, x, y, z, zMid, yaw, pitch, scale, cx, cy);
+      drawLatticePreview(ctx, zMid, yaw, pitch, scale, cx, cy);
       drawInspectionMarker(ctx, zMid, yaw, pitch, scale, cx, cy);
       ctx.fillStyle = 'rgba(21,32,51,.68)';
       ctx.font = '12px Segoe UI, Microsoft YaHei, sans-serif';
       const originLabel = payload.domain.mode === 'rectangle'
         ? '矩形左下角 (0, 0)'
         : 'STL 投影左下基准 (0, 0)';
-      ctx.fillText(`X / Y：mm，原点：${originLabel}   Z：mm`, 14, height - 16);
+      ctx.fillText(`X / Y：mm，原点：${originLabel}   Z：mm（视觉 ×${surfaceZScale.value}）`, 14, height - 16);
     }
 
     function showStats(data) {
@@ -1009,13 +1284,36 @@ def surface_preview_html() -> str:
 
     let timer = null;
     function scheduleRefresh() { clearTimeout(timer); timer = setTimeout(refresh, 120); }
-    surfaceIds.forEach((id) => document.getElementById(id).addEventListener('input', scheduleRefresh));
-    ['part_length_mm', 'part_width_mm', 'part_height_mm', 'surface_start_layer'].forEach((id) => document.getElementById(id).addEventListener('input', scheduleRefresh));
-    conformalDesignIds.forEach((id) => document.getElementById(id).addEventListener('input', updateConformalDesignSummary));
+    function invalidateLatticePreview() { latticePreviewCache = null; }
+    surfaceIds.forEach((id) => document.getElementById(id).addEventListener('input', () => {
+      saveDesignerState();
+      scheduleRefresh();
+    }));
+    ['part_length_mm', 'part_width_mm', 'part_height_mm', 'surface_start_layer'].forEach((id) => document.getElementById(id).addEventListener('input', () => {
+      saveDesignerState();
+      invalidateLatticePreview();
+      scheduleRefresh();
+    }));
+    conformalDesignIds.forEach((id) => document.getElementById(id).addEventListener('input', () => {
+      saveDesignerState();
+      updateConformalDesignSummary();
+    }));
+    ['wall_width_mm', 'base_cell_size_mm', 'orientation_angle_deg'].forEach((id) => document.getElementById(id).addEventListener('input', () => {
+      invalidateLatticePreview();
+      if (payload) render();
+    }));
+    document.getElementById('boundary_mode').addEventListener('change', () => {
+      saveDesignerState();
+      invalidateLatticePreview();
+      if (payload) render();
+    });
     previewMode.addEventListener('change', () => {
+      saveDesignerState();
       previewTitle.textContent = previewMode.value === 'solid_xz' ? '实体层叠 / XZ 剖面' : '三维承载曲面';
       render();
     });
+    surfaceZScale.addEventListener('change', () => { saveDesignerState(); render(); });
+    sectionZScale.addEventListener('change', () => { saveDesignerState(); render(); });
     exportConformalConfigButton.addEventListener('click', async () => {
       try {
         const response = await fetch(`/api/export-conformal-lattice-config?${conformalParameters().toString()}`);
@@ -1083,14 +1381,17 @@ def surface_preview_html() -> str:
       render();
     });
     document.getElementById('reset').addEventListener('click', () => {
-      const defaults = { part_length_mm: 150, part_width_mm: 100, part_height_mm: 10, amplitude_mm: 0.8, wavelength_x_mm: 40, wavelength_y_mm: 50, phase_x_pi: 0, phase_y_pi: 0, z_reference_mm: 0, check_x_mm: 75, check_y_mm: 50, wall_width_mm: 2, base_cell_size_mm: 5, orientation_angle_deg: 0, surface_start_layer: 3, samples_x: 49, samples_y: 49, boundary_mode: 'clip', phase_origin_x_mm: 0, phase_origin_y_mm: 0, random_seed: 0, samples: 49 };
+      const defaults = { part_length_mm: 150, part_width_mm: 100, part_height_mm: 10, amplitude_mm: 1.5, wavelength_x_mm: 100, wavelength_y_mm: 200, phase_x_pi: 1, phase_y_pi: 0, z_reference_mm: 0, check_x_mm: 75, check_y_mm: 50, wall_width_mm: 2, base_cell_size_mm: 5, orientation_angle_deg: 0, surface_start_layer: 3, samples_x: 49, samples_y: 49, boundary_mode: 'clip', random_seed: 0, samples: 49, surfaceZScale: 5, sectionZScale: 3, previewMode: 'surface' };
       Object.entries(defaults).forEach(([id, value]) => {
         document.getElementById(id).value = value;
       });
+      invalidateLatticePreview();
+      saveDesignerState();
       updateConformalDesignSummary();
       refresh();
     });
     window.addEventListener('resize', render);
+    restoreDesignerState();
     updateConformalDesignSummary();
     refresh();
   </script>

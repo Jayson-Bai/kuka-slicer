@@ -222,6 +222,19 @@ def test_surface_preview_html_has_an_independent_surface_api_and_controls():
     assert 'id="check_y_mm"' in html
     assert 'id="previewMode"' in html
     assert '实体层叠 / XZ 剖面' in html
+    assert 'id="surfaceZScale"' in html
+    assert 'id="sectionZScale"' in html
+    assert '视觉 Z 放大只影响画布' in html
+    assert 'const centeredX = x - (bounds[0] + bounds[2]) * 0.5;' in html
+    assert 'const uniformScale = Math.min(' in html
+    assert '蜂窝格栅：墙宽' in html
+    assert 'function drawLatticePreview' in html
+    assert 'function drawSurfaceReferenceFrame' in html
+    assert 'function drawSurfaceGuideMesh' in html
+    assert 'function surfaceLighting' in html
+    assert "const designerStateKey = 'kuka-slicer.conformal-designer-state.v1';" in html
+    assert 'function saveDesignerState()' in html
+    assert 'function restoreDesignerState()' in html
     assert 'id="samples_x" type="number" min="2" max="512" step="1" value="49"' in html
     assert 'id="samples_y" type="number" min="2" max="512" step="1" value="49"' in html
     assert 'id="samples" type="number" min="8" max="120" step="1" value="49"' in html
@@ -234,6 +247,8 @@ def test_surface_preview_html_has_an_independent_surface_api_and_controls():
     assert 'id="layer_height_mm"' not in html
     assert 'id="wall_width_mm"' in html
     assert 'id="base_cell_size_mm"' in html
+    assert 'id="phase_origin_x_mm"' not in html
+    assert '自动避让' in html
     assert 'id="surface_start_layer"' in html
     assert 'id="samples_x"' in html
     assert 'id="samples_y"' in html
@@ -347,6 +362,7 @@ def test_conformal_lattice_export_binds_double_sine_to_a_rectangular_physical_pa
     assert config["lattice"]["base_cell_size_mm"] == pytest.approx(5.0)
     assert config["lattice"]["boundary_mode"] == "inset"
     assert config["lattice"]["phase_origin"] == [1.25, -0.5]
+    assert config["lattice"]["boundary_phase_policy"] == "auto_avoid_outer_boundary_coincidence"
     assert config["fill_field"] == {"mode": "fixed_cell_size", "drivers": []}
     assert config["orientation_field"]["angle_deg"] == pytest.approx(30.0)
     assert config["layer_embedding"]["surface_start_layer"] == 3

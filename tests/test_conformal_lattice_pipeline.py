@@ -116,6 +116,29 @@ def test_pipeline_skips_expensive_fill_diagnostic_for_production_path_export(tmp
     assert loaded_preview["conformal_lattice"]["uses_existing_main_canvas"] is True
 
 
+def test_auto_boundary_phase_policy_moves_the_lattice_without_changing_legacy_specs():
+    automatic = _spec()
+    automatic.lattice["boundary_phase_policy"] = "auto_avoid_outer_boundary_coincidence"
+
+    automatic_run = run_conformal_lattice_pipeline(automatic, logical_layer_count=4)
+    automatic_report = automatic_run.geometry.metadata["config"]["boundary_phase"]
+
+    assert automatic_report["policy"] == "auto_avoid_outer_boundary_coincidence"
+    assert automatic_report["requested_phase_origin"] == [0.0, 0.0]
+    assert automatic_report["effective_phase_origin"] != [0.0, 0.0]
+    assert automatic_run.geometry.metadata["phase_origin"] == pytest.approx(
+        automatic_report["effective_phase_origin"]
+    )
+
+    legacy_run = run_conformal_lattice_pipeline(_spec(), logical_layer_count=4)
+    legacy_report = legacy_run.geometry.metadata["config"]["boundary_phase"]
+    assert legacy_report == {
+        "policy": "manual",
+        "requested_phase_origin": [0.0, 0.0],
+        "effective_phase_origin": [0.0, 0.0],
+    }
+
+
 def test_pipeline_runs_actual_fill_diagnostic_only_when_explicitly_requested():
     run = run_conformal_lattice_pipeline(
         _spec(),

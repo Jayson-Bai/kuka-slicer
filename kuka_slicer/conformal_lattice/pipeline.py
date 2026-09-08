@@ -12,7 +12,11 @@ import numpy as np
 from .contracts import ConformalLatticeSpec, load_conformal_lattice_spec
 from .fill_ratio_validation import FillRatioValidation, validate_realized_fill_ratio
 from .layer_embedding import LayerEmbedding, embed_lattice_layers
-from .lattice_generator import ConformalLatticeGeometry, generate_conformal_lattice_geometry
+from .lattice_generator import (
+    ConformalLatticeGeometry,
+    choose_boundary_safe_phase_origin,
+    generate_conformal_lattice_geometry,
+)
 from .mesh_domain import SurfaceMeshDomain, build_double_sine_surface_domain
 from .orientation_field import OrientationField, build_orientation_field
 from .parameterization import LSCMParameterization, parameterize_spec_lscm
@@ -136,6 +140,21 @@ def run_conformal_lattice_pipeline(
     boundary_mode = str(spec.lattice["boundary_mode"])
     if boundary_mode not in ("clip", "inset"):
         raise ValueError("first-version UI pipeline supports lattice.boundary_mode=clip or inset")
+    requested_phase_origin = tuple(float(value) for value in spec.lattice["phase_origin"])
+    boundary_phase_policy = str(spec.lattice.get("boundary_phase_policy", "manual"))
+    if boundary_phase_policy == "auto_avoid_outer_boundary_coincidence":
+        effective_phase_origin, boundary_phase_report = choose_boundary_safe_phase_origin(
+            domain, phase, requested_phase_origin
+        )
+    elif boundary_phase_policy == "manual":
+        effective_phase_origin = requested_phase_origin
+        boundary_phase_report = {
+            "policy": "manual",
+            "requested_phase_origin": list(requested_phase_origin),
+            "effective_phase_origin": list(effective_phase_origin),
+        }
+    else:  # The contract loader rejects this; retain a local guard for direct specs.
+        raise ValueError("unsupported lattice.boundary_phase_policy")
     geometry = generate_conformal_lattice_geometry(
         domain,
         parameterization,
@@ -143,9 +162,9 @@ def run_conformal_lattice_pipeline(
         orientation,
         phase,
         boundary_mode=boundary_mode,
-        phase_origin=tuple(float(value) for value in spec.lattice["phase_origin"]),
+        phase_origin=effective_phase_origin,
         random_seed=spec.random_seed,
-        config_metadata=spec.metadata(),
+        config_metadata={**spec.metadata(), "boundary_phase": boundary_phase_report},
     )
     fill_validation = None
     if validate_fill_ratio:
