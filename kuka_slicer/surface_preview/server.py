@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import math
 import secrets
+import subprocess
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from ..conformal_lattice.contracts import (
@@ -16,15 +18,35 @@ from ..conformal_lattice.contracts import (
 )
 from .model import DoubleSineSurface
 from .stl_domain import STLProjectionDomain, stl_projection_domain_from_bytes
+from ..surface_mapper.progression import LayerProgression
 
 
 DEFAULT_PREVIEW_WIDTH_MM = 120.0
 DEFAULT_PREVIEW_HEIGHT_MM = 100.0
-DEFAULT_PREVIEW_SAMPLES = 48
+DEFAULT_PREVIEW_SAMPLES = 49
 MAX_PREVIEW_SAMPLES = 120
 MAX_CONFORMAL_SAMPLES = 512
 MAX_STL_BYTES = 64 * 1024 * 1024
 CONFORMAL_MAPPING_REFERENCE_LAYER_HEIGHT_MM = 0.5
+SURFACE_PREVIEW_API_VERSION = "surface_preview_v2"
+
+
+def _git_revision() -> str:
+    """Return a local revision label without making the preview depend on Git."""
+
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parents[2],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=1,
+        ).strip() or "unknown"
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+
+
+SURFACE_PREVIEW_GIT_REVISION = _git_revision()
 
 
 def _query_float(
@@ -89,6 +111,98 @@ def _query_nonnegative_int(
     return value
 
 
+def _inspection_point(
+    params: dict[str, list[str]],
+    surface: DoubleSineSurface,
+    *,
+    x_bounds_mm: tuple[float, float],
+    y_bounds_mm: tuple[float, float],
+) -> dict[str, float]:
+    """Return one inspectable target-surface point in the exported XY frame."""
+
+    x_min_mm, x_max_mm = x_bounds_mm
+    y_min_mm, y_max_mm = y_bounds_mm
+    x_mm = _query_float(params, "check_x_mm", (x_min_mm + x_max_mm) / 2.0)
+    y_mm = _query_float(params, "check_y_mm", (y_min_mm + y_max_mm) / 2.0)
+    if not x_min_mm <= x_mm <= x_max_mm or not y_min_mm <= y_mm <= y_max_mm:
+        raise ValueError("check point must lie inside the preview XY bounds")
+    phase_x = (2.0 * math.pi * x_mm) / surface.wavelength_x_mm + surface.phase_x_rad
+    phase_y = (2.0 * math.pi * y_mm) / surface.wavelength_y_mm + surface.phase_y_rad
+    kx = 2.0 * math.pi / surface.wavelength_x_mm
+    ky = 2.0 * math.pi / surface.wavelength_y_mm
+    sin_x, cos_x = math.sin(phase_x), math.cos(phase_x)
+    sin_y, cos_y = math.sin(phase_y), math.cos(phase_y)
+    fx = surface.amplitude_mm * kx * cos_x * sin_y
+    fy = surface.amplitude_mm * ky * sin_x * cos_y
+    fxx = -surface.amplitude_mm * kx * kx * sin_x * sin_y
+    fyy = -surface.amplitude_mm * ky * ky * sin_x * sin_y
+    fxy = surface.amplitude_mm * kx * ky * cos_x * cos_y
+    denominator = 2.0 * (1.0 + fx * fx + fy * fy) ** 1.5
+    mean_curvature = (
+        (1.0 + fy * fy) * fxx - 2.0 * fx * fy * fxy + (1.0 + fx * fx) * fyy
+    ) / denominator
+    return {
+        "x_mm": x_mm,
+        "y_mm": y_mm,
+        "height_mm": float(surface.height(x_mm, y_mm)),
+        "slope": math.hypot(fx, fy),
+        "mean_curvature_per_mm": mean_curvature,
+    }
+
+
+def _conformal_solid_stack_payload(
+    params: dict[str, list[str]],
+    surface: DoubleSineSurface,
+    *,
+    x_samples_mm: list[float],
+    inspection: dict[str, float],
+) -> dict[str, object] | None:
+    """Sample the existing smoothstep stack on the inspection-point XZ cut."""
+
+    if "part_height_mm" not in params and "surface_start_layer" not in params:
+        return None
+    final_height_mm = _query_float(params, "part_height_mm", 10.0, positive=True)
+    start_layer = _query_nonnegative_int(params, "surface_start_layer", 3)
+    layer_count = int(math.ceil(final_height_mm / CONFORMAL_MAPPING_REFERENCE_LAYER_HEIGHT_MM))
+    progression = LayerProgression(start_layer, layer_count - 1)
+    layer_thicknesses = [CONFORMAL_MAPPING_REFERENCE_LAYER_HEIGHT_MM] * layer_count
+    layer_thicknesses[-1] = final_height_mm - CONFORMAL_MAPPING_REFERENCE_LAYER_HEIGHT_MM * (layer_count - 1)
+    base_z_by_layer: list[float] = []
+    accumulated = 0.0
+    for thickness in layer_thicknesses:
+        base_z_by_layer.append(accumulated + thickness * 0.5)
+        accumulated += thickness
+    y_mm = inspection["y_mm"]
+    target_displacements = [
+        float(surface.height(x_mm, y_mm)) - surface.z_reference_mm
+        for x_mm in x_samples_mm
+    ]
+    layers = []
+    for index, base_z_mm in enumerate(base_z_by_layer):
+        alpha = progression.alpha(index)
+        layers.append(
+            {
+                "index": index,
+                "alpha": alpha,
+                "base_z_mm": base_z_mm,
+                "xz_points": [
+                    [x_mm, base_z_mm + surface.z_reference_mm + alpha * height_mm]
+                    for x_mm, height_mm in zip(x_samples_mm, target_displacements, strict=True)
+                ],
+            }
+        )
+    return {
+        "format": "conformal_solid_stack_preview_v1",
+        "reference_layer_height_mm": CONFORMAL_MAPPING_REFERENCE_LAYER_HEIGHT_MM,
+        "final_height_mm": final_height_mm,
+        "section_y_mm": y_mm,
+        "surface_start_layer": start_layer,
+        "surface_return_layer": progression.surface_return_layer,
+        "peak_layer_indices": list(progression.peak_layers),
+        "layers": layers,
+    }
+
+
 def surface_payload(
     params: dict[str, list[str]],
     domain: STLProjectionDomain | None = None,
@@ -139,7 +253,35 @@ def surface_payload(
         center_x = (grid.x[:-1, :-1] + grid.x[:-1, 1:] + grid.x[1:, 1:] + grid.x[1:, :-1]) / 4.0
         center_y = (grid.y[:-1, :-1] + grid.y[:-1, 1:] + grid.y[1:, 1:] + grid.y[1:, :-1]) / 4.0
         grid_payload["material_mask"] = domain.material_mask(center_x, center_y).tolist()
+    lower_left_origin = domain is not None or rectangle_origin_lower_left
+    origin_label = (
+        "stl_projection_lower_left"
+        if domain is not None
+        else "rectangle_lower_left"
+        if lower_left_origin
+        else "centered_preview"
+    )
+    xy_bounds_mm = (
+        [0.0, 0.0, width_mm, height_mm]
+        if lower_left_origin
+        else [-width_mm / 2.0, -height_mm / 2.0, width_mm / 2.0, height_mm / 2.0]
+    )
+    x_bounds = (0.0, width_mm) if lower_left_origin else (-width_mm / 2.0, width_mm / 2.0)
+    y_bounds = (0.0, height_mm) if lower_left_origin else (-height_mm / 2.0, height_mm / 2.0)
+    inspection = _inspection_point(
+        params,
+        surface,
+        x_bounds_mm=x_bounds,
+        y_bounds_mm=y_bounds,
+    )
     return {
+        "preview_version": SURFACE_PREVIEW_API_VERSION,
+        "export_version": CONFORMAL_LATTICE_SPEC_V1,
+        "git_revision": SURFACE_PREVIEW_GIT_REVISION,
+        "coordinate_system": {
+            "origin_label": origin_label,
+            "xy_bounds_mm": xy_bounds_mm,
+        },
         "surface": {
             "type": "double_sine_product",
             "amplitude_mm": surface.amplitude_mm,
@@ -158,6 +300,13 @@ def surface_payload(
         },
         "statistics": grid.summary(),
         "grid": grid_payload,
+        "inspection_point": inspection,
+        "solid_stack": _conformal_solid_stack_payload(
+            params,
+            surface,
+            x_samples_mm=[float(value) for value in grid.x[0]],
+            inspection=inspection,
+        ),
     }
 
 
@@ -204,7 +353,11 @@ def conformal_lattice_config_payload(params: dict[str, list[str]]) -> dict[str, 
     # actual physical layer height is supplied later by the slicer/Core UI.
     layer_height_mm = CONFORMAL_MAPPING_REFERENCE_LAYER_HEIGHT_MM
     surface_params = {**params, "width_mm": [str(length_mm)], "height_mm": [str(width_mm)]}
-    surface = surface_payload(surface_params, include_projection_geometry=False)["surface"]
+    surface = surface_payload(
+        surface_params,
+        include_projection_geometry=False,
+        rectangle_origin_lower_left=True,
+    )["surface"]
     wall_width_mm = _query_float(params, "wall_width_mm", 2.0, positive=True)
     wall_bead_count = round(wall_width_mm / 2.0)
     if wall_bead_count < 1 or not math.isclose(wall_width_mm, 2.0 * wall_bead_count, rel_tol=0.0, abs_tol=1e-9):
@@ -497,6 +650,9 @@ def surface_preview_html() -> str:
         <div class="field"><label for="phase_y_pi">Y 相位 φy（π）</label><input id="phase_y_pi" type="number" step="0.25" value="0" aria-describedby="phasePiHint"></div>
         <p class="hint" id="phasePiHint">输入 π 的倍数：1 表示 π，0.5 表示 π/2，1.5 表示 3π/2；导出的设计 JSON 仍以 rad 保存。</p>
         <div class="field"><label for="z_reference_mm">Z 基准（mm）</label><input id="z_reference_mm" type="number" step="0.01" value="0"></div>
+        <div class="field"><label for="check_x_mm">检验点 X（mm）</label><input id="check_x_mm" type="number" min="0" step="0.1" value="75" aria-describedby="checkPointHint"></div>
+        <div class="field"><label for="check_y_mm">检验点 Y（mm）</label><input id="check_y_mm" type="number" min="0" step="0.1" value="50" aria-describedby="checkPointHint"></div>
+        <p class="hint" id="checkPointHint">默认检验零件中心 (75, 50)。预览会标出该点，并显示目标曲面的 H、坡度和平均曲率。</p>
         <div class="divider"></div>
         <h2>固定六边形格栅</h2>
         <div class="field"><label for="wall_width_mm">设计墙宽（mm）</label><input id="wall_width_mm" type="number" min="2" step="2" value="2"></div>
@@ -512,13 +668,13 @@ def surface_preview_html() -> str:
         <details class="advanced">
           <summary>高级参数（共形计算）</summary>
           <div class="advancedBody">
-            <div class="field"><label for="samples_x">曲面采样 X</label><input id="samples_x" type="number" min="2" max="512" step="1" value="48"></div>
-            <div class="field"><label for="samples_y">曲面采样 Y</label><input id="samples_y" type="number" min="2" max="512" step="1" value="48"></div>
+            <div class="field"><label for="samples_x">曲面采样 X</label><input id="samples_x" type="number" min="2" max="512" step="1" value="49"></div>
+            <div class="field"><label for="samples_y">曲面采样 Y</label><input id="samples_y" type="number" min="2" max="512" step="1" value="49"></div>
             <div class="field"><label for="boundary_mode">边界策略</label><select id="boundary_mode"><option value="clip" selected>裁剪至矩形</option><option value="inset">向内缩进</option></select></div>
             <div class="field"><label for="phase_origin_x_mm">格栅相位 X（mm）</label><input id="phase_origin_x_mm" type="number" step="0.01" value="0"></div>
             <div class="field"><label for="phase_origin_y_mm">格栅相位 Y（mm）</label><input id="phase_origin_y_mm" type="number" step="0.01" value="0"></div>
             <div class="field"><label for="random_seed">随机种子</label><input id="random_seed" type="number" min="0" step="1" value="0"></div>
-            <div class="field"><label for="samples">预览网格密度</label><input id="samples" type="number" min="8" max="120" step="1" value="48"></div>
+            <div class="field"><label for="samples">预览网格密度</label><input id="samples" type="number" min="8" max="120" step="1" value="49"></div>
             <p class="hint">曲面采样 X/Y 参与共形计算；预览网格密度只影响本页显示。参数化固定使用 LSCM、最远边界锚点和无切缝。</p>
           </div>
         </details>
@@ -529,7 +685,8 @@ def surface_preview_html() -> str:
         <p class="hint">方程：H(x,y)=A·sin(2πx/λx+φx)·sin(2πy/λy+φy)+Zref。导出文件为 <code>conformal_lattice_spec_v1.json</code>，请在主切片器中导入该文件。</p>
       </form>
       <section class="panel preview">
-        <div class="previewHead"><h2>三维曲面</h2><div class="stats" id="stats"></div></div>
+        <div class="previewHead"><h2 id="previewTitle">三维承载曲面</h2><div class="stats" id="stats"></div></div>
+        <div class="field"><label for="previewMode">预览模式</label><select id="previewMode"><option value="surface" selected>承载双正弦曲面</option><option value="solid_xz">实体层叠 / XZ 剖面</option></select></div>
         <canvas id="canvas" aria-label="双正弦曲面预览"></canvas>
         <p class="navigationHint">左键拖拽旋转；中键拖拽平移；右键上下拖拽缩放；滚轮缩放；双击恢复视角。</p>
         <div class="status" id="status">正在生成曲面…</div>
@@ -537,13 +694,15 @@ def surface_preview_html() -> str:
     </section>
   </main>
   <script>
-    const surfaceIds = ['amplitude_mm', 'wavelength_x_mm', 'wavelength_y_mm', 'phase_x_pi', 'phase_y_pi', 'z_reference_mm', 'samples'];
+    const surfaceIds = ['amplitude_mm', 'wavelength_x_mm', 'wavelength_y_mm', 'phase_x_pi', 'phase_y_pi', 'z_reference_mm', 'check_x_mm', 'check_y_mm', 'samples'];
     const mappingReferenceLayerHeightMm = 0.5;
     const conformalDesignIds = ['part_length_mm', 'part_width_mm', 'part_height_mm', 'wall_width_mm', 'base_cell_size_mm', 'orientation_angle_deg', 'surface_start_layer', 'samples_x', 'samples_y', 'boundary_mode', 'phase_origin_x_mm', 'phase_origin_y_mm', 'random_seed'];
     const canvas = document.getElementById('canvas');
     const statusEl = document.getElementById('status');
     const statsEl = document.getElementById('stats');
     const exportConformalConfigButton = document.getElementById('exportConformalConfig');
+    const previewMode = document.getElementById('previewMode');
+    const previewTitle = document.getElementById('previewTitle');
     let payload = null;
     let queued = 0;
     const initialView = { yaw: -42 * Math.PI / 180, pitch: 54 * Math.PI / 180, zoom: 1, panX: 0, panY: 0 };
@@ -617,6 +776,8 @@ def surface_preview_html() -> str:
       surfaceIds.forEach((id) => query.set(id, document.getElementById(id).value));
       query.set('width_mm', document.getElementById('part_length_mm').value);
       query.set('height_mm', document.getElementById('part_width_mm').value);
+      query.set('part_height_mm', document.getElementById('part_height_mm').value);
+      query.set('surface_start_layer', document.getElementById('surface_start_layer').value);
       return query;
     }
 
@@ -680,6 +841,67 @@ def surface_preview_html() -> str:
       });
     }
 
+    function drawInspectionMarker(ctx, zMid, yaw, pitch, scale, cx, cy) {
+      const point = payload.inspection_point;
+      if (!point) return;
+      const projected = project(point.x_mm, point.y_mm, point.height_mm - zMid, yaw, pitch, scale, cx, cy);
+      ctx.beginPath();
+      ctx.arc(projected.x, projected.y, 4, 0, 2 * Math.PI);
+      ctx.fillStyle = '#d14322';
+      ctx.fill();
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      ctx.fillStyle = '#7a271a';
+      ctx.font = '12px Segoe UI, Microsoft YaHei, sans-serif';
+      ctx.fillText(`检验点 (${point.x_mm.toFixed(1)}, ${point.y_mm.toFixed(1)})`, projected.x + 7, projected.y - 7);
+    }
+
+    function renderSolidStack(ctx, width, height) {
+      const stack = payload.solid_stack;
+      if (!stack) return;
+      const layers = stack.layers;
+      const xBounds = payload.coordinate_system.xy_bounds_mm;
+      const xMin = xBounds[0];
+      const xMax = xBounds[2];
+      const zValues = layers.flatMap((layer) => layer.xz_points.map((point) => point[1]));
+      const zMin = Math.min(...zValues);
+      const zMax = Math.max(...zValues);
+      const margin = { left: 54, right: 20, top: 28, bottom: 42 };
+      const plotWidth = Math.max(1, width - margin.left - margin.right);
+      const plotHeight = Math.max(1, height - margin.top - margin.bottom);
+      const mapX = (x) => margin.left + (x - xMin) * plotWidth / Math.max(xMax - xMin, 1e-9);
+      const mapZ = (z) => height - margin.bottom - (z - zMin) * plotHeight / Math.max(zMax - zMin, 1e-9);
+      ctx.strokeStyle = '#a9b9ca';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(margin.left, margin.top);
+      ctx.lineTo(margin.left, height - margin.bottom);
+      ctx.lineTo(width - margin.right, height - margin.bottom);
+      ctx.stroke();
+      layers.forEach((layer) => {
+        ctx.beginPath();
+        layer.xz_points.forEach(([x, z], index) => {
+          if (index === 0) ctx.moveTo(mapX(x), mapZ(z));
+          else ctx.lineTo(mapX(x), mapZ(z));
+        });
+        ctx.strokeStyle = `hsla(207, 74%, ${35 + layer.alpha * 28}%, ${0.2 + layer.alpha * 0.75})`;
+        ctx.lineWidth = layer.alpha >= 0.999 ? 2.2 : 1.15;
+        ctx.stroke();
+        const markerZ = layer.base_z_mm + payload.surface.z_reference_mm
+          + layer.alpha * (payload.inspection_point.height_mm - payload.surface.z_reference_mm);
+        ctx.beginPath();
+        ctx.arc(mapX(payload.inspection_point.x_mm), mapZ(markerZ), 2.5, 0, 2 * Math.PI);
+        ctx.fillStyle = '#d14322';
+        ctx.fill();
+      });
+      ctx.fillStyle = 'rgba(21,32,51,.78)';
+      ctx.font = '12px Segoe UI, Microsoft YaHei, sans-serif';
+      ctx.fillText(`XZ 剖面：Y = ${stack.section_y_mm.toFixed(2)} mm；参考层高 ${stack.reference_layer_height_mm.toFixed(2)} mm；α 为旧版对称 smoothstep`, margin.left, 17);
+      ctx.fillText(`X：${xMin.toFixed(1)} ～ ${xMax.toFixed(1)} mm`, margin.left, height - 16);
+      ctx.fillText(`Z：${zMin.toFixed(2)} ～ ${zMax.toFixed(2)} mm`, width - 148, height - 16);
+    }
+
     function render() {
       if (!payload) return;
       const rect = canvas.getBoundingClientRect();
@@ -691,6 +913,10 @@ def surface_preview_html() -> str:
       const width = rect.width;
       const height = rect.height;
       ctx.clearRect(0, 0, width, height);
+      if (previewMode.value === 'solid_xz' && payload.solid_stack) {
+        renderSolidStack(ctx, width, height);
+        return;
+      }
       const { x, y, z } = payload.grid;
       const stats = payload.statistics;
       const projection = payload.domain.projection;
@@ -732,19 +958,26 @@ def surface_preview_html() -> str:
       });
       if (exactProjectionClip) ctx.restore();
       drawProjectionBoundaries(ctx, projection, zMid, yaw, pitch, scale, cx, cy);
+      drawInspectionMarker(ctx, zMid, yaw, pitch, scale, cx, cy);
       ctx.fillStyle = 'rgba(21,32,51,.68)';
       ctx.font = '12px Segoe UI, Microsoft YaHei, sans-serif';
       const originLabel = payload.domain.mode === 'rectangle'
         ? '矩形左下角 (0, 0)'
         : 'STL 投影左下基准 (0, 0)';
-      ctx.fillText(`X / Y：mm，原点：${{originLabel}}   Z：mm`, 14, height - 16);
+      ctx.fillText(`X / Y：mm，原点：${originLabel}   Z：mm`, 14, height - 16);
     }
 
-    function showStats(statistics) {
+    function showStats(data) {
+      const statistics = data.statistics;
+      const point = data.inspection_point;
+      const coordinateSystem = data.coordinate_system;
       const values = [
         `Z：${statistics.z_min_mm.toFixed(3)} ～ ${statistics.z_max_mm.toFixed(3)} mm`,
         `起伏：${statistics.z_range_mm.toFixed(3)} mm`,
         `最大坡度：${statistics.max_slope.toFixed(3)}`,
+        `检验点 H：${point.height_mm.toFixed(3)} mm；坡度：${point.slope.toFixed(4)}；平均曲率（有符号）：${point.mean_curvature_per_mm.toFixed(5)} 1/mm`,
+        `坐标：${coordinateSystem.origin_label}；范围：[${coordinateSystem.xy_bounds_mm.join(', ')}] mm`,
+        `预览：${data.preview_version}；导出：${data.export_version}；Git：${data.git_revision}`,
       ];
       statsEl.replaceChildren(...values.map((value) => {
         const item = document.createElement('span');
@@ -764,7 +997,7 @@ def surface_preview_html() -> str:
         if (!response.ok || !result.ok) throw new Error(result.error || '无法生成曲面');
         if (sequence !== queued) return;
         payload = result;
-        showStats(result.statistics);
+        showStats(result);
         render();
         statusEl.textContent = '已更新：当前预览对应固定矩形外边界的双正弦承载曲面。';
       } catch (error) {
@@ -777,7 +1010,12 @@ def surface_preview_html() -> str:
     let timer = null;
     function scheduleRefresh() { clearTimeout(timer); timer = setTimeout(refresh, 120); }
     surfaceIds.forEach((id) => document.getElementById(id).addEventListener('input', scheduleRefresh));
+    ['part_length_mm', 'part_width_mm', 'part_height_mm', 'surface_start_layer'].forEach((id) => document.getElementById(id).addEventListener('input', scheduleRefresh));
     conformalDesignIds.forEach((id) => document.getElementById(id).addEventListener('input', updateConformalDesignSummary));
+    previewMode.addEventListener('change', () => {
+      previewTitle.textContent = previewMode.value === 'solid_xz' ? '实体层叠 / XZ 剖面' : '三维承载曲面';
+      render();
+    });
     exportConformalConfigButton.addEventListener('click', async () => {
       try {
         const response = await fetch(`/api/export-conformal-lattice-config?${conformalParameters().toString()}`);
@@ -845,7 +1083,7 @@ def surface_preview_html() -> str:
       render();
     });
     document.getElementById('reset').addEventListener('click', () => {
-      const defaults = { part_length_mm: 150, part_width_mm: 100, part_height_mm: 10, amplitude_mm: 0.8, wavelength_x_mm: 40, wavelength_y_mm: 50, phase_x_pi: 0, phase_y_pi: 0, z_reference_mm: 0, wall_width_mm: 2, base_cell_size_mm: 5, orientation_angle_deg: 0, surface_start_layer: 3, samples_x: 48, samples_y: 48, boundary_mode: 'clip', phase_origin_x_mm: 0, phase_origin_y_mm: 0, random_seed: 0, samples: 48 };
+      const defaults = { part_length_mm: 150, part_width_mm: 100, part_height_mm: 10, amplitude_mm: 0.8, wavelength_x_mm: 40, wavelength_y_mm: 50, phase_x_pi: 0, phase_y_pi: 0, z_reference_mm: 0, check_x_mm: 75, check_y_mm: 50, wall_width_mm: 2, base_cell_size_mm: 5, orientation_angle_deg: 0, surface_start_layer: 3, samples_x: 49, samples_y: 49, boundary_mode: 'clip', phase_origin_x_mm: 0, phase_origin_y_mm: 0, random_seed: 0, samples: 49 };
       Object.entries(defaults).forEach(([id, value]) => {
         document.getElementById(id).value = value;
       });
