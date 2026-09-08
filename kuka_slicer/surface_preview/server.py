@@ -199,6 +199,10 @@ def _conformal_solid_stack_payload(
         "surface_start_layer": start_layer,
         "surface_return_layer": progression.surface_return_layer,
         "peak_layer_indices": list(progression.peak_layers),
+        # The lower of the one/two complete-curvature layers is the stable
+        # three-dimensional representative.  It is a physical layer centre,
+        # not the Z=0 surface-definition reference plane.
+        "representative_peak_layer_index": progression.peak_layers[0],
         "layers": layers,
     }
 
@@ -684,8 +688,8 @@ def surface_preview_html() -> str:
         <p class="hint">方程：H(x,y)=A·sin(2πx/λx+φx)·sin(2πy/λy+φy)+Zref。导出文件为 <code>conformal_lattice_spec_v1.json</code>，请在主切片器中导入该文件。</p>
       </form>
       <section class="panel preview">
-        <div class="previewHead"><h2 id="previewTitle">三维承载曲面</h2><div class="stats" id="stats"></div></div>
-        <div class="field"><label for="previewMode">预览模式</label><select id="previewMode"><option value="surface" selected>承载双正弦曲面</option><option value="solid_xz">实体层叠 / XZ 剖面</option></select></div>
+        <div class="previewHead"><h2 id="previewTitle">α=1 完整曲率层（物理 Z）</h2><div class="stats" id="stats"></div></div>
+        <div class="field"><label for="previewMode">预览模式</label><select id="previewMode"><option value="surface" selected>α=1 完整曲率层（物理 Z）</option><option value="solid_xz">实体层叠 / XZ 剖面</option></select></div>
         <div class="field"><label for="surfaceZScale">三维视觉 Z 放大</label><select id="surfaceZScale"><option value="1">真实比例 ×1</option><option value="3">形态观察 ×3</option><option value="5" selected>形态观察 ×5</option><option value="10">形态观察 ×10</option></select></div>
         <div class="field"><label for="sectionZScale">XZ 剖面视觉 Z 放大</label><select id="sectionZScale"><option value="1">真实比例 ×1</option><option value="3" selected>辅助观察 ×3</option><option value="5">辅助观察 ×5</option></select></div>
         <p class="hint">视觉 Z 放大只影响画布，不改变参数、检验值、导出的 JSON 或实际零件尺寸。XZ 剖面采用统一 X/Z 比例后再按所选倍率放大 Z，避免隐藏的纵向拉伸。</p>
@@ -954,8 +958,10 @@ def surface_preview_html() -> str:
       const displayZ = z * Number(surfaceZScale.value);
       const xr = centeredX * Math.cos(yaw) - centeredY * Math.sin(yaw);
       const yr = centeredX * Math.sin(yaw) + centeredY * Math.cos(yaw);
-      const yp = yr * Math.cos(pitch) - displayZ * Math.sin(pitch);
-      const depth = yr * Math.sin(pitch) + displayZ * Math.cos(pitch);
+      // Canvas Y grows downwards.  This conventional pitch rotation keeps a
+      // positive physical Z axis visually upwards.
+      const yp = yr * Math.cos(pitch) + displayZ * Math.sin(pitch);
+      const depth = -yr * Math.sin(pitch) + displayZ * Math.cos(pitch);
       return { x: cx + xr * scale, y: cy - yp * scale, depth };
     }
 
@@ -966,27 +972,41 @@ def surface_preview_html() -> str:
         * Math.sin((2 * Math.PI * y) / surface.wavelength_y_mm + surface.phase_y_rad);
     }
 
-    function appendProjectedRing(ctx, ring, zMid, yaw, pitch, scale, cx, cy) {
+    function physicalPreviewLayer() {
+      const stack = payload.solid_stack;
+      if (!stack) return { index: 0, alpha: 1, base_z_mm: 0 };
+      const index = Number.isInteger(stack.representative_peak_layer_index)
+        ? stack.representative_peak_layer_index
+        : stack.peak_layer_indices[0];
+      return stack.layers[index];
+    }
+
+    function physicalLayerZ(targetZ, layer) {
+      return layer.base_z_mm + payload.surface.z_reference_mm
+        + layer.alpha * (targetZ - payload.surface.z_reference_mm);
+    }
+
+    function appendProjectedRing(ctx, ring, layer, zMid, yaw, pitch, scale, cx, cy) {
       if (ring.length < 2) return;
-      const first = project(ring[0][0], ring[0][1], heightAt(ring[0][0], ring[0][1]) - zMid, yaw, pitch, scale, cx, cy);
+      const first = project(ring[0][0], ring[0][1], physicalLayerZ(heightAt(ring[0][0], ring[0][1]), layer) - zMid, yaw, pitch, scale, cx, cy);
       ctx.moveTo(first.x, first.y);
       ring.slice(1).forEach(([x, y]) => {
-        const point = project(x, y, heightAt(x, y) - zMid, yaw, pitch, scale, cx, cy);
+        const point = project(x, y, physicalLayerZ(heightAt(x, y), layer) - zMid, yaw, pitch, scale, cx, cy);
         ctx.lineTo(point.x, point.y);
       });
       ctx.closePath();
     }
 
-    function clipToProjection(ctx, projection, zMid, yaw, pitch, scale, cx, cy) {
+    function clipToProjection(ctx, projection, layer, zMid, yaw, pitch, scale, cx, cy) {
       ctx.beginPath();
       projection.polygons.forEach((polygon) => {
-        appendProjectedRing(ctx, polygon.outer, zMid, yaw, pitch, scale, cx, cy);
-        polygon.holes.forEach((ring) => appendProjectedRing(ctx, ring, zMid, yaw, pitch, scale, cx, cy));
+        appendProjectedRing(ctx, polygon.outer, layer, zMid, yaw, pitch, scale, cx, cy);
+        polygon.holes.forEach((ring) => appendProjectedRing(ctx, ring, layer, zMid, yaw, pitch, scale, cx, cy));
       });
       ctx.clip('evenodd');
     }
 
-    function drawProjectionBoundaries(ctx, projection, zMid, yaw, pitch, scale, cx, cy) {
+    function drawProjectionBoundaries(ctx, projection, layer, zMid, yaw, pitch, scale, cx, cy) {
       if (!projection) return;
       ctx.strokeStyle = 'rgba(12, 44, 82, .94)';
       ctx.lineWidth = 1.2;
@@ -994,16 +1014,16 @@ def surface_preview_html() -> str:
         const rings = drag ? [polygon.outer] : [polygon.outer, ...polygon.holes];
         rings.forEach((ring) => {
           ctx.beginPath();
-          appendProjectedRing(ctx, ring, zMid, yaw, pitch, scale, cx, cy);
+          appendProjectedRing(ctx, ring, layer, zMid, yaw, pitch, scale, cx, cy);
           ctx.stroke();
         });
       });
     }
 
-    function drawInspectionMarker(ctx, zMid, yaw, pitch, scale, cx, cy) {
+    function drawInspectionMarker(ctx, layer, zMid, yaw, pitch, scale, cx, cy) {
       const point = payload.inspection_point;
       if (!point) return;
-      const projected = project(point.x_mm, point.y_mm, point.height_mm - zMid, yaw, pitch, scale, cx, cy);
+      const projected = project(point.x_mm, point.y_mm, physicalLayerZ(point.height_mm, layer) - zMid, yaw, pitch, scale, cx, cy);
       ctx.beginPath();
       ctx.arc(projected.x, projected.y, 4, 0, 2 * Math.PI);
       ctx.fillStyle = '#d14322';
@@ -1016,9 +1036,9 @@ def surface_preview_html() -> str:
       ctx.fillText(`检验点 (${point.x_mm.toFixed(1)}, ${point.y_mm.toFixed(1)})`, projected.x + 7, projected.y - 7);
     }
 
-    function drawSurfaceReferenceFrame(ctx, zMid, yaw, pitch, scale, cx, cy, stats) {
+    function drawSurfaceReferenceFrame(ctx, zMid, yaw, pitch, scale, cx, cy) {
       const bounds = payload.coordinate_system.xy_bounds_mm;
-      const baseZ = stats.z_min_mm - Math.max(0.25, stats.z_range_mm * 0.16);
+      const baseZ = 0;
       const corners = [
         [bounds[0], bounds[1]], [bounds[2], bounds[1]], [bounds[2], bounds[3]], [bounds[0], bounds[3]],
       ].map(([x, y]) => project(x, y, baseZ - zMid, yaw, pitch, scale, cx, cy));
@@ -1055,7 +1075,7 @@ def surface_preview_html() -> str:
       ctx.restore();
     }
 
-    function drawSurfaceGuideMesh(ctx, x, y, z, zMid, yaw, pitch, scale, cx, cy) {
+    function drawSurfaceGuideMesh(ctx, x, y, z, layer, zMid, yaw, pitch, scale, cx, cy) {
       const rowStride = Math.max(1, Math.floor((z.length - 1) / 8));
       const colStride = Math.max(1, Math.floor((z[0].length - 1) / 8));
       const centerRow = Math.floor((z.length - 1) * 0.5);
@@ -1063,7 +1083,7 @@ def surface_preview_html() -> str:
       const drawCurve = (points, emphasis) => {
         ctx.beginPath();
         points.forEach(([xMm, yMm, zMm], index) => {
-          const point = project(xMm, yMm, zMm - zMid, yaw, pitch, scale, cx, cy);
+          const point = project(xMm, yMm, physicalLayerZ(zMm, layer) - zMid, yaw, pitch, scale, cx, cy);
           if (index === 0) ctx.moveTo(point.x, point.y);
           else ctx.lineTo(point.x, point.y);
         });
@@ -1083,7 +1103,7 @@ def surface_preview_html() -> str:
       ctx.restore();
     }
 
-    function drawLatticePreview(ctx, zMid, yaw, pitch, scale, cx, cy) {
+    function drawLatticePreview(ctx, layer, zMid, yaw, pitch, scale, cx, cy) {
       const lattice = latticePreviewSegments();
       if (!lattice.segments.length) return;
       const wavelength = Math.min(payload.surface.wavelength_x_mm, payload.surface.wavelength_y_mm);
@@ -1095,7 +1115,7 @@ def surface_preview_html() -> str:
           const ratio = index / subdivisions;
           const x = start[0] + (end[0] - start[0]) * ratio;
           const y = start[1] + (end[1] - start[1]) * ratio;
-          const point = project(x, y, heightAt(x, y) - zMid, yaw, pitch, scale, cx, cy);
+          const point = project(x, y, physicalLayerZ(heightAt(x, y), layer) - zMid, yaw, pitch, scale, cx, cy);
           if (index === 0) ctx.moveTo(point.x, point.y);
           else ctx.lineTo(point.x, point.y);
         }
@@ -1109,7 +1129,7 @@ def surface_preview_html() -> str:
       ctx.fillStyle = 'rgba(7, 71, 62, .78)';
       ctx.font = '12px Segoe UI, Microsoft YaHei, sans-serif';
       const sampling = lattice.sampled ? `；显示降采样边长 ${lattice.previewEdgeLength.toFixed(2)} mm` : '';
-      ctx.fillText(`蜂窝格栅：墙宽 ${lattice.wallWidth.toFixed(2)} mm；目标边长 ${lattice.edgeLength.toFixed(2)} mm；${lattice.segments.length} 条墙${sampling}`, 14, 20);
+      ctx.fillText(`蜂窝格栅：墙宽 ${lattice.wallWidth.toFixed(2)} mm；目标边长 ${lattice.edgeLength.toFixed(2)} mm；α=${layer.alpha.toFixed(2)}，物理层 ${layer.index + 1}${sampling}`, 14, 20);
     }
 
     function renderSolidStack(ctx, width, height) {
@@ -1119,7 +1139,7 @@ def surface_preview_html() -> str:
       const xBounds = payload.coordinate_system.xy_bounds_mm;
       const xMin = xBounds[0];
       const xMax = xBounds[2];
-      const zValues = layers.flatMap((layer) => layer.xz_points.map((point) => point[1]));
+      const zValues = [0, ...layers.flatMap((layer) => layer.xz_points.map((point) => point[1]))];
       const zMin = Math.min(...zValues);
       const zMax = Math.max(...zValues);
       const margin = { left: 54, right: 20, top: 28, bottom: 42 };
@@ -1146,6 +1166,18 @@ def surface_preview_html() -> str:
       ctx.lineTo(offsetX, offsetY + renderedHeight);
       ctx.lineTo(offsetX + renderedWidth, offsetY + renderedHeight);
       ctx.stroke();
+      ctx.save();
+      ctx.strokeStyle = 'rgba(29, 78, 216, .65)';
+      ctx.setLineDash([5, 4]);
+      ctx.beginPath();
+      ctx.moveTo(offsetX, mapZ(0));
+      ctx.lineTo(offsetX + renderedWidth, mapZ(0));
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = 'rgba(29, 78, 216, .82)';
+      ctx.font = '600 11px Segoe UI, Microsoft YaHei, sans-serif';
+      ctx.fillText('Z=0 基准面', offsetX + 5, mapZ(0) - 5);
+      ctx.restore();
       layers.forEach((layer) => {
         ctx.beginPath();
         layer.xz_points.forEach(([x, z], index) => {
@@ -1153,7 +1185,7 @@ def surface_preview_html() -> str:
           else ctx.lineTo(mapX(x), mapZ(z));
         });
         ctx.strokeStyle = `hsla(207, 74%, ${35 + layer.alpha * 28}%, ${0.2 + layer.alpha * 0.75})`;
-        ctx.lineWidth = layer.alpha >= 0.999 ? 2.2 : 1.15;
+        ctx.lineWidth = layer.index === stack.representative_peak_layer_index ? 2.7 : layer.alpha >= 0.999 ? 2.2 : 1.15;
         ctx.stroke();
         const markerZ = layer.base_z_mm + payload.surface.z_reference_mm
           + layer.alpha * (payload.inspection_point.height_mm - payload.surface.z_reference_mm);
@@ -1164,7 +1196,7 @@ def surface_preview_html() -> str:
       });
       ctx.fillStyle = 'rgba(21,32,51,.78)';
       ctx.font = '12px Segoe UI, Microsoft YaHei, sans-serif';
-      ctx.fillText(`XZ 剖面：Y = ${stack.section_y_mm.toFixed(2)} mm；参考层高 ${stack.reference_layer_height_mm.toFixed(2)} mm；视觉 Z ×${visualZScale}；α 为旧版对称 smoothstep`, margin.left, 17);
+      ctx.fillText(`XZ 剖面：Y = ${stack.section_y_mm.toFixed(2)} mm；完整曲率层 = L${stack.representative_peak_layer_index + 1}；参考层高 ${stack.reference_layer_height_mm.toFixed(2)} mm；视觉 Z ×${visualZScale}；α 为旧版对称 smoothstep`, margin.left, 17);
       ctx.fillText(`X：${xMin.toFixed(1)} ～ ${xMax.toFixed(1)} mm`, offsetX, height - 16);
       ctx.fillText(`物理 Z：${zMin.toFixed(2)} ～ ${zMax.toFixed(2)} mm`, width - 178, height - 16);
     }
@@ -1189,21 +1221,26 @@ def surface_preview_html() -> str:
       const projection = payload.domain.projection;
       const materialMask = payload.grid.material_mask;
       const { yaw, pitch } = view;
-      const span = Math.max(payload.domain.width_mm, payload.domain.height_mm, stats.z_range_mm * 2 * Number(surfaceZScale.value), 1);
+      const layer = physicalPreviewLayer();
+      const physicalZMin = physicalLayerZ(stats.z_min_mm, layer);
+      const physicalZMax = physicalLayerZ(stats.z_max_mm, layer);
+      const zMin = Math.min(0, physicalZMin);
+      const zMax = Math.max(0, physicalZMax);
+      const span = Math.max(payload.domain.width_mm, payload.domain.height_mm, (zMax - zMin) * Number(surfaceZScale.value), 1);
       const scale = Math.min(width, height) * 0.72 * view.zoom / span;
       const cx = width / 2 + view.panX;
       const cy = height / 2 + 8 + view.panY;
-      const zMid = (stats.z_min_mm + stats.z_max_mm) / 2;
+      const zMid = (zMin + zMax) / 2;
       const exactProjectionClip = Boolean(projection && !drag);
       const cells = [];
       for (let row = 0; row < z.length - 1; row += 1) {
         for (let col = 0; col < z[row].length - 1; col += 1) {
           if (!exactProjectionClip && materialMask && !materialMask[row][col]) continue;
           const p = [
-            project(x[row][col], y[row][col], z[row][col] - zMid, yaw, pitch, scale, cx, cy),
-            project(x[row][col + 1], y[row][col + 1], z[row][col + 1] - zMid, yaw, pitch, scale, cx, cy),
-            project(x[row + 1][col + 1], y[row + 1][col + 1], z[row + 1][col + 1] - zMid, yaw, pitch, scale, cx, cy),
-            project(x[row + 1][col], y[row + 1][col], z[row + 1][col] - zMid, yaw, pitch, scale, cx, cy),
+            project(x[row][col], y[row][col], physicalLayerZ(z[row][col], layer) - zMid, yaw, pitch, scale, cx, cy),
+            project(x[row][col + 1], y[row][col + 1], physicalLayerZ(z[row][col + 1], layer) - zMid, yaw, pitch, scale, cx, cy),
+            project(x[row + 1][col + 1], y[row + 1][col + 1], physicalLayerZ(z[row + 1][col + 1], layer) - zMid, yaw, pitch, scale, cx, cy),
+            project(x[row + 1][col], y[row + 1][col], physicalLayerZ(z[row + 1][col], layer) - zMid, yaw, pitch, scale, cx, cy),
           ];
           const averageZ = (z[row][col] + z[row][col + 1] + z[row + 1][col + 1] + z[row + 1][col]) / 4;
           const centerX = (x[row][col] + x[row][col + 1] + x[row + 1][col + 1] + x[row + 1][col]) / 4;
@@ -1212,10 +1249,10 @@ def surface_preview_html() -> str:
         }
       }
       cells.sort((a, b) => a.depth - b.depth);
-      drawSurfaceReferenceFrame(ctx, zMid, yaw, pitch, scale, cx, cy, stats);
+      drawSurfaceReferenceFrame(ctx, zMid, yaw, pitch, scale, cx, cy);
       if (exactProjectionClip) {
         ctx.save();
-        clipToProjection(ctx, projection, zMid, yaw, pitch, scale, cx, cy);
+        clipToProjection(ctx, projection, layer, zMid, yaw, pitch, scale, cx, cy);
       }
       ctx.save();
       ctx.globalAlpha = 0.72;
@@ -1230,16 +1267,16 @@ def surface_preview_html() -> str:
       });
       ctx.restore();
       if (exactProjectionClip) ctx.restore();
-      drawProjectionBoundaries(ctx, projection, zMid, yaw, pitch, scale, cx, cy);
-      drawSurfaceGuideMesh(ctx, x, y, z, zMid, yaw, pitch, scale, cx, cy);
-      drawLatticePreview(ctx, zMid, yaw, pitch, scale, cx, cy);
-      drawInspectionMarker(ctx, zMid, yaw, pitch, scale, cx, cy);
+      drawProjectionBoundaries(ctx, projection, layer, zMid, yaw, pitch, scale, cx, cy);
+      drawSurfaceGuideMesh(ctx, x, y, z, layer, zMid, yaw, pitch, scale, cx, cy);
+      drawLatticePreview(ctx, layer, zMid, yaw, pitch, scale, cx, cy);
+      drawInspectionMarker(ctx, layer, zMid, yaw, pitch, scale, cx, cy);
       ctx.fillStyle = 'rgba(21,32,51,.68)';
       ctx.font = '12px Segoe UI, Microsoft YaHei, sans-serif';
       const originLabel = payload.domain.mode === 'rectangle'
         ? '矩形左下角 (0, 0)'
         : 'STL 投影左下基准 (0, 0)';
-      ctx.fillText(`X / Y：mm，原点：${originLabel}   Z：mm（视觉 ×${surfaceZScale.value}）`, 14, height - 16);
+      ctx.fillText(`X / Y：mm，原点：${originLabel}；Z=0 为零件底面；展示 L${layer.index + 1}（α=${layer.alpha.toFixed(2)}，中心 Z=${layer.base_z_mm.toFixed(2)} mm）；视觉 Z ×${surfaceZScale.value}`, 14, height - 16);
     }
 
     function showStats(data) {
@@ -1309,7 +1346,7 @@ def surface_preview_html() -> str:
     });
     previewMode.addEventListener('change', () => {
       saveDesignerState();
-      previewTitle.textContent = previewMode.value === 'solid_xz' ? '实体层叠 / XZ 剖面' : '三维承载曲面';
+      previewTitle.textContent = previewMode.value === 'solid_xz' ? '实体层叠 / XZ 剖面' : 'α=1 完整曲率层（物理 Z）';
       render();
     });
     surfaceZScale.addEventListener('change', () => { saveDesignerState(); render(); });

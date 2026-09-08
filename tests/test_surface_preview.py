@@ -160,12 +160,14 @@ def test_conformal_solid_stack_reuses_the_symmetric_smoothstep_layer_progression
     assert stack["surface_start_layer"] == 3
     assert stack["surface_return_layer"] == 16
     assert stack["peak_layer_indices"] == [9, 10]
+    assert stack["representative_peak_layer_index"] == 9
     assert len(stack["layers"]) == 20
     assert stack["layers"][0]["alpha"] == pytest.approx(0.0)
     assert stack["layers"][-1]["alpha"] == pytest.approx(0.0)
     assert stack["layers"][9]["alpha"] == pytest.approx(1.0)
     assert stack["layers"][10]["alpha"] == pytest.approx(1.0)
     assert stack["layers"][0]["xz_points"][0][1] == pytest.approx(0.5)
+    assert stack["layers"][9]["base_z_mm"] == pytest.approx(4.75)
 
 
 def test_surface_payload_converts_designer_pi_multiples_to_internal_radians():
@@ -231,6 +233,11 @@ def test_surface_preview_html_has_an_independent_surface_api_and_controls():
     assert 'function drawLatticePreview' in html
     assert 'function drawSurfaceReferenceFrame' in html
     assert 'function drawSurfaceGuideMesh' in html
+    assert 'function physicalPreviewLayer' in html
+    assert 'function physicalLayerZ' in html
+    assert 'const baseZ = 0;' in html
+    assert 'Z=0 基准面' in html
+    assert 'α=1 完整曲率层（物理 Z）' in html
     assert 'function surfaceLighting' in html
     assert "const designerStateKey = 'kuka-slicer.conformal-designer-state.v1';" in html
     assert 'function saveDesignerState()' in html
