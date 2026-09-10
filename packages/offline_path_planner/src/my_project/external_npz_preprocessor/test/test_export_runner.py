@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from external_npz_preprocessor.export_runner import (
     default_output_npz_dir,
     default_output_path_for_source,
@@ -225,6 +227,93 @@ def test_surface_mapped_job_preserves_nonzero_density(tmp_path, monkeypatch):
     )
 
     assert captured["density"] == 3
+
+
+def test_conformal_source_e_metadata_enables_only_the_explicit_core_mode(tmp_path, monkeypatch):
+    import external_npz_preprocessor.export_runner as runner
+    import numpy as np
+
+    from external_npz_preprocessor.process_params import ProcessParams
+    from external_npz_preprocessor.source_npz import LayerPaths, MaterialPath, SourceJob
+
+    captured = {}
+
+    def fake_export_npz(commands, output_path, **kwargs):
+        captured["preserve_source_e_profile"] = kwargs["preserve_source_e_profile"]
+        return {"rows": 0, "parts": 0, "total_s": 0.0}
+
+    calibration = tmp_path / "head_offsets.json"
+    calibration.write_text('{"resin": {}, "fiber": {}}', encoding="utf-8")
+    job = SourceJob(
+        meta={
+            "core_processing": {
+                "source_e_profile_mode": "piecewise_preserve_v1",
+                "zero_e_connector_semantics": "print_context_constant_e",
+            }
+        },
+        layers=[
+            LayerPaths(
+                index=0,
+                resin_paths=[
+                    MaterialPath(
+                        "R",
+                        0,
+                            np.asarray(
+                                [[0.0, 0.0, 0.5, 0.0, 0.0, 0.0], [1.0, 0.0, 0.5, 0.0, 0.0, 0.0]],
+                                dtype=np.float64,
+                            ),
+                        extrusion=np.asarray([0.0, 1.0], dtype=np.float64),
+                    )
+                ],
+            )
+        ],
+    )
+    monkeypatch.setattr(runner, "export_npz", fake_export_npz)
+
+    runner.convert_source_job(
+        job,
+        source_path=tmp_path / "conformal.npz",
+        output_path=tmp_path / "core.npz",
+        params=ProcessParams(),
+        calibration_path=calibration,
+    )
+
+    assert captured["preserve_source_e_profile"] is True
+
+
+def test_unknown_conformal_source_e_mode_fails_before_core_export(tmp_path):
+    import numpy as np
+
+    from external_npz_preprocessor.process_params import ProcessParams
+    from external_npz_preprocessor.source_npz import LayerPaths, MaterialPath, SourceJob
+    from external_npz_preprocessor.export_runner import convert_source_job
+
+    job = SourceJob(
+        meta={"core_processing": {"source_e_profile_mode": "unexpected"}},
+        layers=[
+            LayerPaths(
+                index=0,
+                resin_paths=[
+                    MaterialPath(
+                        "R", 0,
+                            np.asarray(
+                                [[0.0, 0.0, 0.5, 0.0, 0.0, 0.0], [1.0, 0.0, 0.5, 0.0, 0.0, 0.0]],
+                                dtype=np.float64,
+                            ),
+                        extrusion=np.asarray([0.0, 1.0], dtype=np.float64),
+                    )
+                ],
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="unsupported core source_e_profile_mode"):
+        convert_source_job(
+            job,
+            source_path=tmp_path / "bad.npz",
+            output_path=tmp_path / "core.npz",
+            params=ProcessParams(),
+        )
 
 
 def test_exporter_uses_curve_start_acceleration_without_changing_default(tmp_path, monkeypatch):

@@ -12,7 +12,11 @@ import numpy as np
 from .contracts import ConformalLatticeSpec, load_conformal_lattice_spec
 from .fill_ratio_validation import FillRatioValidation, validate_realized_fill_ratio
 from .layer_embedding import LayerEmbedding, embed_lattice_layers
-from .lattice_generator import ConformalLatticeGeometry, generate_conformal_lattice_geometry
+from .lattice_generator import (
+    ConformalLatticeGeometry,
+    choose_boundary_safe_phase_origin,
+    generate_conformal_lattice_geometry,
+)
 from .mesh_domain import SurfaceMeshDomain, build_double_sine_surface_domain
 from .orientation_field import OrientationField, build_orientation_field
 from .parameterization import LSCMParameterization, parameterize_spec_lscm
@@ -136,7 +140,28 @@ def run_conformal_lattice_pipeline(
     boundary_mode = str(spec.lattice["boundary_mode"])
     if boundary_mode not in ("clip", "inset"):
         raise ValueError("first-version UI pipeline supports lattice.boundary_mode=clip or inset")
-    phase_origin, load_line_alignment = _resolved_phase_origin(spec, domain, phase)
+    requested_phase_origin = tuple(float(value) for value in spec.lattice["phase_origin"])
+    boundary_phase_policy = str(spec.lattice.get("boundary_phase_policy", "manual"))
+    effective_phase_origin, load_line_alignment = _resolved_phase_origin(spec, domain, phase)
+    if load_line_alignment["enabled"]:
+        boundary_phase_report = {
+            "policy": "superseded_by_length_midplane_wall_alignment",
+            "requested_phase_origin": list(requested_phase_origin),
+            "effective_phase_origin": list(effective_phase_origin),
+        }
+    elif boundary_phase_policy == "auto_avoid_outer_boundary_coincidence":
+        effective_phase_origin, boundary_phase_report = choose_boundary_safe_phase_origin(
+            domain, phase, requested_phase_origin
+        )
+    elif boundary_phase_policy == "manual":
+        effective_phase_origin = requested_phase_origin
+        boundary_phase_report = {
+            "policy": "manual",
+            "requested_phase_origin": list(requested_phase_origin),
+            "effective_phase_origin": list(effective_phase_origin),
+        }
+    else:  # The contract loader rejects this; retain a local guard for direct specs.
+        raise ValueError("unsupported lattice.boundary_phase_policy")
     geometry = generate_conformal_lattice_geometry(
         domain,
         parameterization,
@@ -144,9 +169,13 @@ def run_conformal_lattice_pipeline(
         orientation,
         phase,
         boundary_mode=boundary_mode,
-        phase_origin=phase_origin,
+        phase_origin=effective_phase_origin,
         random_seed=spec.random_seed,
-        config_metadata=spec.metadata(),
+        config_metadata={
+            **spec.metadata(),
+            "boundary_phase": boundary_phase_report,
+            "load_line_alignment": load_line_alignment,
+        },
         load_line_alignment=load_line_alignment,
     )
     fill_validation = None
@@ -243,24 +272,23 @@ def _resolved_phase_origin(
     domain: SurfaceMeshDomain,
     phase: PhaseCoordinates,
 ) -> tuple[tuple[float, float], dict[str, object]]:
-    """Resolve semantic loading-plane alignment after phase coordinates exist."""
+    """Resolve a semantic length-midplane wall request in solved phase coordinates."""
 
     manual_origin = tuple(float(value) for value in spec.lattice["phase_origin"])
     request = spec.lattice.get("load_line_alignment")
     if not isinstance(request, Mapping) or not request.get("enabled", False):
-        return manual_origin, {"enabled": False, "mode": "manual_phase_origin"}
+        return manual_origin, {"enabled": False, "mode": "boundary_phase_policy"}
 
     angle_deg = float(spec.orientation_field.get("angle_deg", 0.0))
     if not math.isclose(math.sin(math.radians(angle_deg)), 0.0, abs_tol=1e-9):
         raise ValueError("length-midplane wall alignment requires a global grid direction parallel to X")
 
-    length_mm = float(spec.part["length_mm"])
-    width_mm = float(spec.part["width_mm"])
-    load_center_xy = np.asarray([length_mm / 2.0, width_mm / 2.0], dtype=np.float64)
+    load_center_xy = np.asarray(
+        [float(spec.part["length_mm"]) / 2.0, float(spec.part["width_mm"]) / 2.0], dtype=np.float64
+    )
     load_center_phase = _phase_at_planar_point(domain, phase, load_center_xy)
-    # A regular hexagon's right vertical wall has midpoint (0.5, 0) in the
-    # normalized phase cell.  Placing that midpoint at the load centre makes
-    # the wall pass through the centre of the length-midplane loading line.
+    # A regular phase-domain hexagon's right vertical wall has midpoint
+    # (0.5, 0).  Anchoring it at the load centre makes that wall Y-directed.
     origin = load_center_phase - np.asarray([0.5, 0.0], dtype=np.float64)
     return (float(origin[0]), float(origin[1])), {
         "enabled": True,
@@ -278,7 +306,7 @@ def _phase_at_planar_point(
     phase: PhaseCoordinates,
     point_xy: np.ndarray,
 ) -> np.ndarray:
-    """Interpolate phase coordinates at a point in the rectangular XY domain."""
+    """Interpolate solved phase coordinates at one XY point in the domain."""
 
     triangles = domain.vertices[domain.faces, :2]
     origin = triangles[:, 2, :]

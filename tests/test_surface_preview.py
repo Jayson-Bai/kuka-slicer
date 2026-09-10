@@ -88,6 +88,112 @@ def test_surface_payload_contains_surface_grid_and_diagnostics():
     assert payload["statistics"]["z_range_mm"] > 0.0
 
 
+def test_conformal_rectangle_preview_uses_the_exported_lower_left_origin():
+    payload = surface_payload(
+        {
+            "width_mm": ["90"],
+            "height_mm": ["60"],
+            "samples": ["9"],
+        },
+        rectangle_origin_lower_left=True,
+    )
+
+    assert payload["domain"]["mode"] == "rectangle"
+    assert payload["grid"]["x"][0][0] == pytest.approx(0.0)
+    assert payload["grid"]["x"][0][-1] == pytest.approx(90.0)
+    assert payload["grid"]["y"][0][0] == pytest.approx(0.0)
+    assert payload["grid"]["y"][-1][0] == pytest.approx(60.0)
+
+
+def test_conformal_preview_api_samples_the_center_and_reports_its_coordinate_contract():
+    payload = surface_payload(
+        {
+            "width_mm": ["150"],
+            "height_mm": ["100"],
+            "part_height_mm": ["10"],
+            "surface_start_layer": ["3"],
+            "amplitude_mm": ["1.5"],
+            "wavelength_x_mm": ["100"],
+            "wavelength_y_mm": ["200"],
+            "phase_x_pi": ["1"],
+            "phase_y_pi": ["0"],
+            "check_x_mm": ["75"],
+            "check_y_mm": ["50"],
+            "samples": ["49"],
+        },
+        rectangle_origin_lower_left=True,
+    )
+
+    assert payload["preview_version"] == "surface_preview_v2"
+    assert payload["export_version"] == "conformal_lattice_spec_v1"
+    assert payload["coordinate_system"] == {
+        "origin_label": "rectangle_lower_left",
+        "xy_bounds_mm": [0.0, 0.0, 150.0, 100.0],
+    }
+    assert payload["grid"]["x"][24][24] == pytest.approx(75.0)
+    assert payload["grid"]["y"][24][24] == pytest.approx(50.0)
+    assert payload["grid"]["z"][24][24] == pytest.approx(1.5)
+    assert payload["statistics"]["z_min_mm"] == pytest.approx(-1.5)
+    assert payload["statistics"]["z_max_mm"] == pytest.approx(1.5)
+    assert payload["inspection_point"]["height_mm"] == pytest.approx(1.5)
+    assert payload["inspection_point"]["slope"] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_conformal_solid_stack_reuses_the_symmetric_smoothstep_layer_progression():
+    payload = surface_payload(
+        {
+            "width_mm": ["150"],
+            "height_mm": ["100"],
+            "part_height_mm": ["10"],
+            "surface_start_layer": ["3"],
+            "z_reference_mm": ["0.25"],
+            "check_x_mm": ["75"],
+            "check_y_mm": ["50"],
+            "samples": ["49"],
+        },
+        rectangle_origin_lower_left=True,
+    )
+
+    stack = payload["solid_stack"]
+    assert stack is not None
+    assert stack["reference_layer_height_mm"] == pytest.approx(0.5)
+    assert stack["surface_start_layer"] == 3
+    assert stack["surface_return_layer"] == 16
+    assert stack["peak_layer_indices"] == [9, 10]
+    assert stack["representative_peak_layer_index"] == 9
+    assert len(stack["layers"]) == 20
+    assert stack["layers"][0]["alpha"] == pytest.approx(0.0)
+    assert stack["layers"][-1]["alpha"] == pytest.approx(0.0)
+    assert stack["layers"][9]["alpha"] == pytest.approx(1.0)
+    assert stack["layers"][10]["alpha"] == pytest.approx(1.0)
+    assert stack["layers"][0]["xz_points"][0][1] == pytest.approx(0.5)
+    assert stack["layers"][9]["base_z_mm"] == pytest.approx(4.75)
+
+
+def test_surface_payload_converts_designer_pi_multiples_to_internal_radians():
+    payload = surface_payload(
+        {
+            "phase_x_pi": ["1"],
+            "phase_y_pi": ["0.5"],
+        }
+    )
+
+    assert payload["surface"]["phase_x_rad"] == pytest.approx(math.pi)
+    assert payload["surface"]["phase_y_rad"] == pytest.approx(math.pi / 2.0)
+
+
+def test_surface_payload_keeps_legacy_radian_query_compatibility():
+    payload = surface_payload(
+        {
+            "phase_x_rad": [str(math.pi / 4.0)],
+            "phase_y_rad": [str(-math.pi / 2.0)],
+        }
+    )
+
+    assert payload["surface"]["phase_x_rad"] == pytest.approx(math.pi / 4.0)
+    assert payload["surface"]["phase_y_rad"] == pytest.approx(-math.pi / 2.0)
+
+
 @pytest.mark.parametrize(
     "params, error",
     [
@@ -107,6 +213,42 @@ def test_surface_preview_html_has_an_independent_surface_api_and_controls():
     assert 'fetch(`/api/surface?' in html
     assert 'id="amplitude_mm"' in html
     assert 'id="wavelength_x_mm"' in html
+    assert 'id="phase_x_pi"' in html
+    assert 'id="phase_y_pi"' in html
+    assert 'aria-describedby="phasePiHint"' in html
+    assert '输入 π 的倍数：1 表示 π，0.5 表示 π/2，1.5 表示 3π/2' in html
+    assert 'id="phase_x_rad"' not in html
+    assert 'surface.phase_x_rad' in html
+    assert '矩形左下角 (0, 0)' in html
+    assert 'id="check_x_mm"' in html
+    assert 'id="check_y_mm"' in html
+    assert 'id="previewMode"' in html
+    assert '实体层叠 / XZ 剖面' in html
+    assert 'id="surfaceZScale"' in html
+    assert 'id="sectionZScale"' in html
+    assert '视觉 Z 放大只影响画布' in html
+    assert 'const centeredX = x - (bounds[0] + bounds[2]) * 0.5;' in html
+    assert 'const uniformScale = Math.min(' in html
+    assert '蜂窝格栅：墙宽' in html
+    assert 'function drawLatticePreview' in html
+    assert 'id="latticeLengthSummary"' in html
+    assert 'function updateLatticeLengthSummary' in html
+    assert '当前六边形边线总长' in html
+    assert 'function drawSurfaceReferenceFrame' in html
+    assert 'function drawSurfaceGuideMesh' in html
+    assert 'function physicalPreviewLayer' in html
+    assert 'function physicalLayerZ' in html
+    assert 'const baseZ = 0;' in html
+    assert 'Z=0 基准面' in html
+    assert 'α=1 完整曲率层（物理 Z）' in html
+    assert 'function surfaceLighting' in html
+    assert "const designerStateKey = 'kuka-slicer.conformal-designer-state.v1';" in html
+    assert 'function saveDesignerState()' in html
+    assert 'function restoreDesignerState()' in html
+    assert 'id="samples_x" type="number" min="2" max="512" step="1" value="49"' in html
+    assert 'id="samples_y" type="number" min="2" max="512" step="1" value="49"' in html
+    assert 'id="samples" type="number" min="8" max="120" step="1" value="49"' in html
+    assert '${{' not in html
     assert 'id="canvas"' in html
     assert 'id="exportConformalConfig"' in html
     assert 'id="part_length_mm"' in html
@@ -116,7 +258,9 @@ def test_surface_preview_html_has_an_independent_surface_api_and_controls():
     assert 'id="wall_width_mm"' in html
     assert 'id="base_cell_size_mm"' in html
     assert 'id="align_load_line" type="checkbox" checked' in html
-    assert "syncLoadLineAlignmentControls" in html
+    assert 'syncLoadLineAlignmentControls' in html
+    assert 'id="phase_origin_x_mm"' not in html
+    assert '自动避让' in html
     assert 'id="surface_start_layer"' in html
     assert 'id="samples_x"' in html
     assert 'id="samples_y"' in html
@@ -198,6 +342,8 @@ def test_conformal_lattice_export_binds_double_sine_to_a_rectangular_physical_pa
             "amplitude_mm": ["1.5"],
             "wavelength_x_mm": ["30"],
             "wavelength_y_mm": ["40"],
+            "phase_x_pi": ["1"],
+            "phase_y_pi": ["0.5"],
             "wall_width_mm": ["2.0"],
             "base_cell_size_mm": ["5.0"],
             "surface_start_layer": ["3"],
@@ -220,6 +366,8 @@ def test_conformal_lattice_export_binds_double_sine_to_a_rectangular_physical_pa
     assert "reference_stl" not in source
     assert source["double_sine"]["xy_bounds_mm"] == [0.0, 0.0, 150.0, 100.0]
     assert source["double_sine"]["samples"] == [31, 29]
+    assert source["double_sine"]["phase_x_rad"] == pytest.approx(math.pi)
+    assert source["double_sine"]["phase_y_rad"] == pytest.approx(math.pi / 2.0)
     assert config["part"] == {"boundary": "rectangle", "length_mm": 150.0, "width_mm": 100.0, "final_height_mm": 10.0}
     assert config["manufacturing"] == {"layer_height_mm": 0.5, "nominal_bead_width_mm": 2.0}
     assert config["lattice"]["wall_width_mm"] == pytest.approx(2.0)
@@ -227,6 +375,7 @@ def test_conformal_lattice_export_binds_double_sine_to_a_rectangular_physical_pa
     assert config["lattice"]["base_cell_size_mm"] == pytest.approx(5.0)
     assert config["lattice"]["boundary_mode"] == "inset"
     assert config["lattice"]["phase_origin"] == [1.25, -0.5]
+    assert config["lattice"]["boundary_phase_policy"] == "auto_avoid_outer_boundary_coincidence"
     assert config["lattice"]["load_line_alignment"] == {
         "enabled": False,
         "axis": "x",
@@ -255,6 +404,19 @@ def test_conformal_lattice_export_enables_semantic_length_midplane_wall_alignmen
         "feature": "wall",
     }
     assert config["orientation_field"]["angle_deg"] == 0.0
+
+
+def test_conformal_lattice_export_defaults_to_49_by_49_source_sampling():
+    config = conformal_lattice_config_payload(
+        {
+            "part_length_mm": ["150"],
+            "part_width_mm": ["100"],
+            "part_height_mm": ["10"],
+            "surface_start_layer": ["3"],
+        }
+    )
+
+    assert config["source_surface"]["double_sine"]["samples"] == [49, 49]
 
 
 @pytest.mark.parametrize(

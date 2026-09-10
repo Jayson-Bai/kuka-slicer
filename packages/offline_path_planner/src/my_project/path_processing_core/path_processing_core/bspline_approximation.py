@@ -8,12 +8,18 @@
 
 import math
 import time
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 from .bspline import parameter_selection as ps
 from .bspline import bspline_curve as bc
 
-from .types import MoveCommand, Position, GlobalCurveCommand
+from .types import (
+    MoveCommand,
+    Position,
+    GlobalCurveCommand,
+    validate_source_e_profile,
+)
 from .kuka_orientation import (
     kuka_abc_to_quaternion,
     quaternion_slerp,
@@ -141,6 +147,92 @@ def _generate_fitting_points(
     return densified
 
 
+@dataclass(frozen=True)
+class _FitSample:
+    position: Position
+    absolute_e: float
+
+
+def _generate_fitting_samples(
+    moves: List[MoveCommand],
+    angle_threshold_deg: float,
+    corner_retreat_ratio: float,
+) -> List[_FitSample]:
+    """Generate position/E samples without changing the legacy point path.
+
+    This path is deliberately opt-in.  It mirrors the corner-retreat logic
+    while preserving the absolute E paired with each source position.
+    """
+    if not moves:
+        return []
+
+    samples = [_FitSample(moves[0].start_pos, moves[0].e_val - moves[0].delta_e)]
+    for move in moves:
+        samples.append(_FitSample(move.pos, move.e_val))
+
+    unique_samples = [samples[0]]
+    for sample in samples[1:]:
+        previous = unique_samples[-1]
+        if _distance_xyz(previous.position, sample.position) < 1e-9:
+            if abs(previous.absolute_e - sample.absolute_e) > 1e-9:
+                raise ValueError("cannot fit non-zero E change across a zero-XYZ source segment")
+            continue
+        unique_samples.append(sample)
+
+    if len(unique_samples) <= 2:
+        return unique_samples
+
+    densified = [unique_samples[0]]
+    retreat_ratio = max(0.0, min(corner_retreat_ratio, 0.49))
+    for index in range(1, len(unique_samples) - 1):
+        previous = unique_samples[index - 1]
+        current = unique_samples[index]
+        following = unique_samples[index + 1]
+        prev_pt = previous.position
+        curr_pt = current.position
+        next_pt = following.position
+        v0 = (curr_pt.x - prev_pt.x, curr_pt.y - prev_pt.y, curr_pt.z - prev_pt.z)
+        v1 = (next_pt.x - curr_pt.x, next_pt.y - curr_pt.y, next_pt.z - curr_pt.z)
+        len0 = math.sqrt(sum(component * component for component in v0))
+        len1 = math.sqrt(sum(component * component for component in v1))
+        if len0 < 1e-9 or len1 < 1e-9:
+            densified.append(current)
+            continue
+
+        if compute_angle_deg(v0, v1) >= angle_threshold_deg:
+            u0 = tuple(component / len0 for component in v0)
+            u1 = tuple(component / len1 for component in v1)
+            before_a, before_b, before_c = _interpolate_kuka_abc(prev_pt, curr_pt, 1.0 - retreat_ratio)
+            densified.append(_FitSample(
+                Position(
+                    curr_pt.x - u0[0] * len0 * retreat_ratio,
+                    curr_pt.y - u0[1] * len0 * retreat_ratio,
+                    curr_pt.z - u0[2] * len0 * retreat_ratio,
+                    before_a,
+                    before_b,
+                    before_c,
+                ),
+                previous.absolute_e + (current.absolute_e - previous.absolute_e) * (1.0 - retreat_ratio),
+            ))
+            densified.append(current)
+            after_a, after_b, after_c = _interpolate_kuka_abc(curr_pt, next_pt, retreat_ratio)
+            densified.append(_FitSample(
+                Position(
+                    curr_pt.x + u1[0] * len1 * retreat_ratio,
+                    curr_pt.y + u1[1] * len1 * retreat_ratio,
+                    curr_pt.z + u1[2] * len1 * retreat_ratio,
+                    after_a,
+                    after_b,
+                    after_c,
+                ),
+                current.absolute_e + (following.absolute_e - current.absolute_e) * retreat_ratio,
+            ))
+        else:
+            densified.append(current)
+    densified.append(unique_samples[-1])
+    return densified
+
+
 def _subdivide_points(points: List[Position]) -> List[Position]:
     """
     对点序列进行一次中点加密.
@@ -171,6 +263,28 @@ def _subdivide_points(points: List[Position]) -> List[Position]:
 
     new_points.append(points[-1])
     return new_points
+
+
+def _subdivide_samples(samples: List[_FitSample]) -> List[_FitSample]:
+    if len(samples) < 2:
+        return samples
+    densified: List[_FitSample] = []
+    for first, second in zip(samples, samples[1:]):
+        densified.append(first)
+        a, b, c = _interpolate_kuka_abc(first.position, second.position, 0.5)
+        densified.append(_FitSample(
+            Position(
+                (first.position.x + second.position.x) * 0.5,
+                (first.position.y + second.position.y) * 0.5,
+                (first.position.z + second.position.z) * 0.5,
+                a,
+                b,
+                c,
+            ),
+            (first.absolute_e + second.absolute_e) * 0.5,
+        ))
+    densified.append(samples[-1])
+    return densified
 
 
 def _build_kuka_orientation_samples(
@@ -223,6 +337,7 @@ class GlobalSplinePlanner:
         density: int = 0,  # 数据点加密密度
         degree: int = 3,  # B 样条阶次
         max_fit_points: int = 20000,  # 单段拟合点数上限，防止密度放大拖垮内存/CPU
+        preserve_source_e: bool = False,
     ) -> Optional[GlobalCurveCommand]:
         """
         - 对给定的同类型 MoveCommand 序列进行处理.
@@ -239,11 +354,20 @@ class GlobalSplinePlanner:
 
         # 1. 生成拟合点（包含回退点逻辑）
         t0 = time.perf_counter()
-        fit_points = _generate_fitting_points(
-            moves=moves,
-            angle_threshold_deg=corner_angle_deg,
-            corner_retreat_ratio=corner_retreat_ratio,
-        )
+        fit_samples = None
+        if preserve_source_e:
+            fit_samples = _generate_fitting_samples(
+                moves=moves,
+                angle_threshold_deg=corner_angle_deg,
+                corner_retreat_ratio=corner_retreat_ratio,
+            )
+            fit_points = [sample.position for sample in fit_samples]
+        else:
+            fit_points = _generate_fitting_points(
+                moves=moves,
+                angle_threshold_deg=corner_angle_deg,
+                corner_retreat_ratio=corner_retreat_ratio,
+            )
         profile["fit_gen_points_s"] += time.perf_counter() - t0
 
         # 2. 根据密度参数递归加密数据点
@@ -253,7 +377,11 @@ class GlobalSplinePlanner:
             projected_points = len(fit_points) * 2 - 1
             if projected_points > max_fit_points:
                 break
-            fit_points = _subdivide_points(fit_points)
+            if fit_samples is not None:
+                fit_samples = _subdivide_samples(fit_samples)
+                fit_points = [sample.position for sample in fit_samples]
+            else:
+                fit_points = _subdivide_points(fit_points)
         profile["fit_density_s"] += time.perf_counter() - t0
 
         n_points = len(fit_points)
@@ -342,6 +470,8 @@ class GlobalSplinePlanner:
 
         except Exception as e:
             # 容错处理
+            if preserve_source_e:
+                raise ValueError(f"B样条共形源 E 拟合失败：{e}") from e
             print(f"B样条拟合失败：{e}")
             return None
 
@@ -349,6 +479,14 @@ class GlobalSplinePlanner:
         total_delta_e = sum(m.delta_e for m in moves)
         final_e = moves[-1].e_val
         constraints: List[Tuple[float, float]] = []
+        source_e_profile = None
+        if fit_samples is not None:
+            source_e_profile = validate_source_e_profile(
+                [float(value) for value in param],
+                [sample.absolute_e for sample in fit_samples],
+                start_e=final_e - total_delta_e,
+                end_e=final_e,
+            )
 
         return GlobalCurveCommand(
             # 保留原始段类型并标注拟合
@@ -363,6 +501,8 @@ class GlobalSplinePlanner:
             raw="GLOBAL_BSPLINE_LIB",
             constraints=constraints,
             original_moves=moves,
+            source_e_parameters=(source_e_profile[0] if source_e_profile else None),
+            source_e_values=(source_e_profile[1] if source_e_profile else None),
             orientation_parameters=(orientation_samples[0] if orientation_samples else None),
             orientation_quaternions=(orientation_samples[1] if orientation_samples else None),
         )

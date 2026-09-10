@@ -63,6 +63,10 @@ def test_path_bridge_exports_existing_npz_contract_with_edge_path_provenance(tmp
     assert bridge["trail_partition_status"] == "planned_from_conformal_structural_graph"
     assert bridge["core_handoff"].startswith("external_layer_paths_v1 XYZABC")
     assert metadata["extrusion_compensation"]["requires_xy_preservation"] is False
+    assert metadata["core_processing"] == {
+        "source_e_profile_mode": "piecewise_preserve_v1",
+        "zero_e_connector_semantics": "print_context_constant_e",
+    }
 
 
 def test_path_bridge_rejects_an_implicit_or_invalid_e_volume_conversion():

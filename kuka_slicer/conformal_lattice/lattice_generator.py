@@ -30,6 +30,17 @@ _HEXAGON_OFFSETS = np.asarray(
     [[math.cos(math.pi / 6.0 + index * math.pi / 3.0), math.sin(math.pi / 6.0 + index * math.pi / 3.0)] for index in range(6)],
     dtype=np.float64,
 ) / math.sqrt(3.0)
+_BOUNDARY_PHASE_CANDIDATES = (
+    (0.37, 0.23),
+    (0.11, 0.61),
+    (0.73, 0.41),
+    (0.29, 0.83),
+    (0.53, 0.17),
+    (0.89, 0.67),
+    (0.19, 0.47),
+    (0.67, 0.91),
+)
+_PARALLEL_TOLERANCE = 1e-8
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,6 +253,116 @@ def _validate_inputs(
         raise ValueError("design and orientation fields must share the domain vertices")
     if phase.quality.flipped_phase_triangle_count or phase.quality.degenerate_phase_triangle_count or phase.quality.overlapping_phase_face_pairs:
         raise ValueError("Gate 5 cannot continue from an invalid phase map")
+
+
+def choose_boundary_safe_phase_origin(
+    domain: SurfaceMeshDomain,
+    phase: PhaseCoordinates,
+    requested_origin: np.ndarray | tuple[float, float],
+) -> tuple[tuple[float, float], dict[str, object]]:
+    """Choose a lattice-period translation that avoids collinear outer walls.
+
+    The selection is performed in the solved phase domain, immediately before
+    inverse surface mapping.  This is deliberately not an XY/UI heuristic:
+    a curved surface's LSCM/phase coordinates are what determine whether a
+    generated hex wall can coincide with an exterior boundary segment.
+
+    ``requested_origin`` remains a seed translation.  The chosen offset is a
+    whole-cell-equivalent phase translation plus a deterministic fractional
+    candidate, so it changes placement but never cell scale or orientation.
+    """
+
+    origin = np.asarray(requested_origin, dtype=np.float64)
+    if origin.shape != (2,) or not np.all(np.isfinite(origin)):
+        raise ValueError("requested_origin must contain two finite phase values")
+    phase_vertices = np.column_stack((phase.phi_p, phase.phi_q))
+    if phase_vertices.shape != (len(domain.vertices), 2):
+        raise ValueError("phase coordinates must belong to the supplied domain")
+
+    best_origin: np.ndarray | None = None
+    best_score = -math.inf
+    best_parallel_edge_count = 0
+    for fractional_coordinate in _BOUNDARY_PHASE_CANDIDATES:
+        candidate = origin + _LATTICE_BASIS @ np.asarray(fractional_coordinate, dtype=np.float64)
+        centers = _triangular_lattice_centers(phase_vertices, candidate)
+        polygons = centers[:, None, :] + _HEXAGON_OFFSETS[None, :, :]
+        vertices, edges, _ = _dual_hex_topology(polygons)
+        clearance, parallel_edge_count = _minimum_parallel_boundary_clearance(
+            phase_vertices, domain.boundary_loops, vertices, edges
+        )
+        # The first candidate provides deterministic placement if no lattice
+        # wall is parallel to an exterior segment.  Otherwise maximise the
+        # separation, with earlier candidates as a stable tie breaker.
+        if clearance > best_score:
+            best_origin = candidate
+            best_score = clearance
+            best_parallel_edge_count = parallel_edge_count
+
+    if best_origin is None:  # Defensive: the fixed candidate list is non-empty.
+        raise RuntimeError("could not select a boundary-safe lattice phase origin")
+    return (
+        (float(best_origin[0]), float(best_origin[1])),
+        {
+            "policy": "auto_avoid_outer_boundary_coincidence",
+            "requested_phase_origin": origin.tolist(),
+            "effective_phase_origin": best_origin.tolist(),
+            "candidate_count": len(_BOUNDARY_PHASE_CANDIDATES),
+            "parallel_boundary_edge_count": best_parallel_edge_count,
+            "minimum_parallel_boundary_clearance_phase": None
+            if math.isinf(best_score)
+            else float(best_score),
+        },
+    )
+
+
+def _minimum_parallel_boundary_clearance(
+    phase_vertices: np.ndarray,
+    boundary_loops: tuple[np.ndarray, ...],
+    lattice_vertices: np.ndarray,
+    lattice_edges: np.ndarray,
+) -> tuple[float, int]:
+    """Return clearance only for walls parallel to a boundary segment.
+
+    Intersections at the clipped end of an angled wall are legitimate.  The
+    failure we prohibit is a positive-length wall running *along* the external
+    boundary, so only overlapping projections of parallel segments contribute.
+    """
+
+    starts = lattice_vertices[lattice_edges[:, 0]]
+    ends = lattice_vertices[lattice_edges[:, 1]]
+    deltas = ends - starts
+    lengths = np.linalg.norm(deltas, axis=1)
+    minimum = math.inf
+    matched = 0
+    for loop in boundary_loops:
+        if len(loop) < 2:
+            continue
+        for first, second in zip(loop, np.roll(loop, -1)):
+            boundary_start = phase_vertices[int(first)]
+            boundary_end = phase_vertices[int(second)]
+            boundary_delta = boundary_end - boundary_start
+            boundary_length = float(np.linalg.norm(boundary_delta))
+            if boundary_length <= _EPSILON:
+                continue
+            cross = np.abs(boundary_delta[0] * deltas[:, 1] - boundary_delta[1] * deltas[:, 0])
+            parallel = cross <= _PARALLEL_TOLERANCE * boundary_length * lengths
+            if not np.any(parallel):
+                continue
+            unit = boundary_delta / boundary_length
+            start_projection = (starts - boundary_start) @ unit
+            end_projection = (ends - boundary_start) @ unit
+            lower = np.minimum(start_projection, end_projection)
+            upper = np.maximum(start_projection, end_projection)
+            overlap = parallel & (upper > _EPSILON) & (lower < boundary_length - _EPSILON)
+            if not np.any(overlap):
+                continue
+            distances = np.abs(
+                boundary_delta[0] * (starts[:, 1] - boundary_start[1])
+                - boundary_delta[1] * (starts[:, 0] - boundary_start[0])
+            ) / boundary_length
+            minimum = min(minimum, float(np.min(distances[overlap])))
+            matched += int(np.count_nonzero(overlap))
+    return minimum, matched
 
 
 def _triangular_lattice_centers(phase_vertices: np.ndarray, origin: np.ndarray) -> np.ndarray:

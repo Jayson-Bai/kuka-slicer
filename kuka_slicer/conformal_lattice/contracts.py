@@ -134,6 +134,12 @@ def load_conformal_lattice_spec(data: bytes | str | Mapping[str, object]) -> Con
     if lattice.get("boundary_mode") not in ("clip", "inset", "boundary_frame"):
         raise ValueError("lattice.boundary_mode must be clip, inset, or boundary_frame")
     _vector(lattice.get("phase_origin"), "lattice.phase_origin", length=2)
+    boundary_phase_policy = lattice.get("boundary_phase_policy", "manual")
+    if boundary_phase_policy not in ("manual", "auto_avoid_outer_boundary_coincidence"):
+        raise ValueError(
+            "lattice.boundary_phase_policy must be manual or "
+            "auto_avoid_outer_boundary_coincidence"
+        )
     _validate_load_line_alignment(lattice.get("load_line_alignment"), part)
     if part:
         bead_count = lattice.get("wall_bead_count")

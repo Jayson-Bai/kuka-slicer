@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Union, List, Tuple
+import math
+from typing import Dict, Optional, Sequence, Union, List, Tuple
 
 
 @dataclass
@@ -110,11 +111,59 @@ class GlobalCurveCommand(CurveCommand):
     # present, the sampler follows this profile segment-by-segment instead of
     # distributing only the total delta_e by geometric arc length.
     e_profile: Optional[List[float]] = None
+    # Optional absolute source-E samples on the position B-spline parameter
+    # axis. Unlike e_profile these samples correspond to fitted input points,
+    # not to B-spline control points, so they are safe for SPLINE commands.
+    source_e_parameters: Optional[List[float]] = None
+    source_e_values: Optional[List[float]] = None
     # KUKA A(Z)-B(Y)-C(X) quaternion samples on the position B-spline's
     # normalized parameter axis.  Sampling uses local SLERP to prevent a
     # global least-squares attitude fit from overshooting surface normals.
     orientation_parameters: Optional[List[float]] = None
     orientation_quaternions: Optional[List[Tuple[float, float, float, float]]] = None
+
+
+def validate_source_e_profile(
+    parameters: Sequence[float] | None,
+    values: Sequence[float] | None,
+    *,
+    start_e: float,
+    end_e: float,
+    tolerance: float = 1e-9,
+) -> tuple[List[float], List[float]] | None:
+    """Validate an optional absolute E profile shared with a B-spline u axis.
+
+    ``None`` keeps the legacy total-E-by-arc-length behavior. A partially
+    supplied profile is invalid: source E is an explicit opt-in contract.
+    """
+    if parameters is None and values is None:
+        return None
+    if parameters is None or values is None:
+        raise ValueError("source E parameters and values must be supplied together")
+
+    normalized_parameters = [float(value) for value in parameters]
+    normalized_values = [float(value) for value in values]
+    if len(normalized_parameters) != len(normalized_values) or len(normalized_parameters) < 2:
+        raise ValueError("source E profile requires equal parameter/value lengths of at least 2")
+    if not all(math.isfinite(value) for value in (*normalized_parameters, *normalized_values)):
+        raise ValueError("source E profile values must be finite")
+    if abs(normalized_parameters[0]) > tolerance or abs(normalized_parameters[-1] - 1.0) > tolerance:
+        raise ValueError("source E parameters must start at 0 and end at 1")
+    if any(
+        right - left <= tolerance
+        for left, right in zip(normalized_parameters, normalized_parameters[1:])
+    ):
+        raise ValueError("source E parameters must be strictly increasing")
+    if any(
+        right < left - tolerance
+        for left, right in zip(normalized_values, normalized_values[1:])
+    ):
+        raise ValueError("source E values must be monotonic non-decreasing")
+    if abs(normalized_values[0] - float(start_e)) > tolerance:
+        raise ValueError("source E profile start does not match curve start E")
+    if abs(normalized_values[-1] - float(end_e)) > tolerance:
+        raise ValueError("source E profile end does not match curve end E")
+    return normalized_parameters, normalized_values
 
 
 ParsedCommand = Union[MoveCommand, CurveCommand, GlobalCurveCommand,

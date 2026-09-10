@@ -13,7 +13,7 @@ import bisect
 import math
 import time
 
-from .types import Position, GlobalCurveCommand
+from .types import Position, GlobalCurveCommand, validate_source_e_profile
 from .kuka_orientation import (
     kuka_abc_to_quaternion,
     quaternion_slerp,
@@ -162,6 +162,20 @@ def _sample_kuka_orientation(
     span = parameters[right] - parameters[left]
     local = 0.0 if span <= 1e-12 else (normalized_u - parameters[left]) / span
     return quaternion_slerp(quaternions[left], quaternions[right], local)
+
+
+def _sample_source_e_profile(normalized_u: float, parameters, values) -> float:
+    """Evaluate the opt-in source E profile with monotonic linear segments."""
+    if normalized_u <= parameters[0]:
+        return values[0]
+    if normalized_u >= parameters[-1]:
+        return values[-1]
+    right = bisect.bisect_right(parameters, normalized_u)
+    left = max(0, right - 1)
+    right = min(len(parameters) - 1, right)
+    span = parameters[right] - parameters[left]
+    local = 0.0 if span <= 1e-12 else (normalized_u - parameters[left]) / span
+    return values[left] + (values[right] - values[left]) * local
 
 
 def _build_arc_length_map(ctrl: List[Position], degree: int = 3, samples: int = 400):
@@ -650,6 +664,12 @@ def sample_global_curve_iter(
     corrected_total_time = num_steps * dt
     start_e = curve.e_val - curve.delta_e
     current_e = start_e
+    source_e_profile = validate_source_e_profile(
+        curve.source_e_parameters,
+        curve.source_e_values,
+        start_e=start_e,
+        end_e=curve.e_val,
+    )
 
     # 姿态：仅用起点/终点做 slerp
     # Planner-generated curves carry KUKA samples on the position parameter.
@@ -674,6 +694,9 @@ def sample_global_curve_iter(
     prev_s = 0.0
     lookup_idx = 0
     span = degree
+    u_min = knots[degree]
+    u_max = knots[n_ctrl]
+    u_span = u_max - u_min
     for i in range(num_steps + 1):
         t = i * dt
         s_norm = _three_stage_sept_poly(t, corrected_total_time, t_acc, t_dec)
@@ -696,8 +719,9 @@ def sample_global_curve_iter(
 
         # 姿态插值
         t_pose0 = time.perf_counter()
+        normalized_u = (u - u_min) / u_span if u_span > 1e-12 else 0.0
+        normalized_u = max(0.0, min(1.0, normalized_u))
         if orientation_parameters and orientation_quaternions:
-            normalized_u = u / knots[n_ctrl] if knots[n_ctrl] > 1e-12 else 0.0
             q = _sample_kuka_orientation(normalized_u, orientation_parameters, orientation_quaternions)
             p.a, p.b, p.c = quaternion_to_kuka_abc(q, near_deg=previous_abc)
         elif constant_orientation:
@@ -711,11 +735,30 @@ def sample_global_curve_iter(
         if profile is not None:
             profile["sample_pose_s"] += time.perf_counter() - t_pose0
 
-        # 挤出分配（按弧长比例）
+        # 挤出分配：显式源 E 走参数化分段线性；缺失时保留旧弧长比例。
         t_extrude0 = time.perf_counter()
         delta_s = curr_s - prev_s
-        delta_e = curve.delta_e * (delta_s / total_length)
-        current_e += delta_e
+        if source_e_profile is None:
+            delta_e = curve.delta_e * (delta_s / total_length)
+            current_e += delta_e
+        else:
+            if i == 0:
+                target_e = source_e_profile[1][0]
+            elif i == num_steps:
+                target_e = source_e_profile[1][-1]
+            else:
+                target_e = _sample_source_e_profile(
+                    normalized_u,
+                    source_e_profile[0],
+                    source_e_profile[1],
+                )
+            delta_e = target_e - current_e
+            if delta_e < -1e-9:
+                raise ValueError("source E profile produced a negative sampled extrusion increment")
+            if delta_e < 0.0:
+                delta_e = 0.0
+                target_e = current_e
+            current_e = target_e
         prev_s = curr_s
 
         # 速度估计：用前一帧差分

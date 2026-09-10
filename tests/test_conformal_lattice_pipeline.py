@@ -160,6 +160,70 @@ def test_pipeline_skips_expensive_fill_diagnostic_for_production_path_export(tmp
     assert loaded_preview["conformal_lattice"]["uses_existing_main_canvas"] is True
 
 
+def test_auto_boundary_phase_policy_moves_the_lattice_without_changing_legacy_specs():
+    automatic = _spec()
+    automatic.lattice["boundary_phase_policy"] = "auto_avoid_outer_boundary_coincidence"
+
+    automatic_run = run_conformal_lattice_pipeline(automatic, logical_layer_count=4)
+    automatic_report = automatic_run.geometry.metadata["config"]["boundary_phase"]
+
+    assert automatic_report["policy"] == "auto_avoid_outer_boundary_coincidence"
+    assert automatic_report["requested_phase_origin"] == [0.0, 0.0]
+    assert automatic_report["effective_phase_origin"] != [0.0, 0.0]
+    assert automatic_run.geometry.metadata["phase_origin"] == pytest.approx(
+        automatic_report["effective_phase_origin"]
+    )
+
+    legacy_run = run_conformal_lattice_pipeline(_spec(), logical_layer_count=4)
+    legacy_report = legacy_run.geometry.metadata["config"]["boundary_phase"]
+    assert legacy_report == {
+        "policy": "manual",
+        "requested_phase_origin": [0.0, 0.0],
+        "effective_phase_origin": [0.0, 0.0],
+    }
+
+
+@pytest.mark.parametrize("cell_size_mm", [3.0, 4.0])
+def test_length_midplane_alignment_places_a_y_directed_wall_at_the_part_centre(cell_size_mm):
+    config = conformal_lattice_config_payload(
+        {
+            "part_length_mm": ["20"],
+            "part_width_mm": ["20"],
+            "part_height_mm": ["2"],
+            "amplitude_mm": ["0"],
+            "wall_width_mm": ["2"],
+            "base_cell_size_mm": [str(cell_size_mm)],
+            "surface_start_layer": ["0"],
+            "samples_x": ["9"],
+            "samples_y": ["9"],
+        }
+    )
+
+    run = run_conformal_lattice_pipeline(config)
+    centre_index = np.flatnonzero(
+        np.isclose(run.domain.vertices[:, 0], 10.0) & np.isclose(run.domain.vertices[:, 1], 10.0)
+    )
+    assert len(centre_index) == 1
+    target_phase = np.asarray(
+        [run.phase.phi_p[centre_index[0]], run.phase.phi_q[centre_index[0]]], dtype=np.float64
+    )
+    alignment = run.geometry.metadata["config"]["load_line_alignment"]
+
+    assert alignment["load_center_xy_mm"] == [10.0, 10.0]
+    assert np.asarray(run.geometry.metadata["phase_origin"]) == pytest.approx(target_phase - [0.5, 0.0])
+    assert _phase_point_lies_on_an_edge(target_phase, run.geometry.lattice_nodes_phase, run.geometry.lattice_edges)
+
+
+def _phase_point_lies_on_an_edge(point, nodes, edges) -> bool:
+    endpoints = nodes[edges]
+    starts = endpoints[:, 0, :]
+    directions = endpoints[:, 1, :] - starts
+    offsets = point - starts
+    cross = directions[:, 0] * offsets[:, 1] - directions[:, 1] * offsets[:, 0]
+    dot = np.einsum("ij,ij->i", offsets, point - endpoints[:, 1, :])
+    return bool(np.any((np.abs(cross) < 1e-8) & (dot <= 1e-8)))
+
+
 def test_pipeline_runs_actual_fill_diagnostic_only_when_explicitly_requested():
     run = run_conformal_lattice_pipeline(
         _spec(),

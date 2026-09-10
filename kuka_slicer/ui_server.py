@@ -26,6 +26,7 @@ from .external_npz import (
     ExternalSourceJob,
     MaterialPaths,
     TravelPaths,
+    external_source_job_to_core_source_job,
     write_external_source_npz,
 )
 from .cpu_limiter import limit_slicer_task
@@ -257,6 +258,27 @@ def _core_output_download_path(core_npz_path: Path) -> Path:
         for candidate in [*parts, *sidecars]:
             if candidate.is_file():
                 archive.write(candidate, arcname=candidate.name)
+    return package_path
+
+
+def _conformal_debug_download_path(outputs: dict[str, Path], job_dir: Path) -> Path:
+    """Package optional conformal intermediates without making them Core input.
+
+    The source-path NPZ is useful for offline inspection, but the production
+    conformal route deliberately adapts its in-memory path job directly to
+    Core's ``SourceJob``.  Keeping this package opt-in avoids both the I/O
+    cost and accidental reliance on a serialized source artifact.
+    """
+
+    expected = ("geometry", "paths")
+    missing = [key for key in expected if not outputs.get(key, Path()).is_file()]
+    if missing:
+        raise FileNotFoundError(f"conformal debug intermediates were not written: {', '.join(missing)}")
+    package_path = job_dir / "conformal_lattice_debug.zip"
+    with zipfile.ZipFile(package_path, "w", compression=zipfile.ZIP_STORED) as archive:
+        for key in expected:
+            candidate = outputs[key]
+            archive.write(candidate, arcname=candidate.name)
     return package_path
 
 
@@ -1524,7 +1546,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             raise ValueError("当前 Core 树脂挤出倍率必须为正数")
 
         from .conformal_lattice.path_bridge import ExtrusionVolumeModel
-        from .conformal_lattice.pipeline import run_conformal_lattice_pipeline, write_conformal_lattice_outputs
+        from .conformal_lattice.pipeline import run_conformal_lattice_pipeline
 
         progress(12, "正在计算双正弦曲面、共形蜂窝结构与一笔画分区")
         run = run_conformal_lattice_pipeline(
@@ -1544,11 +1566,14 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             # conformal paths proceed directly to Core.
             validate_fill_ratio=False,
         )
-        progress(55, "正在按一笔画分区生成 External Source NPZ")
-        outputs = write_conformal_lattice_outputs(run, job_dir)
-        source_npz_path = outputs.get("paths")
-        if source_npz_path is None:
-            raise RuntimeError("共形蜂窝路径桥接未生成 External Source NPZ")
+        if run.path_graph is None:
+            raise RuntimeError("共形蜂窝路径桥接未生成一笔画路径")
+        progress(55, "正在将共形一笔画路径适配为 Core SourceJob")
+        conformal_source_job = run.path_graph.to_external_source_job()
+        core_source_job = external_source_job_to_core_source_job(
+            conformal_source_job,
+            default_abc=core_params.default_abc,
+        )
 
         export_runner = importlib.import_module("external_npz_preprocessor.export_runner")
         core_npz_path = job_dir / "conformal_lattice_core.npz"
@@ -1556,18 +1581,19 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         def core_progress(ratio: float) -> None:
             progress(60 + int(max(0.0, min(1.0, float(ratio))) * 35), "正在执行 path_processing_core 并写出系统 NPZ")
 
-        core_stats = export_runner.convert_external_npz(
-            source_npz_path,
-            core_npz_path,
-            core_params,
+        core_stats = export_runner.convert_source_job(
+            core_source_job,
+            source_path=job_dir / source_filename,
+            output_path=core_npz_path,
+            params=core_params,
             progress_callback=core_progress,
             chunk_size=5_000_000,
         )
         progress(97, "正在生成主界面三维预览")
         preview = run.main_preview_payload(planning_line_width_mm=2.0)
         download_path = _core_output_download_path(core_npz_path)
-        path_count = sum(len(group.paths) for group in run.path_graph.to_external_source_job().material_paths) if run.path_graph else 0
-        return {
+        path_count = sum(len(group.paths) for group in conformal_source_job.material_paths)
+        result: dict[str, object] = {
             "download_url": f"/outputs/{quote(stamp)}/{quote(download_path.name)}",
             "filename": download_path.name,
             "layers": len(preview["layers"]),
@@ -1580,6 +1606,21 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             "core_rows": int(core_stats.get("rows", 0)),
             "core_parts": int(core_stats.get("parts", 0)),
         }
+        if _bool_param(params, "conformal_debug_export", False):
+            from .conformal_lattice.pipeline import write_conformal_lattice_outputs
+
+            progress(98, "正在导出共形调试中间结果")
+            debug_path = _conformal_debug_download_path(
+                write_conformal_lattice_outputs(run, job_dir),
+                job_dir,
+            )
+            result.update(
+                {
+                    "debug_download_url": f"/outputs/{quote(stamp)}/{quote(debug_path.name)}",
+                    "debug_filename": debug_path.name,
+                }
+            )
+        return result
 
     def _read_slice_request(
         self, query: str
@@ -4193,6 +4234,7 @@ def _index_html() -> str:
       <button id="surfacePreviewButton" class="surfaceToolButton" type="button">启动蜂窝网格共形设计器</button>
       <button id="conformalSpecButton" class="surfaceToolButton" type="button">导入共形设计 JSON</button>
       <button id="conformalSliceButton" class="surfaceToolButton" type="button" disabled>生成共形蜂窝并送入 Core</button>
+      <button id="conformalDebugExportButton" class="surfaceToolButton" type="button" aria-pressed="false">共形调试导出：关</button>
       <button id="coreNpzPreviewButton" class="surfaceToolButton" type="button">导入 Core NPZ 预览</button>
       <button id="surfaceNpzPreviewButton" class="surfaceToolButton" type="button">导入曲面/共形 NPZ 预览</button>
       <button id="surfaceNpzCollisionButton" class="surfaceToolButton" type="button" disabled>检查当前 NPZ 碰撞</button>
@@ -4210,6 +4252,7 @@ def _index_html() -> str:
         <div class="metric"><span>实际填充策略</span><strong id="executedInfillPattern">-</strong></div>
       </div>
       <a id="download" class="download" href="#">下载 Core NPZ</a>
+      <a id="conformalDebugDownload" class="download" href="#">下载共形调试中间结果</a>
       <div class="viewerControls">
         <div>
           <label for="layerSlider">层</label>
@@ -4946,13 +4989,16 @@ def _index_html() -> str:
     const coreNpzPreviewButton = document.getElementById('coreNpzPreviewButton');
     const conformalSpecButton = document.getElementById('conformalSpecButton');
     const conformalSliceButton = document.getElementById('conformalSliceButton');
+    const conformalDebugExportButton = document.getElementById('conformalDebugExportButton');
     const conformalSpecInput = document.getElementById('conformalSpecInput');
     const conformalSpecResult = document.getElementById('conformalSpecResult');
+    const conformalDebugDownload = document.getElementById('conformalDebugDownload');
     const surfaceNpzCollisionButton = document.getElementById('surfaceNpzCollisionButton');
     const surfaceNpzCollisionResult = document.getElementById('surfaceNpzCollisionResult');
     const surfaceNpzInput = document.getElementById('surfaceNpzInput');
     const statusEl = document.getElementById('status');
     let selectedConformalSpec = null;
+    let conformalDebugExportEnabled = false;
     async function launchSurfaceTool(tool) {{
       const toolButton = surfaceToolButtons[tool];
       const originalLabel = toolButton.textContent;
@@ -5083,6 +5129,13 @@ def _index_html() -> str:
     conformalSpecInput.addEventListener('change', async () => {{
       await inspectConformalSpec(conformalSpecInput.files?.[0]);
     }});
+    conformalDebugExportButton.addEventListener('click', () => {{
+      conformalDebugExportEnabled = !conformalDebugExportEnabled;
+      conformalDebugExportButton.setAttribute('aria-pressed', String(conformalDebugExportEnabled));
+      conformalDebugExportButton.textContent = conformalDebugExportEnabled
+        ? '共形调试导出：开'
+        : '共形调试导出：关';
+    }});
     function appendCurrentCoreSettings(formData) {{
       const coreFieldIds = [
         'coreResinLayerHeight', 'coreResinExtrusionScale', 'coreResinFeed',
@@ -5124,10 +5177,12 @@ def _index_html() -> str:
       statusEl.className = 'status';
       statusEl.textContent = '正在生成共形蜂窝并送入 Core…';
       downloadEl.className = 'download';
+      conformalDebugDownload.className = 'download';
       updateExportProgress({{ progress: 0, message: '正在提交共形蜂窝任务', elapsed_s: 0 }});
       try {{
         const formData = new FormData();
         formData.append('conformal_spec', selectedConformalSpec, selectedConformalSpec.name);
+        formData.append('conformal_debug_export', conformalDebugExportEnabled ? 'true' : 'false');
         appendCurrentCoreSettings(formData);
         const response = await fetch('/conformal-slice', {{ method: 'POST', body: formData }});
         const queued = await response.json();
@@ -5143,6 +5198,11 @@ def _index_html() -> str:
         downloadEl.href = result.download_url;
         downloadEl.textContent = '下载 ' + result.filename;
         downloadEl.className = 'download visible';
+        if (result.debug_download_url && result.debug_filename) {{
+          conformalDebugDownload.href = result.debug_download_url;
+          conformalDebugDownload.textContent = '下载 ' + result.debug_filename;
+          conformalDebugDownload.className = 'download visible';
+        }}
         statusEl.className = 'status ok';
         statusEl.textContent = '完成：共形蜂窝路径已按图分区规划，并已生成 Core NPZ。';
         const coreSeconds = Number(result.core_export_seconds);
