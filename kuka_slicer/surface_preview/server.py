@@ -46,6 +46,18 @@ def _query_float(
     return value
 
 
+def _query_bool(params: dict[str, list[str]], name: str, default: bool) -> bool:
+    raw = params.get(name, ["true" if default else "false"])[0]
+    if isinstance(raw, bool):
+        return raw
+    normalized = str(raw).strip().lower()
+    if normalized in {"1", "true", "on", "yes"}:
+        return True
+    if normalized in {"0", "false", "off", "no"}:
+        return False
+    raise ValueError(f"{name} must be a boolean")
+
+
 def _query_samples(params: dict[str, list[str]]) -> int:
     raw = params.get("samples", [str(DEFAULT_PREVIEW_SAMPLES)])[0]
     try:
@@ -197,7 +209,10 @@ def conformal_lattice_config_payload(params: dict[str, list[str]]) -> dict[str, 
         _query_float(params, "phase_origin_x_mm", 0.0),
         _query_float(params, "phase_origin_y_mm", 0.0),
     ]
-    orientation_angle_deg = _query_float(params, "orientation_angle_deg", 0.0)
+    load_line_alignment_enabled = _query_bool(params, "align_load_line", True)
+    orientation_angle_deg = 0.0 if load_line_alignment_enabled else _query_float(
+        params, "orientation_angle_deg", 0.0
+    )
     random_seed = _query_nonnegative_int(params, "random_seed", 0)
     source_surface: dict[str, object] = {
         "provider": "double_sine",
@@ -236,6 +251,12 @@ def conformal_lattice_config_payload(params: dict[str, list[str]]) -> dict[str, 
             "base_cell_size_mm": base_cell_size_mm,
             "boundary_mode": boundary_mode,
             "phase_origin": phase_origin,
+            "load_line_alignment": {
+                "enabled": load_line_alignment_enabled,
+                "axis": "x",
+                "position": "part_length_midplane",
+                "feature": "wall",
+            },
         },
         "fill_field": {"mode": "fixed_cell_size", "drivers": []},
         "orientation_field": {"mode": "global_axis", "angle_deg": orientation_angle_deg, "constraints": []},
@@ -409,6 +430,8 @@ def surface_preview_html() -> str:
     .field { display: grid; grid-template-columns: 1fr 112px; align-items: center; gap: 10px; margin: 10px 0; }
     label { font-size: 13px; color: #38475d; }
     input { width: 100%; border: 1px solid #bdcadb; border-radius: 7px; padding: 8px; color: #142238; font: inherit; }
+    input[type="checkbox"] { width: 18px; height: 18px; justify-self: start; padding: 0; }
+    input:disabled { background: #f0f4f8; color: #7b8798; cursor: not-allowed; }
     input:focus { outline: 3px solid rgba(36, 122, 207, .18); border-color: #247acf; }
     .divider { height: 1px; background: #e6ecf4; margin: 17px 0; }
     button { width: 100%; border: 0; border-radius: 8px; padding: 10px 12px; background: #126fd1; color: white; font: 600 14px inherit; cursor: pointer; }
@@ -463,6 +486,8 @@ def surface_preview_html() -> str:
         <div class="field"><label for="wall_width_mm">设计墙宽（mm）</label><input id="wall_width_mm" type="number" min="2" step="2" value="2"></div>
         <div class="field"><label for="base_cell_size_mm">目标六边形边长（mm）</label><input id="base_cell_size_mm" type="number" min="0.001" step="0.01" value="5"></div>
         <div class="field"><label for="orientation_angle_deg">全局格栅方向角（°）</label><input id="orientation_angle_deg" type="number" step="1" value="0"></div>
+        <div class="field"><label for="align_load_line">跨中加载面对齐</label><input id="align_load_line" type="checkbox" checked></div>
+        <p class="hint" id="loadLineAlignmentHint">已开启：自动以零件长度中面为加载面，将一条沿 Y 的蜂窝壁放在该面中心；边长或零件尺寸改变后会重新求解相位。</p>
         <p class="hint">喷嘴基准线宽固定为 2 mm。墙宽只能填 2、4、6… mm；4 mm 代表后续由两条 2 mm 沉积道组成。目标边长沿承载曲面测量。</p>
         <div class="designSummary" id="latticeDesignSummary" aria-live="polite"></div>
         <div class="divider"></div>
@@ -476,8 +501,8 @@ def surface_preview_html() -> str:
             <div class="field"><label for="samples_x">曲面采样 X</label><input id="samples_x" type="number" min="2" max="512" step="1" value="48"></div>
             <div class="field"><label for="samples_y">曲面采样 Y</label><input id="samples_y" type="number" min="2" max="512" step="1" value="48"></div>
             <div class="field"><label for="boundary_mode">边界策略</label><select id="boundary_mode"><option value="clip" selected>裁剪至矩形</option><option value="inset">向内缩进</option></select></div>
-            <div class="field"><label for="phase_origin_x_mm">格栅相位 X（mm）</label><input id="phase_origin_x_mm" type="number" step="0.01" value="0"></div>
-            <div class="field"><label for="phase_origin_y_mm">格栅相位 Y（mm）</label><input id="phase_origin_y_mm" type="number" step="0.01" value="0"></div>
+            <div class="field"><label for="phase_origin_x_mm">手动相位原点 X（相位坐标）</label><input id="phase_origin_x_mm" type="number" step="0.01" value="0"></div>
+            <div class="field"><label for="phase_origin_y_mm">手动相位原点 Y（相位坐标）</label><input id="phase_origin_y_mm" type="number" step="0.01" value="0"></div>
             <div class="field"><label for="random_seed">随机种子</label><input id="random_seed" type="number" min="0" step="1" value="0"></div>
             <div class="field"><label for="samples">预览网格密度</label><input id="samples" type="number" min="8" max="120" step="1" value="48"></div>
             <p class="hint">曲面采样 X/Y 参与共形计算；预览网格密度只影响本页显示。参数化固定使用 LSCM、最远边界锚点和无切缝。</p>
@@ -500,7 +525,7 @@ def surface_preview_html() -> str:
   <script>
     const surfaceIds = ['amplitude_mm', 'wavelength_x_mm', 'wavelength_y_mm', 'phase_x_rad', 'phase_y_rad', 'z_reference_mm', 'samples'];
     const mappingReferenceLayerHeightMm = 0.5;
-    const conformalDesignIds = ['part_length_mm', 'part_width_mm', 'part_height_mm', 'wall_width_mm', 'base_cell_size_mm', 'orientation_angle_deg', 'surface_start_layer', 'samples_x', 'samples_y', 'boundary_mode', 'phase_origin_x_mm', 'phase_origin_y_mm', 'random_seed'];
+    const conformalDesignIds = ['part_length_mm', 'part_width_mm', 'part_height_mm', 'wall_width_mm', 'base_cell_size_mm', 'orientation_angle_deg', 'align_load_line', 'surface_start_layer', 'samples_x', 'samples_y', 'boundary_mode', 'phase_origin_x_mm', 'phase_origin_y_mm', 'random_seed'];
     const canvas = document.getElementById('canvas');
     const statusEl = document.getElementById('status');
     const statsEl = document.getElementById('stats');
@@ -583,8 +608,26 @@ def surface_preview_html() -> str:
 
     function conformalParameters() {
       const query = parameters();
-      conformalDesignIds.forEach((id) => query.set(id, document.getElementById(id).value));
+      conformalDesignIds.forEach((id) => {
+        const element = document.getElementById(id);
+        query.set(id, element.type === 'checkbox' ? String(element.checked) : element.value);
+      });
       return query;
+    }
+
+    function syncLoadLineAlignmentControls() {
+      const enabled = document.getElementById('align_load_line').checked;
+      const orientation = document.getElementById('orientation_angle_deg');
+      const phaseX = document.getElementById('phase_origin_x_mm');
+      const phaseY = document.getElementById('phase_origin_y_mm');
+      const hint = document.getElementById('loadLineAlignmentHint');
+      if (enabled) orientation.value = 0;
+      orientation.disabled = enabled;
+      phaseX.disabled = enabled;
+      phaseY.disabled = enabled;
+      hint.textContent = enabled
+        ? '已开启：自动以零件长度中面为加载面，将一条沿 Y 的蜂窝壁放在该面中心；边长或零件尺寸改变后会重新求解相位。'
+        : '已关闭：使用全局格栅方向角与手动相位原点。此时不保证加载中心落在蜂窝壁上。';
     }
 
     function colour(fraction) {
@@ -736,6 +779,10 @@ def surface_preview_html() -> str:
     function scheduleRefresh() { clearTimeout(timer); timer = setTimeout(refresh, 120); }
     surfaceIds.forEach((id) => document.getElementById(id).addEventListener('input', scheduleRefresh));
     conformalDesignIds.forEach((id) => document.getElementById(id).addEventListener('input', updateConformalDesignSummary));
+    document.getElementById('align_load_line').addEventListener('change', () => {
+      syncLoadLineAlignmentControls();
+      updateConformalDesignSummary();
+    });
     exportConformalConfigButton.addEventListener('click', async () => {
       try {
         const response = await fetch(`/api/export-conformal-lattice-config?${conformalParameters().toString()}`);
@@ -807,10 +854,13 @@ def surface_preview_html() -> str:
       Object.entries(defaults).forEach(([id, value]) => {
         document.getElementById(id).value = value;
       });
+      document.getElementById('align_load_line').checked = true;
+      syncLoadLineAlignmentControls();
       updateConformalDesignSummary();
       refresh();
     });
     window.addEventListener('resize', render);
+    syncLoadLineAlignmentControls();
     updateConformalDesignSummary();
     refresh();
   </script>

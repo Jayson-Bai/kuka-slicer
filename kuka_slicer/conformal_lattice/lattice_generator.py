@@ -134,6 +134,7 @@ def generate_conformal_lattice_geometry(
     phase_origin: np.ndarray | tuple[float, float] = (0.0, 0.0),
     random_seed: int = 0,
     config_metadata: Mapping[str, object] | None = None,
+    load_line_alignment: Mapping[str, object] | None = None,
 ) -> ConformalLatticeGeometry:
     """Generate the triangular-lattice Voronoi dual and map it to the surface.
 
@@ -184,7 +185,16 @@ def generate_conformal_lattice_geometry(
         boundary,
         defect,
     )
-    metadata = _metadata(domain, parameterization, phase, boundary_mode, origin, random_seed, config_metadata)
+    metadata = _metadata(
+        domain,
+        parameterization,
+        phase,
+        boundary_mode,
+        origin,
+        random_seed,
+        config_metadata,
+        load_line_alignment,
+    )
     return ConformalLatticeGeometry(
         lattice_nodes_phase=_readonly(np.asarray(nodes.phase, dtype=np.float64).reshape((-1, 2))),
         lattice_nodes_uv=_readonly(np.asarray(nodes.uv, dtype=np.float64).reshape((-1, 2))),
@@ -423,10 +433,11 @@ def _metadata(
     phase_origin: np.ndarray,
     random_seed: int,
     config_metadata: Mapping[str, object] | None,
+    load_line_alignment: Mapping[str, object] | None,
 ) -> dict[str, object]:
     config = dict(config_metadata or {})
     encoded = json.dumps(config, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return {
+    metadata = {
         "format": "conformal_lattice_geometry_v1",
         "source_surface_sha256": domain.input_sha256,
         "parameterization_solver": parameterization.solver,
@@ -437,6 +448,9 @@ def _metadata(
         "config_sha256": hashlib.sha256(encoded).hexdigest(),
         "config": config,
     }
+    if load_line_alignment is not None:
+        metadata["load_line_alignment"] = dict(load_line_alignment)
+    return metadata
 
 
 def _polygon_area(points: np.ndarray) -> float:
