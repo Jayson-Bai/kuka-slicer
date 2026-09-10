@@ -214,6 +214,37 @@ def test_length_midplane_alignment_places_a_y_directed_wall_at_the_part_centre(c
     assert _phase_point_lies_on_an_edge(target_phase, run.geometry.lattice_nodes_phase, run.geometry.lattice_edges)
 
 
+def test_pipeline_interprets_base_cell_size_as_the_true_hexagon_edge_length():
+    config = conformal_lattice_config_payload(
+        {
+            "part_length_mm": ["40"],
+            "part_width_mm": ["40"],
+            "part_height_mm": ["1"],
+            "amplitude_mm": ["0"],
+            "wall_width_mm": ["2"],
+            "base_cell_size_mm": ["5"],
+            "surface_start_layer": ["0"],
+            "samples_x": ["17"],
+            "samples_y": ["17"],
+            "boundary_mode": ["inset"],
+        }
+    )
+
+    run = run_conformal_lattice_pipeline(config)
+    geometry = run.geometry
+    side_lengths = []
+    for start, end, is_boundary in zip(
+        geometry.cell_offsets[:-1], geometry.cell_offsets[1:], geometry.cell_is_boundary
+    ):
+        if is_boundary or end - start != 6:
+            continue
+        points = geometry.lattice_nodes_xyz[geometry.cell_node_indices[start:end], :2]
+        side_lengths.extend(np.linalg.norm(np.roll(points, -1, axis=0) - points, axis=1))
+
+    assert side_lengths
+    assert np.median(side_lengths) == pytest.approx(5.0, abs=1e-6)
+
+
 def _phase_point_lies_on_an_edge(point, nodes, edges) -> bool:
     endpoints = nodes[edges]
     starts = endpoints[:, 0, :]

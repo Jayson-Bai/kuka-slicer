@@ -100,7 +100,13 @@ def solve_phase_coordinates(
         if cell_size_mm_override is None
         else np.asarray(cell_size_mm_override, dtype=np.float64)
     )
-    cell_size_uv = physical_cell_size / scale
+    # ``physical_cell_size`` is the public/design-contract hexagon *edge*
+    # length.  Gate 5 builds a hexagonal Voronoi dual from triangular lattice
+    # sites: its normalized hex-edge length is ``1 / sqrt(3)`` while the site
+    # pitch is one.  Phase therefore has to use the site pitch, sqrt(3) times
+    # the requested edge length.  Passing the edge length through directly
+    # would silently make every finished hexagon too small by sqrt(3).
+    cell_size_uv = math.sqrt(3.0) * physical_cell_size / scale
     p, q = _target_phase_gradients(domain, parameterization.uv, orientation, cell_size_uv)
     phi_p, p_diagnostics = _solve_weighted_phase(gradients, domain.faces, len(domain.vertices), uv_areas, p, anchor.vertex, anchor.phi_p, solver_tolerance)
     phi_q, q_diagnostics = _solve_weighted_phase(gradients, domain.faces, len(domain.vertices), uv_areas, q, anchor.vertex, anchor.phi_q, solver_tolerance)

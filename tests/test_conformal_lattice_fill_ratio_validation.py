@@ -25,7 +25,10 @@ def test_measured_wall_coverage_is_independent_from_target_and_reports_error_met
     assert result.report["mae"] > 0.0
     assert result.report["p95_absolute_error"] >= result.report["mae"]
     assert not np.allclose(result.target_fill_ratio_per_cell, result.realized_fill_ratio_per_cell)
-    assert np.all(result.suggested_cell_scale_factor_per_cell > 1.0)
+    # The requested size is now the true hexagon edge length.  The measured
+    # coverage here is below the thin-wall target, so the next iteration must
+    # reduce (not enlarge) the edge length.
+    assert np.all(result.suggested_cell_scale_factor_per_cell < 1.0)
 
 
 def test_geometry_npz_replaces_gate5_nan_placeholder_only_when_validation_is_supplied(tmp_path):
@@ -73,7 +76,7 @@ def test_measured_correction_is_explicitly_projected_then_consumed_by_a_new_phas
     )
 
     assert correction.report["projected_cell_count"] > 0
-    assert np.all(correction.cell_size_mm_override_per_vertex >= fields.target_cell_size_mm)
+    assert np.all(correction.cell_size_mm_override_per_vertex <= fields.target_cell_size_mm)
     np.testing.assert_allclose(corrected_phase.physical_cell_size_mm_per_vertex, correction.cell_size_mm_override_per_vertex)
     assert corrected_phase.solver["physical_cell_size_source"] == "gate_6_override"
     corrected_geometry = generate_conformal_lattice_geometry(

@@ -56,7 +56,7 @@ def test_conformal_design_json_generates_core_output_without_source_npz_round_tr
 
     assert result["layers"] == 4
     assert result["effective_infill_pattern"] == "共形蜂窝一笔画分区"
-    assert result["preview"]["preview_source"] == "conformal_lattice_external_source_job"
+    assert result["preview"]["preview_source"] == "final_core_npz"
     assert result["preview"]["tool_orientation"]["available"] is True
     job_dir = tmp_path / result["download_url"].split("/")[-2]
     assert not (job_dir / "external_layer_paths_v1.npz").exists()

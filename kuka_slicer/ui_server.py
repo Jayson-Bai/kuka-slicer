@@ -1590,7 +1590,13 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             chunk_size=5_000_000,
         )
         progress(97, "正在生成主界面三维预览")
-        preview = run.main_preview_payload(planning_line_width_mm=2.0)
+        # This branch has already passed through Core.  Use the final NPZ for
+        # the visible result so the browser never presents the pre-Core source
+        # graph as if it were the exported trajectory.
+        preview = _preview_payload_from_final_core_npz(
+            core_npz_path,
+            SliceConfig(line_width=2.0),
+        )
         download_path = _core_output_download_path(core_npz_path)
         path_count = sum(len(group.paths) for group in conformal_source_job.material_paths)
         result: dict[str, object] = {
