@@ -136,6 +136,7 @@ def run_conformal_lattice_pipeline(
     boundary_mode = str(spec.lattice["boundary_mode"])
     if boundary_mode not in ("clip", "inset"):
         raise ValueError("first-version UI pipeline supports lattice.boundary_mode=clip or inset")
+    phase_origin, load_line_alignment = _resolved_phase_origin(spec, domain, phase)
     geometry = generate_conformal_lattice_geometry(
         domain,
         parameterization,
@@ -143,9 +144,10 @@ def run_conformal_lattice_pipeline(
         orientation,
         phase,
         boundary_mode=boundary_mode,
-        phase_origin=tuple(float(value) for value in spec.lattice["phase_origin"]),
+        phase_origin=phase_origin,
         random_seed=spec.random_seed,
         config_metadata=spec.metadata(),
+        load_line_alignment=load_line_alignment,
     )
     fill_validation = None
     if validate_fill_ratio:
@@ -234,6 +236,79 @@ def _orientation_from_spec(domain: SurfaceMeshDomain, spec: ConformalLatticeSpec
         mode="global_axis",
         global_axis_xyz=np.asarray([math.cos(angle), math.sin(angle), 0.0]),
     )
+
+
+def _resolved_phase_origin(
+    spec: ConformalLatticeSpec,
+    domain: SurfaceMeshDomain,
+    phase: PhaseCoordinates,
+) -> tuple[tuple[float, float], dict[str, object]]:
+    """Resolve semantic loading-plane alignment after phase coordinates exist."""
+
+    manual_origin = tuple(float(value) for value in spec.lattice["phase_origin"])
+    request = spec.lattice.get("load_line_alignment")
+    if not isinstance(request, Mapping) or not request.get("enabled", False):
+        return manual_origin, {"enabled": False, "mode": "manual_phase_origin"}
+
+    angle_deg = float(spec.orientation_field.get("angle_deg", 0.0))
+    if not math.isclose(math.sin(math.radians(angle_deg)), 0.0, abs_tol=1e-9):
+        raise ValueError("length-midplane wall alignment requires a global grid direction parallel to X")
+
+    length_mm = float(spec.part["length_mm"])
+    width_mm = float(spec.part["width_mm"])
+    load_center_xy = np.asarray([length_mm / 2.0, width_mm / 2.0], dtype=np.float64)
+    load_center_phase = _phase_at_planar_point(domain, phase, load_center_xy)
+    # A regular hexagon's right vertical wall has midpoint (0.5, 0) in the
+    # normalized phase cell.  Placing that midpoint at the load centre makes
+    # the wall pass through the centre of the length-midplane loading line.
+    origin = load_center_phase - np.asarray([0.5, 0.0], dtype=np.float64)
+    return (float(origin[0]), float(origin[1])), {
+        "enabled": True,
+        "axis": "x",
+        "position": "part_length_midplane",
+        "feature": "wall",
+        "load_center_xy_mm": load_center_xy.tolist(),
+        "load_center_phase": load_center_phase.tolist(),
+        "resolved_phase_origin": origin.tolist(),
+    }
+
+
+def _phase_at_planar_point(
+    domain: SurfaceMeshDomain,
+    phase: PhaseCoordinates,
+    point_xy: np.ndarray,
+) -> np.ndarray:
+    """Interpolate phase coordinates at a point in the rectangular XY domain."""
+
+    triangles = domain.vertices[domain.faces, :2]
+    origin = triangles[:, 2, :]
+    first = triangles[:, 0, :] - origin
+    second = triangles[:, 1, :] - origin
+    relative = point_xy - origin
+    determinant = first[:, 0] * second[:, 1] - first[:, 1] * second[:, 0]
+    valid = np.abs(determinant) > 1e-14
+    first_weight = np.zeros(len(triangles), dtype=np.float64)
+    second_weight = np.zeros(len(triangles), dtype=np.float64)
+    first_weight[valid] = (
+        relative[valid, 0] * second[valid, 1] - relative[valid, 1] * second[valid, 0]
+    ) / determinant[valid]
+    second_weight[valid] = (
+        first[valid, 0] * relative[valid, 1] - first[valid, 1] * relative[valid, 0]
+    ) / determinant[valid]
+    third_weight = 1.0 - first_weight - second_weight
+    matches = np.flatnonzero(
+        valid & (first_weight >= -1e-10) & (second_weight >= -1e-10) & (third_weight >= -1e-10)
+    )
+    if len(matches) == 0:
+        raise ValueError("length-midplane load centre is outside the conformal surface domain")
+    face_index = int(matches[0])
+    weights = np.asarray(
+        [first_weight[face_index], second_weight[face_index], third_weight[face_index]], dtype=np.float64
+    )
+    weights = np.clip(weights, 0.0, 1.0)
+    weights /= weights.sum()
+    phase_vertices = np.column_stack((phase.phi_p, phase.phi_q))[domain.faces[face_index]]
+    return weights @ phase_vertices
 
 
 def _symmetric_layer_embedding(
