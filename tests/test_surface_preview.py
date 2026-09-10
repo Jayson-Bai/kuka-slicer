@@ -231,6 +231,9 @@ def test_surface_preview_html_has_an_independent_surface_api_and_controls():
     assert 'const uniformScale = Math.min(' in html
     assert '蜂窝格栅：墙宽' in html
     assert 'function drawLatticePreview' in html
+    assert 'id="latticeLengthSummary"' in html
+    assert 'function updateLatticeLengthSummary' in html
+    assert '当前六边形边线总长' in html
     assert 'function drawSurfaceReferenceFrame' in html
     assert 'function drawSurfaceGuideMesh' in html
     assert 'function physicalPreviewLayer' in html
@@ -254,6 +257,8 @@ def test_surface_preview_html_has_an_independent_surface_api_and_controls():
     assert 'id="layer_height_mm"' not in html
     assert 'id="wall_width_mm"' in html
     assert 'id="base_cell_size_mm"' in html
+    assert 'id="align_load_line" type="checkbox" checked' in html
+    assert 'syncLoadLineAlignmentControls' in html
     assert 'id="phase_origin_x_mm"' not in html
     assert '自动避让' in html
     assert 'id="surface_start_layer"' in html
@@ -348,6 +353,7 @@ def test_conformal_lattice_export_binds_double_sine_to_a_rectangular_physical_pa
             "phase_origin_x_mm": ["1.25"],
             "phase_origin_y_mm": ["-0.5"],
             "orientation_angle_deg": ["30"],
+            "align_load_line": ["false"],
             "random_seed": ["17"],
             "samples": ["8"],
         },
@@ -370,10 +376,34 @@ def test_conformal_lattice_export_binds_double_sine_to_a_rectangular_physical_pa
     assert config["lattice"]["boundary_mode"] == "inset"
     assert config["lattice"]["phase_origin"] == [1.25, -0.5]
     assert config["lattice"]["boundary_phase_policy"] == "auto_avoid_outer_boundary_coincidence"
+    assert config["lattice"]["load_line_alignment"] == {
+        "enabled": False,
+        "axis": "x",
+        "position": "part_length_midplane",
+        "feature": "wall",
+    }
     assert config["fill_field"] == {"mode": "fixed_cell_size", "drivers": []}
     assert config["orientation_field"]["angle_deg"] == pytest.approx(30.0)
     assert config["layer_embedding"]["surface_start_layer"] == 3
     assert config["random_seed"] == 17
+
+
+def test_conformal_lattice_export_enables_semantic_length_midplane_wall_alignment_by_default():
+    config = conformal_lattice_config_payload(
+        {
+            "part_length_mm": ["180"],
+            "part_width_mm": ["80"],
+            "part_height_mm": ["10"],
+        }
+    )
+
+    assert config["lattice"]["load_line_alignment"] == {
+        "enabled": True,
+        "axis": "x",
+        "position": "part_length_midplane",
+        "feature": "wall",
+    }
+    assert config["orientation_field"]["angle_deg"] == 0.0
 
 
 def test_conformal_lattice_export_defaults_to_49_by_49_source_sampling():

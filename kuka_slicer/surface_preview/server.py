@@ -68,6 +68,18 @@ def _query_float(
     return value
 
 
+def _query_bool(params: dict[str, list[str]], name: str, default: bool) -> bool:
+    raw = params.get(name, ["true" if default else "false"])[0]
+    if isinstance(raw, bool):
+        return raw
+    normalized = str(raw).strip().lower()
+    if normalized in {"1", "true", "on", "yes"}:
+        return True
+    if normalized in {"0", "false", "off", "no"}:
+        return False
+    raise ValueError(f"{name} must be a boolean")
+
+
 def _query_phase_radians(
     params: dict[str, list[str]],
     *,
@@ -390,7 +402,10 @@ def conformal_lattice_config_payload(params: dict[str, list[str]]) -> dict[str, 
         _query_float(params, "phase_origin_x_mm", 0.0),
         _query_float(params, "phase_origin_y_mm", 0.0),
     ]
-    orientation_angle_deg = _query_float(params, "orientation_angle_deg", 0.0)
+    load_line_alignment_enabled = _query_bool(params, "align_load_line", True)
+    orientation_angle_deg = 0.0 if load_line_alignment_enabled else _query_float(
+        params, "orientation_angle_deg", 0.0
+    )
     random_seed = _query_nonnegative_int(params, "random_seed", 0)
     source_surface: dict[str, object] = {
         "provider": "double_sine",
@@ -430,6 +445,12 @@ def conformal_lattice_config_payload(params: dict[str, list[str]]) -> dict[str, 
             "boundary_mode": boundary_mode,
             "phase_origin": phase_origin,
             "boundary_phase_policy": "auto_avoid_outer_boundary_coincidence",
+            "load_line_alignment": {
+                "enabled": load_line_alignment_enabled,
+                "axis": "x",
+                "position": "part_length_midplane",
+                "feature": "wall",
+            },
         },
         "fill_field": {"mode": "fixed_cell_size", "drivers": []},
         "orientation_field": {"mode": "global_axis", "angle_deg": orientation_angle_deg, "constraints": []},
@@ -605,6 +626,8 @@ def surface_preview_html() -> str:
     .field { display: grid; grid-template-columns: 1fr 112px; align-items: center; gap: 10px; margin: 10px 0; }
     label { font-size: 13px; color: #38475d; }
     input { width: 100%; border: 1px solid #bdcadb; border-radius: 7px; padding: 8px; color: #142238; font: inherit; }
+    input[type="checkbox"] { width: 18px; height: 18px; justify-self: start; padding: 0; }
+    input:disabled { background: #f0f4f8; color: #7b8798; cursor: not-allowed; }
     input:focus { outline: 3px solid rgba(36, 122, 207, .18); border-color: #247acf; }
     .divider { height: 1px; background: #e6ecf4; margin: 17px 0; }
     button { width: 100%; border: 0; border-radius: 8px; padding: 10px 12px; background: #126fd1; color: white; font: 600 14px inherit; cursor: pointer; }
@@ -663,8 +686,12 @@ def surface_preview_html() -> str:
         <div class="field"><label for="wall_width_mm">设计墙宽（mm）</label><input id="wall_width_mm" type="number" min="2" step="2" value="2"></div>
         <div class="field"><label for="base_cell_size_mm">目标六边形边长（mm）</label><input id="base_cell_size_mm" type="number" min="0.001" step="0.01" value="5"></div>
         <div class="field"><label for="orientation_angle_deg">全局格栅方向角（°）</label><input id="orientation_angle_deg" type="number" step="1" value="0"></div>
+        <div class="field"><label for="align_load_line">跨中加载面对齐</label><input id="align_load_line" type="checkbox" checked></div>
+        <p class="hint" id="loadLineAlignmentHint">已开启：自动用零件长度中面上的中心加载点定位一条沿 Y 的蜂窝壁；边长或零件尺寸改变后会重新求解相位。</p>
         <p class="hint">喷嘴基准线宽固定为 2 mm。墙宽只能填 2、4、6… mm；4 mm 代表后续由两条 2 mm 沉积道组成。目标边长沿承载曲面测量。</p>
         <div class="designSummary" id="latticeDesignSummary" aria-live="polite"></div>
+        <div class="designSummary" id="latticeLengthSummary" aria-live="polite">六边形边线总长将在曲面预览更新后显示。</div>
+        <p class="hint">该值是矩形 XY 范围内去重后的平面蜂窝墙线总长，不包含层数倍增；实际共形沉积长度以生成后的曲面路径为准。</p>
         <div class="divider"></div>
         <h2>对称层间渐变</h2>
         <div class="field"><label for="surface_start_layer">曲面起始层</label><input id="surface_start_layer" type="number" min="0" step="1" value="3"></div>
@@ -702,7 +729,7 @@ def surface_preview_html() -> str:
   <script>
     const surfaceIds = ['amplitude_mm', 'wavelength_x_mm', 'wavelength_y_mm', 'phase_x_pi', 'phase_y_pi', 'z_reference_mm', 'check_x_mm', 'check_y_mm', 'samples'];
     const mappingReferenceLayerHeightMm = 0.5;
-    const conformalDesignIds = ['part_length_mm', 'part_width_mm', 'part_height_mm', 'wall_width_mm', 'base_cell_size_mm', 'orientation_angle_deg', 'surface_start_layer', 'samples_x', 'samples_y', 'boundary_mode', 'random_seed'];
+    const conformalDesignIds = ['part_length_mm', 'part_width_mm', 'part_height_mm', 'wall_width_mm', 'base_cell_size_mm', 'orientation_angle_deg', 'align_load_line', 'surface_start_layer', 'samples_x', 'samples_y', 'boundary_mode', 'random_seed'];
     const canvas = document.getElementById('canvas');
     const statusEl = document.getElementById('status');
     const statsEl = document.getElementById('stats');
@@ -739,7 +766,10 @@ def surface_preview_html() -> str:
 
     function saveDesignerState() {
       try {
-        const state = Object.fromEntries(persistedInputIds.map((id) => [id, document.getElementById(id).value]));
+        const state = Object.fromEntries(persistedInputIds.map((id) => {
+          const element = document.getElementById(id);
+          return [id, element.type === 'checkbox' ? element.checked : element.value];
+        }));
         localStorage.setItem(designerStateKey, JSON.stringify(state));
       } catch (_) {
         // Local preview remains usable when browser storage is unavailable.
@@ -751,7 +781,9 @@ def surface_preview_html() -> str:
         const state = JSON.parse(localStorage.getItem(designerStateKey) || 'null');
         if (!state || typeof state !== 'object') return;
         persistedInputIds.forEach((id) => {
-          if (typeof state[id] === 'string') document.getElementById(id).value = state[id];
+          const element = document.getElementById(id);
+          if (element.type === 'checkbox' && typeof state[id] === 'boolean') element.checked = state[id];
+          else if (typeof state[id] === 'string') element.value = state[id];
         });
       } catch (_) {
         // Ignore malformed or unavailable browser-local state.
@@ -822,8 +854,22 @@ def surface_preview_html() -> str:
 
     function conformalParameters() {
       const query = parameters();
-      conformalDesignIds.forEach((id) => query.set(id, document.getElementById(id).value));
+      conformalDesignIds.forEach((id) => {
+        const element = document.getElementById(id);
+        query.set(id, element.type === 'checkbox' ? String(element.checked) : element.value);
+      });
       return query;
+    }
+
+    function syncLoadLineAlignmentControls() {
+      const enabled = document.getElementById('align_load_line').checked;
+      const orientation = document.getElementById('orientation_angle_deg');
+      const hint = document.getElementById('loadLineAlignmentHint');
+      if (enabled) orientation.value = 0;
+      orientation.disabled = enabled;
+      hint.textContent = enabled
+        ? '已开启：自动用零件长度中面上的中心加载点定位一条沿 Y 的蜂窝壁；边长或零件尺寸改变后会重新求解相位。'
+        : '已关闭：使用全局格栅方向角；此时不保证加载中心落在蜂窝壁上。';
     }
 
     function colour(fraction, lighting = 1) {
@@ -880,8 +926,18 @@ def surface_preview_html() -> str:
       const wallWidth = positiveNumber('wall_width_mm');
       if (edgeLength === null || wallWidth === null || !payload) return null;
       const bounds = payload.coordinate_system.xy_bounds_mm;
-      const angle = Number(document.getElementById('orientation_angle_deg').value) * Math.PI / 180;
+      const aligned = document.getElementById('align_load_line').checked;
+      const angle = aligned ? 0 : Number(document.getElementById('orientation_angle_deg').value) * Math.PI / 180;
       if (!Number.isFinite(angle)) return null;
+      if (aligned) {
+        const loadCenter = [(bounds[0] + bounds[2]) * 0.5, (bounds[1] + bounds[3]) * 0.5];
+        // In the preview's pointy-top hex lattice, a right vertical wall is
+        // sqrt(3)/2 * a from its cell centre.  Put its midpoint at the part
+        // centre so the visible guide and exported semantic request agree.
+        const origin = [loadCenter[0] - Math.sqrt(3.0) * edgeLength * 0.5, loadCenter[1]];
+        const boundaryMode = document.getElementById('boundary_mode').value;
+        return { edgeLength, wallWidth, angle, origin, bounds, boundaryMode, aligned };
+      }
       // The production pipeline chooses the final offset in the solved phase
       // domain.  This inexpensive canvas equivalent keeps the initial lattice
       // away from the rectangular axes as the requested cell size changes.
@@ -893,7 +949,7 @@ def surface_preview_html() -> str:
       const rotatedOrigin = rotateVector(localOrigin[0], localOrigin[1], angle);
       const origin = [bounds[0] + rotatedOrigin[0], bounds[1] + rotatedOrigin[1]];
       const boundaryMode = document.getElementById('boundary_mode').value;
-      return { edgeLength, wallWidth, angle, origin, bounds, boundaryMode };
+      return { edgeLength, wallWidth, angle, origin, bounds, boundaryMode, aligned };
     }
 
     function latticePreviewSegments() {
@@ -946,9 +1002,28 @@ def surface_preview_html() -> str:
           });
         }
       }
-      const value = { segments, sampled, edgeLength, previewEdgeLength, wallWidth };
+      const totalWallLengthMm = segments.reduce(
+        (total, [start, end]) => total + Math.hypot(end[0] - start[0], end[1] - start[1]), 0
+      );
+      const value = { segments, sampled, edgeLength, previewEdgeLength, wallWidth, totalWallLengthMm };
       latticePreviewCache = { key, value };
       return value;
+    }
+
+    function updateLatticeLengthSummary() {
+      const summary = document.getElementById('latticeLengthSummary');
+      if (!payload) {
+        summary.textContent = '六边形边线总长将在曲面预览更新后显示。';
+        return;
+      }
+      const lattice = latticePreviewSegments();
+      if (!lattice.segments.length) {
+        summary.textContent = '当前参数在矩形范围内没有可显示的蜂窝墙线。';
+      } else if (lattice.sampled) {
+        summary.textContent = '当前网格过密，画布已降采样；为避免把显示近似值当作工艺长度，此处不报告总长。';
+      } else {
+        summary.textContent = `当前六边形边线总长：${lattice.totalWallLengthMm.toFixed(2)} mm（平面预览，${lattice.segments.length} 条去重边线）。`;
+      }
     }
 
     function project(x, y, z, yaw, pitch, scale, cx, cy) {
@@ -1310,6 +1385,7 @@ def surface_preview_html() -> str:
         if (sequence !== queued) return;
         payload = result;
         showStats(result);
+        updateLatticeLengthSummary();
         render();
         statusEl.textContent = '已更新：当前预览对应固定矩形外边界的双正弦承载曲面。';
       } catch (error) {
@@ -1335,13 +1411,23 @@ def surface_preview_html() -> str:
       saveDesignerState();
       updateConformalDesignSummary();
     }));
+    document.getElementById('align_load_line').addEventListener('change', () => {
+      syncLoadLineAlignmentControls();
+      saveDesignerState();
+      invalidateLatticePreview();
+      updateConformalDesignSummary();
+      updateLatticeLengthSummary();
+      if (payload) render();
+    });
     ['wall_width_mm', 'base_cell_size_mm', 'orientation_angle_deg'].forEach((id) => document.getElementById(id).addEventListener('input', () => {
       invalidateLatticePreview();
+      updateLatticeLengthSummary();
       if (payload) render();
     }));
     document.getElementById('boundary_mode').addEventListener('change', () => {
       saveDesignerState();
       invalidateLatticePreview();
+      updateLatticeLengthSummary();
       if (payload) render();
     });
     previewMode.addEventListener('change', () => {
@@ -1422,6 +1508,8 @@ def surface_preview_html() -> str:
       Object.entries(defaults).forEach(([id, value]) => {
         document.getElementById(id).value = value;
       });
+      document.getElementById('align_load_line').checked = true;
+      syncLoadLineAlignmentControls();
       invalidateLatticePreview();
       saveDesignerState();
       updateConformalDesignSummary();
@@ -1429,6 +1517,7 @@ def surface_preview_html() -> str:
     });
     window.addEventListener('resize', render);
     restoreDesignerState();
+    syncLoadLineAlignmentControls();
     updateConformalDesignSummary();
     refresh();
   </script>

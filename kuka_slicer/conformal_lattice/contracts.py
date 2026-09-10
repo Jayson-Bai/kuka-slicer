@@ -140,6 +140,7 @@ def load_conformal_lattice_spec(data: bytes | str | Mapping[str, object]) -> Con
             "lattice.boundary_phase_policy must be manual or "
             "auto_avoid_outer_boundary_coincidence"
         )
+    _validate_load_line_alignment(lattice.get("load_line_alignment"), part)
     if part:
         bead_count = lattice.get("wall_bead_count")
         if not isinstance(bead_count, int) or isinstance(bead_count, bool) or bead_count < 1:
@@ -187,6 +188,28 @@ def load_conformal_lattice_spec(data: bytes | str | Mapping[str, object]) -> Con
         random_seed=seed,
         raw_config=raw,
     )
+
+
+def _validate_load_line_alignment(value: object, part: Mapping[str, object]) -> None:
+    """Validate the optional, semantic loading-plane phase-alignment request."""
+
+    if value is None:
+        return
+    if not isinstance(value, Mapping):
+        raise ValueError("lattice.load_line_alignment must be an object")
+    enabled = value.get("enabled")
+    if not isinstance(enabled, bool):
+        raise ValueError("lattice.load_line_alignment.enabled must be a boolean")
+    if not enabled:
+        return
+    if not part:
+        raise ValueError("enabled lattice.load_line_alignment requires a rectangular part")
+    if value.get("axis") != "x":
+        raise ValueError("enabled lattice.load_line_alignment.axis must be x")
+    if value.get("position") != "part_length_midplane":
+        raise ValueError("enabled lattice.load_line_alignment.position must be part_length_midplane")
+    if value.get("feature") != "wall":
+        raise ValueError("enabled lattice.load_line_alignment.feature must be wall")
 
 
 def _decode(data: bytes | str | Mapping[str, object]) -> dict[str, object]:
