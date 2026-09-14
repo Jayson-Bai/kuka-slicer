@@ -27,6 +27,8 @@ kuka_slicer/_native/*.pdb
 
 outputs/
 tmp_json_fiber_check/
+.runtime/
+临时文件/
 *.log
 
 dist/
