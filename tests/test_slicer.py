@@ -4227,7 +4227,7 @@ def test_ui_exposes_slicing_kernel_input():
     assert 'class="fieldGroup compactDimensionField"' in html
     assert 'id="prusaEffectiveConfig"' not in html
     assert 'id="prusaRaftEnabled"' in html
-    assert 'id="prusaRaftEnabled" type="checkbox" checked' in html
+    assert 'id="prusaRaftEnabled" type="checkbox" checked' not in html
     assert 'id="prusaRaftLayers"' in html
     assert f'id="prusaRaftLayers" type="number" min="1" step="1" value="{DEFAULT_PRUSA_RAFT_LAYER_COUNT}"' in html
     assert f'id="prusaRaftExpansion" type="number" min="0" step="0.1" value="{DEFAULT_PRUSA_RAFT_EXPANSION_MM:g}"' in html
@@ -4324,7 +4324,8 @@ def test_prusa_parameter_labels_offer_hover_help():
         assert "data-tooltip=" in label_markup
 
 
-def test_prusa_config_ignores_legacy_path_parameters_and_reports_effective_values():
+def test_prusa_config_ignores_legacy_path_parameters_and_reports_effective_values(monkeypatch):
+    monkeypatch.setattr("kuka_slicer.ui_server._load_prusa_params", lambda: {})
     shared = {
         "layer_height": 0.5,
         "first_layer_height": 0.5,
@@ -4370,17 +4371,29 @@ def test_prusa_config_ignores_legacy_path_parameters_and_reports_effective_value
         "start_x_mm": 0.0,
         "start_y_mm": 0.0,
         "prusa_raft": {
-            "layer_count": 2,
-            "expansion": 10.0,
+            "layer_count": 0,
+            "expansion": 3.0,
             "first_layer_density": 80.0,
-            "first_layer_expansion": 5.0,
+            "first_layer_expansion": 3.0,
             "contact_distance": 0.25,
+            "contact_auto": True,
+            "contact_layer_height": 0.75,
+            "contact_density": 100.0,
+            "contact_extrusion_width": 1.5,
+        },
+        "prusa_brim": {
+            "enabled": False,
+            "width": 5.0,
+            "type": "outer_only",
+            "separation": 0.0,
+            "one_stroke": False,
         },
         "prusa_geometry": PrusaGeometryConfig().to_metadata(),
     }
 
 
-def test_prusa_config_reads_detachable_native_raft_settings():
+def test_prusa_config_reads_detachable_native_raft_settings(monkeypatch):
+    monkeypatch.setattr("kuka_slicer.ui_server._load_prusa_params", lambda: {})
     shared = {
         "layer_height": 0.5,
         "first_layer_height": 0.5,
@@ -4416,6 +4429,10 @@ def test_prusa_config_reads_detachable_native_raft_settings():
         "first_layer_density": 80.0,
         "first_layer_expansion": 3.0,
         "contact_distance": 0.25,
+        "contact_auto": True,
+        "contact_layer_height": 0.75,
+        "contact_density": 100.0,
+        "contact_extrusion_width": 1.5,
     }
 
 
@@ -4472,7 +4489,7 @@ def test_ui_uses_compact_portrait_band_layout():
     ):
         assert band in html
     assert "grid-template-columns: repeat(12, minmax(0, 1fr))" in html
-    assert '<div class="fieldGroup span-2">' in html
+    assert '<div class="fieldGroup compactDimensionField">' in html
     assert '<div class="fieldGroup span-3">' in html
     assert '<div class="fieldGroup span-4">' in html
     assert '<div id="legacyInfillControl" class="bandGrid compactGrid">' in html
@@ -4491,19 +4508,11 @@ def test_ui_uses_compact_portrait_band_layout():
     assert "min-height: 74px" not in html
 
 
-def test_ui_result_summary_reports_backend_kernel_and_planning_width():
+def test_ui_result_summary_reports_current_execution_summary():
     html = _index_html()
 
-    assert '<span>实际执行内核</span><strong id="executedKernel">-</strong>' in html
-    assert (
-        '<span>实际规划线宽（仅轨迹规划）</span>'
-        '<strong id="executedPlanningLineWidth">-</strong>'
-    ) in html
-    assert "result.slicing_kernel === 'prusa'" in html
-    assert "Prusa 完整路径内核" in html
-    assert "executedPlanningLineWidth = Number(result.planning_line_width)" in html
-    assert "不适用（PySLM 后端自行控制）" in html
-    assert "不适用（Prusa 使用名义线宽）" in html
+    assert '<span>层数</span><strong id="layers">-</strong>' in html
+    assert '<span>输出</span><strong id="outputName">-</strong>' in html
     assert '<span>实际填充策略</span><strong id="executedInfillPattern">-</strong>' in html
     assert "const patternExecution = result.infill_pattern_execution" in html
     assert "安全分层单向之字形" in html
@@ -4538,7 +4547,8 @@ def test_ui_offers_a_visible_gray_blue_dashed_travel_layer():
     assert 'id="showTravelPaths" type="checkbox" checked' in html
     assert "空移 Travel" in html
     assert "layer.travel_paths" in html
-    assert "ctx.setLineDash([7, 5])" in html
+    assert "dash: [7, 5]" in html
+    assert "ctx.setLineDash(batch.dash)" in html
 
 
 def test_ui_preserves_prusa_raft_as_a_separate_preview_role():
@@ -4661,6 +4671,11 @@ def test_ui_can_play_the_selected_print_path_with_direction_markers():
     assert "drawPathDirectionMarkers" not in html
     assert "pathPlayback.running && pathPlayback.timeline" in html
     assert "stopPathPlayback();" in html
+    # Travel is a physical nozzle motion: the selected Travel must be playable
+    # and its final point must own the static surface print-head position.
+    assert "if (entry.points?.length >= 2) return entry;" in html
+    assert "const currentMotion = entries" in html
+    assert "currentMotion.points[currentMotion.points.length - 1]" in html
 
 
 def test_ui_remembers_the_last_surface_npz_preview_directory_when_supported():
@@ -4695,12 +4710,22 @@ def test_main_ui_recognizes_rectangular_conformal_design_json_before_slicing():
         "wall_bead_count": 2,
         "base_cell_size_mm": 8.0,
     }
+    assert summary["fiber_reinforcement"] == {
+        "enabled": False,
+        "reserved": False,
+        "path_generation": "not_configured",
+        "after_resin_physical_layers": [],
+    }
     html = _index_html()
     assert 'id="conformalSpecButton"' in html
     assert 'id="conformalSpecInput"' in html
     assert 'id="conformalSliceButton"' in html
     assert "fetch('/inspect-conformal-spec'" in html
     assert "fetch('/conformal-slice'" in html
+    assert 'id="conformalFiberFirstAfterResinLayer"' not in html
+    assert 'id="conformalFiberLastAfterResinLayer"' not in html
+    assert "首个与末个纤维界面由设计 JSON 自动确定" in html
+    assert 'id="fiberJsonFile" name="fiberJsonFile" type="file" accept=".json,application/json" disabled' in html
 
 
 def test_surface_npz_picker_directory_is_persisted_in_local_ui_state(tmp_path):

@@ -7,6 +7,7 @@ from email.parser import BytesParser
 import html
 import importlib
 import json
+import math
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -31,7 +32,6 @@ from .external_npz import (
 )
 from .cpu_limiter import limit_slicer_task
 from .conformal_lattice.contracts import load_conformal_lattice_spec
-from .fiber_travel import plan_fiber_interpath_travels
 from .gcode_legacy_postprocess import apply_legacy_resin_optimization
 from .honeycomb_pathing import HoneycombPathingConfig
 
@@ -87,6 +87,13 @@ def _conformal_spec_ui_summary(payload: bytes, filename: str) -> dict[str, objec
     manufacturing = spec.manufacturing
     layer_height = float(manufacturing["layer_height_mm"])
     final_height = float(part["final_height_mm"])
+    raw_fiber = spec.raw_config.get("fiber_reinforcement")
+    fiber = raw_fiber if isinstance(raw_fiber, dict) else {}
+    fiber_interfaces_reserved = (
+        fiber.get("path_generation") == "disabled_pending_replacement"
+        and "first_after_resin_layer_physical" in fiber
+        and "last_after_resin_layer_physical" in fiber
+    )
     return {
         "format": "conformal_lattice_spec_v1",
         "file_name": _safe_filename(filename or "conformal_lattice_spec_v1.json"),
@@ -104,6 +111,19 @@ def _conformal_spec_ui_summary(payload: bytes, filename: str) -> dict[str, objec
             "wall_width_mm": float(spec.lattice["wall_width_mm"]),
             "wall_bead_count": int(spec.lattice["wall_bead_count"]),
             "base_cell_size_mm": float(spec.lattice["base_cell_size_mm"]),
+        },
+        "fiber_reinforcement": {
+            "enabled": False,
+            "reserved": fiber_interfaces_reserved,
+            "path_generation": "disabled_pending_replacement" if fiber_interfaces_reserved else "not_configured",
+            "after_resin_physical_layers": (
+                [
+                    int(fiber["first_after_resin_layer_physical"]),
+                    int(fiber["last_after_resin_layer_physical"]),
+                ]
+                if fiber_interfaces_reserved
+                else []
+            ),
         },
         "source_surface_sha256": spec.source_sha256,
     }
@@ -318,6 +338,9 @@ def _core_move_type_codes(data) -> set[int]:
     return {1, 3}
 
 
+_FINAL_CORE_PREVIEW_MAX_POINTS = 16_000
+
+
 def _use_native_prusa_gcode_for_core(
     config: SliceConfig,
     native_gcode: bytes | str | None,
@@ -422,6 +445,16 @@ def _preview_payload_from_final_core_npz(
             count = len(x)
             if count == 0:
                 continue
+            # The final-Core preview must carry the exported cumulative E
+            # profile when it is available.  The browser derives both the
+            # E/mm heat map and zero-extrusion connector styling from adjacent
+            # values; its role alone cannot distinguish deposited PRINT rows
+            # from a print-context connector with constant E.
+            extrusion = None
+            if "e" in data.files:
+                candidate_extrusion = np.asarray(data["e"], dtype=np.float64)
+                if candidate_extrusion.ndim == 1 and len(candidate_extrusion) == count:
+                    extrusion = candidate_extrusion
             tool_id = np.asarray(data["tool_id"], dtype=np.int64)
             move_type = np.asarray(data["move_type"], dtype=np.int64)
             event_flag = (
@@ -532,22 +565,40 @@ def _preview_payload_from_final_core_npz(
                 point_columns = [x[segment_indices], y[segment_indices], z[segment_indices]]
                 if include_abc:
                     point_columns.extend((a[segment_indices], b[segment_indices], c[segment_indices]))
-                # For diagnosis the browser receives the complete final Core
-                # point sequence.  No display-side point decimation is allowed:
-                # a sharp corner must be attributable to the NPZ itself.
+                # For diagnosis the browser receives every final-Core point;
+                # no display-side decimation is allowed because a sharp corner
+                # must be attributable to the NPZ itself.  Large 4 ms Core
+                # paths are nevertheless split into overlapping transport
+                # chunks, matching the established source-preview strategy.
                 points = np.column_stack(point_columns).tolist()
                 if points and not is_stationary_process:
                     if role != "travel" and float(np.ptp(z[segment_indices])) > 1e-7:
                         has_curved_deposition = True
-                    entries_by_layer.setdefault(int(layer[first]), []).append(
-                        {
+                    source_extrusion = (
+                        extrusion[segment_indices].tolist()
+                        if role == "final_resin" and extrusion is not None
+                        else None
+                    )
+                    chunks = (
+                        _preview_path_chunks(
+                            points,
+                            source_extrusion,
+                            max_points=_FINAL_CORE_PREVIEW_MAX_POINTS,
+                        )
+                        if role == "final_resin"
+                        else [(points, None)]
+                    )
+                    for chunk_points, chunk_extrusion in chunks:
+                        entry: dict[str, object] = {
                             "kind": "deposit" if role != "travel" else "travel",
                             "role": role,
-                            "points": points,
+                            "points": chunk_points,
                             "order": order,
                         }
-                    )
-                    order += 1
+                        if chunk_extrusion is not None:
+                            entry["extrusion"] = chunk_extrusion
+                        entries_by_layer.setdefault(int(layer[first]), []).append(entry)
+                        order += 1
                 start = end
 
     all_entries = [entry for entries in entries_by_layer.values() for entry in entries]
@@ -556,10 +607,14 @@ def _preview_payload_from_final_core_npz(
     layers = []
     for layer_index in sorted(entries_by_layer):
         entries = entries_by_layer[layer_index]
-        resin_paths = [
-            {"role": entry["role"], "points": entry["points"]}
-            for entry in entries if entry["role"] == "final_resin"
-        ]
+        resin_paths = []
+        for entry in entries:
+            if entry["role"] != "final_resin":
+                continue
+            resin_path = {"role": entry["role"], "points": entry["points"]}
+            if "extrusion" in entry:
+                resin_path["extrusion"] = entry["extrusion"]
+            resin_paths.append(resin_path)
         fiber_paths = [
             entry["points"] for entry in entries if entry["role"] == "fiber"
         ]
@@ -1304,14 +1359,8 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         npz_path = job_dir / f"{Path(filename).stem}_source.npz"
         stl_path.write_bytes(stl_bytes)
 
-        fiber_json_name = None
-        fiber_template_paths: list[list[list[float]]] = []
         if "fiber_json" in files:
-            fiber_filename, fiber_bytes = files["fiber_json"]
-            fiber_json_name = _safe_filename(fiber_filename or "fiber_paths.json")
-            fiber_json_path = job_dir / fiber_json_name
-            fiber_json_path.write_bytes(fiber_bytes)
-            fiber_template_paths = load_fiber_template_json(fiber_json_path)
+            raise ValueError("旧版纤维路径 JSON 已停用，等待新的纤维铺设策略接入")
 
         mesh = load_stl(stl_path)
         progress(8, "正在准备 Prusa 路径")
@@ -1355,39 +1404,8 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         if isinstance(slicing_meta, dict):
             slicing_meta["resolved_config"] = resolved_config
         fiber_preview_paths = {}
-        fiber_travel_paths = {}
-        if fiber_template_paths:
-            fiber_template_paths = align_fiber_template_paths_to_resin(
-                job,
-                fiber_template_paths,
-            )
-            fiber_preview_paths = expand_fiber_template_for_resin_layers(
-                job, fiber_template_paths
-            )
-            fiber_travel_paths = plan_fiber_interpath_travels(
-                mesh,
-                config,
-                fiber_preview_paths,
-                reference_z_by_layer=job.meta.get("fiber_interpath_reference_z_mm"),
-            )
-            merge_fiber_paths_into_job(
-                job,
-                fiber_preview_paths,
-                fiber_travel_paths,
-            )
-            if core_source_job is not None and source_gcode_module is not None:
-                core_source_job = source_gcode_module.with_fiber_paths(
-                    core_source_job,
-                    fiber_preview_paths,
-                    fiber_travel_paths_by_layer=fiber_travel_paths,
-                )
         if raft_layers:
             z_shift = add_raft_to_job(job, mesh, config, raft_layers, DEFAULT_RAFT_TOP_GAP_MM)
-            fiber_preview_paths = _shift_fiber_preview_paths(
-                fiber_preview_paths,
-                len(raft_layers),
-                z_shift,
-            )
         normalize_job_xy_origin(
             job,
             target_xy=(float(config.start_x_mm), float(config.start_y_mm)),
@@ -1479,7 +1497,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             "paths": path_count,
             "preview": preview,
             "recommendation": recommendation,
-            "fiber_json": fiber_json_name,
+            "fiber_json": None,
             "build_axis": build_axis,
             "slicing_kernel": config.slicing_kernel,
             "resolved_config": resolved_config,
@@ -1544,7 +1562,6 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         bead_area = 2.0 * layer_height * float(resin.extrusion_scale)
         if bead_area <= 0.0:
             raise ValueError("当前 Core 树脂挤出倍率必须为正数")
-
         from .conformal_lattice.path_bridge import ExtrusionVolumeModel
         from .conformal_lattice.pipeline import run_conformal_lattice_pipeline
 
@@ -1568,8 +1585,35 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         )
         if run.path_graph is None:
             raise RuntimeError("共形蜂窝路径桥接未生成一笔画路径")
-        progress(55, "正在将共形一笔画路径适配为 Core SourceJob")
-        conformal_source_job = run.path_graph.to_external_source_job()
+        progress(55, "正在将连续课程路径适配为 Core SourceJob")
+        # The legacy structural macro partitions are replaced unconditionally
+        # by continuous courses below.  Start from the retained perimeter and
+        # grip material instead of rendering/deleting that large temporary
+        # graph, without changing the eventual Core SourceJob geometry.
+        conformal_source_job = run.path_graph.to_external_base_source_job()
+        from .conformal_lattice.fiber_reinforcement import (
+            ContinuousCourseFiberSettings,
+            apply_continuous_course_fiber_strategy,
+            derive_symmetric_curvature_fiber_interfaces,
+        )
+
+        if not run.continuous_course_paths_by_layer:
+            raise RuntimeError("当前共形工作区不能生成连续课程填充路径")
+        first_fiber_interface, last_fiber_interface = derive_symmetric_curvature_fiber_interfaces(
+            run.layer_embedding
+        )
+        fiber_reinforcement = apply_continuous_course_fiber_strategy(
+            source_job=conformal_source_job,
+            graph=run.path_graph,
+            course_paths_by_layer=run.continuous_course_paths_by_layer,
+            settings=ContinuousCourseFiberSettings(
+                enabled=_bool_param(params, "conformal_fiber_enabled", False),
+                first_after_resin_layer_physical=first_fiber_interface,
+                last_after_resin_layer_physical=last_fiber_interface,
+            ),
+            fiber_layer_height_mm=float(core_params.fiber.layer_height_mm),
+            fiber_e_per_mm=float(core_params.fiber.e_per_mm()),
+        )
         core_source_job = external_source_job_to_core_source_job(
             conformal_source_job,
             default_abc=core_params.default_abc,
@@ -1605,9 +1649,11 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             "layers": len(preview["layers"]),
             "paths": path_count,
             "preview": preview,
-            "effective_infill_pattern": "共形蜂窝一笔画分区",
-            "infill_pattern_execution": {"applied": False, "mode": "conformal_lattice_macro_partition"},
+            "effective_infill_pattern": "共形蜂窝连续课程",
+            "infill_pattern_execution": {"applied": True, "mode": "continuous_course_network_v1"},
             "conformal_lattice": run.report,
+            "fiber_reinforcement": fiber_reinforcement.report,
+            "nominal_final_height_mm": fiber_reinforcement.nominal_final_height_mm,
             "core_export_seconds": float(core_stats.get("total_s", 0.0)),
             "core_rows": int(core_stats.get("rows", 0)),
             "core_parts": int(core_stats.get("parts", 0)),
@@ -1616,10 +1662,13 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             from .conformal_lattice.pipeline import write_conformal_lattice_outputs
 
             progress(98, "正在导出共形调试中间结果")
-            debug_path = _conformal_debug_download_path(
-                write_conformal_lattice_outputs(run, job_dir),
-                job_dir,
-            )
+            debug_outputs = write_conformal_lattice_outputs(run, job_dir)
+            # Keep the optional source NPZ inspectable, but make it describe
+            # the same post-replacement R/F paths passed to Core rather than
+            # the superseded structural honeycomb macro partitions.
+            production_source_path = debug_outputs["paths"]
+            write_external_source_npz(conformal_source_job, production_source_path)
+            debug_path = _conformal_debug_download_path(debug_outputs, job_dir)
             result.update(
                 {
                     "debug_download_url": f"/outputs/{quote(stamp)}/{quote(debug_path.name)}",
@@ -4248,6 +4297,16 @@ def _index_html() -> str:
       <input id="surfaceNpzInput" type="file" accept=".npz,application/octet-stream" hidden>
       <input id="conformalSpecInput" type="file" accept=".json,application/json" hidden>
       <output id="conformalSpecResult" class="surfaceCollisionResult" aria-live="polite">尚未导入共形蜂窝设计 JSON。</output>
+      <fieldset class="surfaceCollisionResult" aria-label="共形蜂窝连续纤维策略">
+        <legend>连续纤维（主 UI 工艺策略）</legend>
+        <label><input id="conformalFiberEnabled" type="checkbox"> 启用均匀混合壁</label>
+        <label for="conformalFiberDoubleWallAxis">双层主壁方向</label>
+        <select id="conformalFiberDoubleWallAxis">
+          <option value="x" selected>X 向双壁（拉伸推荐）</option>
+          <option value="y">Y 向双壁（对照组）</option>
+        </select>
+        <small>首个与末个纤维界面由设计 JSON 自动确定：以“首个非零曲率层（物理层）”前的树脂层为起点，并相对实际树脂层数镜像结束。双壁优先使用平行所选轴的直墙；若当前蜂窝取向没有该直墙，则自动使用沿该轴推进的两族斜边锯齿链。树脂蜂窝几何不会改变。</small>
+      </fieldset>
     </div>
   </header>
   <main>
@@ -4319,8 +4378,8 @@ def _index_html() -> str:
               <input id="stlFile" name="stlFile" type="file" accept=".stl" required>
             </div>
             <div class="fieldGroup span-4">
-              <label for="fiberJsonFile">纤维路径 JSON</label>
-              <input id="fiberJsonFile" name="fiberJsonFile" type="file" accept=".json,application/json">
+              <label for="fiberJsonFile">纤维路径 JSON（待接入）</label>
+              <input id="fiberJsonFile" name="fiberJsonFile" type="file" accept=".json,application/json" disabled>
             </div>
             <div class="fieldGroup compactDimensionField">
               <label for="layerHeight">树脂层高 mm</label>
@@ -5003,8 +5062,28 @@ def _index_html() -> str:
     const surfaceNpzCollisionResult = document.getElementById('surfaceNpzCollisionResult');
     const surfaceNpzInput = document.getElementById('surfaceNpzInput');
     const statusEl = document.getElementById('status');
+    const conformalFiberEnabled = document.getElementById('conformalFiberEnabled');
+    const conformalFiberDoubleWallAxis = document.getElementById('conformalFiberDoubleWallAxis');
     let selectedConformalSpec = null;
     let conformalDebugExportEnabled = false;
+    const conformalFiberSettingsStorageKey = 'kuka.conformalMixedWallFiber.v1';
+    function restoreConformalFiberSettings() {{
+      try {{
+        const saved = JSON.parse(window.localStorage.getItem(conformalFiberSettingsStorageKey) || 'null');
+        if (!saved || typeof saved !== 'object') return;
+        if (typeof saved.enabled === 'boolean') conformalFiberEnabled.checked = saved.enabled;
+        if (saved.axis === 'x' || saved.axis === 'y') conformalFiberDoubleWallAxis.value = saved.axis;
+      }} catch (_) {{}}
+    }}
+    function saveConformalFiberSettings() {{
+      window.localStorage.setItem(conformalFiberSettingsStorageKey, JSON.stringify({{
+        enabled: conformalFiberEnabled.checked,
+        axis: conformalFiberDoubleWallAxis.value
+      }}));
+    }}
+    restoreConformalFiberSettings();
+    [conformalFiberEnabled, conformalFiberDoubleWallAxis]
+      .forEach((input) => input.addEventListener('change', saveConformalFiberSettings));
     async function launchSurfaceTool(tool) {{
       const toolButton = surfaceToolButtons[tool];
       const originalLabel = toolButton.textContent;
@@ -5112,8 +5191,9 @@ def _index_html() -> str:
         const summary = result.summary;
         const part = summary.part;
         const lattice = summary.lattice;
+        const fiberText = '；连续纤维由主 UI 的混合壁工艺策略生成';
         conformalSpecResult.className = 'surfaceCollisionResult ok';
-        conformalSpecResult.textContent = `已识别共形蜂窝模式：${{part.length_mm}} × ${{part.width_mm}} × ${{part.final_height_mm}} mm；${{lattice.wall_width_mm}} mm 墙体（${{lattice.wall_bead_count}} 条 2 mm 沉积道），单元边长 ${{lattice.base_cell_size_mm}} mm。实际切片层高由当前 Core 树脂工艺参数决定。`;
+        conformalSpecResult.textContent = `已识别共形蜂窝模式：${{part.length_mm}} × ${{part.width_mm}} × ${{part.final_height_mm}} mm；${{lattice.wall_width_mm}} mm 墙体（${{lattice.wall_bead_count}} 条 2 mm 沉积道），单元边长 ${{lattice.base_cell_size_mm}} mm${{fiberText}}。实际树脂/纤维层高由当前 Core 工艺参数决定。`;
         selectedConformalSpec = file;
         conformalSliceButton.disabled = false;
         statusEl.className = 'status ok';
@@ -5189,6 +5269,8 @@ def _index_html() -> str:
         const formData = new FormData();
         formData.append('conformal_spec', selectedConformalSpec, selectedConformalSpec.name);
         formData.append('conformal_debug_export', conformalDebugExportEnabled ? 'true' : 'false');
+        formData.append('conformal_fiber_enabled', conformalFiberEnabled.checked ? 'true' : 'false');
+        formData.append('conformal_fiber_double_wall_axis', conformalFiberDoubleWallAxis.value);
         appendCurrentCoreSettings(formData);
         const response = await fetch('/conformal-slice', {{ method: 'POST', body: formData }});
         const queued = await response.json();
@@ -5196,7 +5278,7 @@ def _index_html() -> str:
         const result = await waitForSliceJob(queued.job_id);
         layersEl.textContent = result.layers;
         outputNameEl.textContent = result.filename;
-        executedInfillPatternEl.textContent = '共形蜂窝一笔画分区';
+        executedInfillPatternEl.textContent = '共形蜂窝连续课程';
         previewData = result.preview;
         updatePreviewLineWidthValue();
         configureViewer();
@@ -5210,7 +5292,11 @@ def _index_html() -> str:
           conformalDebugDownload.className = 'download visible';
         }}
         statusEl.className = 'status ok';
-        statusEl.textContent = '完成：共形蜂窝路径已按图分区规划，并已生成 Core NPZ。';
+        const fiberReport = result.fiber_reinforcement;
+        const fiberInterfaceText = fiberReport?.enabled
+          ? `；已生成与树脂连续课程同拓扑的 F 路径，共 ${{fiberReport.total_fiber_path_count}} 条，并已按纤维层高抬高后续树脂层`
+          : '；本次未启用连续纤维策略';
+        statusEl.textContent = '完成：共形连续课程路径已生成，并已写出 Core NPZ。' + fiberInterfaceText;
         const coreSeconds = Number(result.core_export_seconds);
         if (Number.isFinite(coreSeconds)) exportElapsedEl.textContent = 'core 最终 NPZ 处理耗时 ' + coreSeconds.toFixed(1) + ' 秒';
       }} catch (error) {{
@@ -6075,7 +6161,7 @@ def _index_html() -> str:
     syncKernelControls();
     installMagnitudeNumberStepping();
     installSettingsPersistence();
-    fiberNotice.textContent = 'JSON 中的单层纤维路径会复制到每个树脂层，纤维层高 0.1 mm 会计入后续树脂层 Z 位置，最后一层树脂封顶不打印纤维。';
+    fiberNotice.textContent = '旧版纤维路径已停用：当前不会插入 F 路径或改变树脂层高度；新的铺设策略将在此接口接入。';
 
     function updateExportProgress(job) {{
       const progress = Math.max(0, Math.min(100, Number(job.progress) || 0));
@@ -6430,7 +6516,10 @@ def _index_html() -> str:
       const visibleCount = Math.min(Number(pathProgressSlider.value), entries.length);
       for (let index = visibleCount - 1; index >= 0; index--) {{
         const entry = entries[index];
-        if (entry.kind === 'deposit' && entry.points?.length >= 2) return entry;
+        // A Travel is a real nozzle motion, not merely a display connector.
+        // Selecting it must animate the nozzle to its own final XYZ point;
+        // skipping it here used to replay the preceding deposition instead.
+        if (entry.points?.length >= 2) return entry;
       }}
       return null;
     }}
@@ -7034,38 +7123,68 @@ def _index_html() -> str:
       }}
 
       function drawExtrusionPath(path, extrusion, fallbackColor) {{
+        // Core records one 4 ms sample per row.  Stroking every edge
+        // separately makes a large conformal job unresponsive, even with the
+        // E heat map disabled.  Batch disconnected segments by their complete
+        // Canvas style, as the historical-layer renderer does, while retaining
+        // every original segment and its zero-E connector semantics.
+        const batches = new Map();
+        const activeAlpha = ctx.globalAlpha;
+        const activeLineWidth = ctx.lineWidth;
+        const addSegment = (key, style, first, last) => {{
+          let batch = batches.get(key);
+          if (!batch) {{
+            batch = {{ ...style, segments: [] }};
+            batches.set(key, batch);
+          }}
+          batch.segments.push([first, last]);
+        }};
         for (let pointIndex = 0; pointIndex < path.length - 1; pointIndex++) {{
           const deltaE = Number(extrusion[pointIndex + 1]) - Number(extrusion[pointIndex]);
           const zeroExtrusion = Number.isFinite(deltaE) && Math.abs(deltaE) <= 1e-9;
           const density = extrusionDensity(path, extrusion, pointIndex);
-          const activeLineWidth = ctx.lineWidth;
-          const activeAlpha = ctx.globalAlpha;
           if (zeroExtrusion) {{
             // A continuous honeycomb motion has connector segments with
             // exactly constant E.  Draw them distinctly even when the
             // extrusion heat map is disabled, so they cannot be mistaken for
             // deposited walls in the preview.
-            ctx.strokeStyle = '#526f8c';
-            ctx.globalAlpha = activeAlpha * 0.95;
-            ctx.lineWidth = Math.min(activeLineWidth, 1.5);
-            ctx.setLineDash([7, 5]);
+            addSegment(
+              'connector',
+              {{ color: '#526f8c', width: Math.min(activeLineWidth, 1.5), dash: [7, 5], alpha: 0.95 }},
+              path[pointIndex], path[pointIndex + 1],
+            );
           }} else if (density === null || extrusionRange === null) {{
-            ctx.strokeStyle = fallbackColor;
+            addSegment(
+              `deposit:${{fallbackColor}}`,
+              {{ color: fallbackColor, width: activeLineWidth, dash: [], alpha: 1 }},
+              path[pointIndex], path[pointIndex + 1],
+            );
           }} else {{
-            ctx.strokeStyle = extrusionColorForSegment(density, extrusionRange);
-          }}
-          const first = viewport.project(path[pointIndex]);
-          const last = viewport.project(path[pointIndex + 1]);
-          ctx.beginPath();
-          ctx.moveTo(first[0], first[1]);
-          ctx.lineTo(last[0], last[1]);
-          ctx.stroke();
-          if (zeroExtrusion) {{
-            ctx.setLineDash([]);
-            ctx.lineWidth = activeLineWidth;
-            ctx.globalAlpha = activeAlpha;
+            const color = extrusionColorForSegment(density, extrusionRange);
+            addSegment(
+              `deposit:${{color}}`,
+              {{ color, width: activeLineWidth, dash: [], alpha: 1 }},
+              path[pointIndex], path[pointIndex + 1],
+            );
           }}
         }}
+        for (const batch of batches.values()) {{
+          ctx.strokeStyle = batch.color;
+          ctx.globalAlpha = activeAlpha * batch.alpha;
+          ctx.lineWidth = batch.width;
+          ctx.setLineDash(batch.dash);
+          ctx.beginPath();
+          for (const [first, last] of batch.segments) {{
+            const projectedFirst = viewport.project(first);
+            const projectedLast = viewport.project(last);
+            ctx.moveTo(projectedFirst[0], projectedFirst[1]);
+            ctx.lineTo(projectedLast[0], projectedLast[1]);
+          }}
+          ctx.stroke();
+        }}
+        ctx.setLineDash([]);
+        ctx.globalAlpha = activeAlpha;
+        ctx.lineWidth = activeLineWidth;
       }}
 
       function drawEntry(entry, opacity = 1) {{
@@ -7235,14 +7354,17 @@ def _index_html() -> str:
         drawPathPoints(ctx, currentEntry.points, pathColor(currentEntry.role), viewport.project);
       }}
       if (surfacePreview && showDirectionInput.checked && !pathPlayback.running) {{
-        const currentDeposit = entries
+        // The selected final motion owns the displayed nozzle location.  In
+        // particular, do not freeze the model on the preceding deposited
+        // stroke when the final visible item is a Travel.
+        const currentMotion = entries
           .slice(0, visibleCount)
           .reverse()
-          .find((entry) => entry.kind === 'deposit' && entry.points?.length);
-        if (currentDeposit) {{
+          .find((entry) => entry.points?.length);
+        if (currentMotion) {{
           drawPrintHeadModel(
             ctx,
-            currentDeposit.points[currentDeposit.points.length - 1],
+            currentMotion.points[currentMotion.points.length - 1],
             viewport,
           );
         }}

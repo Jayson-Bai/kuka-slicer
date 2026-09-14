@@ -10,6 +10,7 @@ from typing import Mapping
 import numpy as np
 
 from .contracts import ConformalLatticeSpec, load_conformal_lattice_spec
+from .continuous_course import ContinuousCoursePlan, build_continuous_course_plan, embed_continuous_course_plan
 from .fill_ratio_validation import FillRatioValidation, validate_realized_fill_ratio
 from .layer_embedding import LayerEmbedding, embed_lattice_layers
 from .lattice_generator import (
@@ -24,6 +25,7 @@ from .path_bridge import ConformalLatticePathGraph, ExtrusionVolumeModel, build_
 from .phase_coordinates import PhaseCoordinates, solve_phase_coordinates
 from .preview import conformal_lattice_preview_payload
 from .scalar_fields import DesignFieldResult, compose_design_fields_from_spec
+from ..surface_preview.model import DoubleSineSurface
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +44,10 @@ class ConformalLatticeRun:
     fill_validation: FillRatioValidation | None
     layer_embedding: LayerEmbedding
     path_graph: ConformalLatticePathGraph | None
+    # The production resin/fiber fill is the designer's red continuous-course
+    # topology, mapped only after its planar geometry has been fixed.
+    continuous_course_plan: ContinuousCoursePlan | None
+    continuous_course_paths_by_layer: tuple[tuple[tuple[np.ndarray, np.ndarray], ...], ...]
 
     def preview_payload(self) -> dict[str, object]:
         """Return Gate 7 diagnostics without changing any generated geometry."""
@@ -132,12 +138,26 @@ def run_conformal_lattice_pipeline(
     if not isinstance(validate_fill_ratio, bool):
         raise ValueError("validate_fill_ratio must be a boolean")
 
-    domain = build_double_sine_surface_domain(spec)
+    grip_end_length_mm = _symmetric_grip_end_length(spec)
+    # The source double-sine field is always global.  Only the honeycomb
+    # generator is restricted to the central working region; perimeter and
+    # grip paths below still sample the original whole-part field.
+    full_domain = build_double_sine_surface_domain(spec)
+    lattice_bounds = _central_lattice_bounds(spec, grip_end_length_mm)
+    domain = full_domain if lattice_bounds is None else build_double_sine_surface_domain(
+        spec,
+        xy_bounds_mm=lattice_bounds,
+    )
     parameterization = parameterize_spec_lscm(spec, domain)
     design_fields = compose_design_fields_from_spec(domain, spec)
     orientation = _orientation_from_spec(domain, spec)
     phase = solve_phase_coordinates(domain, parameterization, design_fields, orientation)
-    boundary_mode = str(spec.lattice["boundary_mode"])
+    requested_boundary_mode = str(spec.lattice["boundary_mode"])
+    # ``inset`` intentionally keeps all cells away from a boundary, which is
+    # unsuitable for a load-bearing internal separator: it would recreate the
+    # visible unconnected gap.  Partitioned parts therefore clip the central
+    # honeycomb only at its shared walls.
+    boundary_mode = "clip" if grip_end_length_mm > 0.0 else requested_boundary_mode
     if boundary_mode not in ("clip", "inset"):
         raise ValueError("first-version UI pipeline supports lattice.boundary_mode=clip or inset")
     requested_phase_origin = tuple(float(value) for value in spec.lattice["phase_origin"])
@@ -145,7 +165,7 @@ def run_conformal_lattice_pipeline(
     effective_phase_origin, load_line_alignment = _resolved_phase_origin(spec, domain, phase)
     if load_line_alignment["enabled"]:
         boundary_phase_report = {
-            "policy": "superseded_by_length_midplane_wall_alignment",
+            "policy": "superseded_by_" + str(load_line_alignment.get("mode", "length_midplane_wall_alignment")),
             "requested_phase_origin": list(requested_phase_origin),
             "effective_phase_origin": list(effective_phase_origin),
         }
@@ -175,6 +195,12 @@ def run_conformal_lattice_pipeline(
             **spec.metadata(),
             "boundary_phase": boundary_phase_report,
             "load_line_alignment": load_line_alignment,
+            "partition_connection": {
+                "mode": "shared_separator_wall_endpoints" if grip_end_length_mm > 0.0 else "not_partitioned",
+                "requested_boundary_mode": requested_boundary_mode,
+                "effective_boundary_mode": boundary_mode,
+                "honeycomb_xy_bounds_mm": list(lattice_bounds) if lattice_bounds is not None else None,
+            },
         },
         load_line_alignment=load_line_alignment,
     )
@@ -190,13 +216,21 @@ def run_conformal_lattice_pipeline(
             samples_per_triangle_side=fill_samples_per_triangle_side,
         )
     layer_embedding = _symmetric_layer_embedding(domain, orientation, geometry, spec, logical_layer_count, base_z_by_layer)
+    continuous_course_plan = build_continuous_course_plan(spec) if spec.part else None
+    continuous_course_paths_by_layer = (
+        embed_continuous_course_plan(continuous_course_plan, spec, layer_embedding)
+        if continuous_course_plan is not None
+        else ()
+    )
     target_node_normals = _lattice_node_normals(domain, orientation, geometry)
     layer_tool_normals = _symmetric_tool_normals(target_node_normals, layer_embedding)
+    boundary_orientation = orientation if domain is full_domain else _orientation_from_spec(full_domain, spec)
     outer_boundary, outer_boundary_tool_normals = (
-        _symmetric_outer_boundary(domain, orientation, spec, layer_embedding)
+        _symmetric_outer_boundary(full_domain, boundary_orientation, spec, layer_embedding)
         if spec.part
         else (None, None)
     )
+    auxiliary_paths = _symmetric_partition_paths(spec, layer_embedding) if grip_end_length_mm > 0.0 else None
     path_graph = None if extrusion is None else build_conformal_lattice_path_graph(
         geometry,
         extrusion,
@@ -208,6 +242,7 @@ def run_conformal_lattice_pipeline(
         outer_boundary_paths_xyz=outer_boundary,
         layer_tool_normals_xyz=layer_tool_normals,
         outer_boundary_tool_normals_xyz=outer_boundary_tool_normals,
+        auxiliary_deposition_paths_by_layer=auxiliary_paths,
     )
     return ConformalLatticeRun(
         spec=spec,
@@ -220,6 +255,8 @@ def run_conformal_lattice_pipeline(
         fill_validation=fill_validation,
         layer_embedding=layer_embedding,
         path_graph=path_graph,
+        continuous_course_plan=continuous_course_plan,
+        continuous_course_paths_by_layer=continuous_course_paths_by_layer,
     )
 
 
@@ -256,6 +293,141 @@ def write_conformal_lattice_outputs(
     return outputs
 
 
+def _symmetric_grip_end_length(spec: ConformalLatticeSpec) -> float:
+    """Read the optional geometry-only tensile grip partition from the spec."""
+
+    if not spec.part:
+        return 0.0
+    value = float(spec.part.get("symmetric_grip_end_length_mm", 0.0))
+    if value < 0.0 or not math.isfinite(value):
+        raise ValueError("part.symmetric_grip_end_length_mm must be a finite non-negative value")
+    return value
+
+
+def _central_lattice_bounds(spec: ConformalLatticeSpec, grip_end_length_mm: float) -> tuple[float, float, float, float] | None:
+    """Return the exact framed honeycomb region, including its connection line.
+
+    The clipped honeycomb edge endpoints must land on the two explicit
+    separator walls.  Moving this domain inward leaves a visible and physical
+    gap, whereas sharing isolated endpoints with a wall creates the intended
+    continuous structural joint.  Boundary-phase selection prevents a whole
+    honeycomb edge from becoming collinear with the wall and being deposited
+    twice.
+    """
+
+    if grip_end_length_mm <= 0.0:
+        return None
+    if not spec.part:
+        raise ValueError("symmetric grip regions require a rectangular part")
+    length = float(spec.part["length_mm"])
+    width = float(spec.part["width_mm"])
+    bounds = (grip_end_length_mm, 0.0, length - grip_end_length_mm, width)
+    if bounds[2] <= bounds[0] or bounds[3] <= bounds[1]:
+        raise ValueError("grip region and explicit wall clearance leave no printable central honeycomb area")
+    return bounds
+
+
+def _symmetric_partition_paths(
+    spec: ConformalLatticeSpec,
+    layer_embedding: LayerEmbedding,
+) -> tuple[tuple[tuple[str, np.ndarray, np.ndarray], ...], ...]:
+    """Reuse 2-D X-zigzag planning, then embed all paths with one surface law.
+
+    No process controls are read from the JSON.  The portable config supplies
+    only the grip range; the fixed resin bead width from the active conformal
+    manufacturing contract supplies the planning envelope.
+    """
+
+    if not spec.part:
+        raise ValueError("partition paths require a rectangular part")
+    grip = _symmetric_grip_end_length(spec)
+    if grip <= 0.0:
+        return ()
+    length = float(spec.part["length_mm"])
+    width = float(spec.part["width_mm"])
+    bead_width = float(spec.manufacturing["nominal_bead_width_mm"])
+    # Reserve the global perimeter and both separator lines.  This avoids
+    # depositing a second bead on their common edges while preserving a full
+    # density resin fill within each end grip.
+    left_bounds = (bead_width, bead_width, grip - bead_width, width - bead_width)
+    right_bounds = (length - grip + bead_width, bead_width, length - bead_width, width - bead_width)
+    if left_bounds[2] <= left_bounds[0] or right_bounds[2] <= right_bounds[0] or left_bounds[3] <= left_bounds[1]:
+        raise ValueError("grip region is too narrow after reserving the perimeter and separator wall")
+    left_zigzag = _horizontal_one_stroke_zigzag(left_bounds, bead_width)
+    right_zigzag = _horizontal_one_stroke_zigzag(right_bounds, bead_width)
+    points_per_separator = max(3, int(math.ceil(width / bead_width)) + 1)
+    separator_left = np.column_stack((np.full(points_per_separator, grip), np.linspace(0.0, width, points_per_separator)))
+    separator_right = np.column_stack((np.full(points_per_separator, length - grip), np.linspace(0.0, width, points_per_separator)))
+    alpha = np.asarray(layer_embedding.report.get("alpha_by_layer"), dtype=np.float64)
+    base_z = np.asarray(layer_embedding.report.get("base_z_by_layer_mm"), dtype=np.float64)
+    if alpha.shape != base_z.shape or alpha.ndim != 1:
+        raise ValueError("symmetric layer embedding is missing per-layer alpha/base-Z data")
+    surface = _double_sine_surface(spec)
+    result: list[tuple[tuple[str, np.ndarray, np.ndarray], ...]] = []
+    for layer_alpha, layer_base_z in zip(alpha, base_z):
+        result.append(
+            (
+                ("conformal_partition_wall", *_embed_planar_path(separator_left, surface, layer_alpha, layer_base_z)),
+                ("conformal_partition_wall", *_embed_planar_path(separator_right, surface, layer_alpha, layer_base_z)),
+                ("conformal_grip_zigzag_x_one_stroke", *_embed_planar_path(left_zigzag, surface, layer_alpha, layer_base_z)),
+                ("conformal_grip_zigzag_x_one_stroke", *_embed_planar_path(right_zigzag, surface, layer_alpha, layer_base_z)),
+            )
+        )
+    return tuple(result)
+
+
+def _horizontal_one_stroke_zigzag(bounds: tuple[float, float, float, float], bead_width_mm: float) -> np.ndarray:
+    """Adapter for the established resin zigzag planner; no duplicate planner."""
+
+    from shapely.geometry import box
+    from ..slicer import _solid_zigzag_infill_paths
+
+    paths = _solid_zigzag_infill_paths(
+        box(*bounds),
+        spacing=bead_width_mm,
+        line_width=bead_width_mm,
+        angle_degrees=0.0,
+        minimum_clearance=0.05,
+        tolerance=1e-6,
+        connect_adjacent=True,
+        follow_boundaries=True,
+    )
+    if len(paths) != 1:
+        raise ValueError("horizontal grip zigzag must resolve to exactly one continuous path")
+    return np.asarray(paths[0], dtype=np.float64)
+
+
+def _double_sine_surface(spec: ConformalLatticeSpec) -> DoubleSineSurface:
+    values = spec.source_surface.get("double_sine")
+    if not isinstance(values, Mapping):
+        raise ValueError("double-sine source metadata is malformed")
+    return DoubleSineSurface(
+        amplitude_mm=float(values["amplitude_mm"]),
+        wavelength_x_mm=float(values["wavelength_x_mm"]),
+        wavelength_y_mm=float(values["wavelength_y_mm"]),
+        phase_x_rad=float(values["phase_x_rad"]),
+        phase_y_rad=float(values["phase_y_rad"]),
+        z_reference_mm=float(values["z_reference_mm"]),
+    )
+
+
+def _embed_planar_path(
+    points_xy: np.ndarray,
+    surface: DoubleSineSurface,
+    alpha: float,
+    base_z_mm: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Apply global H, smoothstep alpha, and the matching height-field normal."""
+
+    xy = np.asarray(points_xy, dtype=np.float64)
+    heights = np.asarray(surface.height(xy[:, 0], xy[:, 1]), dtype=np.float64)
+    dz_dx, dz_dy = surface.gradient(xy[:, 0], xy[:, 1])
+    xyz = np.column_stack((xy, base_z_mm + alpha * (heights - surface.z_reference_mm)))
+    normals = np.column_stack((-alpha * dz_dx, -alpha * dz_dy, np.ones(len(xy))))
+    normals /= np.linalg.norm(normals, axis=1, keepdims=True)
+    return xyz, normals
+
+
 def _orientation_from_spec(domain: SurfaceMeshDomain, spec: ConformalLatticeSpec) -> OrientationField:
     if spec.orientation_field.get("mode") != "global_axis":
         raise ValueError("first-version UI pipeline supports orientation_field.mode=global_axis")
@@ -272,32 +444,70 @@ def _resolved_phase_origin(
     domain: SurfaceMeshDomain,
     phase: PhaseCoordinates,
 ) -> tuple[tuple[float, float], dict[str, object]]:
-    """Resolve a semantic length-midplane wall request in solved phase coordinates."""
+    """Resolve semantic X/Y honeycomb features in solved phase coordinates."""
 
     manual_origin = tuple(float(value) for value in spec.lattice["phase_origin"])
     request = spec.lattice.get("load_line_alignment")
-    if not isinstance(request, Mapping) or not request.get("enabled", False):
+    honeycomb_request = spec.lattice.get("honeycomb_feature_alignment")
+    load_alignment = isinstance(request, Mapping) and request.get("enabled", False)
+    explicit_feature_alignment = isinstance(honeycomb_request, Mapping)
+    align_x = explicit_feature_alignment and honeycomb_request.get("align_x", False) is True
+    align_y = explicit_feature_alignment and honeycomb_request.get("align_y", False) is True
+    if not load_alignment and not align_x and not align_y:
         return manual_origin, {"enabled": False, "mode": "boundary_phase_policy"}
 
     angle_deg = float(spec.orientation_field.get("angle_deg", 0.0))
     if not math.isclose(math.sin(math.radians(angle_deg)), 0.0, abs_tol=1e-9):
-        raise ValueError("length-midplane wall alignment requires a global grid direction parallel to X")
+        raise ValueError("honeycomb feature alignment requires a global grid direction parallel to X")
 
-    load_center_xy = np.asarray(
+    part_center_xy = np.asarray(
         [float(spec.part["length_mm"]) / 2.0, float(spec.part["width_mm"]) / 2.0], dtype=np.float64
     )
-    load_center_phase = _phase_at_planar_point(domain, phase, load_center_xy)
-    # A regular phase-domain hexagon's right vertical wall has midpoint
-    # (0.5, 0).  Anchoring it at the load centre makes that wall Y-directed.
-    origin = load_center_phase - np.asarray([0.5, 0.0], dtype=np.float64)
+    target_xy = np.array(part_center_xy, copy=True)
+    if explicit_feature_alignment:
+        target_xy[0] = float(honeycomb_request["target_x_mm"])
+        target_xy[1] = float(honeycomb_request["target_y_mm"])
+    target_phase = _phase_at_planar_point(domain, phase, target_xy)
+    if load_alignment:
+        # Historical bending semantics centre the whole local honeycomb phase
+        # at the load point, not only its p coordinate.  Keep existing JSON
+        # exports bit-for-bit meaningful.
+        origin = target_phase - np.asarray([0.5, 0.0], dtype=np.float64)
+    else:
+        origin = np.asarray(manual_origin, dtype=np.float64)
+        if align_x:
+            origin[0] = target_phase[0] - 0.5
+        if align_y:
+            # In the normalized triangular-lattice phase basis, the requested
+            # X-progressing zigzag centre-line is sqrt(3)/4 above the
+            # cell-centre origin.
+            origin[1] = target_phase[1] - math.sqrt(3.0) / 4.0
+        if align_x or align_y:
+            # A feature may otherwise land exactly on an LSCM-domain edge;
+            # move one hundredth of a micron in phase space so inverse
+            # mapping remains well-defined without a measurable shift.
+            origin[1] += 1e-7
+    mode = "honeycomb_center_features" if explicit_feature_alignment else "length_midplane_wall_alignment"
     return (float(origin[0]), float(origin[1])), {
         "enabled": True,
-        "axis": "x",
-        "position": "part_length_midplane",
-        "feature": "wall",
-        "load_center_xy_mm": load_center_xy.tolist(),
-        "load_center_phase": load_center_phase.tolist(),
+        "mode": mode,
+        "align_x": bool(load_alignment or align_x),
+        "align_y": bool(align_y),
+        "target_xy_mm": target_xy.tolist(),
+        "target_phase": target_phase.tolist(),
         "resolved_phase_origin": origin.tolist(),
+        # Retained for existing bending exports and their downstream readers.
+        **(
+            {
+                "axis": "x",
+                "position": "part_length_midplane",
+                "feature": "wall",
+                "load_center_xy_mm": target_xy.tolist(),
+                "load_center_phase": target_phase.tolist(),
+            }
+            if load_alignment
+            else {}
+        ),
     }
 
 

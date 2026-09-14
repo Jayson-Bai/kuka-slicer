@@ -24,6 +24,16 @@ from kuka_slicer.ui_server import (
     merge_fiber_paths_into_job,
 )
 from kuka_slicer.external_npz import ExternalSourceJob, MaterialPaths
+from kuka_slicer.conformal_lattice.fiber_reinforcement import (
+    ContinuousCourseFiberSettings,
+    MixedWallFiberSettings,
+    _primary_wall_mask,
+    apply_continuous_course_fiber_strategy,
+    apply_mixed_wall_fiber_strategy,
+    derive_symmetric_curvature_fiber_interfaces,
+)
+from kuka_slicer.conformal_lattice.path_bridge import ExtrusionVolumeModel
+from kuka_slicer.conformal_lattice.pipeline import run_conformal_lattice_pipeline
 from kuka_slicer.surface_preview.server import conformal_lattice_config_payload
 
 
@@ -55,7 +65,12 @@ def test_conformal_design_json_generates_core_output_without_source_npz_round_tr
     )
 
     assert result["layers"] == 4
-    assert result["effective_infill_pattern"] == "共形蜂窝一笔画分区"
+    assert result["effective_infill_pattern"] == "共形蜂窝连续课程"
+    assert result["infill_pattern_execution"] == {"applied": True, "mode": "continuous_course_network_v1"}
+    assert result["fiber_reinforcement"]["enabled"] is False
+    assert result["fiber_reinforcement"]["reserved"] is False
+    assert result["fiber_reinforcement"]["total_fiber_path_count"] == 0
+    assert result["fiber_reinforcement"]["automatic_resin_z_raise"] is False
     assert result["preview"]["preview_source"] == "final_core_npz"
     assert result["preview"]["tool_orientation"]["available"] is True
     job_dir = tmp_path / result["download_url"].split("/")[-2]
@@ -64,6 +79,254 @@ def test_conformal_design_json_generates_core_output_without_source_npz_round_tr
     with np.load(job_dir / "conformal_lattice_core.npz", allow_pickle=False) as core:
         assert np.linalg.norm(np.column_stack((core["a"], core["b"], core["c"]))) > 1e-3
     assert progress[-1] == 97
+
+
+def test_main_ui_continuous_course_fiber_strategy_reaches_final_core_output(tmp_path: Path):
+    config = conformal_lattice_config_payload(
+        {
+            "part_length_mm": ["30"],
+            "part_width_mm": ["20"],
+            "part_height_mm": ["2"],
+            "grip_end_length_mm": ["5"],
+            "wall_width_mm": ["2"],
+            "base_cell_size_mm": ["6"],
+            "orientation_angle_deg": ["90"],
+            "honeycomb_align_x": ["false"],
+            "honeycomb_align_y": ["false"],
+            "surface_start_layer": ["1"],
+            "samples_x": ["12"],
+            "samples_y": ["12"],
+        }
+    )
+    handler = object.__new__(_SlicerUiHandler)
+    handler.server_output_dir = tmp_path
+
+    result = handler._handle_conformal_slice(
+        "",
+        request_data=(
+            {
+                "core_resin_layer_height": ["0.5"],
+                "conformal_fiber_enabled": ["true"],
+                "conformal_fiber_double_wall_axis": ["x"],
+            },
+            {"conformal_spec": ("mixed_wall.json", json.dumps(config).encode("utf-8"))},
+        ),
+    )
+
+    report = result["fiber_reinforcement"]
+    assert report["enabled"] is True
+    assert report["mode"] == "continuous_course_network_v1"
+    assert report["course_semantics"] == "every rectangle-clipped continuous-course fragment is an independent resin/F path with normal Core travel/cut boundaries"
+    assert report["layer_interface_source"] == "design_json_symmetric_nonzero_curvature"
+    assert report["after_resin_physical_layers"] == [1, 4]
+    assert report["total_fiber_path_count"] > 0
+    assert report["automatic_resin_z_raise"] is True
+    job_dir = tmp_path / result["download_url"].split("/")[-2]
+    with np.load(job_dir / "conformal_lattice_core.npz", allow_pickle=False) as core:
+        assert core["x"].size > 0
+    assert any(layer["fiber_paths"] for layer in result["preview"]["layers"])
+
+
+def test_production_continuous_courses_replace_only_legacy_honeycomb_and_keep_grips():
+    config = conformal_lattice_config_payload(
+        {
+            "part_length_mm": ["150"],
+            "part_width_mm": ["50"],
+            "part_height_mm": ["10"],
+            "grip_end_length_mm": ["25"],
+            "wall_width_mm": ["2"],
+            "base_cell_size_mm": ["6"],
+            "surface_start_layer": ["1"],
+            "samples_x": ["48"],
+            "samples_y": ["24"],
+        }
+    )
+    run = run_conformal_lattice_pipeline(
+        config,
+        physical_layer_height_mm=0.5,
+        extrusion=ExtrusionVolumeModel(1.0, 1.0),
+    )
+    assert run.path_graph is not None
+    assert run.continuous_course_plan is not None
+    assert len(run.continuous_course_plan.paths_xy) == 6
+    assert run.continuous_course_plan.course_bounds_mm == pytest.approx((25.0, 0.0, 125.0, 50.0))
+    assert run.continuous_course_plan.row_pitch_mm - np.sqrt(3.0) * 6.0 == pytest.approx(4.0)
+    assert all(np.all(np.diff(path[:, 0]) >= -1e-9) for path in run.continuous_course_plan.paths_xy)
+    source_job = run.path_graph.to_external_base_source_job()
+    first, last = derive_symmetric_curvature_fiber_interfaces(run.layer_embedding)
+    result = apply_continuous_course_fiber_strategy(
+        source_job=source_job,
+        graph=run.path_graph,
+        course_paths_by_layer=run.continuous_course_paths_by_layer,
+        settings=ContinuousCourseFiberSettings(True, first, last),
+        fiber_layer_height_mm=0.2,
+        fiber_e_per_mm=1.0,
+    )
+
+    assert result.paths_per_layer == 6
+    first_layer_travel = next(group for group in source_job.travel_paths if group.layer_index == 0)
+    resin = next(group for group in source_job.material_paths if group.material == "R" and group.layer_index == 0)
+    # Every independent deposition path now receives an explicit route.  The
+    # router follows the working-region perimeter/partition boundary rather
+    # than leaving Core to create a chord through the honeycomb pores.
+    assert len(first_layer_travel.paths) == len(resin.paths) - 1
+    for route in first_layer_travel.paths:
+        for start, end in zip(route, route[1:]):
+            midpoint = (start[:2] + end[:2]) * 0.5
+            assert not (25.0 + 1e-7 < midpoint[0] < 125.0 - 1e-7 and 1e-7 < midpoint[1] < 50.0 - 1e-7)
+    roles = source_job.meta["path_roles"]["R"]["0"]
+    assert "conformal_honeycomb_macro_partition" not in roles
+    assert roles.count("conformal_continuous_course_fragment") == 6
+    assert "conformal_outer_boundary" in roles
+    assert roles.count("conformal_partition_wall") == 2
+    assert roles.count("conformal_grip_zigzag_x_one_stroke") == 2
+    resin = next(group for group in source_job.material_paths if group.material == "R" and group.layer_index == 0)
+    courses = [path for path, role in zip(resin.paths, roles) if role == "conformal_continuous_course_fragment"]
+    assert len(courses) == 6
+    # Serpentine ordering may reverse independent courses to avoid a diagonal
+    # inter-course Travel; their geometric endpoints remain the same sides.
+    assert all({round(float(path[0, 0]), 6), round(float(path[-1, 0]), 6)} == {25.0, 125.0} for path in courses)
+    assert all(abs(np.diff(path[:, 0])).max() > 0.0 for path in courses)
+    selected_layer = result.resin_layer_indices[0]
+    selected_roles = source_job.meta["path_roles"]["R"][str(selected_layer)]
+    selected_resin = next(group for group in source_job.material_paths if group.material == "R" and group.layer_index == selected_layer)
+    selected_courses = [path for path, role in zip(selected_resin.paths, selected_roles) if role == "conformal_continuous_course_fragment"]
+    fiber = next(group for group in source_job.material_paths if group.material == "F" and group.layer_index == selected_layer)
+    assert len(fiber.paths) == len(selected_courses) == 6
+    for resin_path, fiber_path in zip(selected_courses, fiber.paths):
+        np.testing.assert_allclose(resin_path[:, :2], fiber_path[:, :2])
+
+
+def test_boundary_clipped_continuous_courses_are_retained_as_independent_paths():
+    config = conformal_lattice_config_payload(
+        {
+            "part_length_mm": ["160"],
+            "part_width_mm": ["60"],
+            "part_height_mm": ["10"],
+            "grip_end_length_mm": ["25"],
+            "wall_width_mm": ["2"],
+            "base_cell_size_mm": ["10"],
+            "surface_start_layer": ["1"],
+            "samples_x": ["48"],
+            "samples_y": ["24"],
+        }
+    )
+    run = run_conformal_lattice_pipeline(
+        config,
+        physical_layer_height_mm=0.5,
+        extrusion=ExtrusionVolumeModel(1.0, 1.0),
+    )
+    assert run.path_graph is not None
+    assert run.continuous_course_plan is not None
+    # Four through-routes plus three independently clipped fragments on each
+    # of the upper/lower rectangle boundaries.  Pure diagonal corner grazes
+    # are excluded because they have no horizontal pore-channel support.
+    assert len(run.continuous_course_plan.paths_xy) == 10
+    assert all(np.all(path[:, 0] >= 25.0 - 1e-9) and np.all(path[:, 0] <= 135.0 + 1e-9) for path in run.continuous_course_plan.paths_xy)
+    assert sum(np.isclose(path[:, 1], 0.0).any() for path in run.continuous_course_plan.paths_xy) == 3
+    assert sum(np.isclose(path[:, 1], 60.0).any() for path in run.continuous_course_plan.paths_xy) == 3
+
+    source_job = run.path_graph.to_external_base_source_job()
+    first, last = derive_symmetric_curvature_fiber_interfaces(run.layer_embedding)
+    result = apply_continuous_course_fiber_strategy(
+        source_job=source_job,
+        graph=run.path_graph,
+        course_paths_by_layer=run.continuous_course_paths_by_layer,
+        settings=ContinuousCourseFiberSettings(True, first, last),
+        fiber_layer_height_mm=0.2,
+        fiber_e_per_mm=1.0,
+    )
+    assert result.paths_per_layer == 10
+    roles = source_job.meta["path_roles"]["R"]["0"]
+    assert roles.count("conformal_continuous_course_fragment") == 10
+    resin = next(group for group in source_job.material_paths if group.material == "R" and group.layer_index == 0)
+    fiber = next(group for group in source_job.material_paths if group.material == "F" and group.layer_index == result.resin_layer_indices[0])
+    resin_fragments = [path for path, role in zip(resin.paths, roles) if role == "conformal_continuous_course_fragment"]
+    assert len(resin_fragments) == len(fiber.paths) == 10
+    for resin_path, fiber_path in zip(resin_fragments, fiber.paths):
+        np.testing.assert_allclose(resin_path[:, :2], fiber_path[:, :2])
+
+
+def test_x_fiber_strategy_accepts_default_vertical_wall_honeycomb():
+    """Default 0° honeycomb uses inclined X-progressing zigzag chains."""
+
+    config = conformal_lattice_config_payload(
+        {
+            "part_length_mm": ["30"],
+            "part_width_mm": ["20"],
+            "part_height_mm": ["2"],
+            "wall_width_mm": ["2"],
+            "base_cell_size_mm": ["6"],
+            "orientation_angle_deg": ["0"],
+            "honeycomb_align_x": ["false"],
+            "honeycomb_align_y": ["false"],
+            "surface_start_layer": ["1"],
+            "samples_x": ["12"],
+            "samples_y": ["12"],
+        }
+    )
+    run = run_conformal_lattice_pipeline(
+        config,
+        physical_layer_height_mm=0.5,
+        extrusion=ExtrusionVolumeModel(1.0, 1.0),
+    )
+    assert run.path_graph is not None
+    mask, selection = _primary_wall_mask(
+        np.asarray(run.path_graph.layer_node_positions_xyz[0]),
+        np.asarray(run.path_graph.edge_node_ids),
+        0,
+    )
+
+    assert selection == "axis_progressing_zigzag_wall_chain"
+    assert int(np.count_nonzero(mask)) > 0
+
+
+def test_mixed_wall_chain_strategy_shares_complete_courses_between_resin_and_fiber():
+    """Mapped triangle segments must never become independent F/R courses."""
+
+    config = conformal_lattice_config_payload(
+        {
+            "part_length_mm": ["150"],
+            "part_width_mm": ["50"],
+            "part_height_mm": ["10"],
+            "grip_end_length_mm": ["25"],
+            "wall_width_mm": ["2"],
+            "base_cell_size_mm": ["6"],
+            "orientation_angle_deg": ["0"],
+            "surface_start_layer": ["1"],
+            "samples_x": ["48"],
+            "samples_y": ["24"],
+        }
+    )
+    run = run_conformal_lattice_pipeline(
+        config,
+        physical_layer_height_mm=0.5,
+        extrusion=ExtrusionVolumeModel(1.0, 1.0),
+    )
+    assert run.path_graph is not None
+    source_job = run.path_graph.to_external_source_job()
+    first, last = derive_symmetric_curvature_fiber_interfaces(run.layer_embedding)
+    result = apply_mixed_wall_fiber_strategy(
+        source_job=source_job,
+        graph=run.path_graph,
+        settings=MixedWallFiberSettings(True, "x", first, last),
+        fiber_layer_height_mm=0.2,
+        fiber_e_per_mm=1.0,
+    )
+
+    report = result.report
+    assert report["mode"] == "uniform_mixed_wall_chain_v2"
+    assert report["paths_per_fiber_layer"] < len(run.path_graph.edge_node_ids)
+    assert report["resin_honeycomb_paths_per_layer"] == report["paths_per_fiber_layer"]
+    selected_layer = result.resin_layer_indices[0]
+    resin_group = next(group for group in source_job.material_paths if group.layer_index == selected_layer and group.material == "R")
+    fiber_group = next(group for group in source_job.material_paths if group.layer_index == selected_layer and group.material == "F")
+    resin_chain_paths = resin_group.paths[-len(fiber_group.paths):]
+    assert len(fiber_group.paths) == report["paths_per_fiber_layer"]
+    assert max(len(path) for path in fiber_group.paths) > 2
+    for resin_path, fiber_path in zip(resin_chain_paths, fiber_group.paths):
+        np.testing.assert_allclose(resin_path[:, :2], fiber_path[:, :2])
+    assert source_job.travel_paths == []
 
 
 def test_conformal_debug_export_is_opt_in_and_never_becomes_core_input(tmp_path: Path):
@@ -361,6 +624,38 @@ def test_final_core_preview_uses_final_rows_and_bounds_each_path(tmp_path: Path)
     assert preview["bounds"]["max_y"] == pytest.approx(2.0)
 
 
+def test_final_core_preview_chunks_dense_resin_without_dropping_e_values(tmp_path: Path):
+    output = tmp_path / "dense_final_core.npz"
+    count = 16_003
+    points = np.column_stack((
+        np.arange(count, dtype=np.float64),
+        np.zeros(count, dtype=np.float64),
+        np.full(count, 0.5),
+    ))
+    extrusion = np.linspace(2.0, 4.0, count)
+    np.savez_compressed(
+        output,
+        x=points[:, 0], y=points[:, 1], z=points[:, 2], e=extrusion,
+        tool_id=np.full(count, 2),
+        move_type=np.full(count, 1),
+        event_flag=np.zeros(count, dtype=np.uint8),
+        layer_index=np.zeros(count, dtype=np.uint32),
+        path_id=np.full(count, 7),
+        path_end_flag=np.r_[np.zeros(count - 1, dtype=np.uint8), 1],
+        move_type_vocab_keys=np.asarray(["PRINT"]),
+        move_type_vocab_vals=np.asarray([1]),
+    )
+
+    preview = _preview_payload_from_final_core_npz(output, SliceConfig(line_width=2.0))
+
+    resin_paths = preview["layers"][0]["resin_paths"]
+    assert [len(path["points"]) for path in resin_paths] == [16_000, 4]
+    restored_points = resin_paths[0]["points"] + resin_paths[1]["points"][1:]
+    restored_extrusion = resin_paths[0]["extrusion"] + resin_paths[1]["extrusion"][1:]
+    assert restored_points == points.tolist()
+    assert restored_extrusion == extrusion.tolist()
+
+
 def test_final_core_preview_joins_adjacent_travel_paths_without_rewriting_points(tmp_path: Path):
     output = tmp_path / "adjacent_travel.npz"
     points = np.asarray([
@@ -430,10 +725,43 @@ def test_final_core_preview_omits_stationary_print_process_rows_only(tmp_path: P
     assert layer["resin_paths"] == [{
         "role": "final_resin",
         "points": spatial_points.tolist(),
+        "extrusion": [0.0, 0.5],
     }]
+    assert layer["motion_paths"][0]["extrusion"] == [0.0, 0.5]
     with np.load(output, allow_pickle=False) as data:
         np.testing.assert_array_equal(data["e"], process_e)
         np.testing.assert_array_equal(data["seq"], np.arange(len(points)))
+
+
+def test_final_core_preview_preserves_zero_e_connector_profile(tmp_path: Path):
+    output = tmp_path / "zero_e_connector.npz"
+    points = np.asarray([
+        [0.0, 0.0, 0.5],
+        [1.0, 0.0, 0.5],
+        [2.0, 0.0, 0.5],
+    ])
+    extrusion = np.asarray([5.0, 5.0, 5.4])
+    np.savez_compressed(
+        output,
+        x=points[:, 0], y=points[:, 1], z=points[:, 2], e=extrusion,
+        tool_id=np.full(len(points), 2),
+        move_type=np.full(len(points), 1),
+        event_flag=np.zeros(len(points), dtype=np.uint8),
+        layer_index=np.zeros(len(points), dtype=np.uint32),
+        path_id=np.full(len(points), 1),
+        path_end_flag=np.asarray([0, 0, 1]),
+        move_type_vocab_keys=np.asarray(["PRINT"]),
+        move_type_vocab_vals=np.asarray([1]),
+    )
+
+    preview = _preview_payload_from_final_core_npz(output, SliceConfig(line_width=2.0))
+
+    resin = preview["layers"][0]["resin_paths"][0]
+    assert resin["points"] == points.tolist()
+    assert resin["extrusion"] == extrusion.tolist()
+    # The browser uses the equal first two E values to render this segment as
+    # the gray-blue dashed, zero-extrusion connector rather than deposition.
+    assert resin["extrusion"][1] - resin["extrusion"][0] == 0.0
 
 
 def test_core_cooling_is_always_enabled_without_ui_switches():

@@ -26,6 +26,10 @@ from ..honeycomb_pathing.planner import _Edge, _minimum_trail_cover
 _EDGE_ID_BITS = 32
 _EDGE_ID_COMPONENT_MAX = (1 << _EDGE_ID_BITS) - 1
 
+# The role travels with each non-honeycomb path so the Core hand-off remains
+# auditable after perimeter, separator and grip-fill paths are merged.
+AuxiliaryLayerPath = tuple[str, np.ndarray, np.ndarray]
+
 
 @dataclass(frozen=True, slots=True)
 class ExtrusionVolumeModel:
@@ -90,6 +94,7 @@ class ConformalLatticePathGraph:
     outer_boundary_paths_xyz: np.ndarray | None = None
     layer_tool_normals_xyz: np.ndarray | None = None
     outer_boundary_tool_normals_xyz: np.ndarray | None = None
+    auxiliary_deposition_paths_by_layer: tuple[tuple[AuxiliaryLayerPath, ...], ...] = ()
 
     def to_external_source_job(self, *, material: Literal["R", "F"] = "R") -> ExternalSourceJob:
         """Plan graph edges into non-repeating macro partitions for Core."""
@@ -141,6 +146,30 @@ class ConformalLatticePathGraph:
                 }
             else:
                 planning_report = {**planning_report, "outer_boundary_path_count": 0}
+            auxiliary = self._auxiliary_paths_for_layer(layer_index)
+            if auxiliary:
+                auxiliary_paths: list[np.ndarray] = []
+                auxiliary_profiles: list[np.ndarray] = []
+                auxiliary_roles: list[str] = []
+                for role, points_xyz, normals_xyz in auxiliary:
+                    auxiliary_paths.append(_with_kuka_surface_orientation(points_xyz, normals_xyz))
+                    auxiliary_profiles.append(
+                        _profile_for_deposition_segments(
+                            points_xyz,
+                            [True] * (len(points_xyz) - 1),
+                            bead_area_mm2=float(extrusion_config["bead_cross_section_area_mm2"]),
+                            e_volume_per_unit_mm3=float(extrusion_config["e_volume_per_unit_mm3"]),
+                        )
+                    )
+                    auxiliary_roles.append(role)
+                insertion = 1 if outer_boundary is not None else 0
+                paths[insertion:insertion] = auxiliary_paths
+                extrusion[insertion:insertion] = auxiliary_profiles
+                planning_report = {
+                    **planning_report,
+                    "auxiliary_deposition_path_count": len(auxiliary),
+                    "auxiliary_deposition_roles": auxiliary_roles,
+                }
             material_paths.append(MaterialPaths(layer_index, material, paths, extrusion))
             travel_paths.append(TravelPaths(layer_index, travels))
             edge_ids_by_layer[str(layer_index)] = [int(value) for value in self.edge_ids]
@@ -168,11 +197,7 @@ class ConformalLatticePathGraph:
             },
             "path_roles": {
                 material: {
-                    str(layer): (
-                        (["conformal_outer_boundary"] if self.outer_boundary_paths_xyz is not None else [])
-                        + ["conformal_honeycomb_macro_partition"]
-                        * (len(material_paths[layer].paths) - (1 if self.outer_boundary_paths_xyz is not None else 0))
-                    )
+                    str(layer): self._roles_for_layer(layer, len(material_paths[layer].paths))
                     for layer in range(len(self.layer_node_positions_xyz))
                 }
             },
@@ -193,6 +218,78 @@ class ConformalLatticePathGraph:
             meta=job_metadata,
         )
 
+    def to_external_base_source_job(self, *, material: Literal["R", "F"] = "R") -> ExternalSourceJob:
+        """Render only non-honeycomb material that survives course replacement.
+
+        The continuous-course workflow never consumes the structural macro
+        partitions or their zero-E connectors: it retains the perimeter,
+        separators and grip fills, then appends its own analytic courses.
+        Avoiding that throw-away graph planning is intentionally a preparation
+        optimisation only; the resulting retained paths use the exact same
+        orientation and cumulative-E renderer as ``to_external_source_job``.
+        """
+
+        if material not in ("R", "F"):
+            raise ValueError("material must be R or F")
+        extrusion_config = self.metadata["config"]["extrusion"]
+        bead_area = float(extrusion_config["bead_cross_section_area_mm2"])
+        e_volume = float(extrusion_config["e_volume_per_unit_mm3"])
+        material_paths: list[MaterialPaths] = []
+        roles_by_layer: dict[str, list[str]] = {}
+        for layer_index in range(len(self.layer_node_positions_xyz)):
+            paths: list[np.ndarray] = []
+            profiles: list[np.ndarray] = []
+            roles: list[str] = []
+            outer_boundary = None if self.outer_boundary_paths_xyz is None else self.outer_boundary_paths_xyz[layer_index]
+            if outer_boundary is not None:
+                paths.append(_with_kuka_surface_orientation(outer_boundary, self._outer_boundary_tool_normals_for_layer(layer_index)))
+                profiles.append(_profile_for_deposition_segments(
+                    outer_boundary,
+                    [True] * (len(outer_boundary) - 1),
+                    bead_area_mm2=bead_area,
+                    e_volume_per_unit_mm3=e_volume,
+                ))
+                roles.append("conformal_outer_boundary")
+            for role, points_xyz, normals_xyz in self._auxiliary_paths_for_layer(layer_index):
+                paths.append(_with_kuka_surface_orientation(points_xyz, normals_xyz))
+                profiles.append(_profile_for_deposition_segments(
+                    points_xyz,
+                    [True] * (len(points_xyz) - 1),
+                    bead_area_mm2=bead_area,
+                    e_volume_per_unit_mm3=e_volume,
+                ))
+                roles.append(role)
+            material_paths.append(MaterialPaths(layer_index, material, paths, profiles))
+            roles_by_layer[str(layer_index)] = roles
+        bridge_meta = {
+            **self.metadata,
+            "material": material,
+            "path_order": "perimeter and auxiliary deposition before continuous-course replacement",
+            "trail_partition_status": "skipped_for_continuous_course_network_v1",
+            "core_handoff": (
+                "external_layer_paths_v1 XYZABC; tool orientation follows the "
+                "interpolated surface normal using the calibrated legacy KUKA convention"
+            ),
+        }
+        job_metadata: dict[str, object] = {
+            "conformal_lattice_path_bridge": bridge_meta,
+            "core_processing": {
+                "source_e_profile_mode": "piecewise_preserve_v1",
+                "zero_e_connector_semantics": "print_context_constant_e",
+            },
+            "path_roles": {material: roles_by_layer},
+            "extrusion_compensation": {
+                "format": "conformal_edge_volume_e_v1",
+                "scope": "per-path cumulative E from actual 3-D arc length and explicit bead volume",
+                "requires_xy_preservation": False,
+                "replaces_legacy_arc_length_ratio": True,
+            },
+        }
+        preview_line_width = extrusion_config.get("preview_line_width_mm")
+        if isinstance(preview_line_width, (int, float)) and not isinstance(preview_line_width, bool):
+            job_metadata["slicing"] = {"resolved_config": {"line_width": float(preview_line_width)}}
+        return ExternalSourceJob(material_paths=material_paths, travel_paths=[], meta=job_metadata)
+
     def _tool_normals_for_layer(self, layer_index: int) -> np.ndarray:
         if self.layer_tool_normals_xyz is None:
             return self.node_normals_xyz
@@ -202,6 +299,19 @@ class ConformalLatticePathGraph:
         if self.outer_boundary_paths_xyz is None or self.outer_boundary_tool_normals_xyz is None:
             raise ValueError("outer boundary paths require matching per-layer tool normals")
         return self.outer_boundary_tool_normals_xyz[layer_index]
+
+    def _auxiliary_paths_for_layer(self, layer_index: int) -> tuple[AuxiliaryLayerPath, ...]:
+        if not self.auxiliary_deposition_paths_by_layer:
+            return ()
+        return self.auxiliary_deposition_paths_by_layer[layer_index]
+
+    def _roles_for_layer(self, layer_index: int, expected_count: int) -> list[str]:
+        roles = (["conformal_outer_boundary"] if self.outer_boundary_paths_xyz is not None else [])
+        roles.extend(role for role, _points, _normals in self._auxiliary_paths_for_layer(layer_index))
+        roles.extend(["conformal_honeycomb_macro_partition"] * (expected_count - len(roles)))
+        if len(roles) != expected_count:
+            raise ValueError("auxiliary deposition paths exceed the rendered layer path count")
+        return roles
 
 
 def build_conformal_lattice_path_graph(
@@ -216,6 +326,7 @@ def build_conformal_lattice_path_graph(
     outer_boundary_paths_xyz: np.ndarray | None = None,
     layer_tool_normals_xyz: np.ndarray | None = None,
     outer_boundary_tool_normals_xyz: np.ndarray | None = None,
+    auxiliary_deposition_paths_by_layer: tuple[tuple[AuxiliaryLayerPath, ...], ...] | None = None,
 ) -> ConformalLatticePathGraph:
     """Turn verified structural edges into a deterministic, un-routed graph.
 
@@ -233,6 +344,10 @@ def build_conformal_lattice_path_graph(
     outer_boundary_tool_normals = _outer_boundary_tool_normals(
         outer_boundary_tool_normals_xyz,
         outer_boundary,
+        layer_count=len(positions),
+    )
+    auxiliary_paths = _auxiliary_deposition_paths(
+        auxiliary_deposition_paths_by_layer,
         layer_count=len(positions),
     )
     if not isinstance(wall_bead_count, int) or isinstance(wall_bead_count, bool) or wall_bead_count < 1:
@@ -300,6 +415,7 @@ def build_conformal_lattice_path_graph(
         outer_boundary_paths_xyz=outer_boundary,
         layer_tool_normals_xyz=layer_tool_normals,
         outer_boundary_tool_normals_xyz=outer_boundary_tool_normals,
+        auxiliary_deposition_paths_by_layer=auxiliary_paths,
     )
 
 
@@ -400,6 +516,39 @@ def _outer_boundary_tool_normals(
     if np.any(lengths <= 1e-12):
         raise ValueError("outer_boundary_tool_normals_xyz contains a zero-length normal")
     return _readonly(normals / lengths[:, :, None])
+
+
+def _auxiliary_deposition_paths(
+    value: tuple[tuple[AuxiliaryLayerPath, ...], ...] | None,
+    *,
+    layer_count: int,
+) -> tuple[tuple[AuxiliaryLayerPath, ...], ...]:
+    """Validate path additions that use the same conformal XYZABC/E bridge."""
+
+    if value is None:
+        return ()
+    if len(value) != layer_count:
+        raise ValueError("auxiliary_deposition_paths_by_layer must contain one group per layer")
+    result: list[tuple[AuxiliaryLayerPath, ...]] = []
+    for paths in value:
+        validated: list[AuxiliaryLayerPath] = []
+        for role, points, normals in paths:
+            if not isinstance(role, str) or not role.startswith("conformal_"):
+                raise ValueError("auxiliary deposition path role must be a conformal_* string")
+            xyz = np.asarray(points, dtype=np.float64)
+            normal = np.asarray(normals, dtype=np.float64)
+            if xyz.ndim != 2 or xyz.shape[1] != 3 or len(xyz) < 2 or not np.all(np.isfinite(xyz)):
+                raise ValueError("auxiliary deposition path must be a finite Nx3 array with at least two points")
+            if normal.shape != xyz.shape or not np.all(np.isfinite(normal)):
+                raise ValueError("auxiliary deposition path normals must match the XYZ points")
+            normal_length = np.linalg.norm(normal, axis=1)
+            if np.any(normal_length <= 1e-12):
+                raise ValueError("auxiliary deposition path normals must be non-zero")
+            if np.any(np.linalg.norm(np.diff(xyz, axis=0), axis=1) <= 1e-12):
+                raise ValueError("auxiliary deposition path cannot contain zero-length segments")
+            validated.append((role, _readonly(np.array(xyz, copy=True)), _readonly(normal / normal_length[:, None])))
+        result.append(tuple(validated))
+    return tuple(result)
 
 
 def _node_normals_for_paths(

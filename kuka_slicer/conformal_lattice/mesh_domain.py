@@ -174,8 +174,17 @@ def cut_mesh_along_edges(
     )
 
 
-def build_double_sine_surface_domain(spec: ConformalLatticeSpec) -> SurfaceMeshDomain:
-    """Triangulate the spec's analytical height field with deterministic indexing."""
+def build_double_sine_surface_domain(
+    spec: ConformalLatticeSpec,
+    *,
+    xy_bounds_mm: Sequence[float] | None = None,
+) -> SurfaceMeshDomain:
+    """Triangulate the analytical height field, optionally over an inner rectangle.
+
+    The optional bounds do not alter the source surface definition or its
+    provenance.  They only select the central honeycomb working region while
+    auxiliary paths can still be mapped against the same global surface.
+    """
 
     if spec.source_provider != "double_sine":
         raise ValueError("double-sine domain construction requires a double_sine source")
@@ -194,8 +203,21 @@ def build_double_sine_surface_domain(spec: ConformalLatticeSpec) -> SurfaceMeshD
         phase_y_rad=float(values["phase_y_rad"]),
         z_reference_mm=float(values["z_reference_mm"]),
     )
-    x_min, y_min, x_max, y_max = (float(value) for value in values["xy_bounds_mm"])
+    global_bounds = tuple(float(value) for value in values["xy_bounds_mm"])
+    x_min, y_min, x_max, y_max = global_bounds
     samples_x, samples_y = (int(value) for value in values["samples"])
+    if xy_bounds_mm is not None:
+        requested = tuple(float(value) for value in xy_bounds_mm)
+        if len(requested) != 4 or not all(np.isfinite(requested)):
+            raise ValueError("xy_bounds_mm override must contain four finite values")
+        x_min, y_min, x_max, y_max = requested
+        gx_min, gy_min, gx_max, gy_max = global_bounds
+        if not (gx_min <= x_min < x_max <= gx_max and gy_min <= y_min < y_max <= gy_max):
+            raise ValueError("xy_bounds_mm override must be a positive rectangle inside the global source surface")
+        # Preserve approximately the same analytical mesh spacing as the
+        # global preview instead of degrading the central lattice solve.
+        samples_x = max(2, round((samples_x - 1) * (x_max - x_min) / (gx_max - gx_min)) + 1)
+        samples_y = max(2, round((samples_y - 1) * (y_max - y_min) / (gy_max - gy_min)) + 1)
     x = np.linspace(x_min, x_max, samples_x)
     y = np.linspace(y_min, y_max, samples_y)
     xx, yy = np.meshgrid(x, y, indexing="xy")
@@ -219,7 +241,16 @@ def build_double_sine_surface_domain(spec: ConformalLatticeSpec) -> SurfaceMeshD
         input_sha256=spec.source_sha256,
         validate_self_intersections=False,
     )
-    return _with_report(domain, {"provider": "double_sine", "source_file": spec.source_file, "generated": True})
+    return _with_report(
+        domain,
+        {
+            "provider": "double_sine",
+            "source_file": spec.source_file,
+            "generated": True,
+            "global_xy_bounds_mm": list(global_bounds),
+            "generated_xy_bounds_mm": [x_min, y_min, x_max, y_max],
+        },
+    )
 
 
 def load_triangle_mesh_domain(spec: ConformalLatticeSpec, source_bytes: bytes) -> SurfaceMeshDomain:

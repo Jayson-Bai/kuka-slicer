@@ -141,6 +141,7 @@ def load_conformal_lattice_spec(data: bytes | str | Mapping[str, object]) -> Con
             "auto_avoid_outer_boundary_coincidence"
         )
     _validate_load_line_alignment(lattice.get("load_line_alignment"), part)
+    _validate_honeycomb_feature_alignment(lattice.get("honeycomb_feature_alignment"), part)
     if part:
         bead_count = lattice.get("wall_bead_count")
         if not isinstance(bead_count, int) or isinstance(bead_count, bool) or bead_count < 1:
@@ -153,6 +154,7 @@ def load_conformal_lattice_spec(data: bytes | str | Mapping[str, object]) -> Con
     orientation_field = _object(raw, "orientation_field")
     layer_embedding = _object(raw, "layer_embedding")
     quality_limits = _object(raw, "quality_limits")
+    _validate_fiber_reinforcement(raw.get("fiber_reinforcement"))
     fill_mode = fill_field.get("mode")
     if fill_mode not in ("fixed_cell_size", "weighted_composite", "direct_target_fill_ratio"):
         raise ValueError("fill_field.mode is unsupported")
@@ -190,6 +192,35 @@ def load_conformal_lattice_spec(data: bytes | str | Mapping[str, object]) -> Con
     )
 
 
+def _validate_fiber_reinforcement(
+    value: object,
+) -> None:
+    """Validate the reserved layer interfaces for a future fiber planner."""
+
+    if value is None:
+        return
+    if not isinstance(value, Mapping):
+        raise ValueError("fiber_reinforcement must be an object")
+    enabled = value.get("enabled")
+    if not isinstance(enabled, bool):
+        raise ValueError("fiber_reinforcement.enabled must be a boolean")
+    if enabled:
+        raise ValueError(
+            "fiber_reinforcement.enabled=true belongs to the retired fiber-path planner; "
+            "re-export the design JSON before using the new fiber strategy"
+        )
+    if value.get("mode") != "reserved_future_path_v1":
+        raise ValueError("fiber_reinforcement.mode must be reserved_future_path_v1 while path generation is disabled")
+    if value.get("path_generation") != "disabled_pending_replacement":
+        raise ValueError("fiber_reinforcement.path_generation must be disabled_pending_replacement")
+    for name in ("first_after_resin_layer_physical", "last_after_resin_layer_physical"):
+        item = value.get(name)
+        if not isinstance(item, int) or isinstance(item, bool) or item < 1:
+            raise ValueError(f"fiber_reinforcement.{name} must be an integer >= 1")
+    if value["last_after_resin_layer_physical"] < value["first_after_resin_layer_physical"]:
+        raise ValueError("fiber_reinforcement last layer must not precede its first layer")
+
+
 def _validate_load_line_alignment(value: object, part: Mapping[str, object]) -> None:
     """Validate the optional, semantic loading-plane phase-alignment request."""
 
@@ -210,6 +241,34 @@ def _validate_load_line_alignment(value: object, part: Mapping[str, object]) -> 
         raise ValueError("enabled lattice.load_line_alignment.position must be part_length_midplane")
     if value.get("feature") != "wall":
         raise ValueError("enabled lattice.load_line_alignment.feature must be wall")
+
+
+def _validate_honeycomb_feature_alignment(value: object, part: Mapping[str, object]) -> None:
+    """Validate optional independent X/Y centre-feature phase controls."""
+
+    if value is None:
+        return
+    if not isinstance(value, Mapping):
+        raise ValueError("lattice.honeycomb_feature_alignment must be an object")
+    align_x = value.get("align_x")
+    align_y = value.get("align_y")
+    if not isinstance(align_x, bool) or not isinstance(align_y, bool):
+        raise ValueError("lattice.honeycomb_feature_alignment.align_x and align_y must be booleans")
+    if value.get("x_feature") != "y_directed_wall":
+        raise ValueError("lattice.honeycomb_feature_alignment.x_feature is unsupported")
+    if value.get("y_feature") != "inclined_edge_zigzag_centerline":
+        raise ValueError("lattice.honeycomb_feature_alignment.y_feature is unsupported")
+    if value.get("scope") != "center_features_only":
+        raise ValueError("lattice.honeycomb_feature_alignment.scope is unsupported")
+    target_x = _finite(value.get("target_x_mm"), "lattice.honeycomb_feature_alignment.target_x_mm")
+    target_y = _finite(value.get("target_y_mm"), "lattice.honeycomb_feature_alignment.target_y_mm")
+    if (align_x or align_y) and not part:
+        raise ValueError("enabled lattice.honeycomb_feature_alignment requires a rectangular part")
+    if part:
+        if not 0.0 <= target_x <= float(part["length_mm"]):
+            raise ValueError("lattice.honeycomb_feature_alignment.target_x_mm must lie within the part X range")
+        if not 0.0 <= target_y <= float(part["width_mm"]):
+            raise ValueError("lattice.honeycomb_feature_alignment.target_y_mm must lie within the part Y range")
 
 
 def _decode(data: bytes | str | Mapping[str, object]) -> dict[str, object]:
@@ -286,3 +345,12 @@ def _validate_rectangular_part(part: Mapping[str, object], manufacturing: Mappin
     bead_width = _positive(manufacturing.get("nominal_bead_width_mm"), "manufacturing.nominal_bead_width_mm")
     if not math.isclose(bead_width, 2.0, rel_tol=0.0, abs_tol=1e-9):
         raise ValueError("manufacturing.nominal_bead_width_mm must be exactly 2.0 for the configured resin nozzle")
+    # This is deliberately a geometric partition only.  Process choices such
+    # as hatch pitch and E calibration stay in the slicer/Core process preset,
+    # not in the portable conformal design JSON.
+    grip = part.get("symmetric_grip_end_length_mm", 0.0)
+    grip_value = _finite(grip, "part.symmetric_grip_end_length_mm")
+    if grip_value < 0.0:
+        raise ValueError("part.symmetric_grip_end_length_mm must be non-negative")
+    if grip_value and 2.0 * grip_value >= float(part["length_mm"]):
+        raise ValueError("part.symmetric_grip_end_length_mm must leave a positive honeycomb working length")

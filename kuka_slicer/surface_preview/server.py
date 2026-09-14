@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import secrets
 import subprocess
 from http import HTTPStatus
@@ -27,8 +28,55 @@ DEFAULT_PREVIEW_SAMPLES = 49
 MAX_PREVIEW_SAMPLES = 120
 MAX_CONFORMAL_SAMPLES = 512
 MAX_STL_BYTES = 64 * 1024 * 1024
+MAX_DESIGNER_STATE_BYTES = 32 * 1024
 CONFORMAL_MAPPING_REFERENCE_LAYER_HEIGHT_MM = 0.5
 SURFACE_PREVIEW_API_VERSION = "surface_preview_v2"
+
+
+def _designer_state_path() -> Path:
+    """Return the per-user, persistent design-state location."""
+
+    root = Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
+    return root / "KukaSlicer" / "conformal_designer_state_v1.json"
+
+
+def _load_designer_state(state_path: Path) -> dict[str, str | bool]:
+    """Load one small, user-editable designer state without trusting its shape."""
+
+    try:
+        if not state_path.is_file() or state_path.stat().st_size > MAX_DESIGNER_STATE_BYTES:
+            return {}
+        raw = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, dict) or len(raw) > 64:
+        return {}
+    state: dict[str, str | bool] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str) or not key.replace("_", "").isalnum() or len(key) > 80:
+            return {}
+        if isinstance(value, (str, bool)):
+            state[key] = value
+        else:
+            return {}
+    return state
+
+
+def _save_designer_state(state_path: Path, state: dict[str, str | bool]) -> None:
+    """Persist a validated small state atomically for the next server launch."""
+
+    if len(state) > 64:
+        raise ValueError("designer state has too many fields")
+    for key, value in state.items():
+        if not key.replace("_", "").isalnum() or len(key) > 80 or not isinstance(value, (str, bool)):
+            raise ValueError("designer state contains an invalid field")
+    encoded = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) > MAX_DESIGNER_STATE_BYTES:
+        raise ValueError("designer state is too large")
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = state_path.with_suffix(".tmp")
+    temporary_path.write_text(encoded, encoding="utf-8")
+    temporary_path.replace(state_path)
 
 
 def _git_revision() -> str:
@@ -109,6 +157,82 @@ def _query_samples(params: dict[str, list[str]]) -> int:
     return samples
 
 
+def _normalized_positive_phase(phase_rad: float) -> float:
+    """Express an analytically equivalent phase in [0, 2π)."""
+
+    return phase_rad % (2.0 * math.pi)
+
+
+def _query_positive_half_integer(params: dict[str, list[str]], name: str, default: float) -> float:
+    """Read a positive half-integer wave count for the tensile phase rule."""
+
+    value = _query_float(params, name, default, positive=True)
+    if not math.isclose(value - 0.5, round(value - 0.5), rel_tol=0.0, abs_tol=1e-9):
+        raise ValueError(f"{name} must be a positive half-integer (0.5, 1.5, 2.5, ...)")
+    return value
+
+
+def _surface_from_query(
+    params: dict[str, list[str]], *, x_extent_mm: float, y_extent_mm: float
+) -> tuple[DoubleSineSurface, dict[str, object]]:
+    """Resolve either manual parameters or the tensile, size-normalised rule.
+
+    The tensile rule uses wave counts rather than fixed wavelengths.  It keeps
+    the double-sine geometry comparable when a specimen's gauge dimensions
+    change, while placing a positive stationary peak at the gauge centre and
+    a zero-height contour at each gauge boundary.  It is a geometry rule, not
+    an inspection-point or bending-load alignment rule.
+    """
+
+    mode = params.get("surface_parameter_mode", ["manual_wavelength_phase"])[0]
+    amplitude_mm = _query_float(params, "amplitude_mm", 0.8)
+    z_reference_mm = _query_float(params, "z_reference_mm", 0.0)
+    if mode == "tensile_centered_wave_count":
+        wave_count_x = _query_positive_half_integer(params, "wave_count_x", 1.5)
+        wave_count_y = _query_positive_half_integer(params, "wave_count_y", 1.5)
+        wavelength_x_mm = x_extent_mm / wave_count_x
+        wavelength_y_mm = y_extent_mm / wave_count_y
+        phase_x_rad = _normalized_positive_phase(math.pi / 2.0 - math.pi * wave_count_x)
+        phase_y_rad = _normalized_positive_phase(math.pi / 2.0 - math.pi * wave_count_y)
+        return (
+            DoubleSineSurface(
+                amplitude_mm=amplitude_mm,
+                wavelength_x_mm=wavelength_x_mm,
+                wavelength_y_mm=wavelength_y_mm,
+                phase_x_rad=phase_x_rad,
+                phase_y_rad=phase_y_rad,
+                z_reference_mm=z_reference_mm,
+            ),
+            {
+                "mode": mode,
+                "wave_count_x": wave_count_x,
+                "wave_count_y": wave_count_y,
+                "phase_policy": "gauge_center_positive_peak_and_boundary_zero",
+            },
+        )
+    if mode != "manual_wavelength_phase":
+        raise ValueError("surface_parameter_mode must be tensile_centered_wave_count or manual_wavelength_phase")
+    return (
+        DoubleSineSurface(
+            amplitude_mm=amplitude_mm,
+            wavelength_x_mm=_query_float(params, "wavelength_x_mm", 40.0, positive=True),
+            wavelength_y_mm=_query_float(params, "wavelength_y_mm", 50.0, positive=True),
+            phase_x_rad=_query_phase_radians(
+                params,
+                pi_multiple_name="phase_x_pi",
+                legacy_radians_name="phase_x_rad",
+            ),
+            phase_y_rad=_query_phase_radians(
+                params,
+                pi_multiple_name="phase_y_pi",
+                legacy_radians_name="phase_y_rad",
+            ),
+            z_reference_mm=z_reference_mm,
+        ),
+        {"mode": mode, "phase_policy": "manual"},
+    )
+
+
 def _query_nonnegative_int(
     params: dict[str, list[str]], name: str, default: int, *, minimum: int = 0, maximum: int | None = None
 ) -> int:
@@ -121,6 +245,37 @@ def _query_nonnegative_int(
         upper = f", {maximum}" if maximum is not None else ""
         raise ValueError(f"{name} must be in the range [{minimum}{upper}]")
     return value
+
+
+def _resolve_surface_progression_start(
+    params: dict[str, list[str]], *, logical_layer_count: int
+) -> tuple[int, int]:
+    """Resolve the UI's physical first-curved-layer wording to legacy indices.
+
+    The shared mapper contract continues to use ``surface_start_layer`` as a
+    zero-based, zero-alpha boundary layer.  The design UI submits an explicit
+    semantic marker, under which the same numeric input means the one-based
+    physical layer that first has ``alpha > 0``.  Keeping the conversion here
+    prevents the user-facing wording from leaking into mapper/Core contracts.
+    """
+
+    if logical_layer_count < 1:
+        raise ValueError("logical_layer_count must be positive")
+    semantics = params.get("surface_start_layer_semantics", ["legacy_zero_alpha_zero_based"])[0]
+    if semantics == "first_nonzero_curvature_physical":
+        first_curved_layer = _query_nonnegative_int(
+            params, "surface_start_layer", 3, minimum=2
+        )
+        legacy_start_layer = first_curved_layer - 2
+    elif semantics == "legacy_zero_alpha_zero_based":
+        legacy_start_layer = _query_nonnegative_int(params, "surface_start_layer", 3)
+        first_curved_layer = legacy_start_layer + 2
+    else:
+        raise ValueError("surface_start_layer_semantics is unsupported")
+
+    if legacy_start_layer > (logical_layer_count - 1) // 2:
+        raise ValueError("surface_start_layer must leave a symmetric curved region inside the final physical height")
+    return legacy_start_layer, first_curved_layer
 
 
 def _inspection_point(
@@ -167,15 +322,17 @@ def _conformal_solid_stack_payload(
     surface: DoubleSineSurface,
     *,
     x_samples_mm: list[float],
-    inspection: dict[str, float],
+    section_y_mm: float,
 ) -> dict[str, object] | None:
-    """Sample the existing smoothstep stack on the inspection-point XZ cut."""
+    """Sample the existing smoothstep stack on a selected XZ cut."""
 
     if "part_height_mm" not in params and "surface_start_layer" not in params:
         return None
     final_height_mm = _query_float(params, "part_height_mm", 10.0, positive=True)
-    start_layer = _query_nonnegative_int(params, "surface_start_layer", 3)
     layer_count = int(math.ceil(final_height_mm / CONFORMAL_MAPPING_REFERENCE_LAYER_HEIGHT_MM))
+    start_layer, first_curved_layer = _resolve_surface_progression_start(
+        params, logical_layer_count=layer_count
+    )
     progression = LayerProgression(start_layer, layer_count - 1)
     layer_thicknesses = [CONFORMAL_MAPPING_REFERENCE_LAYER_HEIGHT_MM] * layer_count
     layer_thicknesses[-1] = final_height_mm - CONFORMAL_MAPPING_REFERENCE_LAYER_HEIGHT_MM * (layer_count - 1)
@@ -184,7 +341,7 @@ def _conformal_solid_stack_payload(
     for thickness in layer_thicknesses:
         base_z_by_layer.append(accumulated + thickness * 0.5)
         accumulated += thickness
-    y_mm = inspection["y_mm"]
+    y_mm = section_y_mm
     target_displacements = [
         float(surface.height(x_mm, y_mm)) - surface.z_reference_mm
         for x_mm in x_samples_mm
@@ -209,6 +366,8 @@ def _conformal_solid_stack_payload(
         "final_height_mm": final_height_mm,
         "section_y_mm": y_mm,
         "surface_start_layer": start_layer,
+        "first_nonzero_curvature_layer_physical": first_curved_layer,
+        "surface_start_layer_semantics": "first_nonzero_curvature_physical",
         "surface_return_layer": progression.surface_return_layer,
         "peak_layer_indices": list(progression.peak_layers),
         # The lower of the one/two complete-curvature layers is the stable
@@ -234,27 +393,16 @@ def surface_payload(
     rather than the legacy centered demonstration grid.
     """
 
-    surface = DoubleSineSurface(
-        amplitude_mm=_query_float(params, "amplitude_mm", 0.8),
-        wavelength_x_mm=_query_float(params, "wavelength_x_mm", 40.0, positive=True),
-        wavelength_y_mm=_query_float(params, "wavelength_y_mm", 50.0, positive=True),
-        phase_x_rad=_query_phase_radians(
-            params,
-            pi_multiple_name="phase_x_pi",
-            legacy_radians_name="phase_x_rad",
-        ),
-        phase_y_rad=_query_phase_radians(
-            params,
-            pi_multiple_name="phase_y_pi",
-            legacy_radians_name="phase_y_rad",
-        ),
-        z_reference_mm=_query_float(params, "z_reference_mm", 0.0),
-    )
     width_mm = domain.width_mm if domain else _query_float(
         params, "width_mm", DEFAULT_PREVIEW_WIDTH_MM, positive=True
     )
     height_mm = domain.height_mm if domain else _query_float(
         params, "height_mm", DEFAULT_PREVIEW_HEIGHT_MM, positive=True
+    )
+    surface, surface_parameterization = _surface_from_query(
+        params,
+        x_extent_mm=width_mm,
+        y_extent_mm=height_mm,
     )
     samples = _query_samples(params)
     grid = surface.sample_grid(
@@ -284,12 +432,18 @@ def surface_payload(
     )
     x_bounds = (0.0, width_mm) if lower_left_origin else (-width_mm / 2.0, width_mm / 2.0)
     y_bounds = (0.0, height_mm) if lower_left_origin else (-height_mm / 2.0, height_mm / 2.0)
-    inspection = _inspection_point(
-        params,
-        surface,
-        x_bounds_mm=x_bounds,
-        y_bounds_mm=y_bounds,
+    inspection_enabled = _query_bool(params, "inspection_enabled", True)
+    inspection = (
+        _inspection_point(
+            params,
+            surface,
+            x_bounds_mm=x_bounds,
+            y_bounds_mm=y_bounds,
+        )
+        if inspection_enabled
+        else None
     )
+    section_y_mm = inspection["y_mm"] if inspection is not None else (y_bounds[0] + y_bounds[1]) / 2.0
     return {
         "preview_version": SURFACE_PREVIEW_API_VERSION,
         "export_version": CONFORMAL_LATTICE_SPEC_V1,
@@ -307,6 +461,7 @@ def surface_payload(
             "phase_y_rad": surface.phase_y_rad,
             "z_reference_mm": surface.z_reference_mm,
         },
+        "surface_parameterization": surface_parameterization,
         "domain": {
             "width_mm": width_mm,
             "height_mm": height_mm,
@@ -321,7 +476,7 @@ def surface_payload(
             params,
             surface,
             x_samples_mm=[float(value) for value in grid.x[0]],
-            inspection=inspection,
+            section_y_mm=section_y_mm,
         ),
     }
 
@@ -362,8 +517,13 @@ def conformal_lattice_config_payload(params: dict[str, list[str]]) -> dict[str, 
     """Build the STL-free rectangular conformal-design contract."""
 
     length_mm = _query_float(params, "part_length_mm", 150.0, positive=True)
-    width_mm = _query_float(params, "part_width_mm", 100.0, positive=True)
+    width_mm = _query_float(params, "part_width_mm", 50.0, positive=True)
     final_height_mm = _query_float(params, "part_height_mm", 10.0, positive=True)
+    grip_end_length_mm = _query_float(params, "grip_end_length_mm", 0.0)
+    if grip_end_length_mm < 0.0:
+        raise ValueError("grip_end_length_mm must be non-negative")
+    if 2.0 * grip_end_length_mm >= length_mm:
+        raise ValueError("two grip_end_length_mm regions must leave a positive honeycomb working length")
     # The design page describes surface morphology, not process settings.
     # Keep one stable reference for validating a layer-index start value; the
     # actual physical layer height is supplied later by the slicer/Core UI.
@@ -385,10 +545,10 @@ def conformal_lattice_config_payload(params: dict[str, list[str]]) -> dict[str, 
             "wall_width_mm and base_cell_size_mm produce a nominal fill ratio of at least 1; "
             "reduce wall_width_mm or increase base_cell_size_mm"
         )
-    surface_start_layer = _query_nonnegative_int(params, "surface_start_layer", 3)
     logical_layer_count = math.ceil(final_height_mm / layer_height_mm)
-    if surface_start_layer > (logical_layer_count - 1) // 2:
-        raise ValueError("surface_start_layer must leave a symmetric curved region inside the final physical height")
+    surface_start_layer, first_curved_layer = _resolve_surface_progression_start(
+        params, logical_layer_count=logical_layer_count
+    )
     samples_x = _query_nonnegative_int(
         params, "samples_x", DEFAULT_PREVIEW_SAMPLES, minimum=2, maximum=MAX_CONFORMAL_SAMPLES
     )
@@ -402,8 +562,22 @@ def conformal_lattice_config_payload(params: dict[str, list[str]]) -> dict[str, 
         _query_float(params, "phase_origin_x_mm", 0.0),
         _query_float(params, "phase_origin_y_mm", 0.0),
     ]
-    load_line_alignment_enabled = _query_bool(params, "align_load_line", True)
-    orientation_angle_deg = 0.0 if load_line_alignment_enabled else _query_float(
+    load_line_alignment_enabled = _query_bool(params, "align_load_line", False)
+    honeycomb_align_x = _query_bool(params, "honeycomb_align_x", False)
+    honeycomb_align_y = _query_bool(params, "honeycomb_align_y", False)
+    honeycomb_align_x_mm = _query_float(
+        params, "honeycomb_align_x_mm", length_mm / 2.0
+    )
+    honeycomb_align_y_mm = _query_float(
+        params, "honeycomb_align_y_mm", width_mm / 2.0
+    )
+    if not 0.0 <= honeycomb_align_x_mm <= length_mm:
+        raise ValueError("honeycomb_align_x_mm must lie within the part X range")
+    if not 0.0 <= honeycomb_align_y_mm <= width_mm:
+        raise ValueError("honeycomb_align_y_mm must lie within the part Y range")
+    if load_line_alignment_enabled and (honeycomb_align_x or honeycomb_align_y):
+        raise ValueError("three-point-bending load-line alignment and honeycomb X/Y alignment cannot be enabled together")
+    orientation_angle_deg = 0.0 if (load_line_alignment_enabled or honeycomb_align_x or honeycomb_align_y) else _query_float(
         params, "orientation_angle_deg", 0.0
     )
     random_seed = _query_nonnegative_int(params, "random_seed", 0)
@@ -451,6 +625,15 @@ def conformal_lattice_config_payload(params: dict[str, list[str]]) -> dict[str, 
                 "position": "part_length_midplane",
                 "feature": "wall",
             },
+            "honeycomb_feature_alignment": {
+                "align_x": honeycomb_align_x,
+                "align_y": honeycomb_align_y,
+                "target_x_mm": honeycomb_align_x_mm,
+                "target_y_mm": honeycomb_align_y_mm,
+                "x_feature": "y_directed_wall",
+                "y_feature": "inclined_edge_zigzag_centerline",
+                "scope": "center_features_only",
+            },
         },
         "fill_field": {"mode": "fixed_cell_size", "drivers": []},
         "orientation_field": {"mode": "global_axis", "angle_deg": orientation_angle_deg, "constraints": []},
@@ -458,10 +641,16 @@ def conformal_lattice_config_payload(params: dict[str, list[str]]) -> dict[str, 
             "mode": "symmetric_shape_morphing",
             "transition": "smoothstep",
             "surface_start_layer": surface_start_layer,
+            "surface_start_layer_semantics": "legacy_zero_alpha_zero_based",
+            "first_nonzero_curvature_layer_physical": first_curved_layer,
         },
         "quality_limits": {},
         "random_seed": random_seed,
     }
+    if grip_end_length_mm > 0.0:
+        # A pure geometry range: the executable zigzag process settings are
+        # intentionally supplied later by the resin path planner/Core preset.
+        config["part"]["symmetric_grip_end_length_mm"] = grip_end_length_mm  # type: ignore[index]
     load_conformal_lattice_spec(config)
     return config
 
@@ -471,6 +660,7 @@ def run_surface_preview_server(host: str, port: int) -> None:
 
     server = ThreadingHTTPServer((host, port), SurfacePreviewHandler)
     server.preview_domains = {}
+    server.designer_state_path = _designer_state_path()
     print(f"KUKA surface preview running at http://{host}:{port}")
     try:
         server.serve_forever()
@@ -503,6 +693,9 @@ class SurfacePreviewHandler(BaseHTTPRequestHandler):
                 return
             self._send_json({"ok": True, **payload})
             return
+        if parsed.path == "/api/designer-state":
+            self._send_json({"ok": True, "state": _load_designer_state(self.server.designer_state_path)})
+            return
         if parsed.path == "/api/export-surface-config":
             try:
                 params = parse_qs(parsed.query)
@@ -533,6 +726,24 @@ class SurfacePreviewHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        if parsed.path == "/api/designer-state":
+            try:
+                raw_length = self.headers.get("Content-Length")
+                if raw_length is None:
+                    raise ValueError("designer state requires Content-Length")
+                content_length = int(raw_length)
+                if not 0 < content_length <= MAX_DESIGNER_STATE_BYTES:
+                    raise ValueError("designer state must be between 1 byte and 32 KB")
+                raw_state = json.loads(self.rfile.read(content_length).decode("utf-8"))
+                if not isinstance(raw_state, dict):
+                    raise ValueError("designer state must be an object")
+                state = dict(raw_state)
+                _save_designer_state(self.server.designer_state_path, state)
+            except (UnicodeDecodeError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json({"ok": True})
+            return
         if parsed.path != "/api/stl-domain":
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
             return
@@ -660,42 +871,68 @@ def surface_preview_html() -> str:
   <main>
     <header>
       <h1>蜂窝网格共形设计器</h1>
-      <p>在固定矩形实体上定义双正弦承载曲面和六边形格栅；导出 JSON 后回到主切片器生成路径与送入 Core。</p>
+      <p>在矩形实体上定义双正弦共形曲面与六边形格栅；默认采用拉伸标距段策略，导出 JSON 后回到主切片器生成路径与送入 Core。</p>
     </header>
     <section class="workspace">
       <form class="panel controls" id="surfaceForm">
         <h2>矩形实体</h2>
         <div class="field"><label for="part_length_mm">零件长度 X（mm）</label><input id="part_length_mm" type="number" min="0.001" step="1" value="150"></div>
-        <div class="field"><label for="part_width_mm">零件宽度 Y（mm）</label><input id="part_width_mm" type="number" min="0.001" step="1" value="100"></div>
+        <div class="field"><label for="part_width_mm">零件宽度 Y（mm）</label><input id="part_width_mm" type="number" min="0.001" step="1" value="50"></div>
         <div class="field"><label for="part_height_mm">最终物理高度 Z（mm）</label><input id="part_height_mm" type="number" min="0.001" step="0.1" value="10"></div>
+        <div class="field"><label for="grip_end_length_mm">每端夹持区 X（mm）</label><input id="grip_end_length_mm" type="number" min="0" step="0.5" value="25" aria-describedby="gripLengthHint"></div>
+        <p class="hint" id="gripLengthHint">两端采用相同长度；蜂窝工作段为 X 总长 − 2 × 每端夹持区。曲面仍按完整零件 X/Y 范围计算，不会因夹持区而改变波长、相位或曲率。</p>
         <p class="modelMeta" id="modelMeta">外边界固定为矩形；新共形流程不读取 STL，也不继承 STL 中的蜂窝孔壁。</p>
         <div class="divider"></div>
         <h2>曲面参数</h2>
+        <div class="field"><label for="surface_parameter_mode">曲面参数策略</label><select id="surface_parameter_mode"><option value="tensile_centered_wave_count" selected>拉伸：试样中心对称波数</option><option value="manual_wavelength_phase">手动：波长与相位</option></select></div>
         <div class="field"><label for="amplitude_mm">幅值 A（mm）</label><input id="amplitude_mm" type="number" step="0.01" value="1.5"></div>
-        <div class="field"><label for="wavelength_x_mm">X 波长 λx（mm）</label><input id="wavelength_x_mm" type="number" min="0.001" step="0.1" value="100"></div>
-        <div class="field"><label for="wavelength_y_mm">Y 波长 λy（mm）</label><input id="wavelength_y_mm" type="number" min="0.001" step="0.1" value="200"></div>
-        <div class="field"><label for="phase_x_pi">X 相位 φx（π）</label><input id="phase_x_pi" type="number" step="0.25" value="1" aria-describedby="phasePiHint"></div>
-        <div class="field"><label for="phase_y_pi">Y 相位 φy（π）</label><input id="phase_y_pi" type="number" step="0.25" value="0" aria-describedby="phasePiHint"></div>
-        <p class="hint" id="phasePiHint">输入 π 的倍数：1 表示 π，0.5 表示 π/2，1.5 表示 3π/2；导出的设计 JSON 仍以 rad 保存。</p>
+        <div id="tensileWaveFields">
+          <div class="field"><label for="wave_count_x">X 向波数 nx</label><input id="wave_count_x" type="number" min="0.5" step="1" value="1.5"></div>
+          <div class="field"><label for="wave_count_y">Y 向波数 ny</label><input id="wave_count_y" type="number" min="0.5" step="1" value="1.5"></div>
+          <button type="button" class="secondary" id="applyTensilePreset">应用拉伸中间参数组</button>
+          <p class="hint" id="tensileWaveHint">仅允许 0.5、1.5、2.5… 等半整数波数。波数按完整试样 X/Y 尺寸归一化：自动计算 λx、λy 与相位，使试样中心为正峰，四周边界回到 H=0；改变矩形尺寸不会改变无量纲曲面构型。</p>
+        </div>
+        <div id="manualSurfaceFields" hidden>
+          <div class="field"><label for="wavelength_x_mm">X 波长 λx（mm）</label><input id="wavelength_x_mm" type="number" min="0.001" step="0.1" value="100"></div>
+          <div class="field"><label for="wavelength_y_mm">Y 波长 λy（mm）</label><input id="wavelength_y_mm" type="number" min="0.001" step="0.1" value="66.667"></div>
+          <div class="field"><label for="phase_x_pi">X 相位 φx（π）</label><input id="phase_x_pi" type="number" step="0.25" value="1" aria-describedby="phasePiHint"></div>
+          <div class="field"><label for="phase_y_pi">Y 相位 φy（π）</label><input id="phase_y_pi" type="number" step="0.25" value="1" aria-describedby="phasePiHint"></div>
+          <p class="hint" id="phasePiHint">输入 π 的倍数：1 表示 π，0.5 表示 π/2，1.5 表示 3π/2；导出的设计 JSON 仍以 rad 保存。</p>
+        </div>
         <div class="field"><label for="z_reference_mm">Z 基准（mm）</label><input id="z_reference_mm" type="number" step="0.01" value="0"></div>
-        <div class="field"><label for="check_x_mm">检验点 X（mm）</label><input id="check_x_mm" type="number" min="0" step="0.1" value="75" aria-describedby="checkPointHint"></div>
-        <div class="field"><label for="check_y_mm">检验点 Y（mm）</label><input id="check_y_mm" type="number" min="0" step="0.1" value="50" aria-describedby="checkPointHint"></div>
-        <p class="hint" id="checkPointHint">默认检验零件中心 (75, 50)。预览会标出该点，并显示目标曲面的 H、坡度和平均曲率。</p>
         <div class="divider"></div>
-        <h2>固定六边形格栅</h2>
-        <div class="field"><label for="wall_width_mm">设计墙宽（mm）</label><input id="wall_width_mm" type="number" min="2" step="2" value="2"></div>
-        <div class="field"><label for="base_cell_size_mm">目标六边形边长（mm）</label><input id="base_cell_size_mm" type="number" min="0.001" step="0.01" value="5"></div>
-        <div class="field"><label for="orientation_angle_deg">全局格栅方向角（°）</label><input id="orientation_angle_deg" type="number" step="1" value="0"></div>
-        <div class="field"><label for="align_load_line">跨中加载面对齐</label><input id="align_load_line" type="checkbox" checked></div>
-        <p class="hint" id="loadLineAlignmentHint">已开启：自动用零件长度中面上的中心加载点定位一条沿 Y 的蜂窝壁；边长或零件尺寸改变后会重新求解相位。</p>
-        <p class="hint">喷嘴基准线宽固定为 2 mm。墙宽只能填 2、4、6… mm；4 mm 代表后续由两条 2 mm 沉积道组成。目标边长沿承载曲面测量。</p>
+        <h2>弯曲专用检验（可选）</h2>
+        <div class="field"><label for="inspection_enabled">显示弯曲检验点</label><input id="inspection_enabled" type="checkbox"></div>
+        <div id="inspectionPointFields" hidden>
+          <div class="field"><label for="check_x_mm">检验点 X（mm）</label><input id="check_x_mm" type="number" min="0" step="0.1" value="75" aria-describedby="checkPointHint"></div>
+          <div class="field"><label for="check_y_mm">检验点 Y（mm）</label><input id="check_y_mm" type="number" min="0" step="0.1" value="50" aria-describedby="checkPointHint"></div>
+          <p class="hint" id="checkPointHint">仅在第三章三点弯曲时启用。启用后可查看任意点的 H、坡度和平均曲率；尺寸变化时，超出矩形范围的坐标会自动收回到范围内。</p>
+        </div>
+        <div class="divider"></div>
+        <h2>连续课程蜂窝（预览）</h2>
+        <div class="field"><label for="base_cell_size_mm">目标六边形边长（mm）</label><input id="base_cell_size_mm" type="number" min="0.001" step="0.01" value="10"></div>
+        <p class="hint">以目标边长为唯一蜂窝几何参数。一个完整黄色孔洞中心固定在蜂窝工作区中心；300 × 300 mm 母板只用于向外铺展，再按当前工作区逐边裁剪。裁剪窗已扣除外矩形轮廓和夹持分界树脂带的半宽，因此边界允许出现截断六边形，但不会穿入树脂轮廓。</p>
+        <p class="hint">红线为 2 mm 连续纤维的中心线预览：先沿黄色孔洞之间可容纳纤维的 X 向材料通道绕行，再在左右夹持区保持当前 Y 高度直线延伸到零件边界。绿色点为起点、深红点为终点；纤维只在试样端部切断。</p>
+        <!-- Kept only so the still-supported legacy JSON form remains readable while
+             the new continuous-course topology is preview-only. -->
+        <div hidden aria-hidden="true">
+          <input id="wall_width_mm" value="2">
+          <input id="orientation_angle_deg" value="0">
+          <input id="align_load_line" type="checkbox">
+          <input id="honeycomb_align_x" type="checkbox">
+          <input id="honeycomb_align_x_mm" value="75">
+          <input id="honeycomb_align_y" type="checkbox">
+          <input id="honeycomb_align_y_mm" value="25">
+          <button type="button" id="centreHoneycombAlignment"></button>
+          <span id="loadLineAlignmentHint"></span><span id="honeycombAlignmentHint"></span>
+        </div>
         <div class="designSummary" id="latticeDesignSummary" aria-live="polite"></div>
-        <div class="designSummary" id="latticeLengthSummary" aria-live="polite">六边形边线总长将在曲面预览更新后显示。</div>
-        <p class="hint">该值是矩形 XY 范围内去重后的平面蜂窝墙线总长，不包含层数倍增；实际共形沉积长度以生成后的曲面路径为准。</p>
+        <div class="designSummary" id="latticeLengthSummary" aria-live="polite">连续课程总长将在曲面预览更新后显示。</div>
+        <p class="hint">长度是平面预览中每条完整连续课程的累加，不包含层数和曲面映射造成的弧长变化；后续接入路径内核时会重新以实际三维长度计算挤出量。</p>
         <div class="divider"></div>
         <h2>对称层间渐变</h2>
-        <div class="field"><label for="surface_start_layer">曲面起始层</label><input id="surface_start_layer" type="number" min="0" step="1" value="3"></div>
-        <p class="hint">沿用旧版语义：起始层本身保持平面，下一层才开始增大曲率。</p>
+        <div class="field"><label for="surface_start_layer">首个非零曲率层（物理层）</label><input id="surface_start_layer" type="number" min="2" step="1" value="3"></div>
+        <p class="hint">以自下而上、从 1 开始计数。填 3 表示第 1–2 层为平面，第 3 层首次出现非零曲率；连续纤维可在第 2 层树脂完成后铺设。导出仍保留旧映射器所需的零基边界层索引。</p>
         <div class="designSummary" id="layerProgressionSummary" aria-live="polite"></div>
         <details class="advanced">
           <summary>高级参数（共形计算）</summary>
@@ -710,9 +947,9 @@ def surface_preview_html() -> str:
         </details>
         <div class="divider"></div>
         <h2>下一步</h2>
-        <button type="button" id="exportConformalConfig">导出共形蜂窝设计 JSON</button>
+        <button type="button" id="exportConformalConfig">导出连续课程 JSON</button>
         <button type="button" class="secondary" id="reset">恢复示例参数</button>
-        <p class="hint">方程：H(x,y)=A·sin(2πx/λx+φx)·sin(2πy/λy+φy)+Zref。导出文件为 <code>conformal_lattice_spec_v1.json</code>，请在主切片器中导入该文件。</p>
+        <p class="hint">方程：H(x,y)=A·sin(2πx/λx+φx)·sin(2πy/λy+φy)+Zref。导出的 JSON 可直接导入主切片器，连续课程会作为树脂与可选纤维的正式路径拓扑。</p>
       </form>
       <section class="panel preview">
         <div class="previewHead"><h2 id="previewTitle">α=1 完整曲率层（物理 Z）</h2><div class="stats" id="stats"></div></div>
@@ -727,9 +964,9 @@ def surface_preview_html() -> str:
     </section>
   </main>
   <script>
-    const surfaceIds = ['amplitude_mm', 'wavelength_x_mm', 'wavelength_y_mm', 'phase_x_pi', 'phase_y_pi', 'z_reference_mm', 'check_x_mm', 'check_y_mm', 'samples'];
+    const surfaceIds = ['surface_parameter_mode', 'amplitude_mm', 'wave_count_x', 'wave_count_y', 'wavelength_x_mm', 'wavelength_y_mm', 'phase_x_pi', 'phase_y_pi', 'z_reference_mm', 'inspection_enabled', 'check_x_mm', 'check_y_mm', 'samples'];
     const mappingReferenceLayerHeightMm = 0.5;
-    const conformalDesignIds = ['part_length_mm', 'part_width_mm', 'part_height_mm', 'wall_width_mm', 'base_cell_size_mm', 'orientation_angle_deg', 'align_load_line', 'surface_start_layer', 'samples_x', 'samples_y', 'boundary_mode', 'random_seed'];
+    const conformalDesignIds = ['part_length_mm', 'part_width_mm', 'part_height_mm', 'grip_end_length_mm', 'wall_width_mm', 'base_cell_size_mm', 'orientation_angle_deg', 'align_load_line', 'honeycomb_align_x', 'honeycomb_align_x_mm', 'honeycomb_align_y', 'honeycomb_align_y_mm', 'surface_start_layer', 'samples_x', 'samples_y', 'boundary_mode', 'random_seed'];
     const canvas = document.getElementById('canvas');
     const statusEl = document.getElementById('status');
     const statsEl = document.getElementById('stats');
@@ -750,6 +987,9 @@ def surface_preview_html() -> str:
     let payload = null;
     let queued = 0;
     let latticePreviewCache = null;
+    let continuousCoursePreviewCache = null;
+    let designerStateDirty = false;
+    let persistentStateSaveTimer = null;
     const initialView = { yaw: -42 * Math.PI / 180, pitch: 54 * Math.PI / 180, zoom: 1, panX: 0, panY: 0 };
     const view = { ...initialView };
     let drag = null;
@@ -759,68 +999,155 @@ def surface_preview_html() -> str:
       return Number.isFinite(value) && value > 0 ? value : null;
     }
 
+    function nonNegativeNumber(id) {
+      const value = Number(document.getElementById(id).value);
+      return Number.isFinite(value) && value >= 0 ? value : null;
+    }
+
+    function honeycombActiveXBounds() {
+      const length = positiveNumber('part_length_mm');
+      const grip = nonNegativeNumber('grip_end_length_mm');
+      if (length === null || grip === null || 2 * grip >= length) return null;
+      return [grip, length - grip];
+    }
+
     function nonNegativeInteger(id) {
       const value = Number(document.getElementById(id).value);
       return Number.isInteger(value) && value >= 0 ? value : null;
     }
 
+    function currentDesignerState() {
+      return Object.fromEntries(persistedInputIds.map((id) => {
+        const element = document.getElementById(id);
+        return [id, element.type === 'checkbox' ? element.checked : element.value];
+      }));
+    }
+
+    function applyDesignerState(state) {
+      if (!state || typeof state !== 'object') return false;
+      const needsTensileMigration = !Object.prototype.hasOwnProperty.call(state, 'surface_parameter_mode');
+      persistedInputIds.forEach((id) => {
+        const element = document.getElementById(id);
+        if (element.type === 'checkbox' && typeof state[id] === 'boolean') element.checked = state[id];
+        else if (typeof state[id] === 'string') element.value = state[id];
+      });
+      if (needsTensileMigration) {
+        document.getElementById('surface_parameter_mode').value = 'tensile_centered_wave_count';
+        document.getElementById('wave_count_x').value = 1.5;
+        document.getElementById('wave_count_y').value = 1.5;
+        document.getElementById('inspection_enabled').checked = false;
+        document.getElementById('align_load_line').checked = false;
+      }
+      return true;
+    }
+
     function saveDesignerState() {
+      const state = currentDesignerState();
+      designerStateDirty = true;
       try {
-        const state = Object.fromEntries(persistedInputIds.map((id) => {
-          const element = document.getElementById(id);
-          return [id, element.type === 'checkbox' ? element.checked : element.value];
-        }));
         localStorage.setItem(designerStateKey, JSON.stringify(state));
       } catch (_) {
-        // Local preview remains usable when browser storage is unavailable.
+        // The per-user state file below remains available when browser storage is not.
       }
+      clearTimeout(persistentStateSaveTimer);
+      persistentStateSaveTimer = setTimeout(() => {
+        fetch('/api/designer-state', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(state),
+        }).catch(() => {});
+      }, 250);
     }
 
     function restoreDesignerState() {
       try {
-        const state = JSON.parse(localStorage.getItem(designerStateKey) || 'null');
-        if (!state || typeof state !== 'object') return;
-        persistedInputIds.forEach((id) => {
-          const element = document.getElementById(id);
-          if (element.type === 'checkbox' && typeof state[id] === 'boolean') element.checked = state[id];
-          else if (typeof state[id] === 'string') element.value = state[id];
-        });
+        applyDesignerState(JSON.parse(localStorage.getItem(designerStateKey) || 'null'));
       } catch (_) {
         // Ignore malformed or unavailable browser-local state.
       }
     }
 
+    async function restorePersistentDesignerState() {
+      try {
+        const response = await fetch('/api/designer-state');
+        const result = await response.json();
+        if (!designerStateDirty && response.ok && result.ok) applyDesignerState(result.state);
+      } catch (_) {
+        // Browser-local state remains available when the local state file cannot be read.
+      }
+    }
+
+    function syncSurfaceParameterControls() {
+      const tensileMode = document.getElementById('surface_parameter_mode').value === 'tensile_centered_wave_count';
+      document.getElementById('tensileWaveFields').hidden = !tensileMode;
+      document.getElementById('manualSurfaceFields').hidden = tensileMode;
+      ['wave_count_x', 'wave_count_y'].forEach((id) => { document.getElementById(id).disabled = !tensileMode; });
+      ['wavelength_x_mm', 'wavelength_y_mm', 'phase_x_pi', 'phase_y_pi'].forEach((id) => { document.getElementById(id).disabled = tensileMode; });
+      updateTensileWaveHint();
+    }
+
+    function updateTensileWaveHint() {
+      const hint = document.getElementById('tensileWaveHint');
+      const length = positiveNumber('part_length_mm');
+      const width = positiveNumber('part_width_mm');
+      const nx = positiveNumber('wave_count_x');
+      const ny = positiveNumber('wave_count_y');
+      const isHalfInteger = (waves) => Math.abs((waves - 0.5) - Math.round(waves - 0.5)) < 1e-9;
+      if (length === null || width === null || nx === null || ny === null || !isHalfInteger(nx) || !isHalfInteger(ny)) {
+        hint.textContent = '请输入正的试样尺寸，以及 0.5、1.5、2.5… 等半整数 X/Y 波数，以自动换算波长和相位。';
+        return;
+      }
+      const phasePi = (waves) => ((0.5 - waves) % 2 + 2) % 2;
+      hint.textContent = `当前换算：λx=${(length / nx).toFixed(3)} mm，λy=${(width / ny).toFixed(3)} mm，φx=${phasePi(nx).toFixed(3)}π，φy=${phasePi(ny).toFixed(3)}π。中心为正峰，边界 H=0；改变矩形尺寸时保持 nx、ny 不变即可保持同类构型。`;
+    }
+
+    function clampInspectionPointToPartBounds() {
+      if (!document.getElementById('inspection_enabled').checked) return;
+      const length = positiveNumber('part_length_mm');
+      const width = positiveNumber('part_width_mm');
+      if (length === null || width === null) return;
+      const xInput = document.getElementById('check_x_mm');
+      const yInput = document.getElementById('check_y_mm');
+      const x = Number(xInput.value);
+      const y = Number(yInput.value);
+      xInput.value = Number.isFinite(x) ? Math.min(length, Math.max(0, x)) : length / 2;
+      yInput.value = Number.isFinite(y) ? Math.min(width, Math.max(0, y)) : width / 2;
+    }
+
+    function syncInspectionPointControls() {
+      const enabled = document.getElementById('inspection_enabled').checked;
+      const fields = document.getElementById('inspectionPointFields');
+      fields.hidden = !enabled;
+      ['check_x_mm', 'check_y_mm'].forEach((id) => { document.getElementById(id).disabled = !enabled; });
+      if (enabled) clampInspectionPointToPartBounds();
+    }
+
     function updateConformalDesignSummary() {
-      const wallWidth = positiveNumber('wall_width_mm');
       const cellSize = positiveNumber('base_cell_size_mm');
+      const activeXBounds = honeycombActiveXBounds();
       const latticeSummary = document.getElementById('latticeDesignSummary');
-      const beadCount = wallWidth === null ? null : Math.round(wallWidth / 2);
-      const isNozzleMultiple = beadCount !== null && beadCount >= 1 && Math.abs(wallWidth - 2 * beadCount) < 1e-9;
-      if (wallWidth === null || cellSize === null) {
+      if (activeXBounds === null) {
         latticeSummary.className = 'designSummary error';
-        latticeSummary.textContent = '设计墙宽和目标六边形边长都必须是正数。';
-      } else if (!isNozzleMultiple) {
+        latticeSummary.textContent = '每端夹持区必须为非负数，且两端夹持区之和必须小于零件长度，才能留下蜂窝工作段。';
+      } else if (cellSize === null) {
         latticeSummary.className = 'designSummary error';
-        latticeSummary.textContent = '设计墙宽必须是 2 mm 喷嘴基准线宽的正整数倍，例如 2、4、6。';
+        latticeSummary.textContent = '目标六边形边长必须为正数。';
       } else {
-        const nominalFill = (2 * wallWidth) / (Math.sqrt(3) * cellSize);
-        if (nominalFill >= 1) {
-          latticeSummary.className = 'designSummary error';
-          latticeSummary.textContent = `名义填充率为 ${(nominalFill * 100).toFixed(1)}%，必须小于 100%。请减小墙宽或增大单元边长。`;
-        } else {
-          latticeSummary.className = 'designSummary';
-          latticeSummary.textContent = `名义填充率：${(nominalFill * 100).toFixed(1)}%；墙体将规划为 ${beadCount} 条 2 mm 沉积道。实际填充率以生成几何测量结果为准。`;
-        }
+        latticeSummary.className = 'designSummary';
+        const workingLength = activeXBounds[1] - activeXBounds[0];
+        const width = positiveNumber('part_width_mm');
+        const estimatedCourses = width === null ? '?' : Math.max(1, Math.floor(width / (Math.sqrt(3) * cellSize)));
+        latticeSummary.textContent = `连续课程工作段：X=${activeXBounds[0].toFixed(2)}–${activeXBounds[1].toFixed(2)} mm（长 ${workingLength.toFixed(2)} mm）；目标边长 ${cellSize.toFixed(2)} mm；预计 ${estimatedCourses} 条左右的 X 向长连续课程。课程数由完整单元能否落入矩形决定，不以蜂窝边数计。`;
       }
 
-      const startLayer = nonNegativeInteger('surface_start_layer');
+      const firstCurvedLayer = nonNegativeInteger('surface_start_layer');
       const samplesX = nonNegativeInteger('samples_x');
       const samplesY = nonNegativeInteger('samples_y');
       const partHeight = positiveNumber('part_height_mm');
       const progressionSummary = document.getElementById('layerProgressionSummary');
-      if (startLayer === null) {
+      if (firstCurvedLayer === null || firstCurvedLayer < 2) {
         progressionSummary.className = 'designSummary error';
-        progressionSummary.textContent = '曲面起始层必须是非负整数。';
+        progressionSummary.textContent = '首个非零曲率层必须是大于等于 2 的物理层号。';
       } else if (partHeight === null) {
         progressionSummary.className = 'designSummary error';
         progressionSummary.textContent = '最终物理高度必须是正数。';
@@ -829,26 +1156,32 @@ def surface_preview_html() -> str:
         progressionSummary.textContent = '曲面采样 X 和 Y 都必须是不小于 2 的整数。';
       } else {
         const layerCount = Math.ceil(partHeight / mappingReferenceLayerHeightMm);
-        const maxStart = Math.floor((layerCount - 1) / 2);
-        if (startLayer > maxStart) {
+        const maxLegacyStart = Math.floor((layerCount - 1) / 2);
+        const maxFirstCurvedLayer = maxLegacyStart + 2;
+        if (firstCurvedLayer > maxFirstCurvedLayer) {
           progressionSummary.className = 'designSummary error';
-          progressionSummary.textContent = `当前高度与层高共得到 ${layerCount} 个逻辑层；曲面起始层不能大于 ${maxStart}。`;
+          progressionSummary.textContent = `当前高度与参考层高共得到 ${layerCount} 个物理层；首个非零曲率层不能大于 ${maxFirstCurvedLayer}。`;
         } else {
-          const returnLayer = layerCount - 1 - startLayer;
-          const peakLayers = layerCount % 2 === 1 ? `${Math.floor(layerCount / 2)}` : `${layerCount / 2 - 1}、${layerCount / 2}`;
+          const legacyStartLayer = firstCurvedLayer - 2;
+          const returnLayerPhysical = layerCount - legacyStartLayer;
+          const peakLayers = layerCount % 2 === 1 ? `${Math.floor(layerCount / 2) + 1}` : `${layerCount / 2}、${layerCount / 2 + 1}`;
           progressionSummary.className = 'designSummary';
-          progressionSummary.textContent = `映射参考层数：${layerCount}；曲面起始层：${startLayer}；镜像回落层：${returnLayer}；完整曲率层：${peakLayers}；共形采样：${samplesX} × ${samplesY}。实际切片层高在主界面 Core 工艺参数中设置。`;
+          progressionSummary.textContent = `映射参考层数：${layerCount}；首个非零曲率层：第 ${firstCurvedLayer} 层；对称回落至平面：第 ${returnLayerPhysical} 层；完整曲率层：第 ${peakLayers} 层；共形采样：${samplesX} × ${samplesY}。实际切片层高在主界面 Core 工艺参数中设置。`;
         }
       }
     }
 
     function parameters() {
       const query = new URLSearchParams();
-      surfaceIds.forEach((id) => query.set(id, document.getElementById(id).value));
+      surfaceIds.forEach((id) => {
+        const element = document.getElementById(id);
+        query.set(id, element.type === 'checkbox' ? String(element.checked) : element.value);
+      });
       query.set('width_mm', document.getElementById('part_length_mm').value);
       query.set('height_mm', document.getElementById('part_width_mm').value);
       query.set('part_height_mm', document.getElementById('part_height_mm').value);
       query.set('surface_start_layer', document.getElementById('surface_start_layer').value);
+      query.set('surface_start_layer_semantics', 'first_nonzero_curvature_physical');
       return query;
     }
 
@@ -865,11 +1198,28 @@ def surface_preview_html() -> str:
       const enabled = document.getElementById('align_load_line').checked;
       const orientation = document.getElementById('orientation_angle_deg');
       const hint = document.getElementById('loadLineAlignmentHint');
-      if (enabled) orientation.value = 0;
-      orientation.disabled = enabled;
+      if (enabled) {
+        document.getElementById('honeycomb_align_x').checked = false;
+        document.getElementById('honeycomb_align_y').checked = false;
+      }
+      syncHoneycombAlignmentControls();
+      const honeycombAligned = document.getElementById('honeycomb_align_x').checked || document.getElementById('honeycomb_align_y').checked;
+      if (enabled || honeycombAligned) orientation.value = 0;
+      orientation.disabled = enabled || honeycombAligned;
       hint.textContent = enabled
-        ? '已开启：自动用零件长度中面上的中心加载点定位一条沿 Y 的蜂窝壁；边长或零件尺寸改变后会重新求解相位。'
-        : '已关闭：使用全局格栅方向角；此时不保证加载中心落在蜂窝壁上。';
+        ? '已开启：自动在零件长度中面定位一条沿 Y 的蜂窝壁；该选项只服务于第三章三点弯曲，不改变双正弦曲面参数。'
+        : '默认关闭：使用全局格栅方向角；拉伸试验不需要加载线蜂窝壁对齐。';
+    }
+
+    function syncHoneycombAlignmentControls() {
+      const alignX = document.getElementById('honeycomb_align_x').checked;
+      const alignY = document.getElementById('honeycomb_align_y').checked;
+      document.getElementById('honeycomb_align_x_mm').disabled = !alignX;
+      document.getElementById('honeycomb_align_y_mm').disabled = !alignY;
+      const hint = document.getElementById('honeycombAlignmentHint');
+      hint.textContent = alignX || alignY
+        ? '已开启中心特征对齐：X 放置沿 Y 蜂窝壁，Y 放置纤维所用斜边锯齿链的几何中线；链会在目标 Y 上下交替，并非水平墙。格栅方向固定为 0°；这不代表裁切后的整张网格严格镜像对称。'
+        : '已关闭中心特征对齐：使用手动/自动避边相位。可保留任意格栅方向，但连续纤维路径不再保证围绕零件中线布置。';
     }
 
     function colour(fraction, lighting = 1) {
@@ -925,18 +1275,37 @@ def surface_preview_html() -> str:
       const edgeLength = positiveNumber('base_cell_size_mm');
       const wallWidth = positiveNumber('wall_width_mm');
       if (edgeLength === null || wallWidth === null || !payload) return null;
-      const bounds = payload.coordinate_system.xy_bounds_mm;
-      const aligned = document.getElementById('align_load_line').checked;
+      const partBounds = payload.coordinate_system.xy_bounds_mm;
+      const activeXBounds = honeycombActiveXBounds();
+      if (activeXBounds === null) return null;
+      const bounds = [activeXBounds[0], partBounds[1], activeXBounds[1], partBounds[3]];
+      const loadAligned = document.getElementById('align_load_line').checked;
+      const alignX = document.getElementById('honeycomb_align_x').checked;
+      const alignY = document.getElementById('honeycomb_align_y').checked;
+      const aligned = loadAligned || alignX || alignY;
       const angle = aligned ? 0 : Number(document.getElementById('orientation_angle_deg').value) * Math.PI / 180;
       if (!Number.isFinite(angle)) return null;
-      if (aligned) {
-        const loadCenter = [(bounds[0] + bounds[2]) * 0.5, (bounds[1] + bounds[3]) * 0.5];
+      if (loadAligned || alignX || alignY) {
+        const loadCenter = [(partBounds[0] + partBounds[2]) * 0.5, (partBounds[1] + partBounds[3]) * 0.5];
         // In the preview's pointy-top hex lattice, a right vertical wall is
         // sqrt(3)/2 * a from its cell centre.  Put its midpoint at the part
         // centre so the visible guide and exported semantic request agree.
-        const origin = [loadCenter[0] - Math.sqrt(3.0) * edgeLength * 0.5, loadCenter[1]];
+        const targetX = loadAligned ? loadCenter[0] : Number(document.getElementById('honeycomb_align_x_mm').value);
+        const targetY = loadAligned ? loadCenter[1] : Number(document.getElementById('honeycomb_align_y_mm').value);
+        const phaseSeed = [0.37, 0.23];
+        const fallbackOrigin = [
+          bounds[0] + Math.sqrt(3.0) * edgeLength * (phaseSeed[0] + 0.5 * phaseSeed[1]),
+          bounds[1] + 1.5 * edgeLength * phaseSeed[1],
+        ];
+        const origin = [
+          (loadAligned || alignX) ? targetX - Math.sqrt(3.0) * edgeLength * 0.5 : fallbackOrigin[0],
+          // A left-to-right honeycomb course is an inclined-edge zigzag. Its
+          // two vertex rows sit at centre-line ±a/4, so the underlying cell
+          // centre must be 3a/4 below the requested course centre-line.
+          (loadAligned || alignY) ? targetY - 0.75 * edgeLength : fallbackOrigin[1],
+        ];
         const boundaryMode = document.getElementById('boundary_mode').value;
-        return { edgeLength, wallWidth, angle, origin, bounds, boundaryMode, aligned };
+        return { edgeLength, wallWidth, angle, origin, bounds, partBounds, boundaryMode, aligned };
       }
       // The production pipeline chooses the final offset in the solved phase
       // domain.  This inexpensive canvas equivalent keeps the initial lattice
@@ -949,14 +1318,14 @@ def surface_preview_html() -> str:
       const rotatedOrigin = rotateVector(localOrigin[0], localOrigin[1], angle);
       const origin = [bounds[0] + rotatedOrigin[0], bounds[1] + rotatedOrigin[1]];
       const boundaryMode = document.getElementById('boundary_mode').value;
-      return { edgeLength, wallWidth, angle, origin, bounds, boundaryMode, aligned };
+      return { edgeLength, wallWidth, angle, origin, bounds, partBounds, boundaryMode, aligned };
     }
 
     function latticePreviewSegments() {
       const settings = latticePreviewParameters();
       if (!settings) return { segments: [], sampled: false, edgeLength: 0, wallWidth: 0 };
-      const { edgeLength, wallWidth, angle, origin, bounds, boundaryMode } = settings;
-      const key = JSON.stringify({ edgeLength, wallWidth, angle, origin, bounds, boundaryMode });
+      const { edgeLength, wallWidth, angle, origin, bounds, partBounds, boundaryMode } = settings;
+      const key = JSON.stringify({ edgeLength, wallWidth, angle, origin, bounds, partBounds, boundaryMode });
       if (latticePreviewCache?.key === key) return latticePreviewCache.value;
       const area = (bounds[2] - bounds[0]) * (bounds[3] - bounds[1]);
       const exactCellEstimate = area / (1.5 * Math.sqrt(3.0) * edgeLength * edgeLength);
@@ -1005,24 +1374,704 @@ def surface_preview_html() -> str:
       const totalWallLengthMm = segments.reduce(
         (total, [start, end]) => total + Math.hypot(end[0] - start[0], end[1] - start[1]), 0
       );
-      const value = { segments, sampled, edgeLength, previewEdgeLength, wallWidth, totalWallLengthMm };
+      const value = { segments, sampled, edgeLength, previewEdgeLength, wallWidth, totalWallLengthMm, activeXBounds: [bounds[0], bounds[2]] };
       latticePreviewCache = { key, value };
       return value;
+    }
+
+    function continuousCoursePreview() {
+      const fiberTowWidthMm = 2.0;
+      const edgeLength = positiveNumber('base_cell_size_mm');
+      const activeXBounds = honeycombActiveXBounds();
+      if (!payload || edgeLength === null || activeXBounds === null) {
+        return { courses: [], pores: [], edgeLength: 0, fiberTowWidthMm, totalLengthMm: 0, activeXBounds: [0, 0] };
+      }
+      const partBounds = payload.coordinate_system.xy_bounds_mm;
+      const bounds = [activeXBounds[0], partBounds[1], activeXBounds[1], partBounds[3]];
+      // Both the global rectangular perimeter and the two grip separators are
+      // planned on their nominal resin-bead centre lines.  A pore may reach
+      // only the material's *inner* edge, hence the half-bead inset here.
+      const resinContourWidthMm = positiveNumber('wall_width_mm') ?? 2.0;
+      const contourInnerInsetMm = resinContourWidthMm * 0.5;
+      const poreClipBounds = [
+        bounds[0] + contourInnerInsetMm,
+        bounds[1] + contourInnerInsetMm,
+        bounds[2] - contourInnerInsetMm,
+        bounds[3] - contourInnerInsetMm,
+      ];
+      const key = JSON.stringify({ edgeLength, bounds, resinContourWidthMm });
+      if (continuousCoursePreviewCache?.key === key) return continuousCoursePreviewCache.value;
+      if (poreClipBounds[0] >= poreClipBounds[2] || poreClipBounds[1] >= poreClipBounds[3]) {
+        return { courses: [], pores: [], poreClipBounds, resinContourWidthMm, edgeLength, fiberTowWidthMm, totalLengthMm: 0, activeXBounds };
+      }
+
+      // The yellow geometry is primary: it is a regular, two-phase pore
+      // lattice.  Main rows have a 4 mm horizontal opening; the void between
+      // adjacent main cells is occupied by a same-size interleaved pore.  Its
+      // facing inclined sides are exactly 2 mm apart, so they carry one tow.
+      const singleWallMm = fiberTowWidthMm;
+      const doubleWallMm = fiberTowWidthMm * 2.0;
+      const xMid = (bounds[0] + bounds[2]) * 0.5;
+      const yMid = (bounds[1] + bounds[3]) * 0.5;
+      // The 300 mm parent is only an oversized source for clipping.  Its
+      // phase is translated for every cell size so that one *complete* pore
+      // centre always coincides with the tensile working-region centre.  This
+      // keeps cell size separate from pore/curvature/load-axis registration.
+      const parentHalfSpanMm = 150.0;
+      const parentBounds = [
+        xMid - parentHalfSpanMm,
+        yMid - parentHalfSpanMm,
+        xMid + parentHalfSpanMm,
+        yMid + parentHalfSpanMm,
+      ];
+      const parentXMid = xMid;
+      const parentYMid = yMid;
+      const hexHalfHeight = Math.sqrt(3.0) * edgeLength * 0.5;
+      const rowPitch = hexHalfHeight * 2.0 + doubleWallMm;
+      const referenceHexagon = (centerX, centerY) => [
+        [centerX - edgeLength, centerY],
+        [centerX - edgeLength * 0.5, centerY + hexHalfHeight],
+        [centerX + edgeLength * 0.5, centerY + hexHalfHeight],
+        [centerX + edgeLength, centerY],
+        [centerX + edgeLength * 0.5, centerY - hexHalfHeight],
+        [centerX - edgeLength * 0.5, centerY - hexHalfHeight],
+      ];
+      const signedArea = (start, end, point) => (
+        (end[0] - start[0]) * (point[1] - start[1])
+        - (end[1] - start[1]) * (point[0] - start[0])
+      );
+      // Build the parent as horizontal main rows.  Consecutive main rows
+      // leave an exact 2w opening.  The half-row is filled with interleaved
+      // pores, producing the single-width inclined channels requested by the
+      // fibre topology.
+      const sidePortInsetX = fiberTowWidthMm / (2.0 * Math.sqrt(3.0));
+      // The interleaved centre lies halfway through a 2w horizontal opening.
+      // The face-normal projection of the 2 mm diagonal channel is w, hence
+      // its X phase is 1.5s + w/sqrt(3), not 1.5s + sqrt(3)w (the latter
+      // would make the apparent diagonal opening 4 mm wide).
+      const diagonalColumnOffset = edgeLength * 1.5 + fiberTowWidthMm / Math.sqrt(3.0);
+      const diagonalRowOffset = hexHalfHeight + fiberTowWidthMm;
+      // A main row and its interleaved row are separated by a single 2 mm
+      // diagonal channel.  Doubling the X offset leaves a same-size hexagon
+      // in every alternating void, including the one marked in the review.
+      const columnPitch = diagonalColumnOffset * 2.0;
+      const pores = [];
+      const poreRecords = [];
+      const columnMinimum = Math.ceil((parentBounds[0] - edgeLength - parentXMid) / columnPitch);
+      const columnMaximum = Math.floor((parentBounds[2] + edgeLength - parentXMid) / columnPitch);
+      const parentRowOriginY = parentYMid - rowPitch * 0.5;
+      const parentRowMinimum = Math.ceil((parentBounds[1] - hexHalfHeight - parentRowOriginY) / rowPitch);
+      const parentRowMaximum = Math.floor((parentBounds[3] + hexHalfHeight - parentRowOriginY) / rowPitch);
+      for (let row = parentRowMinimum; row <= parentRowMaximum; row += 1) {
+        const centerY = parentRowOriginY + row * rowPitch;
+        for (let column = columnMinimum - 1; column <= columnMaximum + 1; column += 1) {
+          // Every row uses the same X phase.  Thus the upper/lower yellow
+          // horizontal sides of a pore column have identical endpoints: the
+          // corresponding cells remain the same size instead of forming the
+          // stagger-induced oversized voids visible in the previous preview.
+          const centerX = parentXMid + column * columnPitch;
+          const vertices = referenceHexagon(centerX, centerY);
+          const record = { id: `${row}:${column}`, row, column, center: [centerX, centerY], vertices };
+          poreRecords.push(record);
+          pores.push(vertices);
+        }
+        // Fill every alternating void in the parent lattice.  Do not make a
+        // boundary exception here: both yellow pores and fibre centre-lines
+        // are generated on this full parent and clipped only afterwards.
+        const interleavedCenterY = centerY + diagonalRowOffset;
+        for (let column = columnMinimum - 1; column <= columnMaximum + 1; column += 1) {
+          const centerX = parentXMid + column * columnPitch + diagonalColumnOffset;
+          const vertices = referenceHexagon(centerX, interleavedCenterY);
+          const record = {
+            id: `${row + 0.5}:${column}`,
+            row: row + 0.5,
+            column,
+            center: [centerX, interleavedCenterY],
+            vertices,
+          };
+          poreRecords.push(record);
+          pores.push(vertices);
+        }
+      }
+
+      // Superseded experimental analytic-offset implementation follows in a
+      // disabled block; it is retained only so this rollback stays local.
+      // The red paths are derived directly from the yellow pores.  Offset a
+      // pore edge by one half tow width: two pores separated by 4 mm leave two
+      // distinct 2 mm centreline rails, whereas pores separated by 2 mm
+      // produce the same (single) offset rail.  This is the uniform
+      // mixed-wall construction; it deliberately contains no raster search.
+      /* Prior free-space corridor search retained only for comparison during
+         this replacement; it is intentionally not called.
+      const courses = [];
+      const fiberRadiusMm = fiberTowWidthMm * 0.5;
+      const courseBounds = [
+        activeXBounds[0],
+        partBounds[1] + fiberRadiusMm,
+        activeXBounds[1],
+        partBounds[3] - fiberRadiusMm,
+      ];
+      const clipCourseSegment = (start, end, clipBounds) => {
+        const dx = end[0] - start[0];
+        const dy = end[1] - start[1];
+        let lower = 0.0;
+        let upper = 1.0;
+        const tests = [
+          [-dx, start[0] - clipBounds[0]], [dx, clipBounds[2] - start[0]],
+          [-dy, start[1] - clipBounds[1]], [dy, clipBounds[3] - start[1]],
+        ];
+        for (const [p, q] of tests) {
+          if (Math.abs(p) < 1e-12) {
+            if (q < 0) return null;
+            continue;
+          }
+          const ratio = q / p;
+          if (p < 0) lower = Math.max(lower, ratio);
+          else upper = Math.min(upper, ratio);
+          if (lower > upper) return null;
+        }
+        return [
+          [start[0] + lower * dx, start[1] + lower * dy],
+          [start[0] + upper * dx, start[1] + upper * dy],
+        ];
+      };
+      const cross = (first, second) => first[0] * second[1] - first[1] * second[0];
+      const lineIntersection = (firstStart, firstEnd, secondStart, secondEnd) => {
+        const firstVector = [firstEnd[0] - firstStart[0], firstEnd[1] - firstStart[1]];
+        const secondVector = [secondEnd[0] - secondStart[0], secondEnd[1] - secondStart[1]];
+        const denominator = cross(firstVector, secondVector);
+        if (Math.abs(denominator) < 1e-9) return null;
+        const delta = [secondStart[0] - firstStart[0], secondStart[1] - firstStart[1]];
+        const t = cross(delta, secondVector) / denominator;
+        return [firstStart[0] + firstVector[0] * t, firstStart[1] + firstVector[1] * t];
+      };
+      const outwardOffsetPolygon = (polygon, offsetMm) => {
+        const shiftedEdges = polygon.map((start, index) => {
+          const end = polygon[(index + 1) % polygon.length];
+          const dx = end[0] - start[0];
+          const dy = end[1] - start[1];
+          const length = Math.hypot(dx, dy);
+          // referenceHexagon is clockwise, hence its left normal is outward.
+          const normal = [-dy / length, dx / length];
+          return [
+            [start[0] + normal[0] * offsetMm, start[1] + normal[1] * offsetMm],
+            [end[0] + normal[0] * offsetMm, end[1] + normal[1] * offsetMm],
+          ];
+        });
+        return shiftedEdges.map((edge, index) => (
+          lineIntersection(shiftedEdges[(index + shiftedEdges.length - 1) % shiftedEdges.length][0], shiftedEdges[(index + shiftedEdges.length - 1) % shiftedEdges.length][1], edge[0], edge[1]) || edge[0]
+        ));
+      };
+      const pointKey = (point) => `${point[0].toFixed(6)},${point[1].toFixed(6)}`;
+      const edgeKey = (start, end) => {
+        const first = pointKey(start);
+        const second = pointKey(end);
+        return first < second ? `${first}|${second}` : `${second}|${first}`;
+      };
+      const nodes = new Map();
+      const edges = [];
+      const uniqueEdges = new Set();
+      const addNode = (point) => {
+        const key = pointKey(point);
+        if (!nodes.has(key)) nodes.set(key, { point, edgeIds: [] });
+        return key;
+      };
+      pores.forEach((pore) => {
+        const offsetPore = outwardOffsetPolygon(pore, fiberRadiusMm);
+        offsetPore.forEach((start, index) => {
+          const clipped = clipCourseSegment(start, offsetPore[(index + 1) % offsetPore.length], courseBounds);
+          if (!clipped || Math.hypot(clipped[1][0] - clipped[0][0], clipped[1][1] - clipped[0][1]) < 1e-7) return;
+          const key = edgeKey(clipped[0], clipped[1]);
+          if (uniqueEdges.has(key)) return;
+          uniqueEdges.add(key);
+          const startKey = addNode(clipped[0]);
+          const endKey = addNode(clipped[1]);
+          const id = edges.length;
+          edges.push({ startKey, endKey });
+          nodes.get(startKey).edgeIds.push(id);
+          nodes.get(endKey).edgeIds.push(id);
+        });
+      });
+      const otherKey = (edge, nodeKey) => edge.startKey === nodeKey ? edge.endKey : edge.startKey;
+      const simplifyExactCourse = (points) => points.filter((point, index) => {
+        if (index === 0 || index === points.length - 1) return true;
+        const previous = points[index - 1];
+        const next = points[index + 1];
+        return Math.abs(signedArea(previous, point, next)) > 1e-7;
+      });
+      const unusedEdges = new Set(edges.map((_, index) => index));
+      const traceForwardCourse = (startKey, firstEdge) => {
+        const points = [nodes.get(startKey).point];
+        let currentKey = startKey;
+        let edgeId = firstEdge;
+        const usedByCourse = [];
+        while (edgeId !== undefined && !usedByCourse.includes(edgeId)) {
+          usedByCourse.push(edgeId);
+          const nextKey = otherKey(edges[edgeId], currentKey);
+          points.push(nodes.get(nextKey).point);
+          currentKey = nextKey;
+          if (reachesRight(nodes.get(currentKey).point)) break;
+          const current = nodes.get(currentKey).point;
+          const candidates = nodes.get(currentKey).edgeIds
+            .filter((candidate) => candidate !== edgeId && unusedEdges.has(candidate) && !usedByCourse.includes(candidate))
+            .map((candidate) => {
+              const next = nodes.get(otherKey(edges[candidate], currentKey)).point;
+              const dx = next[0] - current[0];
+              const dy = next[1] - current[1];
+              return { candidate, dx, directionX: dx / Math.hypot(dx, dy) };
+            })
+            .filter(({ dx }) => dx > 1e-7)
+            .sort((first, second) => second.directionX - first.directionX || second.dx - first.dx);
+          edgeId = candidates[0]?.candidate;
+        }
+        return { points: simplifyExactCourse(points), edgeIds: usedByCourse };
+      };
+      const reachesLeft = (point) => Math.abs(point[0] - activeXBounds[0]) < 1e-6;
+      const reachesRight = (point) => Math.abs(point[0] - activeXBounds[1]) < 1e-6;
+      const addThroughGripCourse = (corePoints) => {
+        if (corePoints.length < 2) return;
+        let points = corePoints;
+        if (reachesRight(points[0]) && reachesLeft(points[points.length - 1])) points = points.slice().reverse();
+        if (!reachesLeft(points[0]) || !reachesRight(points[points.length - 1])) return;
+        courses.push({
+          points: [[partBounds[0], points[0][1]], ...points, [partBounds[2], points[points.length - 1][1]]],
+          railOffsetsMm: [0],
+        });
+      };
+      // Begin at clipped left ports and follow only the next analytic segment
+      // with a positive X component.  At a mixed-wall junction this pairs
+      // each rail with its forward diagonal continuation, so distinct fibres
+      // never merge.  A completed route then claims its own segments.
+      [...nodes.entries()]
+        .filter(([nodeKey]) => reachesLeft(nodes.get(nodeKey).point))
+        .sort(([, first], [, second]) => first.point[1] - second.point[1])
+        .forEach(([nodeKey, node]) => {
+          node.edgeIds.forEach((edgeId) => {
+            if (!unusedEdges.has(edgeId)) return;
+            const trace = traceForwardCourse(nodeKey, edgeId);
+            if (!reachesRight(trace.points.at(-1))) return;
+            trace.edgeIds.forEach((usedEdgeId) => unusedEdges.delete(usedEdgeId));
+            addThroughGripCourse(trace.points);
+          });
+        });
+      */
+      // Roll back to the prior corridor-course preview.  Its source points
+      // are sampled in the actual pore gaps, then simplified to long courses;
+      // it retains all viable X-through channels instead of discarding them
+      // while trying to resolve mixed-wall graph branches.
+      /*
+      const courses = [];
+      const extendThroughGripRegions = (corePoints) => {
+        if (corePoints.length < 2) return [];
+        const first = corePoints[0];
+        const last = corePoints[corePoints.length - 1];
+        return [[partBounds[0], first[1]], ...corePoints, [partBounds[2], last[1]]];
+      };
+      const fiberRadiusMm = fiberTowWidthMm * 0.5;
+      const routeClearanceMm = fiberRadiusMm - 1e-6;
+      const gridStepMm = 0.5;
+      const routePores = pores.filter((pore) => {
+        const xs = pore.map((point) => point[0]);
+        const ys = pore.map((point) => point[1]);
+        return Math.max(...xs) >= activeXBounds[0] - fiberRadiusMm
+          && Math.min(...xs) <= activeXBounds[1] + fiberRadiusMm
+          && Math.max(...ys) >= poreClipBounds[1] - fiberRadiusMm
+          && Math.min(...ys) <= poreClipBounds[3] + fiberRadiusMm;
+      });
+      const pointToSegmentDistance = (point, start, end) => {
+        const dx = end[0] - start[0];
+        const dy = end[1] - start[1];
+        const lengthSquared = dx * dx + dy * dy;
+        if (lengthSquared <= 1e-12) return Math.hypot(point[0] - start[0], point[1] - start[1]);
+        const t = Math.max(0, Math.min(1, ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy) / lengthSquared));
+        return Math.hypot(point[0] - (start[0] + dx * t), point[1] - (start[1] + dy * t));
+      };
+      const pointOnSegment = (point, start, end) => {
+        if (Math.abs(signedArea(start, end, point)) > 1e-9) return false;
+        return point[0] >= Math.min(start[0], end[0]) - 1e-9
+          && point[0] <= Math.max(start[0], end[0]) + 1e-9
+          && point[1] >= Math.min(start[1], end[1]) - 1e-9
+          && point[1] <= Math.max(start[1], end[1]) + 1e-9;
+      };
+      const pointInsidePolygon = (point, polygon) => {
+        let inside = false;
+        polygon.forEach((start, index) => {
+          const end = polygon[(index + 1) % polygon.length];
+          if (pointOnSegment(point, start, end)) inside = true;
+          if ((start[1] > point[1]) !== (end[1] > point[1])) {
+            const crossingX = (end[0] - start[0]) * (point[1] - start[1]) / (end[1] - start[1]) + start[0];
+            if (point[0] < crossingX) inside = !inside;
+          }
+        });
+        return inside;
+      };
+      const poreClearance = (point) => {
+        let clearance = Number.POSITIVE_INFINITY;
+        for (const pore of routePores) {
+          if (pointInsidePolygon(point, pore)) return -Number.POSITIVE_INFINITY;
+          pore.forEach((start, index) => {
+            clearance = Math.min(clearance, pointToSegmentDistance(point, start, pore[(index + 1) % pore.length]));
+          });
+        }
+        return clearance;
+      };
+      const segmentsIntersect = (firstStart, firstEnd, secondStart, secondEnd) => {
+        const firstSecondStart = signedArea(firstStart, firstEnd, secondStart);
+        const firstSecondEnd = signedArea(firstStart, firstEnd, secondEnd);
+        const secondFirstStart = signedArea(secondStart, secondEnd, firstStart);
+        const secondFirstEnd = signedArea(secondStart, secondEnd, firstEnd);
+        if ((firstSecondStart > 1e-9 && firstSecondEnd < -1e-9 || firstSecondStart < -1e-9 && firstSecondEnd > 1e-9)
+          && (secondFirstStart > 1e-9 && secondFirstEnd < -1e-9 || secondFirstStart < -1e-9 && secondFirstEnd > 1e-9)) return true;
+        return pointOnSegment(secondStart, firstStart, firstEnd)
+          || pointOnSegment(secondEnd, firstStart, firstEnd)
+          || pointOnSegment(firstStart, secondStart, secondEnd)
+          || pointOnSegment(firstEnd, secondStart, secondEnd);
+      };
+      const segmentClearance = (start, end) => {
+        let clearance = Number.POSITIVE_INFINITY;
+        for (const pore of routePores) {
+          if (pointInsidePolygon(start, pore) || pointInsidePolygon(end, pore)) return -Number.POSITIVE_INFINITY;
+          pore.forEach((edgeStart, index) => {
+            const edgeEnd = pore[(index + 1) % pore.length];
+            if (segmentsIntersect(start, end, edgeStart, edgeEnd)) {
+              clearance = 0.0;
+              return;
+            }
+            clearance = Math.min(
+              clearance,
+              pointToSegmentDistance(start, edgeStart, edgeEnd),
+              pointToSegmentDistance(end, edgeStart, edgeEnd),
+              pointToSegmentDistance(edgeStart, start, end),
+              pointToSegmentDistance(edgeEnd, start, end),
+            );
+          });
+          if (clearance < routeClearanceMm) return clearance;
+        }
+        return clearance;
+      };
+      const simplifyCorridorCourse = (points) => {
+        if (points.length < 3) return points;
+        const simplified = [points[0]];
+        let current = 0;
+        while (current < points.length - 1) {
+          let next = points.length - 1;
+          while (next > current + 1 && segmentClearance(points[current], points[next]) < routeClearanceMm) next -= 1;
+          simplified.push(points[next]);
+          current = next;
+        }
+        return simplified;
+      };
+      const xCount = Math.max(2, Math.round((activeXBounds[1] - activeXBounds[0]) / gridStepMm) + 1);
+      const yCount = Math.max(2, Math.round((poreClipBounds[3] - poreClipBounds[1]) / gridStepMm) + 1);
+      const xCoordinates = Array.from({ length: xCount }, (_, index) => (
+        activeXBounds[0] + (activeXBounds[1] - activeXBounds[0]) * index / (xCount - 1)
+      ));
+      const yCoordinates = Array.from({ length: yCount }, (_, index) => (
+        poreClipBounds[1] + (poreClipBounds[3] - poreClipBounds[1]) * index / (yCount - 1)
+      ));
+      const clearanceGrid = xCoordinates.map((xCoordinate) => yCoordinates.map((yCoordinate) => poreClearance([xCoordinate, yCoordinate])));
+      const middleXIndex = xCoordinates.reduce((bestIndex, xCoordinate, index) => (
+        Math.abs(xCoordinate - xMid) < Math.abs(xCoordinates[bestIndex] - xMid) ? index : bestIndex
+      ), 0);
+      const freeAtMiddle = clearanceGrid[middleXIndex].map((clearance) => clearance >= routeClearanceMm);
+      const seedRows = [];
+      for (let first = 0; first < yCount;) {
+        if (!freeAtMiddle[first]) { first += 1; continue; }
+        let last = first;
+        while (last + 1 < yCount && freeAtMiddle[last + 1]) last += 1;
+        if (yCoordinates[last] - yCoordinates[first] >= fiberTowWidthMm - 1e-9) {
+          seedRows.push(first, last);
+        } else {
+          seedRows.push(Math.round((first + last) * 0.5));
+        }
+        first = last + 1;
+      }
+      const traceCorridorToSide = (seedRow, direction) => {
+        const xIndices = [];
+        for (let index = middleXIndex; index >= 0 && index < xCount; index += direction) xIndices.push(index);
+        let previousCosts = new Float64Array(yCount);
+        previousCosts.fill(Number.POSITIVE_INFINITY);
+        previousCosts[seedRow] = 0.0;
+        const parents = [];
+        for (let step = 1; step < xIndices.length; step += 1) {
+          const currentCosts = new Float64Array(yCount);
+          currentCosts.fill(Number.POSITIVE_INFINITY);
+          const parent = new Int16Array(yCount);
+          parent.fill(-1);
+          for (let row = 0; row < yCount; row += 1) {
+            const clearance = clearanceGrid[xIndices[step]][row];
+            if (clearance < routeClearanceMm) continue;
+            for (let previousRow = Math.max(0, row - 3); previousRow <= Math.min(yCount - 1, row + 3); previousRow += 1) {
+              if (!Number.isFinite(previousCosts[previousRow])) continue;
+              const rowChange = row - previousRow;
+              const centreBias = (yCoordinates[row] - yCoordinates[seedRow]) / fiberTowWidthMm;
+              const cost = previousCosts[previousRow] + rowChange * rowChange * 0.09 + centreBias * centreBias * 0.002 - Math.min(clearance, fiberTowWidthMm * 2.0) * 0.02;
+              if (cost < currentCosts[row]) { currentCosts[row] = cost; parent[row] = previousRow; }
+            }
+          }
+          if (![...currentCosts].some(Number.isFinite)) return null;
+          parents.push(parent);
+          previousCosts = currentCosts;
+        }
+        let finalRow = 0;
+        for (let row = 1; row < yCount; row += 1) if (previousCosts[row] < previousCosts[finalRow]) finalRow = row;
+        if (!Number.isFinite(previousCosts[finalRow])) return null;
+        const rows = Array(xIndices.length);
+        rows[rows.length - 1] = finalRow;
+        for (let step = parents.length - 1; step >= 0; step -= 1) rows[step] = parents[step][rows[step + 1]];
+        return xIndices.map((xIndex, step) => [xCoordinates[xIndex], yCoordinates[rows[step]]]);
+      };
+      [...new Set(seedRows)].filter((row) => clearanceGrid[middleXIndex][row] >= routeClearanceMm).forEach((seedRow) => {
+        const left = traceCorridorToSide(seedRow, -1);
+        const right = traceCorridorToSide(seedRow, 1);
+        if (!left || !right) return;
+        const points = extendThroughGripRegions(simplifyCorridorCourse([...left.slice().reverse(), ...right.slice(1)]));
+        if (points.length >= 2) courses.push({ points, railOffsetsMm: [0] });
+      });
+      */
+      // Build the requested paths directly from the yellow parent lattice.
+      // Each 4 mm horizontal opening starts two lanes.  Those lanes travel on
+      // opposite sides of the interleaved pore in that opening: each inclined
+      // 2 mm channel therefore has capacity one, and no route search or
+      // nearest-edge snapping is involved.
+      const courses = [];
+      const fiberRadiusMm = fiberTowWidthMm * 0.5;
+      const appendDistinctPoint = (points, point) => {
+        const previous = points.at(-1);
+        if (!previous || Math.hypot(point[0] - previous[0], point[1] - previous[1]) > 1e-7) points.push(point);
+      };
+      const simplifyMonotoneCourse = (points) => points.filter((point, index) => {
+        if (index === 0 || index === points.length - 1) return true;
+        const previous = points[index - 1];
+        const next = points[index + 1];
+        return Math.abs(signedArea(previous, point, next)) > 1e-7;
+      });
+      // Build the directed
+      // opening topology.  Each complete 2w horizontal opening owns exactly
+      // two lanes: the upper offset of its lower pore row and the lower offset
+      // of its upper pore row.  Their corners are intersections of the
+      // analytic side-offset supports, not sampled or snapped points.
+      const recordsByRow = new Map();
+      poreRecords.forEach((record) => {
+        if (!recordsByRow.has(record.row)) recordsByRow.set(record.row, []);
+        recordsByRow.get(record.row).push(record);
+      });
+      recordsByRow.forEach((records) => records.sort((first, second) => first.center[0] - second.center[0]));
+      const offsetHalfPore = (record, side) => {
+        const [centerX, centerY] = record.center;
+        const verticalSign = side === 'upper' ? 1.0 : -1.0;
+        const portY = centerY + verticalSign * fiberRadiusMm;
+        const flatY = centerY + verticalSign * (hexHalfHeight + fiberRadiusMm);
+        return [
+          [centerX - edgeLength - sidePortInsetX, portY],
+          [centerX - edgeLength * 0.5 - sidePortInsetX, flatY],
+          [centerX + edgeLength * 0.5 + sidePortInsetX, flatY],
+          [centerX + edgeLength + sidePortInsetX, portY],
+        ];
+      };
+      const analyticRowCourse = (row, side) => {
+        const records = recordsByRow.get(row) ?? [];
+        const sidePaths = records.map((record) => offsetHalfPore(record, side));
+        if (!sidePaths.length) return [];
+        // Keep the complete parent track.  The renderer clips each resulting
+        // segment to the real rectangular part, so no boundary repair segment
+        // is invented after a pore has been cut.
+        const sourcePoints = [sidePaths[0][0]];
+        sidePaths.forEach((path) => {
+          appendDistinctPoint(sourcePoints, path[0]);
+          appendDistinctPoint(sourcePoints, path[1]);
+          appendDistinctPoint(sourcePoints, path[2]);
+          appendDistinctPoint(sourcePoints, path[3]);
+        });
+        return simplifyMonotoneCourse(sourcePoints);
+      };
+      // The parent route remains one analytical line for design purposes, but
+      // every rectangle-clipped run is one manufacturing path.  Keeping this
+      // split here makes the designer use the same endpoint semantics as the
+      // Core SourceJob: no invisible connector is invented across a cut.
+      const clippedCourseFragments = (points) => {
+        const clipSegment = (start, end) => {
+          const dx = end[0] - start[0];
+          const dy = end[1] - start[1];
+          let lower = 0.0;
+          let upper = 1.0;
+          for (const [p, q] of [
+            [-dx, start[0] - bounds[0]], [dx, bounds[2] - start[0]],
+            [-dy, start[1] - bounds[1]], [dy, bounds[3] - start[1]],
+          ]) {
+            if (Math.abs(p) < 1e-12) {
+              if (q < 0) return null;
+              continue;
+            }
+            const ratio = q / p;
+            if (p < 0) lower = Math.max(lower, ratio);
+            else upper = Math.min(upper, ratio);
+            if (lower > upper) return null;
+          }
+          return [[start[0] + lower * dx, start[1] + lower * dy], [start[0] + upper * dx, start[1] + upper * dy]];
+        };
+        const fragments = [];
+        let fragment = [];
+        points.slice(1).forEach((end, index) => {
+          const segment = clipSegment(points[index], end);
+          if (!segment) {
+            if (fragment.length > 1) fragments.push(fragment);
+            fragment = [];
+            return;
+          }
+          if (!fragment.length || Math.hypot(fragment.at(-1)[0] - segment[0][0], fragment.at(-1)[1] - segment[0][1]) > 1e-7) {
+            if (fragment.length > 1) fragments.push(fragment);
+            fragment = [segment[0]];
+          }
+          if (Math.hypot(fragment.at(-1)[0] - segment[1][0], fragment.at(-1)[1] - segment[1][1]) > 1e-7) fragment.push(segment[1]);
+        });
+        if (fragment.length > 1) fragments.push(fragment);
+        // A corner-only diagonal tip is not a usable pore-to-pore channel.
+        // A printable boundary fragment must retain a finite horizontal
+        // support.  This is intentionally the same filter as Core's
+        // continuous_course planner, so the displayed red paths are exactly
+        // the independent manufacturing paths handed to Core.
+        return fragments.filter((fragment) => fragment.slice(1).some((point, index) => (
+          Math.abs(point[1] - fragment[index][1]) <= 1e-7
+          && point[0] - fragment[index][0] > 1e-7
+        )));
+      };
+      const mainRows = [...recordsByRow.keys()]
+        .filter((row) => Math.abs(row - Math.round(row)) < 1e-7)
+        .sort((first, second) => first - second);
+      mainRows.slice(1).forEach((upperRow, index) => {
+        const lowerRow = mainRows[index];
+        const lowerCenterY = recordsByRow.get(lowerRow)[0].center[1];
+        const upperCenterY = recordsByRow.get(upperRow)[0].center[1];
+        const gapLowerY = lowerCenterY + hexHalfHeight;
+        const gapUpperY = upperCenterY - hexHalfHeight;
+        if (gapLowerY < poreClipBounds[1] - 1e-7 || gapUpperY > poreClipBounds[3] + 1e-7) return;
+        const lowerPoints = analyticRowCourse(lowerRow + 0.5, 'lower');
+        const upperPoints = analyticRowCourse(lowerRow + 0.5, 'upper');
+        courses.push({
+          points: lowerPoints,
+          fragments: clippedCourseFragments(lowerPoints),
+          railOffsetsMm: [0],
+          opening: { lowerRow, upperRow, lane: 'lower', capacity: 2 },
+        });
+        courses.push({
+          points: upperPoints,
+          fragments: clippedCourseFragments(upperPoints),
+          railOffsetsMm: [0],
+          opening: { lowerRow, upperRow, lane: 'upper', capacity: 2 },
+        });
+      });
+      const courseLength = (course) => course.fragments.flatMap((fragment) => fragment.slice(1).map((point, index) => [fragment[index], point])).reduce(
+        (length, [start, end]) => length + Math.hypot(end[0] - start[0], end[1] - start[1]), 0
+      );
+      const totalLengthMm = courses.reduce((total, course) => total + courseLength(course) * course.railOffsetsMm.length, 0);
+      const value = {
+        courses,
+        pores,
+        poreClipBounds,
+        resinContourWidthMm,
+        fiberTowWidthMm,
+        edgeLength,
+        totalLengthMm,
+        activeXBounds,
+        courseClipBounds: bounds,
+        latticeAnchorMm: [xMid, yMid],
+        parentBounds,
+        parentRowOriginY,
+        rowPitch,
+        columnPitch,
+      };
+      continuousCoursePreviewCache = { key, value };
+      return value;
+    }
+
+    function offsetContinuousCourse(course, offsetMm) {
+      if (course.length < 2 || Math.abs(offsetMm) < 1e-9) return course.map((point) => [...point]);
+      const unitNormal = (start, end) => {
+        const dx = end[0] - start[0];
+        const dy = end[1] - start[1];
+        const length = Math.hypot(dx, dy);
+        return length <= 1e-9 ? [0, 0] : [-dy / length, dx / length];
+      };
+      const result = [];
+      course.forEach((point, index) => {
+        const previousNormal = index === 0
+          ? unitNormal(course[0], course[1])
+          : unitNormal(course[index - 1], point);
+        const nextNormal = index === course.length - 1
+          ? previousNormal
+          : unitNormal(point, course[index + 1]);
+        const miterX = previousNormal[0] + nextNormal[0];
+        const miterY = previousNormal[1] + nextNormal[1];
+        const miterLength = Math.hypot(miterX, miterY);
+        if (miterLength <= 1e-8) {
+          // A reference-course U-turn has no finite miter.  Keep its two
+          // sharp rail endpoints explicitly rather than inventing an arc.
+          result.push([point[0] + previousNormal[0] * offsetMm, point[1] + previousNormal[1] * offsetMm]);
+          result.push([point[0] + nextNormal[0] * offsetMm, point[1] + nextNormal[1] * offsetMm]);
+          return;
+        }
+        const unitMiter = [miterX / miterLength, miterY / miterLength];
+        const denominator = Math.abs(unitMiter[0] * nextNormal[0] + unitMiter[1] * nextNormal[1]);
+        const distance = Math.min(Math.abs(offsetMm) * 4, Math.abs(offsetMm) / Math.max(denominator, 1e-6));
+        const direction = offsetMm < 0 ? -1 : 1;
+        result.push([point[0] + unitMiter[0] * distance * direction, point[1] + unitMiter[1] * distance * direction]);
+      });
+      return result;
+    }
+
+    function appendProjectedContinuousCourse(ctx, course, layer, zMid, yaw, pitch, scale, cx, cy) {
+      course.forEach((point, index) => {
+        const projected = project(point[0], point[1], physicalLayerZ(heightAt(point[0], point[1]), layer) - zMid, yaw, pitch, scale, cx, cy);
+        if (index === 0) ctx.moveTo(projected.x, projected.y);
+        else ctx.lineTo(projected.x, projected.y);
+      });
+    }
+
+    function appendProjectedClippedContinuousCourse(ctx, course, clipBounds, layer, zMid, yaw, pitch, scale, cx, cy) {
+      course.slice(1).forEach((end, index) => {
+        const segment = clipSegmentToBounds(course[index], end, clipBounds);
+        if (!segment) return;
+        const projectedStart = project(segment[0][0], segment[0][1], physicalLayerZ(heightAt(segment[0][0], segment[0][1]), layer) - zMid, yaw, pitch, scale, cx, cy);
+        const projectedEnd = project(segment[1][0], segment[1][1], physicalLayerZ(heightAt(segment[1][0], segment[1][1]), layer) - zMid, yaw, pitch, scale, cx, cy);
+        ctx.moveTo(projectedStart.x, projectedStart.y);
+        ctx.lineTo(projectedEnd.x, projectedEnd.y);
+      });
+    }
+
+    function appendProjectedClosedPore(ctx, pore, layer, zMid, yaw, pitch, scale, cx, cy) {
+      pore.forEach((point, index) => {
+        const projected = project(point[0], point[1], physicalLayerZ(heightAt(point[0], point[1]), layer) - zMid, yaw, pitch, scale, cx, cy);
+        if (index === 0) ctx.moveTo(projected.x, projected.y);
+        else ctx.lineTo(projected.x, projected.y);
+      });
+      ctx.closePath();
+    }
+
+    function appendProjectedClippedPore(ctx, pore, clipBounds, layer, zMid, yaw, pitch, scale, cx, cy) {
+      pore.forEach((start, index) => {
+        const end = pore[(index + 1) % pore.length];
+        const segment = clipSegmentToBounds(start, end, clipBounds);
+        if (!segment) return;
+        const projectedStart = project(segment[0][0], segment[0][1], physicalLayerZ(heightAt(segment[0][0], segment[0][1]), layer) - zMid, yaw, pitch, scale, cx, cy);
+        const projectedEnd = project(segment[1][0], segment[1][1], physicalLayerZ(heightAt(segment[1][0], segment[1][1]), layer) - zMid, yaw, pitch, scale, cx, cy);
+        ctx.moveTo(projectedStart.x, projectedStart.y);
+        ctx.lineTo(projectedEnd.x, projectedEnd.y);
+      });
     }
 
     function updateLatticeLengthSummary() {
       const summary = document.getElementById('latticeLengthSummary');
       if (!payload) {
-        summary.textContent = '六边形边线总长将在曲面预览更新后显示。';
+        summary.textContent = '连续课程总长将在曲面预览更新后显示。';
         return;
       }
-      const lattice = latticePreviewSegments();
-      if (!lattice.segments.length) {
-        summary.textContent = '当前参数在矩形范围内没有可显示的蜂窝墙线。';
-      } else if (lattice.sampled) {
-        summary.textContent = '当前网格过密，画布已降采样；为避免把显示近似值当作工艺长度，此处不报告总长。';
+      const courses = continuousCoursePreview();
+      if (!courses.courses.length) {
+        summary.textContent = '当前尺寸与目标边长不能容纳完整的连续课程单元。请减小目标边长或增大工作段。';
       } else {
-        summary.textContent = `当前六边形边线总长：${lattice.totalWallLengthMm.toFixed(2)} mm（平面预览，${lattice.segments.length} 条去重边线）。`;
+        const fragmentCount = courses.courses.reduce((count, course) => count + course.fragments.length, 0);
+        summary.textContent = `当前平面连续课程：中心孔锚定在 (${courses.latticeAnchorMm[0].toFixed(2)}, ${courses.latticeAnchorMm[1].toFixed(2)}) mm；黄色孔洞由该锚点的 300 × 300 mm 母板裁切，并在外矩形轮廓和夹持分界树脂带内侧截断（树脂轮廓宽 ${courses.resinContourWidthMm.toFixed(2)} mm）。${courses.courses.length} 条母课程裁为 ${fragmentCount} 条独立制造路径；每个截断首尾均按独立树脂/纤维路径处理。预计纤维总长 ${courses.totalLengthMm.toFixed(2)} mm。`;
       }
     }
 
@@ -1179,32 +2228,66 @@ def surface_preview_html() -> str:
     }
 
     function drawLatticePreview(ctx, layer, zMid, yaw, pitch, scale, cx, cy) {
-      const lattice = latticePreviewSegments();
-      if (!lattice.segments.length) return;
-      const wavelength = Math.min(payload.surface.wavelength_x_mm, payload.surface.wavelength_y_mm);
-      const subdivisions = drag ? 1 : Math.max(2, Math.min(6, Math.ceil(lattice.previewEdgeLength / Math.max(wavelength / 8, 0.1))));
+      const coursePreview = continuousCoursePreview();
+      if (!coursePreview.pores.length && !coursePreview.courses.length) return;
       ctx.save();
+      // Yellow is the clear-pore skeleton.  It is a geometric reference only,
+      // not an added printable path.  Its source is the fixed 300 x 300 mm
+      // parent lattice; only its individual line segments are clipped here.
       ctx.beginPath();
-      lattice.segments.forEach(([start, end]) => {
-        for (let index = 0; index <= subdivisions; index += 1) {
-          const ratio = index / subdivisions;
-          const x = start[0] + (end[0] - start[0]) * ratio;
-          const y = start[1] + (end[1] - start[1]) * ratio;
-          const point = project(x, y, physicalLayerZ(heightAt(x, y), layer) - zMid, yaw, pitch, scale, cx, cy);
-          if (index === 0) ctx.moveTo(point.x, point.y);
-          else ctx.lineTo(point.x, point.y);
-        }
-      });
-      ctx.strokeStyle = 'rgba(7, 91, 76, .88)';
-      ctx.lineWidth = Math.max(0.8, Math.min(12, lattice.wallWidth * scale * 0.72));
-      ctx.lineJoin = 'round';
-      ctx.lineCap = 'round';
+      coursePreview.pores.forEach((pore) => appendProjectedClippedPore(ctx, pore, coursePreview.poreClipBounds, layer, zMid, yaw, pitch, scale, cx, cy));
+      ctx.strokeStyle = 'rgba(255, 191, 0, .98)';
+      ctx.lineWidth = Math.max(1.0, Math.min(2.4, scale * 0.18));
+      ctx.lineJoin = 'miter';
+      ctx.lineCap = 'butt';
       ctx.stroke();
+      // Red is a centreline-only view.  Single-track and double-track bands
+      // are explicit properties of each course, never a blanket offset of an
+      // old honeycomb skeleton.  The double band uses centres +/-1 mm.
+      coursePreview.courses.forEach((course) => {
+        ctx.beginPath();
+        course.railOffsetsMm.forEach((offsetMm) => {
+          course.fragments.forEach((fragment) => appendProjectedContinuousCourse(
+            ctx,
+            offsetContinuousCourse(fragment, offsetMm),
+            layer,
+            zMid,
+            yaw,
+            pitch,
+            scale,
+            cx,
+            cy,
+          ));
+        });
+        ctx.strokeStyle = 'rgba(213, 42, 51, .96)';
+        ctx.lineWidth = Math.max(0.9, Math.min(1.8, scale * 0.13));
+        ctx.lineJoin = 'miter';
+        ctx.miterLimit = 4;
+        ctx.lineCap = 'butt';
+        ctx.stroke();
+      });
+      coursePreview.courses.forEach((course) => {
+        course.railOffsetsMm.forEach((offsetMm) => {
+          course.fragments.forEach((fragment) => {
+            const track = offsetContinuousCourse(fragment, offsetMm);
+            if (track.length < 2) return;
+            [track[0], track.at(-1)].forEach((point, index) => {
+            const projected = project(point[0], point[1], physicalLayerZ(heightAt(point[0], point[1]), layer) - zMid, yaw, pitch, scale, cx, cy);
+            ctx.beginPath();
+            ctx.arc(projected.x, projected.y, 2.7, 0, 2 * Math.PI);
+            ctx.fillStyle = index === 0 ? '#16856e' : '#8d1b26';
+            ctx.fill();
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 0.7;
+            ctx.stroke();
+          });
+          });
+        });
+      });
       ctx.restore();
-      ctx.fillStyle = 'rgba(7, 71, 62, .78)';
+      ctx.fillStyle = 'rgba(132, 25, 37, .88)';
       ctx.font = '12px Segoe UI, Microsoft YaHei, sans-serif';
-      const sampling = lattice.sampled ? `；显示降采样边长 ${lattice.previewEdgeLength.toFixed(2)} mm` : '';
-      ctx.fillText(`蜂窝格栅：墙宽 ${lattice.wallWidth.toFixed(2)} mm；目标边长 ${lattice.edgeLength.toFixed(2)} mm；α=${layer.alpha.toFixed(2)}，物理层 ${layer.index + 1}${sampling}`, 14, 20);
+      ctx.fillText(`连续课程蜂窝：中心孔锚定 (${coursePreview.latticeAnchorMm[0].toFixed(2)}, ${coursePreview.latticeAnchorMm[1].toFixed(2)})；黄色由 300 × 300 mm 母板逐边裁切；红色为孔间通道中心线，裁断后每段独立制造；目标边长 ${coursePreview.edgeLength.toFixed(2)} mm；α=${layer.alpha.toFixed(2)}，物理层 ${layer.index + 1}`, 14, 20);
     }
 
     function renderSolidStack(ctx, width, height) {
@@ -1262,12 +2345,14 @@ def surface_preview_html() -> str:
         ctx.strokeStyle = `hsla(207, 74%, ${35 + layer.alpha * 28}%, ${0.2 + layer.alpha * 0.75})`;
         ctx.lineWidth = layer.index === stack.representative_peak_layer_index ? 2.7 : layer.alpha >= 0.999 ? 2.2 : 1.15;
         ctx.stroke();
-        const markerZ = layer.base_z_mm + payload.surface.z_reference_mm
-          + layer.alpha * (payload.inspection_point.height_mm - payload.surface.z_reference_mm);
-        ctx.beginPath();
-        ctx.arc(mapX(payload.inspection_point.x_mm), mapZ(markerZ), 2.5, 0, 2 * Math.PI);
-        ctx.fillStyle = '#d14322';
-        ctx.fill();
+        if (payload.inspection_point) {
+          const markerZ = layer.base_z_mm + payload.surface.z_reference_mm
+            + layer.alpha * (payload.inspection_point.height_mm - payload.surface.z_reference_mm);
+          ctx.beginPath();
+          ctx.arc(mapX(payload.inspection_point.x_mm), mapZ(markerZ), 2.5, 0, 2 * Math.PI);
+          ctx.fillStyle = '#d14322';
+          ctx.fill();
+        }
       });
       ctx.fillStyle = 'rgba(21,32,51,.78)';
       ctx.font = '12px Segoe UI, Microsoft YaHei, sans-serif';
@@ -1362,10 +2447,15 @@ def surface_preview_html() -> str:
         `Z：${statistics.z_min_mm.toFixed(3)} ～ ${statistics.z_max_mm.toFixed(3)} mm`,
         `起伏：${statistics.z_range_mm.toFixed(3)} mm`,
         `最大坡度：${statistics.max_slope.toFixed(3)}`,
-        `检验点 H：${point.height_mm.toFixed(3)} mm；坡度：${point.slope.toFixed(4)}；平均曲率（有符号）：${point.mean_curvature_per_mm.toFixed(5)} 1/mm`,
         `坐标：${coordinateSystem.origin_label}；范围：[${coordinateSystem.xy_bounds_mm.join(', ')}] mm`,
         `预览：${data.preview_version}；导出：${data.export_version}；Git：${data.git_revision}`,
       ];
+      if (data.surface_parameterization.mode === 'tensile_centered_wave_count') {
+        values.splice(3, 0, `拉伸波数：nx=${data.surface_parameterization.wave_count_x.toFixed(2)}；ny=${data.surface_parameterization.wave_count_y.toFixed(2)}`);
+      }
+      if (point) {
+        values.splice(3, 0, `检验点 H：${point.height_mm.toFixed(3)} mm；坡度：${point.slope.toFixed(4)}；平均曲率（有符号）：${point.mean_curvature_per_mm.toFixed(5)} 1/mm`);
+      }
       statsEl.replaceChildren(...values.map((value) => {
         const item = document.createElement('span');
         item.className = 'stat';
@@ -1397,12 +2487,18 @@ def surface_preview_html() -> str:
 
     let timer = null;
     function scheduleRefresh() { clearTimeout(timer); timer = setTimeout(refresh, 120); }
-    function invalidateLatticePreview() { latticePreviewCache = null; }
+    function invalidateLatticePreview() {
+      latticePreviewCache = null;
+      continuousCoursePreviewCache = null;
+    }
     surfaceIds.forEach((id) => document.getElementById(id).addEventListener('input', () => {
+      updateTensileWaveHint();
       saveDesignerState();
       scheduleRefresh();
     }));
     ['part_length_mm', 'part_width_mm', 'part_height_mm', 'surface_start_layer'].forEach((id) => document.getElementById(id).addEventListener('input', () => {
+      syncInspectionPointControls();
+      updateTensileWaveHint();
       saveDesignerState();
       invalidateLatticePreview();
       scheduleRefresh();
@@ -1419,7 +2515,52 @@ def surface_preview_html() -> str:
       updateLatticeLengthSummary();
       if (payload) render();
     });
-    ['wall_width_mm', 'base_cell_size_mm', 'orientation_angle_deg'].forEach((id) => document.getElementById(id).addEventListener('input', () => {
+    ['honeycomb_align_x', 'honeycomb_align_y'].forEach((id) => document.getElementById(id).addEventListener('change', () => {
+      if (document.getElementById(id).checked) document.getElementById('align_load_line').checked = false;
+      syncLoadLineAlignmentControls();
+      saveDesignerState();
+      invalidateLatticePreview();
+      updateConformalDesignSummary();
+      updateLatticeLengthSummary();
+      if (payload) render();
+    }));
+    document.getElementById('centreHoneycombAlignment').addEventListener('click', () => {
+      const length = positiveNumber('part_length_mm');
+      const width = positiveNumber('part_width_mm');
+      if (length === null || width === null) return;
+      document.getElementById('honeycomb_align_x_mm').value = (length / 2).toFixed(3);
+      document.getElementById('honeycomb_align_y_mm').value = (width / 2).toFixed(3);
+      saveDesignerState();
+      invalidateLatticePreview();
+      updateLatticeLengthSummary();
+      if (payload) render();
+    });
+    document.getElementById('surface_parameter_mode').addEventListener('change', () => {
+      syncSurfaceParameterControls();
+      saveDesignerState();
+      scheduleRefresh();
+    });
+    document.getElementById('inspection_enabled').addEventListener('change', () => {
+      syncInspectionPointControls();
+      saveDesignerState();
+      scheduleRefresh();
+    });
+    document.getElementById('applyTensilePreset').addEventListener('click', () => {
+      document.getElementById('surface_parameter_mode').value = 'tensile_centered_wave_count';
+      document.getElementById('amplitude_mm').value = 1.5;
+      document.getElementById('wave_count_x').value = 1.5;
+      document.getElementById('wave_count_y').value = 1.5;
+      document.getElementById('inspection_enabled').checked = false;
+      document.getElementById('align_load_line').checked = false;
+      syncSurfaceParameterControls();
+      syncInspectionPointControls();
+      syncLoadLineAlignmentControls();
+      invalidateLatticePreview();
+      saveDesignerState();
+      updateConformalDesignSummary();
+      scheduleRefresh();
+    });
+    ['grip_end_length_mm', 'wall_width_mm', 'base_cell_size_mm', 'orientation_angle_deg', 'honeycomb_align_x_mm', 'honeycomb_align_y_mm'].forEach((id) => document.getElementById(id).addEventListener('input', () => {
       invalidateLatticePreview();
       updateLatticeLengthSummary();
       if (payload) render();
@@ -1451,7 +2592,7 @@ def surface_preview_html() -> str:
         link.click();
         URL.revokeObjectURL(link.href);
         statusEl.className = 'status';
-        statusEl.textContent = '已导出共形蜂窝设计 JSON；回到主切片器导入该文件以生成路径。';
+        statusEl.textContent = '已导出连续课程设计 JSON；回到主切片器导入该文件以生成正式路径。';
       } catch (error) {
         statusEl.className = 'status error';
         statusEl.textContent = error.message;
@@ -1504,11 +2645,15 @@ def surface_preview_html() -> str:
       render();
     });
     document.getElementById('reset').addEventListener('click', () => {
-      const defaults = { part_length_mm: 150, part_width_mm: 100, part_height_mm: 10, amplitude_mm: 1.5, wavelength_x_mm: 100, wavelength_y_mm: 200, phase_x_pi: 1, phase_y_pi: 0, z_reference_mm: 0, check_x_mm: 75, check_y_mm: 50, wall_width_mm: 2, base_cell_size_mm: 5, orientation_angle_deg: 0, surface_start_layer: 3, samples_x: 49, samples_y: 49, boundary_mode: 'clip', random_seed: 0, samples: 49, surfaceZScale: 5, sectionZScale: 3, previewMode: 'surface' };
+      const defaults = { part_length_mm: 150, part_width_mm: 50, part_height_mm: 10, grip_end_length_mm: 25, surface_parameter_mode: 'tensile_centered_wave_count', amplitude_mm: 1.5, wave_count_x: 1.5, wave_count_y: 1.5, wavelength_x_mm: 100, wavelength_y_mm: 33.333, phase_x_pi: 1, phase_y_pi: 1, z_reference_mm: 0, inspection_enabled: false, check_x_mm: 75, check_y_mm: 25, wall_width_mm: 2, base_cell_size_mm: 10, orientation_angle_deg: 0, honeycomb_align_x: false, honeycomb_align_x_mm: 75, honeycomb_align_y: false, honeycomb_align_y_mm: 25, surface_start_layer: 3, samples_x: 49, samples_y: 49, boundary_mode: 'clip', random_seed: 0, samples: 49, surfaceZScale: 5, sectionZScale: 3, previewMode: 'surface' };
       Object.entries(defaults).forEach(([id, value]) => {
-        document.getElementById(id).value = value;
+        const element = document.getElementById(id);
+        if (element.type === 'checkbox') element.checked = value;
+        else element.value = value;
       });
-      document.getElementById('align_load_line').checked = true;
+      document.getElementById('align_load_line').checked = false;
+      syncSurfaceParameterControls();
+      syncInspectionPointControls();
       syncLoadLineAlignmentControls();
       invalidateLatticePreview();
       saveDesignerState();
@@ -1516,10 +2661,16 @@ def surface_preview_html() -> str:
       refresh();
     });
     window.addEventListener('resize', render);
-    restoreDesignerState();
-    syncLoadLineAlignmentControls();
-    updateConformalDesignSummary();
-    refresh();
+    async function initialiseDesigner() {
+      restoreDesignerState();
+      await restorePersistentDesignerState();
+      syncSurfaceParameterControls();
+      syncInspectionPointControls();
+      syncLoadLineAlignmentControls();
+      updateConformalDesignSummary();
+      refresh();
+    }
+    initialiseDesigner();
   </script>
 </body>
 </html>'''
