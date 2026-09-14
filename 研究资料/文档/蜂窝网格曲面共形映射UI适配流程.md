@@ -99,17 +99,17 @@ z(x,y)=z_{ref}+A\sin\left(\frac{2\pi x}{\lambda_x}+\phi_x\right)
 层间形貌固定为“对称 smoothstep”，不提供其他策略下拉框。UI 仅增加或保留：
 
 - 设计期映射参考层数：由最终物理高度和固定 0.5 mm 参考值计算，只读显示；实际逻辑层数由主界面 Core 层高决定；
-- 曲面起始层：`surface_start_layer`，用户输入整数；
+- 首个非零曲率层（物理层）：用户输入自下而上、从 1 开始计数的整数；
 - 曲面回落层：自动镜像计算，只读显示；
 - 峰值层：自动计算，只读显示。
 
-“曲面起始层”的语义与旧版一致：该层本身仍为 `alpha=0`，下一层开始逐渐增加曲率。
+UI 输入的语义为“首个 `alpha>0` 的物理层”。例如填 `3` 时，第 1–2 层保持平面，第 3 层首次出现非零曲率。为了保持已有 mapper/Core 合同兼容，导出时将其转换为旧的零基平面边界索引：`surface_start_layer = first_nonzero_curvature_layer_physical - 2`，并同时写入人可读字段 `first_nonzero_curvature_layer_physical`。旧 API 未携带语义标记时，仍按原始 `surface_start_layer` 解释。
 
 ### 3.2 系数计算
 
 设：
 
-- `s` 为用户输入的曲面起始层；
+- `s` 为导出给旧 mapper 的零基平面边界层索引，不是 UI 直接显示的物理层号；
 - `L` 为最后一个逻辑层索引；
 - `r=L-s` 为镜像回落层；
 - `k` 为当前逻辑层。
