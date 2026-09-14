@@ -260,9 +260,17 @@ def export_npz(
                 })
                 injection_block_by_command_index[command_index] = block_id
 
+    zero_machine_calibration = (
+        all(abs(float(value)) <= 1e-12 for value in tool_offset)
+        and abs(float(resin_z_print_compensation_mm)) <= 1e-12
+    )
     core_injection_manifest = {
-        "format": "core_npz_local_injection_v1",
-        "schema_version": 1,
+        "format": (
+            "core_npz_local_injection_v2"
+            if zero_machine_calibration
+            else "core_npz_local_injection_v1"
+        ),
+        "schema_version": 2 if zero_machine_calibration else 1,
         "description": (
             "Embedded local-injection catalog. Row markers are metadata only; "
             "they do not change motion, E, seq, or RSI timing."
@@ -309,6 +317,17 @@ def export_npz(
         ],
         "blocks": injection_blocks,
     }
+    if zero_machine_calibration:
+        core_injection_manifest.update({
+            "offset_kind": "command_compensation",
+            "offset_frame": "calibrated_flat_print_reference",
+            "abc_convention": "KUKA_AZ_BY_CX",
+            "abc_semantics": "relative_to_calibrated_flat_printing_pose",
+            "offset_application": "per_sample_pose_rotated",
+            "injection_state": "base",
+            "calibration_id": None,
+            "injected_at": None,
+        })
     core_injection_manifest_json = json.dumps(
         core_injection_manifest,
         ensure_ascii=False,
@@ -2139,8 +2158,26 @@ def export_npz(
     try:
         offset_file = base_no_ext + ".offset.json"
         with open(offset_file, "w", encoding="utf-8") as f:
-            json.dump({"tool_offset": list(tool_offset), "resin_z_print_compensation_mm": float(
-                resin_z_print_compensation_mm)}, f, ensure_ascii=False, indent=2)
+            sidecar = {
+                "format": core_injection_manifest["format"],
+                "schema_version": core_injection_manifest["schema_version"],
+                "tool_offset": list(tool_offset),
+                "resin_z_print_compensation_mm": float(
+                    resin_z_print_compensation_mm
+                ),
+            }
+            if zero_machine_calibration:
+                sidecar.update({
+                    "injection_state": "base",
+                    "offset_kind": "command_compensation",
+                    "offset_frame": "calibrated_flat_print_reference",
+                    "abc_convention": "KUKA_AZ_BY_CX",
+                    "abc_semantics": "relative_to_calibrated_flat_printing_pose",
+                    "offset_application": "per_sample_pose_rotated",
+                    "calibration_id": None,
+                    "injected_at": None,
+                })
+            json.dump(sidecar, f, ensure_ascii=False, indent=2)
     except Exception as exc:
         print(f"[Warning] Failed to write offset sidecar json: {exc}")
 

@@ -78,6 +78,13 @@ def test_conformal_design_json_generates_core_output_without_source_npz_round_tr
     assert not (job_dir / "conformal_lattice_geometry_v1.npz").exists()
     with np.load(job_dir / "conformal_lattice_core.npz", allow_pickle=False) as core:
         assert np.linalg.norm(np.column_stack((core["a"], core["b"], core["c"]))) > 1e-3
+        manifest = json.loads(str(core["core_injection_manifest"].item()))
+        assert manifest["format"] == "core_npz_local_injection_v2"
+        assert manifest["injection_state"] == "base"
+        assert manifest["offset_frame"] == "calibrated_flat_print_reference"
+        assert manifest["offset_application"] == "per_sample_pose_rotated"
+        assert manifest["base_parameters"]["tool_offset"] == [0.0, 0.0, 0.0]
+        assert manifest["base_parameters"]["resin_z_print_compensation_mm"] == 0.0
     assert progress[-1] == 97
 
 
@@ -775,6 +782,33 @@ def test_core_cooling_is_always_enabled_without_ui_switches():
 
     assert params.resin.fan_enabled is True
     assert params.fiber.fan_enabled is True
+
+
+def test_offline_slicer_always_exports_a_zero_offset_base_contract():
+    _ensure_offline_planner_import_paths()
+    module = importlib.import_module("external_npz_preprocessor.process_params")
+
+    params = _parse_core_process_params(
+        {
+            "core_fiber_offset_x": ["9.0"],
+            "core_fiber_offset_y": ["8.0"],
+            "core_fiber_offset_z": ["7.0"],
+            "core_resin_z_comp": ["-30.5"],
+        },
+        module,
+    )
+
+    assert params.export.fiber_x_print_compensation_mm == 0.0
+    assert params.export.fiber_y_print_compensation_mm == 0.0
+    assert params.export.fiber_z_print_compensation_mm == 0.0
+    assert params.export.resin_z_print_compensation_mm == 0.0
+
+    html = _index_html()
+    assert "机器喷头偏置由上位机现场注入" in html
+    assert 'id="coreFiberOffsetX"' not in html
+    assert 'id="coreFiberOffsetY"' not in html
+    assert 'id="coreFiberOffsetZ"' not in html
+    assert 'id="coreResinZComp"' not in html
 
 
 def test_core_placement_uses_integrated_prusa_start_xy():

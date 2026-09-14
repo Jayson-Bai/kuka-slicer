@@ -1901,10 +1901,12 @@ def _parse_core_process_params(
         start_accel_s=_float_param(params, "core_fiber_start_accel", fiber_defaults.start_accel_s),
     )
     export = module.CoreExportParams(
-        fiber_x_print_compensation_mm=_optional_float_param(params, "core_fiber_offset_x") if "core_fiber_offset_x" in params else export_defaults.fiber_x_print_compensation_mm,
-        fiber_y_print_compensation_mm=_optional_float_param(params, "core_fiber_offset_y") if "core_fiber_offset_y" in params else export_defaults.fiber_y_print_compensation_mm,
-        fiber_z_print_compensation_mm=_optional_float_param(params, "core_fiber_offset_z") if "core_fiber_offset_z" in params else export_defaults.fiber_z_print_compensation_mm,
-        resin_z_print_compensation_mm=_optional_float_param(params, "core_resin_z_comp") if "core_resin_z_comp" in params else export_defaults.resin_z_print_compensation_mm,
+        # Machine calibration is injected only by the live upper computer.
+        # The offline slicer always emits a reusable, zero-offset base NPZ.
+        fiber_x_print_compensation_mm=0.0,
+        fiber_y_print_compensation_mm=0.0,
+        fiber_z_print_compensation_mm=0.0,
+        resin_z_print_compensation_mm=0.0,
         enable_extrude_wait=_bool_param(params, "core_enable_extrude_wait", export_defaults.enable_extrude_wait),
         enable_travel_extrude_overlap=_bool_param(
             params, "core_enable_travel_extrude_overlap", export_defaults.enable_travel_extrude_overlap
@@ -4955,13 +4957,9 @@ def _index_html() -> str:
           </section>
 
           <section class="prusaAdvancedGroup">
-            <h4>现场材料补偿与工具偏置</h4>
-            <p class="notice">按材料区分的现场校准参数。它们在 process_core 命令层注入，随后统一经过七阶参数化。</p>
+            <h4>Core 导出控制</h4>
+            <p class="notice">机器喷头偏置由上位机现场注入；离线切片器固定输出零偏置基础轨迹。</p>
             <div class="prusaSettingsGrid">
-              <div class="fieldGroup"><label for="coreFiberOffsetX">纤维头 X 偏置 mm</label><input id="coreFiberOffsetX" type="number" step="0.001" placeholder="读取校准文件"></div>
-              <div class="fieldGroup"><label for="coreFiberOffsetY">纤维头 Y 偏置 mm</label><input id="coreFiberOffsetY" type="number" step="0.001" placeholder="读取校准文件"></div>
-              <div class="fieldGroup"><label for="coreFiberOffsetZ">纤维头 Z 偏置 mm</label><input id="coreFiberOffsetZ" type="number" step="0.001" placeholder="读取校准文件"></div>
-              <div class="fieldGroup"><label for="coreResinZComp">树脂 Z 补偿 mm</label><input id="coreResinZComp" type="number" step="0.001" placeholder="读取校准文件"></div>
               <div class="fieldGroup"><label for="coreFiberRetractOverride">纤维回抽覆盖 mm</label><input id="coreFiberRetractOverride" type="number" min="0" step="0.001" placeholder="使用纤维工艺参数"></div>
             </div>
           </section>
@@ -5236,8 +5234,7 @@ def _index_html() -> str:
         'corePrimelineLength', 'coreDt', 'coreCornerAngle',
         'coreCornerRetreatRatio', 'coreSplineMaxError', 'coreSplineMaxAngle',
         'coreSourceMergeDistance', 'coreCornerRetreatMax', 'coreCornerBlendSegments',
-        'coreDensity', 'coreDegree', 'coreMaxFitPoints', 'coreFiberOffsetX',
-        'coreFiberOffsetY', 'coreFiberOffsetZ', 'coreResinZComp',
+        'coreDensity', 'coreDegree', 'coreMaxFitPoints',
         'coreToolSafeLift', 'coreCutLift', 'coreCutWait', 'coreFiberRetractOverride',
         'coreInitialTool'
       ];
@@ -5523,10 +5520,6 @@ def _index_html() -> str:
       ['coreDensity', 'core_density', 'root', 'density'],
       ['coreDegree', 'core_degree', 'root', 'degree'],
       ['coreMaxFitPoints', 'core_max_fit_points', 'root', 'max_fit_points_per_segment'],
-      ['coreFiberOffsetX', 'core_fiber_offset_x', 'export', 'fiber_x_print_compensation_mm'],
-      ['coreFiberOffsetY', 'core_fiber_offset_y', 'export', 'fiber_y_print_compensation_mm'],
-      ['coreFiberOffsetZ', 'core_fiber_offset_z', 'export', 'fiber_z_print_compensation_mm'],
-      ['coreResinZComp', 'core_resin_z_comp', 'export', 'resin_z_print_compensation_mm'],
       ['coreToolSafeLift', 'core_tool_safe_lift', 'export', 'tool_change_safe_lift_mm'],
       ['coreCutLift', 'core_cut_lift', 'export', 'cut_lift_mm'],
       ['coreCutWait', 'core_cut_wait', 'export', 'cut_wait_s'],
@@ -6229,8 +6222,7 @@ def _index_html() -> str:
          'corePrimelineLength', 'coreDt', 'coreCornerAngle',
          'coreCornerRetreatRatio', 'coreSplineMaxError', 'coreSplineMaxAngle',
          'coreSourceMergeDistance', 'coreCornerRetreatMax', 'coreCornerBlendSegments',
-         'coreDensity', 'coreDegree', 'coreMaxFitPoints', 'coreFiberOffsetX',
-         'coreFiberOffsetY', 'coreFiberOffsetZ', 'coreResinZComp',
+         'coreDensity', 'coreDegree', 'coreMaxFitPoints',
          'coreToolSafeLift', 'coreCutLift', 'coreCutWait', 'coreFiberRetractOverride',
          'coreInitialTool'
        ];

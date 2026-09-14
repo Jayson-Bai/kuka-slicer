@@ -62,13 +62,20 @@ core_injection_role_vocab_vals       uint8 vocabulary values
 ```
 
 `core_injection_manifest` is versioned as
-`core_npz_local_injection_v1`.  It records the export-time values of
+`core_npz_local_injection_v2` for a zero-machine-calibration base export. It
+records the export-time values and the
+KUKA A-Z/B-Y/C-X pose-rotated, flat-reference command-compensation contract of
 `tool_offset`, resin-Z compensation, tool-change safe lift, CUT lift/wait,
 the sample period, and a complete catalog of tool-change/CUT blocks.  The
 per-row marker arrays identify the exact contiguous rows belonging to the
 pre-action, event, action, post-travel, and next-path anchor roles.  The
 markers are metadata only: they do not alter `seq`, `e`, planned time, or
 RSI timing.
+
+Legacy callers that request non-zero calibration during the export remain
+marked as `core_npz_local_injection_v1`, because those values were applied as
+fixed BASE-frame translations and must not be mistaken for the v2 pose-rotated
+contract.
 
 The intended site-side operation is to load the NPZ, read the embedded
 manifest, rebuild only the marked atomic regions with the new machine

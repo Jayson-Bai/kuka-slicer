@@ -1185,6 +1185,7 @@ def test_system_npz_embeds_local_injection_catalog_and_row_markers(tmp_path):
         with np.load(part, allow_pickle=False) as data:
             manifest = json.loads(str(data["core_injection_manifest"].item()))
             assert manifest["format"] == "core_npz_local_injection_v1"
+            assert manifest["schema_version"] == 1
             assert manifest["sample_period_s"] == 0.1
             assert manifest["base_parameters"]["tool_offset"] == [1.0, 2.0, 3.0]
             assert {"tool_change", "cut", "resin_z_compensation"}.issubset(
