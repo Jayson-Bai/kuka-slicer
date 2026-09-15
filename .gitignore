@@ -24,6 +24,10 @@ kuka_slicer/_native/*.dll
 kuka_slicer/_native/*.lib
 kuka_slicer/_native/*.exp
 kuka_slicer/_native/*.pdb
+kuka_slicer/_native/*.so
+kuka_slicer/_native/*.dylib
+kuka_slicer/_native/*.a
+kuka_slicer/_native/*.dSYM/
 
 outputs/
 tmp_json_fiber_check/

@@ -1,0 +1,104 @@
+diff --git a/src/libslic3r/Preset.cpp b/src/libslic3r/Preset.cpp
+index 555d9ce..734851e 100644
+--- a/src/libslic3r/Preset.cpp
++++ b/src/libslic3r/Preset.cpp
+@@ -489,7 +489,7 @@ static std::vector<std::string> s_Preset_print_options {
+     "external_perimeter_acceleration", "top_solid_infill_acceleration", "solid_infill_acceleration", "travel_acceleration", "wipe_tower_acceleration",
+     "bridge_acceleration", "first_layer_acceleration", "first_layer_acceleration_over_raft", "default_acceleration", "skirts", "skirt_distance", "skirt_height", "draft_shield",
+     "min_skirt_length", "brim_width", "brim_separation", "brim_type", "support_material", "support_material_auto", "support_material_threshold", "support_material_enforce_layers",
+-    "raft_layers", "raft_first_layer_density", "raft_first_layer_expansion", "raft_contact_distance", "raft_expansion",
++    "raft_layers", "raft_first_layer_density", "raft_first_layer_expansion", "raft_contact_distance", "raft_contact_layer_height", "raft_contact_density", "raft_contact_extrusion_width", "raft_expansion",
+     "support_material_pattern", "support_material_with_sheath", "support_material_spacing", "support_material_closing_radius", "support_material_style",
+     "support_material_synchronize_layers", "support_material_angle", "support_material_interface_layers", "support_material_bottom_interface_layers",
+     "support_material_interface_pattern", "support_material_interface_spacing", "support_material_interface_contact_loops", 
+diff --git a/src/libslic3r/PrintConfig.cpp b/src/libslic3r/PrintConfig.cpp
+index 5462830..2da3ab7 100644
+--- a/src/libslic3r/PrintConfig.cpp
++++ b/src/libslic3r/PrintConfig.cpp
+@@ -2178,6 +2178,34 @@ void PrintConfigDef::init_fff_params()
+     def->mode = comExpert;
+     def->set_default_value(new ConfigOptionFloat(0.1));
+ 
++    def = this->add("raft_contact_layer_height", coFloat);
++    def->label = L("Raft contact layer height");
++    def->category = L("Support material");
++    def->tooltip = L("Manual height of the raft layer touching the object. Zero keeps the automatic nozzle-based calculation.");
++    def->sidetext = L("mm");
++    def->min = 0;
++    def->mode = comExpert;
++    def->set_default_value(new ConfigOptionFloat(0.));
++
++    def = this->add("raft_contact_density", coPercent);
++    def->label = L("Raft contact layer density");
++    def->category = L("Support material");
++    def->tooltip = L("Manual density of the raft contact layer. Zero keeps the automatic interface density.");
++    def->sidetext = L("%");
++    def->min = 0;
++    def->max = 100;
++    def->mode = comExpert;
++    def->set_default_value(new ConfigOptionPercent(0));
++
++    def = this->add("raft_contact_extrusion_width", coFloat);
++    def->label = L("Raft contact layer extrusion width");
++    def->category = L("Extrusion Width");
++    def->tooltip = L("Manual extrusion width of the raft contact layer. Zero keeps the automatic support width.");
++    def->sidetext = L("mm");
++    def->min = 0;
++    def->mode = comExpert;
++    def->set_default_value(new ConfigOptionFloat(0.));
++
+     def = this->add("ironing_speed", coFloat);
+     def->label = L("Ironing");
+     def->category = L("Speed");
+diff --git a/src/libslic3r/PrintConfig.hpp b/src/libslic3r/PrintConfig.hpp
+index 8cb4109..75852e4 100644
+--- a/src/libslic3r/PrintConfig.hpp
++++ b/src/libslic3r/PrintConfig.hpp
+@@ -663,6 +663,9 @@ PRINT_CONFIG_CLASS_DEFINE(
+     ((ConfigOptionFloat,               mmu_segmented_region_max_width))
+     ((ConfigOptionFloat,               mmu_segmented_region_interlocking_depth))
+     ((ConfigOptionFloat,               raft_contact_distance))
++    ((ConfigOptionFloat,               raft_contact_layer_height))
++    ((ConfigOptionPercent,             raft_contact_density))
++    ((ConfigOptionFloat,               raft_contact_extrusion_width))
+     ((ConfigOptionFloat,               raft_expansion))
+     ((ConfigOptionPercent,             raft_first_layer_density))
+     ((ConfigOptionFloat,               raft_first_layer_expansion))
+diff --git a/src/libslic3r/Slicing.cpp b/src/libslic3r/Slicing.cpp
+index f27def7..fde9b14 100644
+--- a/src/libslic3r/Slicing.cpp
++++ b/src/libslic3r/Slicing.cpp
+@@ -135,7 +135,9 @@ SlicingParameters SlicingParameters::create_from_config(
+         params.base_raft_layer_height       = std::max(params.layer_height, 0.75 * support_material_extruder_dmr);
+         params.interface_raft_layer_height  = std::max(params.layer_height, 0.75 * support_material_interface_extruder_dmr);
+         params.first_object_layer_bridging  = false;
+-        params.contact_raft_layer_height    = std::max(params.layer_height, 0.75 * support_material_interface_extruder_dmr);
++        params.contact_raft_layer_height    = object_config.raft_contact_layer_height.value > 0.
++            ? object_config.raft_contact_layer_height.value
++            : std::max(params.layer_height, 0.75 * support_material_interface_extruder_dmr);
+         params.first_object_layer_height    = params.layer_height;
+     }
+ 
+diff --git a/src/libslic3r/Support/SupportParameters.cpp b/src/libslic3r/Support/SupportParameters.cpp
+index 3086aa9..33fc7e3 100644
+--- a/src/libslic3r/Support/SupportParameters.cpp
++++ b/src/libslic3r/Support/SupportParameters.cpp
+@@ -51,6 +51,9 @@ SupportParameters::SupportParameters(const PrintObject &object)
+     this->support_material_flow              = Slic3r::support_material_flow(&object, float(slicing_params.layer_height));
+     this->support_material_interface_flow    = Slic3r::support_material_interface_flow(&object, float(slicing_params.layer_height));
+     this->raft_interface_flow                = support_material_interface_flow;
++    if (object_config.raft_contact_extrusion_width.value > 0.)
++        this->raft_interface_flow = this->raft_interface_flow.with_width(
++            float(object_config.raft_contact_extrusion_width.value));
+ 
+     // Calculate a minimum support layer height as a minimum over all extruders, but not smaller than 10um.
+     this->support_layer_height_min = scaled<coord_t>(0.01);
+@@ -94,6 +97,8 @@ SupportParameters::SupportParameters(const PrintObject &object)
+     this->interface_density  = std::min(1., this->support_material_interface_flow.spacing() / interface_spacing);
+     double raft_interface_spacing = object_config.support_material_interface_spacing.value + this->raft_interface_flow.spacing();
+     this->raft_interface_density = std::min(1., this->raft_interface_flow.spacing() / raft_interface_spacing);
++    if (object_config.raft_contact_density.value > 0.)
++        this->raft_interface_density = std::min(1., object_config.raft_contact_density.value * 0.01);
+     double support_spacing   = object_config.support_material_spacing.value + this->support_material_flow.spacing();
+     this->support_density    = std::min(1., this->support_material_flow.spacing() / support_spacing);
+     if (object_config.support_material_interface_layers.value == 0) {
