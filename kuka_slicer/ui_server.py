@@ -351,6 +351,143 @@ def _core_move_type_codes(data) -> set[int]:
 
 
 _FINAL_CORE_PREVIEW_MAX_POINTS = 16_000
+_FINAL_CORE_PREVIEW_XYZ_TOLERANCE_MM = 0.02
+_FINAL_CORE_PREVIEW_ORIENTATION_TOLERANCE_DEG = 0.25
+
+
+def _kuka_abc_quaternion_rows(abc: np.ndarray) -> np.ndarray:
+    """Vectorize KUKA ``Rz(A) @ Ry(B) @ Rx(C)`` for preview QA."""
+
+    half = np.radians(np.asarray(abc, dtype=np.float64)) * 0.5
+    ca, cb, cc = np.cos(half).T
+    sa, sb, sc = np.sin(half).T
+    quaternions = np.column_stack((
+        ca * cb * cc + sa * sb * sc,
+        ca * cb * sc - sa * sb * cc,
+        ca * sb * cc + sa * cb * sc,
+        sa * cb * cc - ca * sb * sc,
+    ))
+    quaternions /= np.linalg.norm(quaternions, axis=1, keepdims=True)
+    return quaternions
+
+
+def _preview_slerp_rows(
+    start: np.ndarray,
+    end: np.ndarray,
+    fractions: np.ndarray,
+) -> np.ndarray:
+    """Return quaternion SLERP rows for error-bounded display sampling."""
+
+    dot = float(np.dot(start, end))
+    if dot < 0.0:
+        end = -end
+        dot = -dot
+    dot = max(-1.0, min(1.0, dot))
+    if dot > 1.0 - 1e-10:
+        values = (1.0 - fractions[:, None]) * start + fractions[:, None] * end
+        values /= np.linalg.norm(values, axis=1, keepdims=True)
+        return values
+    angle = math.acos(dot)
+    denominator = math.sin(angle)
+    return (
+        np.sin((1.0 - fractions) * angle)[:, None] / denominator * start
+        + np.sin(fractions * angle)[:, None] / denominator * end
+    )
+
+
+def _error_bounded_preview_indices(
+    points: np.ndarray,
+    *,
+    mandatory_indices: np.ndarray | list[int] | tuple[int, ...] = (),
+    xyz_tolerance_mm: float = _FINAL_CORE_PREVIEW_XYZ_TOLERANCE_MM,
+    orientation_tolerance_deg: float = _FINAL_CORE_PREVIEW_ORIENTATION_TOLERANCE_DEG,
+) -> np.ndarray:
+    """Select source rows with bounded XYZ and quaternion interpolation error."""
+
+    values = np.asarray(points, dtype=np.float64)
+    count = len(values)
+    if count <= 2:
+        return np.arange(count, dtype=np.int64)
+    mandatory = np.asarray(mandatory_indices, dtype=np.int64)
+    mandatory = mandatory[(mandatory >= 0) & (mandatory < count)]
+    selected = set(np.unique(np.r_[0, mandatory, count - 1]).tolist())
+    anchors = sorted(selected)
+    stack = [(left, right) for left, right in zip(anchors, anchors[1:])]
+    quaternions = (
+        _kuka_abc_quaternion_rows(values[:, 3:6])
+        if values.shape[1] >= 6
+        else None
+    )
+
+    while stack:
+        start, end = stack.pop()
+        if end - start <= 1:
+            continue
+        interior_indices = np.arange(start + 1, end, dtype=np.int64)
+        interior_xyz = values[interior_indices, :3]
+        chord = values[end, :3] - values[start, :3]
+        chord_squared = float(np.dot(chord, chord))
+        if chord_squared > 1e-24:
+            fractions = np.clip(
+                ((interior_xyz - values[start, :3]) @ chord) / chord_squared,
+                0.0,
+                1.0,
+            )
+            projected = values[start, :3] + fractions[:, None] * chord
+            xyz_errors = np.linalg.norm(interior_xyz - projected, axis=1)
+        else:
+            fractions = (interior_indices - start) / float(end - start)
+            xyz_errors = np.linalg.norm(
+                interior_xyz - values[start, :3], axis=1
+            )
+        score = xyz_errors / max(float(xyz_tolerance_mm), 1e-12)
+
+        if quaternions is not None:
+            interpolated = _preview_slerp_rows(
+                quaternions[start], quaternions[end], fractions
+            )
+            orientation_dots = np.clip(
+                np.abs(np.sum(interpolated * quaternions[interior_indices], axis=1)),
+                0.0,
+                1.0,
+            )
+            orientation_errors = np.degrees(2.0 * np.arccos(orientation_dots))
+            score = np.maximum(
+                score,
+                orientation_errors / max(float(orientation_tolerance_deg), 1e-12),
+            )
+
+        worst_offset = int(np.argmax(score))
+        if float(score[worst_offset]) <= 1.0:
+            continue
+        split = int(interior_indices[worst_offset])
+        selected.add(split)
+        stack.append((start, split))
+        stack.append((split, end))
+
+    return np.asarray(sorted(selected), dtype=np.int64)
+
+
+def _preview_mandatory_indices(
+    path_ids: np.ndarray,
+    path_end_flags: np.ndarray,
+    extrusion: np.ndarray | None,
+) -> np.ndarray:
+    """Keep path boundaries and zero-E connector boundaries in the preview."""
+
+    count = len(path_ids)
+    mandatory: set[int] = {0, max(0, count - 1)}
+    mandatory.update(np.flatnonzero(path_end_flags).tolist())
+    changes = np.flatnonzero(path_ids[1:] != path_ids[:-1]) + 1
+    for index in changes.tolist():
+        mandatory.update((index - 1, index))
+    if extrusion is not None and len(extrusion) == count and count > 1:
+        zero_edges = np.abs(np.diff(extrusion)) <= 1e-9
+        starts = np.flatnonzero(zero_edges & np.r_[True, ~zero_edges[:-1]])
+        ends = np.flatnonzero(zero_edges & np.r_[~zero_edges[1:], True]) + 1
+        mandatory.update(starts.tolist())
+        mandatory.update(ends.tolist())
+    return np.asarray(sorted(mandatory), dtype=np.int64)
 
 
 def _use_native_prusa_gcode_for_core(
@@ -429,6 +566,8 @@ def _preview_payload_from_final_core_npz(
     offsetting, or interpolation.  Stationary process rows (prime/retract/
     reset at a fixed XYZ) remain in the NPZ for runtime timing, but are not
     spatial paths and therefore are not rendered as deposition points.
+    Display paths are an error-bounded subset of original NPZ rows; selected
+    coordinates are never moved or regenerated, and the NPZ is never changed.
     """
 
     entries_by_layer: dict[int, list[dict[str, object]]] = {}
@@ -443,6 +582,9 @@ def _preview_payload_from_final_core_npz(
     }
     has_curved_deposition = False
     has_tool_orientation = False
+    source_npz_rows = 0
+    source_preview_points = 0
+    display_preview_points = 0
     order = 0
 
     for path in _final_core_npz_parts(core_npz_path):
@@ -456,6 +598,7 @@ def _preview_payload_from_final_core_npz(
             y = np.asarray(data["y"], dtype=np.float64)
             z = np.asarray(data["z"], dtype=np.float64)
             count = len(x)
+            source_npz_rows += count
             if count == 0:
                 continue
             # The final-Core preview must carry the exported cumulative E
@@ -606,20 +749,32 @@ def _preview_payload_from_final_core_npz(
                 point_columns = [x[segment_indices], y[segment_indices], z[segment_indices]]
                 if include_abc:
                     point_columns.extend((a[segment_indices], b[segment_indices], c[segment_indices]))
-                # For diagnosis the browser receives every final-Core point;
-                # no display-side decimation is allowed because a sharp corner
-                # must be attributable to the NPZ itself.  Large 4 ms Core
-                # paths are nevertheless split into overlapping transport
-                # chunks, matching the established source-preview strategy.
-                points = np.column_stack(point_columns).tolist()
-                if points and not is_stationary_process:
+                point_array = np.column_stack(point_columns)
+                if len(point_array) and not is_stationary_process:
                     if role != "travel" and float(np.ptp(z[segment_indices])) > 1e-7:
                         has_curved_deposition = True
-                    source_extrusion = (
-                        extrusion[segment_indices].tolist()
+                    segment_extrusion = (
+                        extrusion[segment_indices]
                         if role == "final_resin" and extrusion is not None
                         else None
                     )
+                    mandatory = _preview_mandatory_indices(
+                        path_id[segment_indices],
+                        path_end[segment_indices],
+                        segment_extrusion,
+                    )
+                    display_indices = _error_bounded_preview_indices(
+                        point_array,
+                        mandatory_indices=mandatory,
+                    )
+                    points = point_array[display_indices].tolist()
+                    source_extrusion = (
+                        segment_extrusion[display_indices].tolist()
+                        if segment_extrusion is not None
+                        else None
+                    )
+                    source_preview_points += len(point_array)
+                    display_preview_points += len(points)
                     chunks = (
                         _preview_path_chunks(
                             points,
@@ -693,6 +848,21 @@ def _preview_payload_from_final_core_npz(
             "fiber": DEFAULT_FIBER_LINE_WIDTH_MM,
         },
         "preview_source": "final_core_npz",
+        "preview_sampling": {
+            "mode": "error_bounded_source_rows",
+            "xyz_tolerance_mm": _FINAL_CORE_PREVIEW_XYZ_TOLERANCE_MM,
+            "orientation_tolerance_deg": _FINAL_CORE_PREVIEW_ORIENTATION_TOLERANCE_DEG,
+            "source_npz_row_count": source_npz_rows,
+            "source_displayable_point_count": source_preview_points,
+            "display_point_count": display_preview_points,
+            "preserves": [
+                "path_endpoints",
+                "path_boundaries",
+                "fiber_cut_events",
+                "zero_e_connector_boundaries",
+                "orientation_corners",
+            ],
+        },
         "layers": layers,
     }
 

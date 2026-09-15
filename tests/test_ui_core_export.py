@@ -10,6 +10,7 @@ import pytest
 
 from kuka_slicer.slicer import SliceConfig
 from kuka_slicer.ui_server import (
+    _FINAL_CORE_PREVIEW_XYZ_TOLERANCE_MM,
     _SlicerUiHandler,
     _core_output_download_path,
     _core_preview_overlay_from_commands,
@@ -640,11 +641,24 @@ def test_final_core_preview_uses_final_rows_and_bounds_each_path(tmp_path: Path)
     resin = layer["resin_paths"][0]["points"]
 
     assert preview["preview_source"] == "final_core_npz"
-    assert len(resin) == len(dense_resin)
+    assert 2 < len(resin) < len(dense_resin)
     assert resin[0] == dense_resin[0].tolist()
     assert resin[-1] == dense_resin[-1].tolist()
     final_resin_points = {tuple(point) for point in dense_resin.tolist()}
     assert all(tuple(point) in final_resin_points for point in resin)
+    simplified = np.asarray(resin)
+    distances = []
+    for point in dense_resin:
+        segment_distances = []
+        for start, end in zip(simplified, simplified[1:]):
+            chord = end - start
+            denominator = float(np.dot(chord, chord))
+            fraction = 0.0 if denominator <= 1e-24 else float(
+                np.clip(np.dot(point - start, chord) / denominator, 0.0, 1.0)
+            )
+            segment_distances.append(np.linalg.norm(point - (start + fraction * chord)))
+        distances.append(min(segment_distances))
+    assert max(distances) <= _FINAL_CORE_PREVIEW_XYZ_TOLERANCE_MM + 1e-12
     assert layer["travel_paths"] == [travel.tolist()]
     assert preview["bounds"]["max_x"] == 22.0
     assert preview["bounds"]["max_y"] == pytest.approx(2.0)
@@ -682,7 +696,7 @@ def test_final_core_preview_exposes_real_fiber_cut_event_coordinates(tmp_path: P
     assert preview["bounds"]["max_y"] == 4.0
 
 
-def test_final_core_preview_chunks_dense_resin_without_dropping_e_values(tmp_path: Path):
+def test_final_core_preview_decimates_dense_resin_without_changing_npz(tmp_path: Path):
     output = tmp_path / "dense_final_core.npz"
     count = 16_003
     points = np.column_stack((
@@ -707,11 +721,15 @@ def test_final_core_preview_chunks_dense_resin_without_dropping_e_values(tmp_pat
     preview = _preview_payload_from_final_core_npz(output, SliceConfig(line_width=2.0))
 
     resin_paths = preview["layers"][0]["resin_paths"]
-    assert [len(path["points"]) for path in resin_paths] == [16_000, 4]
-    restored_points = resin_paths[0]["points"] + resin_paths[1]["points"][1:]
-    restored_extrusion = resin_paths[0]["extrusion"] + resin_paths[1]["extrusion"][1:]
-    assert restored_points == points.tolist()
-    assert restored_extrusion == extrusion.tolist()
+    assert [len(path["points"]) for path in resin_paths] == [2]
+    assert resin_paths[0]["points"] == points[[0, -1]].tolist()
+    assert resin_paths[0]["extrusion"] == extrusion[[0, -1]].tolist()
+    assert preview["preview_sampling"]["source_npz_row_count"] == count
+    assert preview["preview_sampling"]["source_displayable_point_count"] == count
+    assert preview["preview_sampling"]["display_point_count"] == 2
+    with np.load(output, allow_pickle=False) as data:
+        np.testing.assert_array_equal(data["x"], points[:, 0])
+        np.testing.assert_array_equal(data["e"], extrusion)
 
 
 def test_final_core_preview_joins_adjacent_travel_paths_without_rewriting_points(tmp_path: Path):
@@ -750,6 +768,40 @@ def test_final_core_preview_joins_adjacent_travel_paths_without_rewriting_points
         np.testing.assert_array_equal(data["a"], a)
         np.testing.assert_array_equal(data["b"], b)
         np.testing.assert_array_equal(data["c"], c)
+
+
+def test_final_core_preview_preserves_a_sharp_orientation_transition(tmp_path: Path):
+    output = tmp_path / "orientation_corner.npz"
+    points = np.column_stack((
+        np.arange(6, dtype=np.float64),
+        np.zeros(6, dtype=np.float64),
+        np.full(6, 0.5),
+    ))
+    b = np.asarray([0.0, 0.0, 0.0, 30.0, 30.0, 30.0])
+    np.savez_compressed(
+        output,
+        x=points[:, 0], y=points[:, 1], z=points[:, 2],
+        a=np.zeros(6), b=b, c=np.zeros(6),
+        tool_id=np.full(6, 1),
+        move_type=np.full(6, 1),
+        event_flag=np.zeros(6, dtype=np.uint8),
+        layer_index=np.zeros(6, dtype=np.uint32),
+        path_id=np.full(6, 7),
+        path_end_flag=np.r_[np.zeros(5, dtype=np.uint8), 1],
+        move_type_vocab_keys=np.asarray(["PRINT"]),
+        move_type_vocab_vals=np.asarray([1]),
+    )
+
+    preview = _preview_payload_from_final_core_npz(
+        output, SliceConfig(line_width=2.0)
+    )
+
+    fiber = preview["layers"][0]["fiber_paths"][0]
+    assert [2.0, 0.0, 0.5, 0.0, 0.0, 0.0] in fiber
+    assert [3.0, 0.0, 0.5, 0.0, 30.0, 0.0] in fiber
+    assert len(fiber) < len(points)
+    with np.load(output, allow_pickle=False) as data:
+        np.testing.assert_array_equal(data["b"], b)
 
 
 def test_final_core_preview_omits_stationary_print_process_rows_only(tmp_path: Path):
