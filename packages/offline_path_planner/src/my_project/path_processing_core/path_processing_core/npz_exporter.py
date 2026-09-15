@@ -79,6 +79,7 @@ def export_npz(
     degree: int = 3,
     max_fit_points_per_segment: int = 20000,
     default_feed_mm_s: float = 10.0,
+    max_angular_speed_deg_s: float | None = None,
     export_sleep_ms: int = 0,
     export_yield_every: int = 0,
     split_by_layer_type: bool = False,
@@ -689,6 +690,7 @@ def export_npz(
         sample_kwargs = {
             "dt": dt,
             "target_velocity": target_velocity,
+            "max_angular_speed_deg_s": max_angular_speed_deg_s,
         }
         if sample_profile is not None:
             sample_kwargs["profile"] = sample_profile

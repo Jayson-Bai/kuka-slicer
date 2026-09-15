@@ -16,6 +16,10 @@ import time
 from .types import Position, GlobalCurveCommand, validate_source_e_profile
 from .kuka_orientation import (
     kuka_abc_to_quaternion,
+    quaternion_from_rotation_vector,
+    quaternion_inverse,
+    quaternion_multiply,
+    rotation_vector_from_quaternion,
     quaternion_slerp,
     quaternion_to_kuka_abc,
 )
@@ -148,9 +152,9 @@ def _eval_bspline_point(
 
 
 def _sample_kuka_orientation(
-    normalized_u: float, parameters, quaternions
+    normalized_u: float, parameters, quaternions, tangents=None
 ):
-    """Evaluate local KUKA quaternion SLERP on the shared position parameter."""
+    """Evaluate a local, interpolating KUKA quaternion curve."""
 
     if normalized_u <= parameters[0]:
         return quaternions[0]
@@ -161,7 +165,49 @@ def _sample_kuka_orientation(
     right = min(len(parameters) - 1, right)
     span = parameters[right] - parameters[left]
     local = 0.0 if span <= 1e-12 else (normalized_u - parameters[left]) / span
-    return quaternion_slerp(quaternions[left], quaternions[right], local)
+    if not tangents:
+        return quaternion_slerp(quaternions[left], quaternions[right], local)
+    endpoints = quaternion_slerp(quaternions[left], quaternions[right], local)
+    controls = quaternion_slerp(tangents[left], tangents[right], local)
+    return quaternion_slerp(endpoints, controls, 2.0 * local * (1.0 - local))
+
+
+def _build_orientation_tangents(quaternions):
+    """Build local SQUAD controls so angular velocity does not jump at knots."""
+    if len(quaternions) < 3:
+        return list(quaternions)
+    tangents = [quaternions[0]]
+    for previous, current, following in zip(
+        quaternions, quaternions[1:], quaternions[2:]
+    ):
+        inverse = quaternion_inverse(current)
+        before = rotation_vector_from_quaternion(
+            quaternion_multiply(inverse, previous)
+        )
+        after = rotation_vector_from_quaternion(
+            quaternion_multiply(inverse, following)
+        )
+        tangent_delta = tuple(
+            -0.25 * (left + right) for left, right in zip(before, after)
+        )
+        tangents.append(
+            quaternion_multiply(
+                current, quaternion_from_rotation_vector(tangent_delta)
+            )
+        )
+    tangents.append(quaternions[-1])
+    return tangents
+
+
+def _orientation_refinement_parameters(parameters):
+    if not parameters:
+        return None
+    refined = {float(value) for value in parameters}
+    for left, right in zip(parameters, parameters[1:]):
+        span = float(right) - float(left)
+        for fraction in (0.25, 0.5, 0.75):
+            refined.add(float(left) + span * fraction)
+    return sorted(refined)
 
 
 def _sample_source_e_profile(normalized_u: float, parameters, values) -> float:
@@ -178,7 +224,12 @@ def _sample_source_e_profile(normalized_u: float, parameters, values) -> float:
     return values[left] + (values[right] - values[left]) * local
 
 
-def _build_arc_length_map(ctrl: List[Position], degree: int = 3, samples: int = 400):
+def _build_arc_length_map(
+    ctrl: List[Position],
+    degree: int = 3,
+    samples: int = 400,
+    extra_normalized_parameters=None,
+):
     knots = _make_open_uniform_knots(len(ctrl), degree)
     u_min = knots[degree]
     u_max = knots[len(ctrl)]
@@ -188,13 +239,20 @@ def _build_arc_length_map(ctrl: List[Position], degree: int = 3, samples: int = 
     u_list: List[float] = []
     len_list: List[float] = []
 
+    normalized_parameters = {i / samples for i in range(samples + 1)}
+    if extra_normalized_parameters:
+        normalized_parameters.update(
+            max(0.0, min(1.0, float(value)))
+            for value in extra_normalized_parameters
+        )
+
     prev_pos, span = _eval_bspline_point(u_min, degree, knots, ctrl_xyzabc, n_ctrl, degree)
     u_list.append(u_min)
     len_list.append(0.0)
 
     current_len = 0.0
-    for i in range(1, samples + 1):
-        u = u_min + (u_max - u_min) * i / samples
+    for normalized_u in sorted(normalized_parameters)[1:]:
+        u = u_min + (u_max - u_min) * normalized_u
         curr_pos, span = _eval_bspline_point(u, degree, knots, ctrl_xyzabc, n_ctrl, span)
         dist = math.sqrt(
             (curr_pos.x - prev_pos.x) ** 2
@@ -217,6 +275,50 @@ def _arc_length_map_sample_count(control_point_count: int) -> int:
         _ARC_LENGTH_MAP_MIN_SAMPLES,
         max(2, int(control_point_count)) * _ARC_LENGTH_MAP_SAMPLES_PER_CONTROL_POINT,
     )
+
+
+def _quaternion_angle_deg(left, right) -> float:
+    dot = min(1.0, max(-1.0, abs(sum(a * b for a, b in zip(left, right)))))
+    return math.degrees(2.0 * math.acos(dot))
+
+
+def _validate_max_angular_speed(max_angular_speed_deg_s: Optional[float]) -> Optional[float]:
+    if max_angular_speed_deg_s is None:
+        return None
+    value = float(max_angular_speed_deg_s)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError("max_angular_speed_deg_s must be finite and > 0")
+    return value
+
+
+def _pose_timing_increment(
+    distance_mm: float,
+    angle_deg: float,
+    target_velocity: float,
+    max_angular_speed_deg_s: Optional[float],
+) -> float:
+    """Return a smooth combined XYZ/orientation timing metric in millimetres."""
+    if max_angular_speed_deg_s is None or angle_deg <= 0.0:
+        return float(distance_mm)
+    rotation_equivalent_mm = (
+        float(target_velocity) * float(angle_deg) / max_angular_speed_deg_s
+    )
+    return math.hypot(float(distance_mm), rotation_equivalent_mm)
+
+
+def _interpolate_mapped_value(
+    u: float,
+    u_list: List[float],
+    values: List[float],
+    index: int,
+) -> float:
+    index = max(0, min(index, len(u_list) - 2))
+    u0 = u_list[index]
+    u1 = u_list[index + 1]
+    if abs(u1 - u0) <= 1e-12:
+        return float(values[index])
+    ratio = max(0.0, min(1.0, (u - u0) / (u1 - u0)))
+    return float(values[index]) + (float(values[index + 1]) - float(values[index])) * ratio
 
 
 def _is_linear_fallback_curve(curve: GlobalCurveCommand) -> bool:
@@ -354,7 +456,10 @@ def _compute_time_profile(length: float, target_v: float, t_acc: float, t_dec: f
 
 
 def _orientation_only_samples(
-    curve: GlobalCurveCommand, ctrl: List[Position], dt: float
+    curve: GlobalCurveCommand,
+    ctrl: List[Position],
+    dt: float,
+    max_angular_speed_deg_s: Optional[float],
 ):
     """Sample an in-place KUKA rotation with the seventh-order S curve.
 
@@ -366,8 +471,7 @@ def _orientation_only_samples(
     end = ctrl[-1]
     start_q = kuka_abc_to_quaternion(start.a, start.b, start.c)
     end_q = kuka_abc_to_quaternion(end.a, end.b, end.c)
-    dot = min(1.0, max(-1.0, abs(sum(a * b for a, b in zip(start_q, end_q)))))
-    angle_deg = math.degrees(2.0 * math.acos(dot))
+    angle_deg = _quaternion_angle_deg(start_q, end_q)
     if angle_deg <= 1e-9:
         yield InterpolatedPoint(
             t=0.0, pos=start, e=curve.e_val, extrude_speed=0.0,
@@ -378,7 +482,12 @@ def _orientation_only_samples(
 
     # The largest derivative of the seventh-order base curve is 2.1875.
     # Account for it so every emitted RSI frame remains below the angle step.
-    steps = max(1, int(math.ceil(angle_deg * 2.1875 / _MAX_ORIENTATION_STEP_DEG)))
+    max_step_deg = (
+        _MAX_ORIENTATION_STEP_DEG
+        if max_angular_speed_deg_s is None
+        else max_angular_speed_deg_s * dt
+    )
+    steps = max(1, int(math.ceil(angle_deg * 2.1875 / max_step_deg)))
     start_e = curve.e_val - curve.delta_e
     previous_e = start_e
     previous_abc = (start.a, start.b, start.c)
@@ -410,6 +519,7 @@ def sample_global_curve_iter(
     target_velocity: float = 10.0,  # mm/s
     t_acc: float = 2.0,
     t_dec: float = 2.0,
+    max_angular_speed_deg_s: Optional[float] = None,
     profile: Optional[dict] = None,
 ):
     """
@@ -421,6 +531,10 @@ def sample_global_curve_iter(
     """
     if curve is None:
         return
+
+    max_angular_speed_deg_s = _validate_max_angular_speed(
+        max_angular_speed_deg_s
+    )
 
     ctrl = [curve.start_pos] + curve.control_points
     degree = 3
@@ -440,13 +554,16 @@ def sample_global_curve_iter(
         and abs(point.z - curve.start_pos.z) <= 1e-9
         for point in ctrl[1:]
     ):
-        yield from _orientation_only_samples(curve, ctrl, dt)
+        yield from _orientation_only_samples(
+            curve, ctrl, dt, max_angular_speed_deg_s
+        )
         return
 
     if (curve.cmd or "").upper() == "POLYLINE":
         points = [curve.start_pos] + list(curve.control_points)
         e_profile = _polyline_e_profile(curve, len(points))
         seg_lengths = []
+        timing_seg_lengths = []
         total_length = 0.0
         for start, end in zip(points, points[1:]):
             length = math.sqrt(
@@ -455,6 +572,17 @@ def sample_global_curve_iter(
                 + (end.z - start.z) ** 2
             )
             seg_lengths.append(length)
+            timing_seg_lengths.append(
+                _pose_timing_increment(
+                    length,
+                    _quaternion_angle_deg(
+                        kuka_abc_to_quaternion(start.a, start.b, start.c),
+                        kuka_abc_to_quaternion(end.a, end.b, end.c),
+                    ),
+                    target_velocity,
+                    max_angular_speed_deg_s,
+                )
+            )
             total_length += length
         if total_length <= 1e-9:
             yield InterpolatedPoint(
@@ -469,7 +597,10 @@ def sample_global_curve_iter(
             )
             return
 
-        total_time, _ = _compute_time_profile(total_length, target_velocity, t_acc, t_dec)
+        total_timing_length = sum(timing_seg_lengths)
+        total_time, _ = _compute_time_profile(
+            total_timing_length, target_velocity, t_acc, t_dec
+        )
         if total_time <= 0.0:
             return
         num_steps = int(math.ceil(total_time / dt))
@@ -479,6 +610,7 @@ def sample_global_curve_iter(
         prev_s = 0.0
         seg_idx = 0
         seg_start_s = 0.0
+        seg_start_timing = 0.0
         previous_abc = (points[0].a, points[0].b, points[0].c)
 
         for i in range(num_steps + 1):
@@ -488,17 +620,24 @@ def sample_global_curve_iter(
             if i == num_steps:
                 s_norm_clamped = 1.0
 
-            curr_s = s_norm_clamped * total_length
+            curr_timing = s_norm_clamped * total_timing_length
             while (
-                seg_idx < len(seg_lengths) - 1
-                and curr_s > seg_start_s + seg_lengths[seg_idx]
+                seg_idx < len(timing_seg_lengths) - 1
+                and curr_timing > seg_start_timing + timing_seg_lengths[seg_idx]
             ):
                 seg_start_s += seg_lengths[seg_idx]
+                seg_start_timing += timing_seg_lengths[seg_idx]
                 seg_idx += 1
 
             seg_len = seg_lengths[seg_idx]
-            local = 0.0 if seg_len <= 1e-9 else (curr_s - seg_start_s) / seg_len
+            timing_seg_len = timing_seg_lengths[seg_idx]
+            local = (
+                0.0
+                if timing_seg_len <= 1e-12
+                else (curr_timing - seg_start_timing) / timing_seg_len
+            )
             local = max(0.0, min(1.0, local))
+            curr_s = seg_start_s + local * seg_len
             start = points[seg_idx]
             end = points[seg_idx + 1]
             pos = Position(
@@ -563,7 +702,21 @@ def sample_global_curve_iter(
             )
             return
 
-        total_time, _ = _compute_time_profile(total_length, target_velocity, t_acc, t_dec)
+        angle_deg = _quaternion_angle_deg(
+            kuka_abc_to_quaternion(
+                curve.start_pos.a, curve.start_pos.b, curve.start_pos.c
+            ),
+            kuka_abc_to_quaternion(end_pos.a, end_pos.b, end_pos.c),
+        )
+        timing_length = _pose_timing_increment(
+            total_length,
+            angle_deg,
+            target_velocity,
+            max_angular_speed_deg_s,
+        )
+        total_time, _ = _compute_time_profile(
+            timing_length, target_velocity, t_acc, t_dec
+        )
         if total_time <= 0.0:
             return
         num_steps = int(math.ceil(total_time / dt))
@@ -638,6 +791,9 @@ def sample_global_curve_iter(
         ctrl,
         degree=degree,
         samples=_arc_length_map_sample_count(len(ctrl)),
+        extra_normalized_parameters=_orientation_refinement_parameters(
+            curve.orientation_parameters
+        ),
     )
     if profile is not None:
         profile["sample_arc_map_s"] += time.perf_counter() - t0
@@ -655,8 +811,62 @@ def sample_global_curve_iter(
         )
         return
 
-    # 时间规划
-    total_time, t_flat = _compute_time_profile(total_length, target_velocity, t_acc, t_dec)
+    # 时间规划：在 XYZ 弧长之外加入四元数角距离。高曲率区域因此自动
+    # 获得更多时间，同时仍由同一条七阶进度曲线驱动 XYZ、ABC 与 E。
+    orientation_parameters = curve.orientation_parameters
+    orientation_quaternions = curve.orientation_quaternions
+    orientation_tangents = (
+        _build_orientation_tangents(orientation_quaternions)
+        if orientation_parameters and orientation_quaternions
+        else None
+    )
+    end_pos = ctrl[-1]
+    start_q = kuka_abc_to_quaternion(
+        curve.start_pos.a, curve.start_pos.b, curve.start_pos.c,
+    )
+    end_q = kuka_abc_to_quaternion(end_pos.a, end_pos.b, end_pos.c)
+    constant_orientation = (
+        abs(curve.start_pos.a - end_pos.a) < 1e-9
+        and abs(curve.start_pos.b - end_pos.b) < 1e-9
+        and abs(curve.start_pos.c - end_pos.c) < 1e-9
+        and not (orientation_parameters and orientation_quaternions)
+    )
+    u_min = knots[degree]
+    u_max = knots[n_ctrl]
+    u_span = u_max - u_min
+
+    timing_len_list = [0.0]
+    previous_q = None
+    for index, u_value in enumerate(u_list):
+        normalized_u = (u_value - u_min) / u_span if u_span > 1e-12 else 0.0
+        normalized_s = len_list[index] / total_length
+        if orientation_parameters and orientation_quaternions:
+            current_q = _sample_kuka_orientation(
+                normalized_u,
+                orientation_parameters,
+                orientation_quaternions,
+                orientation_tangents,
+            )
+        elif constant_orientation:
+            current_q = start_q
+        else:
+            current_q = quaternion_slerp(start_q, end_q, normalized_s)
+        if previous_q is not None:
+            timing_len_list.append(
+                timing_len_list[-1]
+                + _pose_timing_increment(
+                    len_list[index] - len_list[index - 1],
+                    _quaternion_angle_deg(previous_q, current_q),
+                    target_velocity,
+                    max_angular_speed_deg_s,
+                )
+            )
+        previous_q = current_q
+
+    total_timing_length = timing_len_list[-1]
+    total_time, t_flat = _compute_time_profile(
+        total_timing_length, target_velocity, t_acc, t_dec
+    )
     if total_time <= 0.0:
         return
 
@@ -671,32 +881,16 @@ def sample_global_curve_iter(
         end_e=curve.e_val,
     )
 
-    # 姿态：仅用起点/终点做 slerp
-    # Planner-generated curves carry KUKA samples on the position parameter.
-    # Curves created by older callers retain a KUKA quaternion endpoint fallback.
-    end_pos = ctrl[-1]
-    start_q = kuka_abc_to_quaternion(
-        curve.start_pos.a, curve.start_pos.b, curve.start_pos.c,
-    )
-    end_q = kuka_abc_to_quaternion(end_pos.a, end_pos.b, end_pos.c)
-    constant_orientation = (
-        abs(curve.start_pos.a - end_pos.a) < 1e-9
-        and abs(curve.start_pos.b - end_pos.b) < 1e-9
-        and abs(curve.start_pos.c - end_pos.c) < 1e-9
-    )
+    # 姿态：Planner 曲线使用位置参数轴上的 KUKA 四元数样本；旧调用者
+    # 保留端点 SLERP 回退。
     fixed_a = curve.start_pos.a
     fixed_b = curve.start_pos.b
     fixed_c = curve.start_pos.c
-    orientation_parameters = curve.orientation_parameters
-    orientation_quaternions = curve.orientation_quaternions
     previous_abc = (fixed_a, fixed_b, fixed_c)
 
     prev_s = 0.0
     lookup_idx = 0
     span = degree
-    u_min = knots[degree]
-    u_max = knots[n_ctrl]
-    u_span = u_max - u_min
     for i in range(num_steps + 1):
         t = i * dt
         s_norm = _three_stage_sept_poly(t, corrected_total_time, t_acc, t_dec)
@@ -704,10 +898,17 @@ def sample_global_curve_iter(
         if i == num_steps:
             s_norm_clamped = 1.0  # 确保最后一点落在终点
 
-        curr_s = s_norm_clamped * total_length
+        curr_timing_length = s_norm_clamped * total_timing_length
         t_lookup0 = time.perf_counter()
         u, lookup_idx = _lookup_u_from_target_len_monotonic(
-            curr_s, u_list, len_list, total_length, lookup_idx
+            curr_timing_length,
+            u_list,
+            timing_len_list,
+            total_timing_length,
+            lookup_idx,
+        )
+        curr_s = _interpolate_mapped_value(
+            u, u_list, len_list, lookup_idx
         )
         if profile is not None:
             profile["sample_lookup_s"] += time.perf_counter() - t_lookup0
@@ -722,14 +923,20 @@ def sample_global_curve_iter(
         normalized_u = (u - u_min) / u_span if u_span > 1e-12 else 0.0
         normalized_u = max(0.0, min(1.0, normalized_u))
         if orientation_parameters and orientation_quaternions:
-            q = _sample_kuka_orientation(normalized_u, orientation_parameters, orientation_quaternions)
+            q = _sample_kuka_orientation(
+                normalized_u,
+                orientation_parameters,
+                orientation_quaternions,
+                orientation_tangents,
+            )
             p.a, p.b, p.c = quaternion_to_kuka_abc(q, near_deg=previous_abc)
         elif constant_orientation:
             p.a = fixed_a
             p.b = fixed_b
             p.c = fixed_c
         else:
-            q = quaternion_slerp(start_q, end_q, s_norm_clamped)
+            spatial_ratio = curr_s / total_length
+            q = quaternion_slerp(start_q, end_q, spatial_ratio)
             p.a, p.b, p.c = quaternion_to_kuka_abc(q, near_deg=previous_abc)
         previous_abc = (p.a, p.b, p.c)
         if profile is not None:
@@ -808,6 +1015,7 @@ def sample_global_curve(
     target_velocity: float = 10.0,  # mm/s
     t_acc: float = 2.0,
     t_dec: float = 2.0,
+    max_angular_speed_deg_s: Optional[float] = None,
     profile: Optional[dict] = None,
 ) -> List[InterpolatedPoint]:
     """对一条全局 B 样条进行时间参数化并采样（列表版，兼容旧调用）."""
@@ -818,6 +1026,7 @@ def sample_global_curve(
             target_velocity=target_velocity,
             t_acc=t_acc,
             t_dec=t_dec,
+            max_angular_speed_deg_s=max_angular_speed_deg_s,
             profile=profile))
 
 
