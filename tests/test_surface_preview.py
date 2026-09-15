@@ -552,22 +552,22 @@ def test_surface_preview_html_has_an_independent_surface_api_and_controls():
     assert '视觉 Z 放大只影响画布' in html
     assert 'const centeredX = x - (bounds[0] + bounds[2]) * 0.5;' in html
     assert 'const uniformScale = Math.min(' in html
-    assert '连续课程蜂窝：' in html
+    assert '连续路径蜂窝：' in html
     assert 'function drawLatticePreview' in html
     assert 'function continuousCoursePreview' in html
-    assert 'id="exportConformalConfig">导出连续课程 JSON</button>' in html
+    assert 'id="exportConformalConfig">导出连续路径 JSON</button>' in html
     assert 'id="exportConformalConfig" disabled' not in html
-    assert '连续课程目前仅在本页生成和验证' not in html
+    assert '连续路径目前仅在本页生成和验证' not in html
     assert 'id="latticeLengthSummary"' in html
     assert 'function updateLatticeLengthSummary' in html
-    assert '当前平面连续课程：' in html
+    assert '当前平面连续路径：' in html
     assert '一个完整黄色孔洞中心固定在蜂窝工作区中心' in html
     assert 'function appendProjectedClippedPore' in html
     assert '红线为 2 mm 连续纤维的中心线预览' in html
     assert '夹持分界树脂带内侧截断' in html
     assert '红色为孔间通道中心线，裁断后每段独立制造' in html
     assert 'function offsetContinuousCourse' in html
-    assert '导出连续课程 JSON' in html
+    assert '导出连续路径 JSON' in html
     assert 'function drawFiberDoubleWallPreview' not in html
     assert 'function appendProjectedFiberTrack' not in html
     assert 'function drawSurfaceReferenceFrame' in html

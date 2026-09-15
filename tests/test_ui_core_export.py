@@ -65,7 +65,7 @@ def test_conformal_design_json_generates_core_output_without_source_npz_round_tr
     )
 
     assert result["layers"] == 4
-    assert result["effective_infill_pattern"] == "共形蜂窝连续课程"
+    assert result["effective_infill_pattern"] == "共形蜂窝连续路径"
     assert result["infill_pattern_execution"] == {"applied": True, "mode": "continuous_course_network_v1"}
     assert result["fiber_reinforcement"]["enabled"] is True
     assert result["fiber_reinforcement"]["reserved"] is False
@@ -117,7 +117,6 @@ def test_main_ui_continuous_course_fiber_strategy_reaches_final_core_output(tmp_
             {
                 "core_resin_layer_height": ["0.5"],
                 "conformal_fiber_enabled": ["true"],
-                "conformal_fiber_double_wall_axis": ["x"],
             },
             {"conformal_spec": ("mixed_wall.json", json.dumps(config).encode("utf-8"))},
         ),
@@ -323,7 +322,7 @@ def test_mixed_wall_chain_strategy_shares_complete_courses_between_resin_and_fib
     result = apply_mixed_wall_fiber_strategy(
         source_job=source_job,
         graph=run.path_graph,
-        settings=MixedWallFiberSettings(True, "x", first, last),
+        settings=MixedWallFiberSettings(True, first, last),
         fiber_layer_height_mm=0.2,
         fiber_e_per_mm=1.0,
     )
@@ -501,6 +500,10 @@ def test_ui_uses_pre_core_source_preview_and_exposes_core_export_progress():
     assert "25 °/s 是离线 Core 的工程默认值" in html
     assert 'id="conformalFiberEnabled" type="checkbox" checked' in html
     assert '启用连续纤维路径' in html
+    assert 'id="conformalFiberDoubleWallAxis"' not in html
+    assert "conformal_fiber_double_wall_axis" not in html
+    assert 'id="showFiberCutEvents" type="checkbox" checked' in html
+    assert '纤维剪切点（CUT）' in html
     assert "kuka.conformalContinuousCourseFiber.v2" in html
     assert "const firstFiberLayerPosition = layers.findIndex" in html
     assert "layerSlider.value = firstFiberLayerPosition >= 0 ? firstFiberLayerPosition : 0" in html

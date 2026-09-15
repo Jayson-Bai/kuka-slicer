@@ -909,7 +909,7 @@ def surface_preview_html() -> str:
           <p class="hint" id="checkPointHint">仅在第三章三点弯曲时启用。启用后可查看任意点的 H、坡度和平均曲率；尺寸变化时，超出矩形范围的坐标会自动收回到范围内。</p>
         </div>
         <div class="divider"></div>
-        <h2>连续课程蜂窝（预览）</h2>
+        <h2>连续路径蜂窝（预览）</h2>
         <div class="field"><label for="base_cell_size_mm">目标六边形边长（mm）</label><input id="base_cell_size_mm" type="number" min="0.001" step="0.01" value="10"></div>
         <p class="hint">以目标边长为唯一蜂窝几何参数。一个完整黄色孔洞中心固定在蜂窝工作区中心；300 × 300 mm 母板只用于向外铺展，再按当前工作区逐边裁剪。裁剪窗已扣除外矩形轮廓和夹持分界树脂带的半宽，因此边界允许出现截断六边形，但不会穿入树脂轮廓。</p>
         <p class="hint">红线为 2 mm 连续纤维的中心线预览：先沿黄色孔洞之间可容纳纤维的 X 向材料通道绕行，再在左右夹持区保持当前 Y 高度直线延伸到零件边界。绿色点为起点、深红点为终点；纤维只在试样端部切断。</p>
@@ -927,8 +927,8 @@ def surface_preview_html() -> str:
           <span id="loadLineAlignmentHint"></span><span id="honeycombAlignmentHint"></span>
         </div>
         <div class="designSummary" id="latticeDesignSummary" aria-live="polite"></div>
-        <div class="designSummary" id="latticeLengthSummary" aria-live="polite">连续课程总长将在曲面预览更新后显示。</div>
-        <p class="hint">长度是平面预览中每条完整连续课程的累加，不包含层数和曲面映射造成的弧长变化；后续接入路径内核时会重新以实际三维长度计算挤出量。</p>
+        <div class="designSummary" id="latticeLengthSummary" aria-live="polite">连续路径总长将在曲面预览更新后显示。</div>
+        <p class="hint">长度是平面预览中每条完整连续路径的累加，不包含层数和曲面映射造成的弧长变化；后续接入路径内核时会重新以实际三维长度计算挤出量。</p>
         <div class="divider"></div>
         <h2>对称层间渐变</h2>
         <div class="field"><label for="surface_start_layer">首个非零曲率层（物理层）</label><input id="surface_start_layer" type="number" min="2" step="1" value="3"></div>
@@ -947,9 +947,9 @@ def surface_preview_html() -> str:
         </details>
         <div class="divider"></div>
         <h2>下一步</h2>
-        <button type="button" id="exportConformalConfig">导出连续课程 JSON</button>
+        <button type="button" id="exportConformalConfig">导出连续路径 JSON</button>
         <button type="button" class="secondary" id="reset">恢复示例参数</button>
-        <p class="hint">方程：H(x,y)=A·sin(2πx/λx+φx)·sin(2πy/λy+φy)+Zref。导出的 JSON 可直接导入主切片器，连续课程会作为树脂与可选纤维的正式路径拓扑。</p>
+        <p class="hint">方程：H(x,y)=A·sin(2πx/λx+φx)·sin(2πy/λy+φy)+Zref。导出的 JSON 可直接导入主切片器，连续路径会作为树脂与可选纤维的正式路径拓扑。</p>
       </form>
       <section class="panel preview">
         <div class="previewHead"><h2 id="previewTitle">α=1 完整曲率层（物理 Z）</h2><div class="stats" id="stats"></div></div>
@@ -1137,7 +1137,7 @@ def surface_preview_html() -> str:
         const workingLength = activeXBounds[1] - activeXBounds[0];
         const width = positiveNumber('part_width_mm');
         const estimatedCourses = width === null ? '?' : Math.max(1, Math.floor(width / (Math.sqrt(3) * cellSize)));
-        latticeSummary.textContent = `连续课程工作段：X=${activeXBounds[0].toFixed(2)}–${activeXBounds[1].toFixed(2)} mm（长 ${workingLength.toFixed(2)} mm）；目标边长 ${cellSize.toFixed(2)} mm；预计 ${estimatedCourses} 条左右的 X 向长连续课程。课程数由完整单元能否落入矩形决定，不以蜂窝边数计。`;
+        latticeSummary.textContent = `连续路径工作段：X=${activeXBounds[0].toFixed(2)}–${activeXBounds[1].toFixed(2)} mm（长 ${workingLength.toFixed(2)} mm）；目标边长 ${cellSize.toFixed(2)} mm；预计约 ${estimatedCourses} 条 X 向长路径。路径数由完整单元能否落入矩形决定，不以蜂窝边数计。`;
       }
 
       const firstCurvedLayer = nonNegativeInteger('surface_start_layer');
@@ -2063,15 +2063,15 @@ def surface_preview_html() -> str:
     function updateLatticeLengthSummary() {
       const summary = document.getElementById('latticeLengthSummary');
       if (!payload) {
-        summary.textContent = '连续课程总长将在曲面预览更新后显示。';
+        summary.textContent = '连续路径总长将在曲面预览更新后显示。';
         return;
       }
       const courses = continuousCoursePreview();
       if (!courses.courses.length) {
-        summary.textContent = '当前尺寸与目标边长不能容纳完整的连续课程单元。请减小目标边长或增大工作段。';
+        summary.textContent = '当前尺寸与目标边长不能容纳完整的连续路径单元。请减小目标边长或增大工作段。';
       } else {
         const fragmentCount = courses.courses.reduce((count, course) => count + course.fragments.length, 0);
-        summary.textContent = `当前平面连续课程：中心孔锚定在 (${courses.latticeAnchorMm[0].toFixed(2)}, ${courses.latticeAnchorMm[1].toFixed(2)}) mm；黄色孔洞由该锚点的 300 × 300 mm 母板裁切，并在外矩形轮廓和夹持分界树脂带内侧截断（树脂轮廓宽 ${courses.resinContourWidthMm.toFixed(2)} mm）。${courses.courses.length} 条母课程裁为 ${fragmentCount} 条独立制造路径；每个截断首尾均按独立树脂/纤维路径处理。预计纤维总长 ${courses.totalLengthMm.toFixed(2)} mm。`;
+        summary.textContent = `当前平面连续路径：中心孔锚定在 (${courses.latticeAnchorMm[0].toFixed(2)}, ${courses.latticeAnchorMm[1].toFixed(2)}) mm；黄色孔洞由该锚点的 300 × 300 mm 母板裁切，并在外矩形轮廓和夹持分界树脂带内侧截断（树脂轮廓宽 ${courses.resinContourWidthMm.toFixed(2)} mm）。${courses.courses.length} 条基础长路径裁为 ${fragmentCount} 条独立制造路径；每个截断首尾均按独立树脂/纤维路径处理。预计纤维总长 ${courses.totalLengthMm.toFixed(2)} mm。`;
       }
     }
 
@@ -2287,7 +2287,7 @@ def surface_preview_html() -> str:
       ctx.restore();
       ctx.fillStyle = 'rgba(132, 25, 37, .88)';
       ctx.font = '12px Segoe UI, Microsoft YaHei, sans-serif';
-      ctx.fillText(`连续课程蜂窝：中心孔锚定 (${coursePreview.latticeAnchorMm[0].toFixed(2)}, ${coursePreview.latticeAnchorMm[1].toFixed(2)})；黄色由 300 × 300 mm 母板逐边裁切；红色为孔间通道中心线，裁断后每段独立制造；目标边长 ${coursePreview.edgeLength.toFixed(2)} mm；α=${layer.alpha.toFixed(2)}，物理层 ${layer.index + 1}`, 14, 20);
+      ctx.fillText(`连续路径蜂窝：中心孔锚定 (${coursePreview.latticeAnchorMm[0].toFixed(2)}, ${coursePreview.latticeAnchorMm[1].toFixed(2)})；黄色由 300 × 300 mm 母板逐边裁切；红色为孔间通道中心线，裁断后每段独立制造；目标边长 ${coursePreview.edgeLength.toFixed(2)} mm；α=${layer.alpha.toFixed(2)}，物理层 ${layer.index + 1}`, 14, 20);
     }
 
     function renderSolidStack(ctx, width, height) {
@@ -2592,7 +2592,7 @@ def surface_preview_html() -> str:
         link.click();
         URL.revokeObjectURL(link.href);
         statusEl.className = 'status';
-        statusEl.textContent = '已导出连续课程设计 JSON；回到主切片器导入该文件以生成正式路径。';
+        statusEl.textContent = '已导出连续路径设计 JSON；回到主切片器导入该文件以生成正式路径。';
       } catch (error) {
         statusEl.className = 'status error';
         statusEl.textContent = error.message;

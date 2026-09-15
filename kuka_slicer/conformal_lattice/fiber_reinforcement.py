@@ -8,7 +8,7 @@ creating fiber geometry or changing any resin trajectory.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Mapping
+from typing import Mapping
 
 import numpy as np
 
@@ -35,10 +35,9 @@ class FiberReinforcementResult:
 
 @dataclass(frozen=True, slots=True)
 class MixedWallFiberSettings:
-    """Process-side mixed-wall settings; deliberately absent from design JSON."""
+    """Deprecated mixed-wall settings retained for compatibility tests."""
 
     enabled: bool
-    double_wall_axis: Literal["x", "y"]
     first_after_resin_layer_physical: int
     last_after_resin_layer_physical: int
     double_track_offset_mm: float = 1.0
@@ -65,7 +64,7 @@ def derive_symmetric_curvature_fiber_interfaces(
     following the last non-zero curvature layer.
 
     Returned values use the one-based physical resin-layer convention used by
-    ``MixedWallFiberSettings``.
+    ``ContinuousCourseFiberSettings``.
     """
 
     alpha = np.asarray(layer_embedding.report.get("alpha_by_layer"), dtype=np.float64)
@@ -193,8 +192,6 @@ def apply_mixed_wall_fiber_strategy(
     start/stop overhead.
     """
 
-    if settings.double_wall_axis not in ("x", "y"):
-        raise ValueError("mixed-wall fiber double_wall_axis must be 'x' or 'y'")
     if not np.isfinite(settings.double_track_offset_mm) or settings.double_track_offset_mm <= 0.0:
         raise ValueError("mixed-wall fiber double_track_offset_mm must be positive and finite")
     if any(group.material == "F" for group in source_job.material_paths):
@@ -223,8 +220,8 @@ def apply_mixed_wall_fiber_strategy(
                 "mode": "uniform_mixed_wall_chain_v2",
                 "configured_in": "main_ui_runtime",
                 "reason": "disabled_in_main_ui",
-                "double_wall_axis": settings.double_wall_axis,
                 "primary_wall_selection": chain_plan.primary_wall_selection,
+                "primary_axis_source": "automatic_longest_planar_span",
                 "resin_path_strategy": "complete_planar_honeycomb_wall_chains_then_conformal_embedding",
                 "resin_honeycomb_paths_per_layer": resin_paths_per_layer,
                 "paths_per_fiber_layer": 0,
@@ -289,7 +286,7 @@ def apply_mixed_wall_fiber_strategy(
         "enabled": True,
         "mode": "uniform_mixed_wall_chain_v2",
         "configured_in": "main_ui_runtime",
-        "double_wall_axis": settings.double_wall_axis,
+        "primary_axis_source": "automatic_longest_planar_span",
         "double_track_offset_mm": float(settings.double_track_offset_mm),
         "double_track_center_spacing_mm": float(settings.double_track_offset_mm) * 2.0,
         "first_after_resin_layer_physical": settings.first_after_resin_layer_physical,
@@ -306,7 +303,7 @@ def apply_mixed_wall_fiber_strategy(
         "reserved": False,
         "mode": "uniform_mixed_wall_chain_v2",
         "configured_in": "main_ui_runtime",
-        "double_wall_axis": settings.double_wall_axis,
+        "primary_axis_source": "automatic_longest_planar_span",
         "double_track_offset_mm": float(settings.double_track_offset_mm),
         "double_track_center_spacing_mm": float(settings.double_track_offset_mm) * 2.0,
         "after_resin_physical_layers": [settings.first_after_resin_layer_physical, settings.last_after_resin_layer_physical],
@@ -555,8 +552,6 @@ def _apply_mixed_wall_segment_strategy_legacy(
             reason="disabled_in_main_ui",
             settings=settings,
         )
-    if settings.double_wall_axis not in ("x", "y"):
-        raise ValueError("mixed-wall fiber double_wall_axis must be 'x' or 'y'")
     if not np.isfinite(fiber_layer_height_mm) or fiber_layer_height_mm <= 0.0:
         raise ValueError("fiber_layer_height_mm must be positive and finite")
     if not np.isfinite(fiber_e_per_mm) or fiber_e_per_mm <= 0.0:
@@ -591,13 +586,12 @@ def _apply_mixed_wall_segment_strategy_legacy(
     if max(selected_layers) >= len(graph.layer_node_positions_xyz):
         raise ValueError("fiber interface is outside the conformal layer embedding")
 
-    axis_index = 0 if settings.double_wall_axis == "x" else 1
     reference_positions = np.asarray(graph.layer_node_positions_xyz[0], dtype=np.float64)
+    axis_index = _automatic_primary_axis(reference_positions)
     edge_nodes = np.asarray(graph.edge_node_ids, dtype=np.int64)
     primary_mask, primary_selection = _primary_wall_mask(reference_positions, edge_nodes, axis_index)
     if not bool(np.any(primary_mask)):
-        axis_name = settings.double_wall_axis.upper()
-        raise ValueError(f"no {axis_name}-directed honeycomb walls were found; change the main-UI double-wall axis or lattice orientation")
+        raise ValueError("no honeycomb walls were found along the automatically selected primary span")
 
     fiber_groups: list[MaterialPaths] = []
     paths_per_layer = 0
@@ -646,7 +640,7 @@ def _apply_mixed_wall_segment_strategy_legacy(
         "enabled": True,
         "mode": "uniform_mixed_wall_v1",
         "configured_in": "main_ui_runtime",
-        "double_wall_axis": settings.double_wall_axis,
+        "primary_axis_source": "automatic_longest_planar_span",
         "double_track_offset_mm": float(settings.double_track_offset_mm),
         "double_track_center_spacing_mm": float(settings.double_track_offset_mm) * 2.0,
         "first_after_resin_layer_physical": settings.first_after_resin_layer_physical,
@@ -662,7 +656,7 @@ def _apply_mixed_wall_segment_strategy_legacy(
         "reserved": False,
         "mode": "uniform_mixed_wall_v1",
         "configured_in": "main_ui_runtime",
-        "double_wall_axis": settings.double_wall_axis,
+        "primary_axis_source": "automatic_longest_planar_span",
         "double_track_offset_mm": float(settings.double_track_offset_mm),
         "double_track_center_spacing_mm": float(settings.double_track_offset_mm) * 2.0,
         "after_resin_physical_layers": [settings.first_after_resin_layer_physical, settings.last_after_resin_layer_physical],
@@ -707,11 +701,10 @@ def _plan_mixed_wall_chains(
         [[parent_paths[parent][0], parent_paths[parent][-1]] for parent in parent_ids],
         dtype=np.int64,
     )
-    axis_index = 0 if settings.double_wall_axis == "x" else 1
+    axis_index = _automatic_primary_axis(reference_positions)
     primary_mask, selection = _primary_wall_mask(reference_positions, endpoint_pairs, axis_index)
     if not bool(np.any(primary_mask)):
-        axis_name = settings.double_wall_axis.upper()
-        raise ValueError(f"no {axis_name}-directed honeycomb walls were found; change the main-UI double-wall axis or lattice orientation")
+        raise ValueError("no honeycomb walls were found along the automatically selected primary span")
 
     primary_ids = tuple(parent for parent, is_primary in zip(parent_ids, primary_mask) if is_primary)
     secondary_ids = tuple(parent for parent, is_primary in zip(parent_ids, primary_mask) if not is_primary)
@@ -1314,6 +1307,15 @@ def _replace_honeycomb_resin_with_mixed_wall_chains(
     return len(plan.node_paths)
 
 
+def _automatic_primary_axis(reference_positions: np.ndarray) -> int:
+    """Select the longer planar part span for the deprecated fallback."""
+
+    positions = np.asarray(reference_positions, dtype=np.float64)
+    if positions.ndim != 2 or positions.shape[1] < 2 or len(positions) == 0:
+        raise ValueError("reference_positions must contain planar XY coordinates")
+    return int(np.argmax(np.ptp(positions[:, :2], axis=0)))
+
+
 def _primary_wall_mask(
     positions: np.ndarray,
     edge_nodes: np.ndarray,
@@ -1407,7 +1409,7 @@ def _empty_result_from_height(
             "mode": "uniform_mixed_wall_v1",
             "configured_in": "main_ui_runtime",
             "reason": reason,
-            "double_wall_axis": settings.double_wall_axis,
+            "primary_axis_source": "automatic_longest_planar_span",
             "after_resin_physical_layers": [settings.first_after_resin_layer_physical, settings.last_after_resin_layer_physical],
             "paths_per_fiber_layer": 0,
             "total_fiber_path_count": 0,

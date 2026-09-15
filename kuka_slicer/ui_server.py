@@ -1628,7 +1628,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         )
         if run.path_graph is None:
             raise RuntimeError("共形蜂窝路径桥接未生成一笔画路径")
-        progress(55, "正在将连续课程路径适配为 Core SourceJob")
+        progress(55, "正在将连续路径适配为 Core SourceJob")
         # The legacy structural macro partitions are replaced unconditionally
         # by continuous courses below.  Start from the retained perimeter and
         # grip material instead of rendering/deleting that large temporary
@@ -1641,7 +1641,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         )
 
         if not run.continuous_course_paths_by_layer:
-            raise RuntimeError("当前共形工作区不能生成连续课程填充路径")
+            raise RuntimeError("当前共形工作区不能生成连续填充路径")
         first_fiber_interface, last_fiber_interface = derive_symmetric_curvature_fiber_interfaces(
             run.layer_embedding
         )
@@ -1692,7 +1692,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             "layers": len(preview["layers"]),
             "paths": path_count,
             "preview": preview,
-            "effective_infill_pattern": "共形蜂窝连续课程",
+            "effective_infill_pattern": "共形蜂窝连续路径",
             "infill_pattern_execution": {"applied": True, "mode": "continuous_course_network_v1"},
             "conformal_lattice": run.report,
             "fiber_reinforcement": fiber_reinforcement.report,
@@ -4358,12 +4358,7 @@ def _index_html() -> str:
       <fieldset class="surfaceCollisionResult" aria-label="共形蜂窝连续纤维策略">
         <legend>连续纤维（主 UI 工艺策略）</legend>
         <label><input id="conformalFiberEnabled" type="checkbox" checked> 启用连续纤维路径</label>
-        <label for="conformalFiberDoubleWallAxis">双层主壁方向</label>
-        <select id="conformalFiberDoubleWallAxis">
-          <option value="x" selected>X 向双壁（拉伸推荐）</option>
-          <option value="y">Y 向双壁（对照组）</option>
-        </select>
-        <small>首个与末个纤维界面由设计 JSON 自动确定：以“首个非零曲率层（物理层）”前的树脂层为起点，并相对实际树脂层数镜像结束。双壁优先使用平行所选轴的直墙；若当前蜂窝取向没有该直墙，则自动使用沿该轴推进的两族斜边锯齿链。树脂蜂窝几何不会改变。</small>
+        <small>首个与末个纤维界面由设计 JSON 自动确定：以“首个非零曲率层（物理层）”前的树脂层为起点，并相对实际树脂层数镜像结束。纤维直接复用共形蜂窝的连续路径拓扑，树脂蜂窝几何不会改变。</small>
       </fieldset>
     </div>
   </header>
@@ -5120,7 +5115,6 @@ def _index_html() -> str:
     const surfaceNpzInput = document.getElementById('surfaceNpzInput');
     const statusEl = document.getElementById('status');
     const conformalFiberEnabled = document.getElementById('conformalFiberEnabled');
-    const conformalFiberDoubleWallAxis = document.getElementById('conformalFiberDoubleWallAxis');
     let selectedConformalSpec = null;
     let conformalDebugExportEnabled = false;
     // v2 intentionally starts conformal jobs with continuous fiber enabled.
@@ -5131,18 +5125,15 @@ def _index_html() -> str:
         const saved = JSON.parse(window.localStorage.getItem(conformalFiberSettingsStorageKey) || 'null');
         if (!saved || typeof saved !== 'object') return;
         if (typeof saved.enabled === 'boolean') conformalFiberEnabled.checked = saved.enabled;
-        if (saved.axis === 'x' || saved.axis === 'y') conformalFiberDoubleWallAxis.value = saved.axis;
       }} catch (_) {{}}
     }}
     function saveConformalFiberSettings() {{
       window.localStorage.setItem(conformalFiberSettingsStorageKey, JSON.stringify({{
-        enabled: conformalFiberEnabled.checked,
-        axis: conformalFiberDoubleWallAxis.value
+        enabled: conformalFiberEnabled.checked
       }}));
     }}
     restoreConformalFiberSettings();
-    [conformalFiberEnabled, conformalFiberDoubleWallAxis]
-      .forEach((input) => input.addEventListener('change', saveConformalFiberSettings));
+    conformalFiberEnabled.addEventListener('change', saveConformalFiberSettings);
     async function launchSurfaceTool(tool) {{
       const toolButton = surfaceToolButtons[tool];
       const originalLabel = toolButton.textContent;
@@ -5328,7 +5319,6 @@ def _index_html() -> str:
         formData.append('conformal_spec', selectedConformalSpec, selectedConformalSpec.name);
         formData.append('conformal_debug_export', conformalDebugExportEnabled ? 'true' : 'false');
         formData.append('conformal_fiber_enabled', conformalFiberEnabled.checked ? 'true' : 'false');
-        formData.append('conformal_fiber_double_wall_axis', conformalFiberDoubleWallAxis.value);
         appendCurrentCoreSettings(formData);
         const response = await fetch('/conformal-slice', {{ method: 'POST', body: formData }});
         const queued = await response.json();
@@ -5336,7 +5326,7 @@ def _index_html() -> str:
         const result = await waitForSliceJob(queued.job_id);
         layersEl.textContent = result.layers;
         outputNameEl.textContent = result.filename;
-        executedInfillPatternEl.textContent = '共形蜂窝连续课程';
+        executedInfillPatternEl.textContent = '共形蜂窝连续路径';
         previewData = result.preview;
         updatePreviewLineWidthValue();
         configureViewer();
@@ -5352,9 +5342,9 @@ def _index_html() -> str:
         statusEl.className = 'status ok';
         const fiberReport = result.fiber_reinforcement;
         const fiberInterfaceText = fiberReport?.enabled
-          ? `；已生成与树脂连续课程同拓扑的 F 路径，共 ${{fiberReport.total_fiber_path_count}} 条，并已按纤维层高抬高后续树脂层`
+          ? `；已生成与树脂连续路径同拓扑的 F 路径，共 ${{fiberReport.total_fiber_path_count}} 条，并已按纤维层高抬高后续树脂层`
           : '；本次未启用连续纤维策略';
-        statusEl.textContent = '完成：共形连续课程路径已生成，并已写出 Core NPZ。' + fiberInterfaceText;
+        statusEl.textContent = '完成：共形连续路径已生成，并已写出 Core NPZ。' + fiberInterfaceText;
         const coreSeconds = Number(result.core_export_seconds);
         if (Number.isFinite(coreSeconds)) exportElapsedEl.textContent = 'core 最终 NPZ 处理耗时 ' + coreSeconds.toFixed(1) + ' 秒';
       }} catch (error) {{

@@ -515,7 +515,7 @@ def test_main_ui_mixed_wall_strategy_emits_fiber_and_raises_later_resin_layers()
     result = apply_mixed_wall_fiber_strategy(
         source_job=source_job,
         graph=run.path_graph,
-        settings=MixedWallFiberSettings(True, "x", 2, 19),
+        settings=MixedWallFiberSettings(True, 2, 19),
         fiber_layer_height_mm=0.1,
         fiber_e_per_mm=1.0,
     )
@@ -527,7 +527,7 @@ def test_main_ui_mixed_wall_strategy_emits_fiber_and_raises_later_resin_layers()
         if group.material == "R" and group.layer_index == 3
     )
     assert result.enabled is True
-    assert result.report["double_wall_axis"] == "x"
+    assert result.report["primary_axis_source"] == "automatic_longest_planar_span"
     assert result.total_path_count > 0
     assert fiber_groups
     assert all(path.shape[1] == 6 for group in fiber_groups for path in group.paths)
