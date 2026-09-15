@@ -167,9 +167,18 @@ def _sample_kuka_orientation(
     local = 0.0 if span <= 1e-12 else (normalized_u - parameters[left]) / span
     if not tangents:
         return quaternion_slerp(quaternions[left], quaternions[right], local)
-    endpoints = quaternion_slerp(quaternions[left], quaternions[right], local)
-    controls = quaternion_slerp(tangents[left], tangents[right], local)
-    return quaternion_slerp(endpoints, controls, 2.0 * local * (1.0 - local))
+    return _quaternion_squad(
+        quaternions[left], quaternions[right],
+        tangents[left], tangents[right], local,
+    )
+
+
+def _quaternion_squad(start, end, start_tangent, end_tangent, ratio):
+    endpoints = quaternion_slerp(start, end, ratio)
+    controls = quaternion_slerp(start_tangent, end_tangent, ratio)
+    return quaternion_slerp(
+        endpoints, controls, 2.0 * ratio * (1.0 - ratio)
+    )
 
 
 def _build_orientation_tangents(quaternions):
@@ -304,6 +313,69 @@ def _pose_timing_increment(
         float(target_velocity) * float(angle_deg) / max_angular_speed_deg_s
     )
     return math.hypot(float(distance_mm), rotation_equivalent_mm)
+
+
+def _smoothed_pose_timing_increments(
+    distances_mm,
+    angles_deg,
+    target_velocity: float,
+    max_angular_speed_deg_s: Optional[float],
+    t_acc: float,
+    t_dec: float,
+):
+    """Build a look-ahead timing metric without local feedrate jumps.
+
+    The raw orientation limit can rise sharply where surface curvature tends
+    to zero.  A forward/backward reachable-speed envelope prevents Core from
+    immediately accelerating back to the requested XYZ feedrate at that
+    point.  The acceleration scale is derived from the curve's existing
+    seventh-order ramp times, so no second UI motion model is introduced.
+    """
+    distances = [max(0.0, float(value)) for value in distances_mm]
+    angles = [max(0.0, float(value)) for value in angles_deg]
+    if len(distances) != len(angles):
+        raise ValueError("pose timing distances and angles must have equal lengths")
+    if max_angular_speed_deg_s is None:
+        return distances
+
+    caps = []
+    for distance, angle in zip(distances, angles):
+        if distance <= 1e-12:
+            caps.append(float(target_velocity))
+            continue
+        equivalent = target_velocity * angle / max_angular_speed_deg_s
+        caps.append(
+            target_velocity * distance / math.hypot(distance, equivalent)
+        )
+
+    if t_dec > 0.0:
+        deceleration = target_velocity / t_dec
+        for index in range(len(caps) - 2, -1, -1):
+            reachable = math.sqrt(
+                caps[index + 1] ** 2
+                + 2.0 * deceleration * distances[index]
+            )
+            caps[index] = min(caps[index], reachable)
+    if t_acc > 0.0:
+        acceleration = target_velocity / t_acc
+        for index in range(1, len(caps)):
+            reachable = math.sqrt(
+                caps[index - 1] ** 2
+                + 2.0 * acceleration * distances[index - 1]
+            )
+            caps[index] = min(caps[index], reachable)
+
+    increments = []
+    for distance, angle, cap in zip(distances, angles, caps):
+        required_time = 0.0
+        if distance > 1e-12:
+            required_time = distance / max(cap, 1e-12)
+        if angle > 1e-12:
+            required_time = max(
+                required_time, angle / max_angular_speed_deg_s
+            )
+        increments.append(target_velocity * required_time)
+    return increments
 
 
 def _interpolate_mapped_value(
@@ -563,7 +635,7 @@ def sample_global_curve_iter(
         points = [curve.start_pos] + list(curve.control_points)
         e_profile = _polyline_e_profile(curve, len(points))
         seg_lengths = []
-        timing_seg_lengths = []
+        seg_angles = []
         total_length = 0.0
         for start, end in zip(points, points[1:]):
             length = math.sqrt(
@@ -572,15 +644,10 @@ def sample_global_curve_iter(
                 + (end.z - start.z) ** 2
             )
             seg_lengths.append(length)
-            timing_seg_lengths.append(
-                _pose_timing_increment(
-                    length,
-                    _quaternion_angle_deg(
-                        kuka_abc_to_quaternion(start.a, start.b, start.c),
-                        kuka_abc_to_quaternion(end.a, end.b, end.c),
-                    ),
-                    target_velocity,
-                    max_angular_speed_deg_s,
+            seg_angles.append(
+                _quaternion_angle_deg(
+                    kuka_abc_to_quaternion(start.a, start.b, start.c),
+                    kuka_abc_to_quaternion(end.a, end.b, end.c),
                 )
             )
             total_length += length
@@ -597,6 +664,14 @@ def sample_global_curve_iter(
             )
             return
 
+        timing_seg_lengths = _smoothed_pose_timing_increments(
+            seg_lengths,
+            seg_angles,
+            target_velocity,
+            max_angular_speed_deg_s,
+            t_acc,
+            t_dec,
+        )
         total_timing_length = sum(timing_seg_lengths)
         total_time, _ = _compute_time_profile(
             total_timing_length, target_velocity, t_acc, t_dec
@@ -835,7 +910,8 @@ def sample_global_curve_iter(
     u_max = knots[n_ctrl]
     u_span = u_max - u_min
 
-    timing_len_list = [0.0]
+    timing_distances = []
+    timing_angles = []
     previous_q = None
     for index, u_value in enumerate(u_list):
         normalized_u = (u_value - u_min) / u_span if u_span > 1e-12 else 0.0
@@ -852,17 +928,25 @@ def sample_global_curve_iter(
         else:
             current_q = quaternion_slerp(start_q, end_q, normalized_s)
         if previous_q is not None:
-            timing_len_list.append(
-                timing_len_list[-1]
-                + _pose_timing_increment(
-                    len_list[index] - len_list[index - 1],
-                    _quaternion_angle_deg(previous_q, current_q),
-                    target_velocity,
-                    max_angular_speed_deg_s,
-                )
+            timing_distances.append(
+                len_list[index] - len_list[index - 1]
+            )
+            timing_angles.append(
+                _quaternion_angle_deg(previous_q, current_q)
             )
         previous_q = current_q
 
+    timing_increments = _smoothed_pose_timing_increments(
+        timing_distances,
+        timing_angles,
+        target_velocity,
+        max_angular_speed_deg_s,
+        t_acc,
+        t_dec,
+    )
+    timing_len_list = [0.0]
+    for increment in timing_increments:
+        timing_len_list.append(timing_len_list[-1] + increment)
     total_timing_length = timing_len_list[-1]
     total_time, t_flat = _compute_time_profile(
         total_timing_length, target_velocity, t_acc, t_dec

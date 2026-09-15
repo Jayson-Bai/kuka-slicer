@@ -39,6 +39,23 @@ def _max_quaternion_angular_speed(samples, dt):
     return max(steps, default=0.0)
 
 
+def _max_angular_speed_change(samples, dt):
+    from path_processing_core.kuka_orientation import kuka_abc_to_quaternion
+
+    quaternions = [
+        kuka_abc_to_quaternion(sample.pos.a, sample.pos.b, sample.pos.c)
+        for sample in samples
+    ]
+    speeds = [
+        _quaternion_distance_deg(left, right) / dt
+        for left, right in zip(quaternions, quaternions[1:])
+    ]
+    return max(
+        (abs(right - left) for left, right in zip(speeds, speeds[1:])),
+        default=0.0,
+    )
+
+
 def _quaternion_distance_deg(left, right):
     dot = min(1.0, max(-1.0, abs(sum(a * b for a, b in zip(left, right)))))
     return math.degrees(2.0 * math.acos(dot))
@@ -212,6 +229,42 @@ def test_bspline_surface_orientation_retimes_only_when_limit_requires_it():
 
     assert _max_quaternion_angular_speed(limited, 0.004) <= 30.0 + 0.05
     assert limited[-1].e == pytest.approx(curve.e_val)
+
+
+def test_curvature_speed_limit_uses_existing_ramp_as_lookahead_envelope():
+    points = [
+        Position(float(index), 0.0, 0.5, 0.0, 30.0 * math.sin(math.pi * index / 8.0), 0.0)
+        for index in range(9)
+    ]
+    curve = GlobalSplinePlanner().fit_global_curve(
+        [_move(index, points[index], points[index + 1]) for index in range(8)],
+        density=1,
+    )
+    abrupt = list(
+        sample_global_curve_iter(
+            curve,
+            dt=0.004,
+            target_velocity=20.0,
+            t_acc=0.0,
+            t_dec=0.0,
+            max_angular_speed_deg_s=25.0,
+        )
+    )
+    smoothed = list(
+        sample_global_curve_iter(
+            curve,
+            dt=0.004,
+            target_velocity=20.0,
+            t_acc=0.2,
+            t_dec=0.2,
+            max_angular_speed_deg_s=25.0,
+        )
+    )
+
+    assert _max_angular_speed_change(smoothed, 0.004) < _max_angular_speed_change(
+        abrupt, 0.004
+    )
+    assert _max_quaternion_angular_speed(smoothed, 0.004) <= 25.0 + 0.05
 
 
 def test_exporter_aligns_abc_between_adjacent_moves_in_the_same_buffer(tmp_path):
