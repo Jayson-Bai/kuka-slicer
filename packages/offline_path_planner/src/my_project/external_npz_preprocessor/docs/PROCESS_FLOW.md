@@ -185,7 +185,7 @@ ExtrudeWait(wait_sec=dt, delta_e=0, raw="external_npz_reset_anchor")
 TRAVEL(E=0)
 ```
 
-其中 `L=cut_lift_mm`。CUT 前先完成一次阻塞式 reset 和 E=0 anchor，随后 CUT 事件仍为非阻塞，RSI 紧接着抬升并同步执行 `E:0→+L`。抬升末端保持 3 秒后 reset，回抽由新基准独立执行 `E:0→-L`，再保持 3 秒后 reset。两个 3 秒保持段都在高位，且计入原 `cut_wait_s` 总窗口；剩余等待继续保持高位和 `E=0`。若 UI 等待短于完整执行抬升、两段保持和回抽所需的安全时间，则优先完整执行这些动作。
+其中 `L=cut_lift_mm`。CUT 前先完成一次阻塞式 reset 和 E=0 anchor，随后 CUT 事件仍为非阻塞，RSI 紧接着沿纤维路径末端点的曲面上法向抬升绝对距离 `L`，并同步执行 `E:0→+L`；平面 `ABC=0` 时该方向仍是世界 `+Z`。抬升末端保持 3 秒后 reset，回抽由新基准独立执行 `E:0→-L`，再保持 3 秒后 reset。两个 3 秒保持段都在高位，且计入原 `cut_wait_s` 总窗口；剩余等待继续保持高位和 `E=0`。若 UI 等待短于完整执行抬升、两段保持和回抽所需的安全时间，则优先完整执行这些动作。
 
 CUT 的挤出和固定回抽只受 L 控制，不读取 `fiber.prime_length_mm` 或 `fiber.retract_length_mm`。层末 UI 回抽前的 reset 同时阻断 CUT 向后读取 UI 回抽速度；CUT 固定回抽继续使用默认移动速度，UI 回抽使用自己的 `fiber.retract_speed_mm_s`。
 

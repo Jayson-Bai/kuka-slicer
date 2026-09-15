@@ -76,7 +76,7 @@ This parameter is attached to fiber `GlobalCurveCommand` objects as curve-level 
 - `prime_settle_s`: global stationary wait after every non-zero prime; default `0.5 s`, and `0` disables only the settle.
 - `default_a/default_b/default_c`: pose values appended to Nx3 source paths.
 - `dt`: sample period forwarded to `npz_exporter`.
-- `cut_lift_mm`: Z lift distance after a fiber `CUT`; default `20.0`.
+- `cut_lift_mm`: absolute lift distance along the fiber endpoint's upward surface normal after `CUT`; default `20.0`. Flat-print `ABC=0` remains world `+Z`.
 - `cut_wait_s`: total wait time measured from the exported `cut` event trigger; default `15.0`.
 
 ## Prime and Retract
@@ -100,7 +100,7 @@ Every printable path, including the generated primeline and final path, ends at 
 - Non-final fiber in a layer: `PRINT -> pre-CUT reset -> CUT -> lift/feed -> 3 s hold -> reset -> fixed retract -> 3 s hold -> reset -> remaining high hold -> external_npz_path_reset -> external_npz_reset_anchor -> optional travel(E=0)`.
 - Layer-final fiber: the same isolated CUT sequence, then `reset -> UI retract -> external_npz_path_reset -> external_npz_reset_anchor -> optional travel(E=0)`.
 
-For external-NPZ fiber CUT, the blocking pre-CUT reset establishes E=0 before the nonblocking `cut` event. `cut_lift_mm=L` then produces two reset-isolated absolute-E intervals: lift/feed `0→+L`, followed by fixed retract `0→-L`. Each interval holds its terminal E for 3 seconds before reset, so neither phase can be truncated by the next reset or inherit path/UI E.
+For external-NPZ fiber CUT, the blocking pre-CUT reset establishes E=0 before the nonblocking `cut` event. `cut_lift_mm=L` then produces two reset-isolated absolute-E intervals: surface-normal lift/feed `0→+L`, followed by fixed retract `0→-L`. Each interval holds its terminal E for 3 seconds before reset, so neither phase can be truncated by the next reset or inherit path/UI E.
 
 The two 3-second holds and both motions consume the existing `cut_wait_s` budget measured from the `cut` event; XYZ stays at the lifted pose until that total window ends. If the configured window is shorter than the complete safety sequence, completion takes precedence. CUT does not consume `fiber_prime_length_mm=P` or `fiber_retract_length_mm=R`; UI prime remains `0→+P`, UI retract remains `0→-R`, and their configured speeds remain independent.
 
@@ -133,4 +133,4 @@ tool_offset = (fiber_x_print_compensation_mm,
 resin_z_print_compensation_mm = resin.z_print_compensation_mm
 ```
 
-These values are passed directly to `path_processing_core.npz_exporter.export_npz()`, so tool switching, resin-Z compensation, cut lift/wait expansion, and short-segment polyline sampling stay centralized in the shared exporter logic. The exporter starts from resin tool `2`; before a tool-change event with non-zero head offset, it first lifts `20 mm`, then performs the XYZ offset travel, and only then emits the tool-change event. For an external-NPZ fiber `CUT`, the exporter first establishes the E=0 boundary, emits the nonblocking `cut` event, immediately lifts Z by `cut_lift_mm` while feeding the same absolute length, and runs the isolated high-pose retract sequence described above before any downstream travel.
+These values are passed directly to `path_processing_core.npz_exporter.export_npz()`, so tool switching, resin-Z compensation, cut lift/wait expansion, and short-segment polyline sampling stay centralized in the shared exporter logic. The exporter starts from resin tool `2`; before a tool-change event with non-zero head offset, it first lifts `20 mm`, then performs the XYZ offset travel, and only then emits the tool-change event. For an external-NPZ fiber `CUT`, the exporter first establishes the E=0 boundary, emits the nonblocking `cut` event, immediately lifts by `cut_lift_mm` along the endpoint surface normal while feeding the same absolute length, and runs the isolated high-pose retract sequence described above before any downstream travel.

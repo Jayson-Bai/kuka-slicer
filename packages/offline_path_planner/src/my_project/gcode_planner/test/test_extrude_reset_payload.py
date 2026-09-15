@@ -1,6 +1,7 @@
 import json
 
 import numpy as np
+import pytest
 
 import path_processing_core.npz_exporter as npz_exporter
 from gcode_planner.cli import _default_output_path
@@ -478,6 +479,129 @@ def test_cut_event_lifts_with_matched_fiber_feed_and_preserves_next_prime(tmp_pa
     assert np.isclose(data["x"][next_prime_idx], data["x"][travel_idx[-1]])
     assert np.isclose(data["z"][next_prime_idx], data["z"][travel_idx[-1]])
     assert np.isclose(data["e"][next_prime_idx], 8.0)
+
+
+@pytest.mark.parametrize("external_absolute_e", [False, True])
+def test_curved_fiber_cut_lift_follows_endpoint_surface_normal(
+    tmp_path, external_absolute_e
+):
+    out = tmp_path / f"curved_cut_lift_{external_absolute_e}.npz"
+    endpoint = Position(10.0, 20.0, 30.0, 0.0, 30.0, 0.0)
+    parsed = [
+        MoveCommand(
+            type="PRINT",
+            cmd="G1",
+            start_pos=Position(0.0, 20.0, 30.0, 0.0, 30.0, 0.0),
+            pos=endpoint,
+            e_val=5.0,
+            delta_e=5.0,
+            feedrate=600.0,
+            line=1,
+            layer=0,
+            subtype="FIBER",
+            raw="fiber_print",
+        ),
+        MCommand(
+            type="M_COMMAND",
+            code="CUT",
+            params={"P": 1.0},
+            line=2,
+            layer=0,
+            subtype="FIBER",
+            raw="external_npz_cut",
+            tool=1,
+        ),
+    ]
+
+    lift_mm = 20.0
+    export_npz(
+        parsed,
+        str(out),
+        dt=0.004,
+        default_feed_mm_s=10.0,
+        cut_lift_mm=lift_mm,
+        cut_wait_s=0.0,
+        initial_tool_id=1,
+        external_npz_cut_absolute_e=external_absolute_e,
+    )
+
+    with np.load(out) as data:
+        src_lines = _decoded_src_lines(data)
+        event_vocab = _decoded_event_type_vocab(data)
+        event_types = [event_vocab[int(value)] for value in data["event_type"]]
+        cut_idx = event_types.index("cut")
+        cut_xyz = np.array(
+            [data["x"][cut_idx], data["y"][cut_idx], data["z"][cut_idx]]
+        )
+        cut_rows = [idx for idx, src in enumerate(src_lines) if src == "2" and idx > cut_idx]
+        assert cut_rows
+        displacements = np.column_stack(
+            (data["x"][cut_rows], data["y"][cut_rows], data["z"][cut_rows])
+        ) - cut_xyz
+        distances = np.linalg.norm(displacements, axis=1)
+        high_idx = int(np.argmax(distances))
+
+        expected_normal = np.array([0.5, 0.0, np.sqrt(3.0) / 2.0])
+        assert np.allclose(displacements[high_idx], lift_mm * expected_normal, atol=1e-5)
+        assert np.isclose(distances[high_idx], lift_mm, atol=1e-5)
+        assert np.allclose(data["a"][cut_rows], endpoint.a)
+        assert np.allclose(data["b"][cut_rows], endpoint.b)
+        assert np.allclose(data["c"][cut_rows], endpoint.c)
+
+
+def test_nonfiber_cut_with_tilted_abc_keeps_world_z_lift(tmp_path):
+    out = tmp_path / "nonfiber_cut_lift.npz"
+    endpoint = Position(10.0, 20.0, 30.0, 0.0, 30.0, 0.0)
+    parsed = [
+        MoveCommand(
+            type="PRINT",
+            cmd="G1",
+            start_pos=Position(0.0, 20.0, 30.0, 0.0, 30.0, 0.0),
+            pos=endpoint,
+            e_val=5.0,
+            delta_e=5.0,
+            feedrate=600.0,
+            line=1,
+            layer=0,
+            subtype="RESIN",
+            raw="resin_print",
+        ),
+        MCommand(
+            type="M_COMMAND",
+            code="CUT",
+            params={"P": 1.0},
+            line=2,
+            layer=0,
+            subtype="RESIN",
+            raw="cut",
+            tool=2,
+        ),
+    ]
+
+    export_npz(
+        parsed,
+        str(out),
+        dt=0.25,
+        default_feed_mm_s=10.0,
+        cut_lift_mm=20.0,
+        cut_wait_s=0.0,
+        initial_tool_id=2,
+    )
+
+    with np.load(out) as data:
+        src_lines = _decoded_src_lines(data)
+        event_vocab = _decoded_event_type_vocab(data)
+        event_types = [event_vocab[int(value)] for value in data["event_type"]]
+        cut_idx = event_types.index("cut")
+        cut_xyz = np.array(
+            [data["x"][cut_idx], data["y"][cut_idx], data["z"][cut_idx]]
+        )
+        cut_rows = [idx for idx, src in enumerate(src_lines) if src == "2" and idx > cut_idx]
+        displacements = np.column_stack(
+            (data["x"][cut_rows], data["y"][cut_rows], data["z"][cut_rows])
+        ) - cut_xyz
+        high_idx = int(np.argmax(np.linalg.norm(displacements, axis=1)))
+        assert np.allclose(displacements[high_idx], [0.0, 0.0, 20.0], atol=1e-5)
 
 
 def test_prime_extrude_wait_runs_after_previous_travel_by_default(tmp_path):
