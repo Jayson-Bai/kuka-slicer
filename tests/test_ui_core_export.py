@@ -78,6 +78,7 @@ def test_conformal_design_json_generates_core_output_without_source_npz_round_tr
     assert not (job_dir / "conformal_lattice_geometry_v1.npz").exists()
     with np.load(job_dir / "conformal_lattice_core.npz", allow_pickle=False) as core:
         assert np.linalg.norm(np.column_stack((core["a"], core["b"], core["c"]))) > 1e-3
+        assert "max_tcp_orientation_speed_deg_s" not in core.files
         manifest = json.loads(str(core["core_injection_manifest"].item()))
         assert manifest["format"] == "core_npz_local_injection_v2"
         assert manifest["injection_state"] == "base"
@@ -85,6 +86,7 @@ def test_conformal_design_json_generates_core_output_without_source_npz_round_tr
         assert manifest["offset_application"] == "per_sample_pose_rotated"
         assert manifest["base_parameters"]["tool_offset"] == [0.0, 0.0, 0.0]
         assert manifest["base_parameters"]["resin_z_print_compensation_mm"] == 0.0
+        assert "max_tcp_orientation_speed_deg_s" not in json.dumps(manifest)
     assert progress[-1] == 97
 
 
@@ -489,6 +491,9 @@ def test_ui_uses_pre_core_source_preview_and_exposes_core_export_progress():
     assert '.exportProgress.visible { display: inline-flex; }' in html
     assert "slice-status?job_id=" in html
     assert 'id="coreDt" type="number" min="0.0001" step="0.0001" value="0.004"' in html
+    assert 'id="coreMaxTcpOrientationSpeed"' in html
+    assert "core_max_tcp_orientation_speed" in html
+    assert "25 °/s 是离线 Core 的工程默认值" in html
     assert 'id="showCoreTravelPaths"' in html
     assert 'id="showPrimeline"' in html
     assert 'id="prusaRaftAutoContact"' in html
@@ -782,6 +787,18 @@ def test_core_cooling_is_always_enabled_without_ui_switches():
 
     assert params.resin.fan_enabled is True
     assert params.fiber.fan_enabled is True
+
+
+def test_main_ui_parses_tcp_orientation_speed_into_core_params():
+    _ensure_offline_planner_import_paths()
+    module = importlib.import_module("external_npz_preprocessor.process_params")
+
+    params = _parse_core_process_params(
+        {"core_max_tcp_orientation_speed": ["37.5"]},
+        module,
+    )
+
+    assert params.max_tcp_orientation_speed_deg_s == pytest.approx(37.5)
 
 
 def test_offline_slicer_always_exports_a_zero_offset_base_contract():

@@ -210,6 +210,7 @@ def convert_source_job(
         "dt": params.dt,
         "chunk_size": chunk_size,
         "default_feed_mm_s": params.travel_feed_mm_s,
+        "max_angular_speed_deg_s": params.max_tcp_orientation_speed_deg_s,
         "corner_angle_deg": params.corner_angle_deg,
         "corner_retreat_ratio": params.corner_retreat_ratio,
         "density": params.density,

@@ -77,6 +77,7 @@ def test_convert_uses_shared_head_calibration_offsets(tmp_path, monkeypatch):
     assert captured["kwargs"]["cut_lift_mm"] == 22.0
     assert captured["kwargs"]["cut_wait_s"] == 11.0
     assert captured["kwargs"]["default_feed_mm_s"] == 7.0
+    assert captured["kwargs"]["max_angular_speed_deg_s"] == 25.0
     assert "fiber_retract_length_mm" not in captured["kwargs"]
     assert captured["kwargs"]["external_npz_cut_absolute_e"] is True
 

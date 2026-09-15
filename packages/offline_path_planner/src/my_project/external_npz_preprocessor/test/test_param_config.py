@@ -58,6 +58,18 @@ def test_save_and_load_print_params_round_trip(tmp_path):
     assert loaded == params
 
 
+def test_legacy_params_receive_tcp_orientation_speed_default(tmp_path):
+    path = tmp_path / "legacy.json"
+    path.write_text(
+        '{"format":"external_npz_preprocessor_print_params","version":2,"params":{"dt":0.004}}',
+        encoding="utf-8",
+    )
+
+    loaded = load_print_params(path)
+
+    assert loaded.max_tcp_orientation_speed_deg_s == pytest.approx(25.0)
+
+
 def test_default_print_params_path_uses_data_directory(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "ignored_config"))
     monkeypatch.setenv("APPDATA", str(tmp_path / "ignored_appdata"))

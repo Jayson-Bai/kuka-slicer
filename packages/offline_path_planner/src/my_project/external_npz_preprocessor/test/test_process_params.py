@@ -72,6 +72,7 @@ def test_default_process_params_match_current_material_setup():
     assert params.travel_feed_mm_s == 20.0
     assert params.first_layer_travel_feed_mm_s == 15.0
     assert params.prime_settle_s == pytest.approx(0.5)
+    assert params.max_tcp_orientation_speed_deg_s == pytest.approx(25.0)
     assert params.start_x_mm == 10.0
     assert params.start_y_mm == 10.0
     assert params.corner_angle_deg == 45.0
@@ -108,6 +109,12 @@ def test_primeline_process_params_defaults_are_stable():
     assert params.primeline_x_mm == 0.0
     assert params.primeline_y_mm == -10.0
     assert params.primeline_length_mm == 100.0
+
+
+def test_tcp_orientation_speed_must_be_positive_and_finite():
+    for value in (0.0, -1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="max_tcp_orientation_speed_deg_s"):
+            ProcessParams(max_tcp_orientation_speed_deg_s=value)
 
 
 def test_prime_settle_s_accepts_zero():

@@ -1942,6 +1942,11 @@ def _parse_core_process_params(
         primeline_length_mm=_float_param(params, "core_primeline_length", defaults.primeline_length_mm),
         prime_settle_s=_float_param(params, "core_prime_settle", defaults.prime_settle_s),
         dt=_float_param(params, "core_dt", defaults.dt),
+        max_tcp_orientation_speed_deg_s=_float_param(
+            params,
+            "core_max_tcp_orientation_speed",
+            defaults.max_tcp_orientation_speed_deg_s,
+        ),
         corner_angle_deg=_float_param(params, "core_corner_angle", defaults.corner_angle_deg),
         corner_retreat_ratio=_float_param(params, "core_corner_retreat_ratio", defaults.corner_retreat_ratio),
         spline_max_error_mm=_float_param(params, "core_spline_max_error", defaults.spline_max_error_mm),
@@ -4941,8 +4946,10 @@ def _index_html() -> str:
 
           <section class="prusaAdvancedGroup">
             <h4>路径平滑与七阶采样</h4>
+            <p class="notice">TCP 姿态角速度按 KUKA A-Z / B-Y / C-X 对应的四元数最短转角计算；25 °/s 是离线 Core 的工程默认值，不代表机器人厂家额定上限。</p>
             <div class="prusaSettingsGrid">
               <div class="fieldGroup"><label for="coreDt">采样周期 dt s</label><input id="coreDt" type="number" min="0.0001" step="0.0001" value="0.004"></div>
+              <div class="fieldGroup"><label for="coreMaxTcpOrientationSpeed">TCP 姿态最大角速度 °/s</label><input id="coreMaxTcpOrientationSpeed" type="number" min="0.001" step="0.1" value="25"></div>
               <div class="fieldGroup"><label for="coreCornerAngle">拐角角度阈值 °</label><input id="coreCornerAngle" type="number" min="0" step="0.1" value="45"></div>
               <div class="fieldGroup"><label for="coreCornerRetreatRatio">拐角回退比例</label><input id="coreCornerRetreatRatio" type="number" min="0" max="1" step="0.001" value="0.65"></div>
               <div class="fieldGroup"><label for="coreSplineMaxError">Spline 最大误差 mm</label><input id="coreSplineMaxError" type="number" min="0" step="0.001" value="0.1"></div>
@@ -5510,6 +5517,7 @@ def _index_html() -> str:
       ['corePrimelineY', 'core_primeline_y_mm', 'root', 'primeline_y_mm'],
       ['corePrimelineLength', 'core_primeline_length', 'root', 'primeline_length_mm'],
       ['coreDt', 'core_dt', 'root', 'dt'],
+      ['coreMaxTcpOrientationSpeed', 'core_max_tcp_orientation_speed', 'root', 'max_tcp_orientation_speed_deg_s'],
       ['coreCornerAngle', 'core_corner_angle', 'root', 'corner_angle_deg'],
       ['coreCornerRetreatRatio', 'core_corner_retreat_ratio', 'root', 'corner_retreat_ratio'],
       ['coreSplineMaxError', 'core_spline_max_error', 'root', 'spline_max_error_mm'],
@@ -6219,7 +6227,7 @@ def _index_html() -> str:
          'coreFiberRetractSpeed', 'coreFiberStartAccel', 'coreTravelFeed',
          'coreFirstLayerTravelFeed', 'corePrimeSettle', 'coreDefaultA',
          'coreDefaultB', 'coreDefaultC', 'corePrimelineX', 'corePrimelineY',
-         'corePrimelineLength', 'coreDt', 'coreCornerAngle',
+         'corePrimelineLength', 'coreDt', 'coreMaxTcpOrientationSpeed', 'coreCornerAngle',
          'coreCornerRetreatRatio', 'coreSplineMaxError', 'coreSplineMaxAngle',
          'coreSourceMergeDistance', 'coreCornerRetreatMax', 'coreCornerBlendSegments',
          'coreDensity', 'coreDegree', 'coreMaxFitPoints',

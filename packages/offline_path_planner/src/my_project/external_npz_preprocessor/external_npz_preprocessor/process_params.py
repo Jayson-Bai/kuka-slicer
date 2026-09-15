@@ -92,6 +92,7 @@ class ProcessParams:
     primeline_length_mm: float = 100.0
     prime_settle_s: float = field(default=0.5, kw_only=True)
     dt: float = 0.004
+    max_tcp_orientation_speed_deg_s: float = 25.0
     corner_angle_deg: float = 45.0
     corner_retreat_ratio: float = 0.65
     spline_max_error_mm: float = 0.1
@@ -119,6 +120,10 @@ class ProcessParams:
         prime_settle_s = float(self.prime_settle_s)
         if not math.isfinite(prime_settle_s) or prime_settle_s < 0.0:
             raise ValueError("prime_settle_s must be >= 0")
+
+        max_orientation_speed = float(self.max_tcp_orientation_speed_deg_s)
+        if not math.isfinite(max_orientation_speed) or max_orientation_speed <= 0.0:
+            raise ValueError("max_tcp_orientation_speed_deg_s must be finite and > 0")
 
     @property
     def default_abc(self) -> tuple[float, float, float]:

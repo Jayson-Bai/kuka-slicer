@@ -19,7 +19,7 @@ from .process_params import (
 
 _CONFIG_DIR_NAME = "external_npz_preprocessor"
 _CONFIG_FILE_NAME = "print_params.json"
-_CONFIG_VERSION = 2
+_CONFIG_VERSION = 3
 
 
 def default_print_params_path(data_root: str | Path | None = None) -> Path:
@@ -105,6 +105,12 @@ def process_params_from_dict(data: dict[str, Any]) -> ProcessParams:
             merged.get("prime_settle_s", defaults["prime_settle_s"])
         ),
         dt=float(merged.get("dt", defaults["dt"])),
+        max_tcp_orientation_speed_deg_s=float(
+            merged.get(
+                "max_tcp_orientation_speed_deg_s",
+                defaults["max_tcp_orientation_speed_deg_s"],
+            )
+        ),
         corner_angle_deg=float(merged.get("corner_angle_deg", defaults["corner_angle_deg"])),
         corner_retreat_ratio=float(merged.get("corner_retreat_ratio", defaults["corner_retreat_ratio"])),
         spline_max_error_mm=float(merged.get("spline_max_error_mm", defaults["spline_max_error_mm"])),
