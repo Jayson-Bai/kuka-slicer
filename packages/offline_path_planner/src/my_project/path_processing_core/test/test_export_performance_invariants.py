@@ -68,8 +68,8 @@ def test_dense_spline_uses_refined_arc_length_map_budget() -> None:
     assert _arc_length_map_sample_count(1_191) == 28_584
 
 
-def test_travel_waypoints_share_one_short_polyline_profile(tmp_path) -> None:
-    """Detour vertices must not become independent four-second stop profiles."""
+def test_travel_polyline_stops_at_preserved_interior_waypoints(tmp_path) -> None:
+    """Every hard detour vertex gets an explicit stationary RSI frame."""
 
     p0 = Position(0.0, 0.0, 0.5, 0.0, 0.0, 0.0)
     p1 = Position(1.0, 0.0, 0.5, 0.0, 0.0, 0.0)
@@ -100,6 +100,14 @@ def test_travel_waypoints_share_one_short_polyline_profile(tmp_path) -> None:
     # remains below the upper-computer 0.100020 mm limit without post-sampling
     # subdivision.
     assert np.max(np.linalg.norm(np.diff(points, axis=0), axis=1)) <= 0.10002
+
+    for waypoint in (np.array([1.0, 0.0, 0.5]), np.array([1.0, 1.0, 0.5])):
+        matches = np.linalg.norm(points - waypoint, axis=1) < 1e-12
+        duplicate_starts = np.flatnonzero(matches[:-1] & matches[1:])
+        assert duplicate_starts.size == 1
+        assert np.linalg.norm(
+            points[duplicate_starts[0] + 1] - points[duplicate_starts[0]]
+        ) == 0.0
 
     timing = json.loads(output.with_suffix(".timing.json").read_text(encoding="utf-8"))
     segment = timing["segments"][0]

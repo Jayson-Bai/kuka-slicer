@@ -34,6 +34,7 @@ _MAX_ORIENTATION_STEP_DEG = 0.1
 # user-selected feedrate/time profile.
 _ARC_LENGTH_MAP_SAMPLES_PER_CONTROL_POINT = 24
 _ARC_LENGTH_MAP_MIN_SAMPLES = 800
+_TRAVEL_WAYPOINT_MIN_RAMP_S = 0.08
 
 
 # -------------------------- 基础工具 --------------------------
@@ -583,6 +584,144 @@ def _orientation_only_samples(
         previous_abc = (a, b, c)
 
 
+def _travel_waypoint_ramp_s(
+    ramp_limit_s: float,
+    timing_length: float,
+    target_velocity: float,
+) -> float:
+    """Return a bounded per-edge ramp for an exact waypoint stop."""
+    if ramp_limit_s <= 0.0 or target_velocity <= 0.0:
+        return 0.0
+    proportional_ramp = 0.5 * timing_length / target_velocity
+    return min(
+        float(ramp_limit_s),
+        max(_TRAVEL_WAYPOINT_MIN_RAMP_S, proportional_ramp),
+    )
+
+
+def _sample_travel_polyline_with_waypoint_stops(
+    curve: GlobalCurveCommand,
+    points: List[Position],
+    seg_lengths: List[float],
+    seg_angles: List[float],
+    e_profile: Optional[List[float]],
+    *,
+    dt: float,
+    target_velocity: float,
+    t_acc: float,
+    t_dec: float,
+    max_angular_speed_deg_s: Optional[float],
+):
+    """Sample every preserved travel edge with a zero-speed waypoint stop.
+
+    Each edge gets an independent seventh-order start/stop profile. Repeating
+    the shared waypoint as the next edge's first frame creates one explicit
+    stationary RSI frame, so XYZ and KUKA ABC both restart from zero discrete
+    velocity without changing the obstacle-avoiding polyline geometry.
+    """
+    total_length = sum(seg_lengths)
+    curve_start_e = curve.e_val - curve.delta_e
+    current_e = curve_start_e
+    cumulative_length = 0.0
+    elapsed_t = 0.0
+    previous_abc = (points[0].a, points[0].b, points[0].c)
+
+    for seg_idx, (start, end, seg_len, seg_angle) in enumerate(
+        zip(points, points[1:], seg_lengths, seg_angles)
+    ):
+        timing_length = _pose_timing_increment(
+            seg_len,
+            seg_angle,
+            target_velocity,
+            max_angular_speed_deg_s,
+        )
+        if timing_length <= 1e-12:
+            cumulative_length += seg_len
+            continue
+
+        seg_t_acc = _travel_waypoint_ramp_s(
+            t_acc, timing_length, target_velocity
+        )
+        seg_t_dec = _travel_waypoint_ramp_s(
+            t_dec, timing_length, target_velocity
+        )
+        total_time, _ = _compute_time_profile(
+            timing_length, target_velocity, seg_t_acc, seg_t_dec
+        )
+        if total_time <= 0.0:
+            cumulative_length += seg_len
+            continue
+        num_steps = int(math.ceil(total_time / dt))
+        corrected_total_time = num_steps * dt
+
+        if e_profile is None:
+            segment_start_e = (
+                curve_start_e
+                if total_length <= 1e-12
+                else curve_start_e
+                + curve.delta_e * (cumulative_length / total_length)
+            )
+            segment_end_e = (
+                curve.e_val
+                if total_length <= 1e-12
+                else curve_start_e
+                + curve.delta_e * ((cumulative_length + seg_len) / total_length)
+            )
+        else:
+            segment_start_e = e_profile[seg_idx]
+            segment_end_e = e_profile[seg_idx + 1]
+
+        start_q = kuka_abc_to_quaternion(start.a, start.b, start.c)
+        end_q = kuka_abc_to_quaternion(end.a, end.b, end.c)
+        previous_local = 0.0
+
+        for step in range(num_steps + 1):
+            local_t = step * dt
+            local = _three_stage_sept_poly(
+                local_t, corrected_total_time, seg_t_acc, seg_t_dec
+            )
+            local = max(0.0, min(1.0, local))
+            if step == num_steps:
+                local = 1.0
+
+            pos = Position(
+                x=start.x + (end.x - start.x) * local,
+                y=start.y + (end.y - start.y) * local,
+                z=start.z + (end.z - start.z) * local,
+                a=start.a,
+                b=start.b,
+                c=start.c,
+            )
+            q = quaternion_slerp(start_q, end_q, local)
+            pos.a, pos.b, pos.c = quaternion_to_kuka_abc(
+                q, near_deg=previous_abc
+            )
+            previous_abc = (pos.a, pos.b, pos.c)
+
+            target_e = segment_start_e + (
+                segment_end_e - segment_start_e
+            ) * local
+            delta_e = target_e - current_e
+            current_e = target_e
+            delta_s = (local - previous_local) * seg_len
+            previous_local = local
+
+            yield InterpolatedPoint(
+                t=elapsed_t + local_t,
+                pos=pos,
+                e=current_e,
+                extrude_speed=delta_e / dt if dt > 0.0 else 0.0,
+                feedrate_mm_min=(delta_s / dt * 60.0) if dt > 0.0 else 0.0,
+                cmd_type=curve.type,
+                line=curve.line,
+                raw=curve.raw,
+            )
+
+        cumulative_length += seg_len
+        # The next edge starts with the same pose on the following RSI frame.
+        elapsed_t += corrected_total_time + dt
+
+
 # -------------------------- 采样主逻辑 --------------------------
 
 def sample_global_curve_iter(
@@ -661,6 +800,21 @@ def sample_global_curve_iter(
                 cmd_type=curve.type,
                 line=curve.line,
                 raw=curve.raw,
+            )
+            return
+
+        if curve.type == "TRAVEL" and len(points) > 2:
+            yield from _sample_travel_polyline_with_waypoint_stops(
+                curve,
+                points,
+                seg_lengths,
+                seg_angles,
+                e_profile,
+                dt=dt,
+                target_velocity=target_velocity,
+                t_acc=t_acc,
+                t_dec=t_dec,
+                max_angular_speed_deg_s=max_angular_speed_deg_s,
             )
             return
 

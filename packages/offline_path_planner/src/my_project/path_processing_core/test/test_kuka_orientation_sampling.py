@@ -206,6 +206,49 @@ def test_polyline_curvature_retimes_xyz_abc_and_e_together():
     assert limited[-1].e == pytest.approx(10.0)
 
 
+def test_travel_polyline_restarts_xyz_and_orientation_from_zero_at_waypoint():
+    from path_processing_core.types import GlobalCurveCommand
+
+    waypoint = Position(5.0, 0.0, 0.5, 0.0, 15.0, 0.0)
+    curve = GlobalCurveCommand(
+        type="TRAVEL",
+        cmd="POLYLINE",
+        start_pos=Position(0.0, 0.0, 0.5, 0.0, 0.0, 0.0),
+        control_points=[
+            waypoint,
+            Position(5.0, 5.0, 0.5, 0.0, -20.0, 0.0),
+        ],
+        e_val=0.0,
+        delta_e=0.0,
+        feedrate=1200.0,
+        line=1,
+    )
+
+    samples = list(
+        sample_global_curve_iter(
+            curve,
+            dt=0.004,
+            target_velocity=20.0,
+            t_acc=0.25,
+            t_dec=0.25,
+            max_angular_speed_deg_s=25.0,
+        )
+    )
+    xyz = np.array(
+        [[sample.pos.x, sample.pos.y, sample.pos.z] for sample in samples]
+    )
+    waypoint_rows = np.flatnonzero(
+        np.linalg.norm(xyz - np.array([5.0, 0.0, 0.5]), axis=1) < 1e-12
+    )
+
+    assert waypoint_rows.size == 2
+    assert waypoint_rows[1] == waypoint_rows[0] + 1
+    left, right = waypoint_rows
+    assert xyz[right].tolist() == pytest.approx(xyz[left].tolist())
+    assert samples[right].pos.b == pytest.approx(samples[left].pos.b)
+    assert _max_quaternion_angular_speed(samples, 0.004) <= 25.0 + 1e-4
+
+
 def test_bspline_surface_orientation_retimes_only_when_limit_requires_it():
     points = [
         Position(float(index), 0.0, 0.5, 0.0, 30.0 * math.sin(math.pi * index / 8.0), 0.0)
