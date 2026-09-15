@@ -318,11 +318,9 @@ def _final_core_npz_parts(core_npz_path: Path) -> list[Path]:
     return parts
 
 
-def _core_move_type_codes(data) -> set[int]:
-    """Return vocabulary codes that represent deposited Core trajectory rows."""
+def _core_vocab_codes(data, keys_name: str, values_name: str, names: set[str]) -> set[int]:
+    """Resolve named Core vocabulary entries without assuming numeric codes."""
 
-    keys_name = "move_type_vocab_keys"
-    values_name = "move_type_vocab_vals"
     if keys_name in data.files and values_name in data.files:
         def _name(value) -> str:
             raw = value.item() if hasattr(value, "item") else value
@@ -331,8 +329,22 @@ def _core_move_type_codes(data) -> set[int]:
         return {
             int(value)
             for key, value in zip(data[keys_name], data[values_name])
-            if _name(key).upper() in {"PRINT", "PRINT_FIT"}
+            if _name(key).upper() in names
         }
+    return set()
+
+
+def _core_move_type_codes(data) -> set[int]:
+    """Return vocabulary codes that represent deposited Core trajectory rows."""
+
+    codes = _core_vocab_codes(
+        data,
+        "move_type_vocab_keys",
+        "move_type_vocab_vals",
+        {"PRINT", "PRINT_FIT"},
+    )
+    if codes:
+        return codes
     # Legacy Core files use these stable numeric values when no vocabulary is
     # present.  Keep the fallback local to preview decoding.
     return {1, 3}
@@ -420,6 +432,7 @@ def _preview_payload_from_final_core_npz(
     """
 
     entries_by_layer: dict[int, list[dict[str, object]]] = {}
+    fiber_cut_events_by_layer: dict[int, list[dict[str, object]]] = {}
     bounds = {
         "min_x": None,
         "max_x": None,
@@ -483,6 +496,34 @@ def _preview_payload_from_final_core_npz(
             a = np.asarray(data["a"], dtype=np.float64) if "a" in data.files else None
             b = np.asarray(data["b"], dtype=np.float64) if "b" in data.files else None
             c = np.asarray(data["c"], dtype=np.float64) if "c" in data.files else None
+
+            cut_codes = _core_vocab_codes(
+                data,
+                "event_type_vocab_keys",
+                "event_type_vocab_vals",
+                {"CUT"},
+            )
+            if cut_codes and "event_type" in data.files:
+                event_type = np.asarray(data["event_type"], dtype=np.int64)
+                cut_mask = (
+                    (event_flag == 1)
+                    & np.isin(event_type, list(cut_codes))
+                    & (tool_id == 1)
+                    & np.isfinite(x)
+                    & np.isfinite(y)
+                    & np.isfinite(z)
+                )
+                for cut_index in np.flatnonzero(cut_mask):
+                    fiber_cut_events_by_layer.setdefault(int(layer[cut_index]), []).append(
+                        {
+                            "point": [
+                                float(x[cut_index]),
+                                float(y[cut_index]),
+                                float(z[cut_index]),
+                            ],
+                            "path_id": int(path_id[cut_index]),
+                        }
+                    )
 
             valid = (
                 (event_flag != 1)
@@ -593,6 +634,7 @@ def _preview_payload_from_final_core_npz(
                             "kind": "deposit" if role != "travel" else "travel",
                             "role": role,
                             "points": chunk_points,
+                            "path_id": int(path_id[first]),
                             "order": order,
                         }
                         if chunk_extrusion is not None:
@@ -626,6 +668,7 @@ def _preview_payload_from_final_core_npz(
                 "index": layer_index,
                 "resin_paths": resin_paths,
                 "fiber_paths": fiber_paths,
+                "fiber_cut_events": fiber_cut_events_by_layer.get(layer_index, []),
                 "travel_paths": travel_paths,
                 "motion_paths": entries,
             }
@@ -4129,6 +4172,14 @@ def _index_html() -> str:
     .infillSwatch {{ background: #0b6bcb; }}
     .raftSwatch {{ background: #7f5539; }}
     .fiberSwatch {{ background: #e66f00; }}
+    .fiberCutSwatch {{
+      width: 11px;
+      height: 11px;
+      border-radius: 50%;
+      border: 2px solid #713f12;
+      background: #ffd400;
+      box-shadow: 0 0 0 2px rgba(255, 212, 0, .3);
+    }}
     .travelSwatch {{
       height: 4px;
       background: repeating-linear-gradient(90deg, #526f8c 0 7px, transparent 7px 12px);
@@ -4353,6 +4404,7 @@ def _index_html() -> str:
         <label class="legendItem"><input id="showResinInfill" type="checkbox" checked><span class="swatch infillSwatch"></span>树脂填充</label>
         <label class="legendItem"><input id="showRaftPaths" type="checkbox" checked><span class="swatch raftSwatch"></span>Prusa 筏层</label>
         <label class="legendItem"><input id="showFiberPaths" type="checkbox" checked><span class="swatch fiberSwatch"></span>纤维路径</label>
+        <label class="legendItem"><input id="showFiberCutEvents" type="checkbox" checked><span class="swatch fiberCutSwatch"></span>纤维剪切点（CUT）</label>
         <label class="legendItem"><input id="showTravelPaths" type="checkbox" checked><span class="swatch travelSwatch"></span>空移 Travel</label>
         <label class="legendItem"><input id="showCoreTravelPaths" type="checkbox" checked><span class="swatch coreTravelSwatch"></span>Core 转场空走</label>
         <label class="legendItem"><input id="showPrimeline" type="checkbox" checked><span class="swatch primelineSwatch"></span>Core Primeline</label>
@@ -5425,6 +5477,7 @@ def _index_html() -> str:
     const showResinInfillInput = document.getElementById('showResinInfill');
     const showRaftPathsInput = document.getElementById('showRaftPaths');
     const showFiberPathsInput = document.getElementById('showFiberPaths');
+    const showFiberCutEventsInput = document.getElementById('showFiberCutEvents');
     const showTravelPathsInput = document.getElementById('showTravelPaths');
     const showCoreTravelPathsInput = document.getElementById('showCoreTravelPaths');
     const showPrimelineInput = document.getElementById('showPrimeline');
@@ -7247,6 +7300,38 @@ def _index_html() -> str:
         ctx.restore();
       }}
 
+      function drawFiberCutEvents(events, opacity = 1) {{
+        if (!showFiberPathsInput.checked || !showFiberCutEventsInput.checked) return;
+        ctx.save();
+        ctx.globalAlpha = opacity;
+        ctx.fillStyle = '#ffd400';
+        ctx.strokeStyle = '#713f12';
+        ctx.lineWidth = 1.8;
+        ctx.shadowColor = 'rgba(255, 212, 0, .78)';
+        ctx.shadowBlur = 7;
+        for (const event of events || []) {{
+          if (!Array.isArray(event?.point) || event.point.length < 3) continue;
+          const point = viewport.project(event.point);
+          ctx.beginPath();
+          ctx.arc(point[0], point[1], 5.5, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.stroke();
+        }}
+        ctx.restore();
+      }}
+
+      function visibleFiberCutEvents(targetLayer, visibleEntries) {{
+        const visibleFiberPathIds = new Set(
+          visibleEntries
+            .filter((entry) => entry.role === 'fiber')
+            .map((entry) => Number(entry.path_id))
+            .filter(Number.isFinite)
+        );
+        return (targetLayer?.fiber_cut_events || []).filter((event) =>
+          visibleFiberPathIds.has(Number(event.path_id))
+        );
+      }}
+
       function drawHistoricalOverlay(entries) {{
         // Historical layers share one opacity and are immutable until the
         // layer or role filters change.  Batch their Canvas strokes by style
@@ -7371,6 +7456,20 @@ def _index_html() -> str:
       for (let index = 0; index < visibleCount; index++) {{
         drawEntry(entries[index]);
       }}
+      if (showLayerOverlayInput.checked && showFiberPathsInput.checked && showFiberCutEventsInput.checked) {{
+        const layers = previewData?.layers || [];
+        const currentLayerPosition = Number(layerSlider.value);
+        for (let layerPosition = 0; layerPosition < currentLayerPosition; layerPosition++) {{
+          const historicalLayer = layers[layerPosition];
+          drawFiberCutEvents(
+            visibleFiberCutEvents(historicalLayer, selectedPrintEntries(historicalLayer)),
+            0.48,
+          );
+        }}
+      }}
+      drawFiberCutEvents(
+        visibleFiberCutEvents(layer, entries.slice(0, visibleCount)),
+      );
       if (currentEntry && showPathPointsInput.checked) {{
         drawPathPoints(ctx, currentEntry.points, pathColor(currentEntry.role), viewport.project);
       }}
@@ -7939,6 +8038,7 @@ def _index_html() -> str:
       showResinInfillInput,
       showRaftPathsInput,
       showFiberPathsInput,
+      showFiberCutEventsInput,
       showTravelPathsInput
     ]) {{
       input.addEventListener('change', () => {{

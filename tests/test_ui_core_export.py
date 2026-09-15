@@ -135,6 +135,10 @@ def test_main_ui_continuous_course_fiber_strategy_reaches_final_core_output(tmp_
     with np.load(job_dir / "conformal_lattice_core.npz", allow_pickle=False) as core:
         assert core["x"].size > 0
     assert any(layer["fiber_paths"] for layer in result["preview"]["layers"])
+    assert sum(
+        len(layer["fiber_cut_events"])
+        for layer in result["preview"]["layers"]
+    ) == report["total_fiber_path_count"]
 
 
 def test_production_continuous_courses_replace_only_legacy_honeycomb_and_keep_grips():
@@ -641,6 +645,38 @@ def test_final_core_preview_uses_final_rows_and_bounds_each_path(tmp_path: Path)
     assert layer["travel_paths"] == [travel.tolist()]
     assert preview["bounds"]["max_x"] == 22.0
     assert preview["bounds"]["max_y"] == pytest.approx(2.0)
+
+
+def test_final_core_preview_exposes_real_fiber_cut_event_coordinates(tmp_path: Path):
+    output = tmp_path / "fiber_cut_core.npz"
+    points = np.asarray([
+        [1.0, 2.0, 0.6],
+        [3.0, 4.0, 0.7],
+        [3.0, 4.0, 0.7],
+    ])
+    np.savez_compressed(
+        output,
+        x=points[:, 0], y=points[:, 1], z=points[:, 2],
+        tool_id=np.asarray([1, 1, 1]),
+        move_type=np.asarray([1, 1, 0]),
+        event_flag=np.asarray([0, 0, 1], dtype=np.uint8),
+        event_type=np.asarray([0, 0, 8], dtype=np.uint8),
+        preview_layer_index=np.asarray([2, 2, 2], dtype=np.uint32),
+        path_id=np.asarray([17, 17, 17], dtype=np.uint32),
+        path_end_flag=np.asarray([0, 1, 0], dtype=np.uint8),
+        move_type_vocab_keys=np.asarray(["TRAVEL", "PRINT"]),
+        move_type_vocab_vals=np.asarray([0, 1], dtype=np.uint8),
+        event_type_vocab_keys=np.asarray(["", "cut"]),
+        event_type_vocab_vals=np.asarray([0, 8], dtype=np.uint8),
+    )
+
+    preview = _preview_payload_from_final_core_npz(output, SliceConfig(line_width=2.0))
+    layer = preview["layers"][0]
+
+    assert layer["motion_paths"][0]["path_id"] == 17
+    assert layer["fiber_cut_events"] == [{"point": [3.0, 4.0, 0.7], "path_id": 17}]
+    assert preview["bounds"]["max_x"] == 3.0
+    assert preview["bounds"]["max_y"] == 4.0
 
 
 def test_final_core_preview_chunks_dense_resin_without_dropping_e_values(tmp_path: Path):
