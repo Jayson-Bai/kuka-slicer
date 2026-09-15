@@ -1607,7 +1607,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             graph=run.path_graph,
             course_paths_by_layer=run.continuous_course_paths_by_layer,
             settings=ContinuousCourseFiberSettings(
-                enabled=_bool_param(params, "conformal_fiber_enabled", False),
+                enabled=_bool_param(params, "conformal_fiber_enabled", True),
                 first_after_resin_layer_physical=first_fiber_interface,
                 last_after_resin_layer_physical=last_fiber_interface,
             ),
@@ -4306,7 +4306,7 @@ def _index_html() -> str:
       <output id="conformalSpecResult" class="surfaceCollisionResult" aria-live="polite">尚未导入共形蜂窝设计 JSON。</output>
       <fieldset class="surfaceCollisionResult" aria-label="共形蜂窝连续纤维策略">
         <legend>连续纤维（主 UI 工艺策略）</legend>
-        <label><input id="conformalFiberEnabled" type="checkbox"> 启用均匀混合壁</label>
+        <label><input id="conformalFiberEnabled" type="checkbox" checked> 启用连续纤维路径</label>
         <label for="conformalFiberDoubleWallAxis">双层主壁方向</label>
         <select id="conformalFiberDoubleWallAxis">
           <option value="x" selected>X 向双壁（拉伸推荐）</option>
@@ -5071,7 +5071,9 @@ def _index_html() -> str:
     const conformalFiberDoubleWallAxis = document.getElementById('conformalFiberDoubleWallAxis');
     let selectedConformalSpec = null;
     let conformalDebugExportEnabled = false;
-    const conformalFiberSettingsStorageKey = 'kuka.conformalMixedWallFiber.v1';
+    // v2 intentionally starts conformal jobs with continuous fiber enabled.
+    // Do not restore the retired v1 default-off mixed-wall state.
+    const conformalFiberSettingsStorageKey = 'kuka.conformalContinuousCourseFiber.v2';
     function restoreConformalFiberSettings() {{
       try {{
         const saved = JSON.parse(window.localStorage.getItem(conformalFiberSettingsStorageKey) || 'null');
@@ -6380,7 +6382,18 @@ def _index_html() -> str:
       stopPathPlayback();
       layerSlider.disabled = layers.length === 0;
       layerSlider.max = Math.max(0, layers.length - 1);
-      layerSlider.value = 0;
+      // A conformal fiber course is inserted after a resin layer, so the
+      // first displayed layer is normally a resin-only base layer.  Starting
+      // every preview at index 0 made a valid F trajectory look absent.  When
+      // the final Core payload contains fiber, open the first such layer;
+      // resin-only jobs retain the established first-layer default.
+      const firstFiberLayerPosition = layers.findIndex((layer) =>
+        (Array.isArray(layer?.fiber_paths) && layer.fiber_paths.length > 0)
+        || (Array.isArray(layer?.motion_paths) && layer.motion_paths.some(
+          (entry) => entry?.kind !== 'travel' && entry?.role === 'fiber'
+        ))
+      );
+      layerSlider.value = firstFiberLayerPosition >= 0 ? firstFiberLayerPosition : 0;
       resetPreviewView();
       const isSurface = isSurfacePreview();
       showDirectionLabel.textContent = isSurface ? '显示路径方向/打印头' : '显示打印方向';
@@ -6592,7 +6605,15 @@ def _index_html() -> str:
       const layer = currentLayer();
       const layerCount = previewData?.layers?.length || 0;
       const pathCount = selectedPrintEntries(layer).length;
-      layerLabel.textContent = layer ? `${{Number(layerSlider.value) + 1}} / ${{layerCount}}` : '-';
+      const containsFiber = Boolean(
+        (Array.isArray(layer?.fiber_paths) && layer.fiber_paths.length > 0)
+        || (Array.isArray(layer?.motion_paths) && layer.motion_paths.some(
+          (entry) => entry?.kind !== 'travel' && entry?.role === 'fiber'
+        ))
+      );
+      layerLabel.textContent = layer
+        ? `${{Number(layerSlider.value) + 1}} / ${{layerCount}}${{containsFiber ? ' · 含纤维' : ''}}`
+        : '-';
       pathProgressLabel.textContent = pathCount
         ? `${{pathProgressSlider.value}} / ${{pathCount}}`
         : '-';

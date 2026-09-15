@@ -67,10 +67,11 @@ def test_conformal_design_json_generates_core_output_without_source_npz_round_tr
     assert result["layers"] == 4
     assert result["effective_infill_pattern"] == "共形蜂窝连续课程"
     assert result["infill_pattern_execution"] == {"applied": True, "mode": "continuous_course_network_v1"}
-    assert result["fiber_reinforcement"]["enabled"] is False
+    assert result["fiber_reinforcement"]["enabled"] is True
     assert result["fiber_reinforcement"]["reserved"] is False
-    assert result["fiber_reinforcement"]["total_fiber_path_count"] == 0
-    assert result["fiber_reinforcement"]["automatic_resin_z_raise"] is False
+    assert result["fiber_reinforcement"]["total_fiber_path_count"] > 0
+    assert result["fiber_reinforcement"]["automatic_resin_z_raise"] is True
+    assert any(layer["fiber_paths"] for layer in result["preview"]["layers"])
     assert result["preview"]["preview_source"] == "final_core_npz"
     assert result["preview"]["tool_orientation"]["available"] is True
     job_dir = tmp_path / result["download_url"].split("/")[-2]
@@ -494,6 +495,12 @@ def test_ui_uses_pre_core_source_preview_and_exposes_core_export_progress():
     assert 'id="coreMaxTcpOrientationSpeed"' in html
     assert "core_max_tcp_orientation_speed" in html
     assert "25 °/s 是离线 Core 的工程默认值" in html
+    assert 'id="conformalFiberEnabled" type="checkbox" checked' in html
+    assert '启用连续纤维路径' in html
+    assert "kuka.conformalContinuousCourseFiber.v2" in html
+    assert "const firstFiberLayerPosition = layers.findIndex" in html
+    assert "layerSlider.value = firstFiberLayerPosition >= 0 ? firstFiberLayerPosition : 0" in html
+    assert "containsFiber ? ' · 含纤维' : ''" in html
     assert 'id="showCoreTravelPaths"' in html
     assert 'id="showPrimeline"' in html
     assert 'id="prusaRaftAutoContact"' in html
