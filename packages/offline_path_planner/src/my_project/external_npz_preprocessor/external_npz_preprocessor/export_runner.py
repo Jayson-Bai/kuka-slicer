@@ -136,6 +136,7 @@ def convert_external_npz(
         cut_wait_s=cut_wait_s,
         chunk_size=chunk_size,
         commands_callback=commands_callback,
+        reuse_parallel_workers=reuse_parallel_workers,
     )
 
 
@@ -186,6 +187,7 @@ def convert_source_job(
     cut_wait_s: float | None = None,
     chunk_size: int = 100000,
     commands_callback=None,
+    reuse_parallel_workers: bool = False,
 ) -> dict:
     """Export one normalized source job through the sole Core consumer path."""
 
