@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import json
+import math
 
 import numpy as np
 
 from path_processing_core.npz_exporter import export_npz
-from path_processing_core.polynomial_interpolator import _arc_length_map_sample_count
+from path_processing_core.kuka_orientation import _normalize
+from path_processing_core.polynomial_interpolator import (
+    _arc_length_map_sample_count,
+    _basis_funs,
+    _make_open_uniform_knots,
+)
 from path_processing_core.types import MoveCommand, Position
 
 
@@ -66,6 +72,54 @@ def test_dense_spline_uses_refined_arc_length_map_budget() -> None:
 
     assert _arc_length_map_sample_count(19) == 800
     assert _arc_length_map_sample_count(1_191) == 28_584
+
+
+def test_quaternion_hot_path_keeps_legacy_float_results_exact() -> None:
+    quaternion = (
+        2.098788675049369,
+        2.073554763941045,
+        2.972451657445239,
+        -2.6559677859980146,
+    )
+    legacy_norm = math.sqrt(sum(value * value for value in quaternion))
+    legacy = tuple(value / legacy_norm for value in quaternion)
+    assert _normalize(quaternion) == legacy
+
+
+def test_unrolled_cubic_basis_matches_generic_operation_order_exactly() -> None:
+    knots = _make_open_uniform_knots(11, degree=3)
+
+    def generic(span: int, u: float) -> list[float]:
+        values = [0.0] * 4
+        values[0] = 1.0
+        left = [0.0] * 4
+        right = [0.0] * 4
+        for degree_step in range(1, 4):
+            left[degree_step] = u - knots[span + 1 - degree_step]
+            right[degree_step] = knots[span + degree_step] - u
+            saved = 0.0
+            for basis_index in range(degree_step):
+                denominator = (
+                    right[basis_index + 1]
+                    + left[degree_step - basis_index]
+                )
+                temporary = (
+                    0.0
+                    if abs(denominator) < 1e-12
+                    else values[basis_index] / denominator
+                )
+                values[basis_index] = (
+                    saved + right[basis_index + 1] * temporary
+                )
+                saved = left[degree_step - basis_index] * temporary
+            values[degree_step] = saved
+        return values
+
+    for u in (0.0, 0.125, 0.5, 1.0, 2.75, 5.5, 7.999999999999):
+        span = 10 if u == knots[11] else next(
+            index for index in range(3, 11) if knots[index] <= u < knots[index + 1]
+        )
+        assert _basis_funs(span, u, 3, knots) == generic(span, u)
 
 
 def test_travel_polyline_stops_at_preserved_interior_waypoints(tmp_path) -> None:

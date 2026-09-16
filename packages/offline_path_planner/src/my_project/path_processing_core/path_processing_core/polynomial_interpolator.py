@@ -97,6 +97,9 @@ def _find_span_monotonic(
 
 
 def _basis_funs(span: int, u: float, degree: int, knots: List[float]) -> List[float]:
+    if degree == 3:
+        return _basis_funs_cubic(span, u, knots)
+
     values = [0.0] * (degree + 1)
     values[0] = 1.0
     left = [0.0] * (degree + 1)
@@ -112,6 +115,51 @@ def _basis_funs(span: int, u: float, degree: int, knots: List[float]) -> List[fl
             values[r] = saved + right[r + 1] * temp
             saved = left[j - r] * temp
         values[j] = saved
+    return values
+
+
+def _basis_funs_cubic(span: int, u: float, knots: List[float]) -> List[float]:
+    """Unrolled cubic Cox-de Boor basis with the generic operation order."""
+
+    values = [1.0, 0.0, 0.0, 0.0]
+    left1 = u - knots[span]
+    right1 = knots[span + 1] - u
+
+    denominator = right1 + left1
+    temporary = 0.0 if abs(denominator) < 1e-12 else values[0] / denominator
+    values[0] = 0.0 + right1 * temporary
+    saved = left1 * temporary
+    values[1] = saved
+
+    left2 = u - knots[span - 1]
+    right2 = knots[span + 2] - u
+    saved = 0.0
+    denominator = right1 + left2
+    temporary = 0.0 if abs(denominator) < 1e-12 else values[0] / denominator
+    values[0] = saved + right1 * temporary
+    saved = left2 * temporary
+    denominator = right2 + left1
+    temporary = 0.0 if abs(denominator) < 1e-12 else values[1] / denominator
+    values[1] = saved + right2 * temporary
+    saved = left1 * temporary
+    values[2] = saved
+
+    left3 = u - knots[span - 2]
+    right3 = knots[span + 3] - u
+    saved = 0.0
+    denominator = right1 + left3
+    temporary = 0.0 if abs(denominator) < 1e-12 else values[0] / denominator
+    values[0] = saved + right1 * temporary
+    saved = left3 * temporary
+    denominator = right2 + left2
+    temporary = 0.0 if abs(denominator) < 1e-12 else values[1] / denominator
+    values[1] = saved + right2 * temporary
+    saved = left2 * temporary
+    denominator = right3 + left1
+    temporary = 0.0 if abs(denominator) < 1e-12 else values[2] / denominator
+    values[2] = saved + right3 * temporary
+    saved = left1 * temporary
+    values[3] = saved
     return values
 
 
