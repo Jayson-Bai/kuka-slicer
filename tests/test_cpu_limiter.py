@@ -47,6 +47,26 @@ def test_task_limiter_applies_and_restores_affinity(monkeypatch) -> None:
     assert calls == [available_cpus[:13], available_cpus]
 
 
+def test_task_limiter_can_preserve_process_affinity_for_bounded_process_pools(monkeypatch) -> None:
+    calls: list[tuple[int, ...]] = []
+    available_cpus = tuple(range(16))
+    monkeypatch.setattr(cpu_limiter, "_get_cpu_affinity", lambda: available_cpus)
+    monkeypatch.setattr(
+        cpu_limiter,
+        "_set_cpu_affinity",
+        lambda cpus: calls.append(cpus) or True,
+    )
+    monkeypatch.setattr(cpu_limiter, "_get_windows_priority", lambda: None)
+    monkeypatch.setattr(cpu_limiter, "_windows_total_physical_memory_bytes", lambda: None)
+    monkeypatch.setattr(cpu_limiter, "_get_windows_working_set_limits", lambda: None)
+
+    with cpu_limiter.limit_slicer_task(apply_affinity=False) as info:
+        assert info.max_cores == 13
+        assert info.affinity_applied is False
+
+    assert calls == []
+
+
 def test_low_priority_is_opt_in(monkeypatch) -> None:
     monkeypatch.delenv(cpu_limiter.LOW_PRIORITY_ENV, raising=False)
     assert cpu_limiter.low_priority_requested() is False

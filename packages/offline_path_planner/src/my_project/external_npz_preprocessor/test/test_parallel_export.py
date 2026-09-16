@@ -66,11 +66,12 @@ def test_layer_parallel_export_is_byte_identical_to_serial_export(tmp_path: Path
     commands = source_job_to_parsed_commands(job, params)
     serial = tmp_path / "serial.npz"
     parallel = tmp_path / "parallel.npz"
+    progress: list[float] = []
     kwargs = {
         "dt": 0.05,
         "chunk_size": 1_000_000,
         "default_feed_mm_s": params.travel_feed_mm_s,
-        "density": 1,
+        "density": 0,
         "enable_extrude_wait": True,
         "external_npz_cut_absolute_e": True,
         "cut_lift_mm": 1.0,
@@ -82,9 +83,11 @@ def test_layer_parallel_export_is_byte_identical_to_serial_export(tmp_path: Path
         commands,
         str(parallel),
         max_workers=2,
+        progress_callback=progress.append,
         **kwargs,
     )
 
+    assert progress[0] == 0.0
     assert serial.read_bytes() == parallel.read_bytes()
     assert serial.with_suffix(".offset.json").read_bytes() == parallel.with_suffix(
         ".offset.json"

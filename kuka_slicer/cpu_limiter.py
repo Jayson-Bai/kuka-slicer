@@ -256,12 +256,17 @@ def _windows_kernel32():
 
 
 @contextmanager
-def limit_slicer_task() -> Iterator[CpuLimitInfo]:
-    """Run one slicer task with an affinity and priority cap.
+def limit_slicer_task(*, apply_affinity: bool = True) -> Iterator[CpuLimitInfo]:
+    """Run one slicer task with optional affinity and priority caps.
 
     The lock serialises local slicing jobs.  Affinity is process-wide, so this
     prevents two browser requests from combining into a full-CPU workload and
     makes nested calls safe.
+
+    ``apply_affinity=False`` is for an operation that owns its CPU budget by
+    creating a bounded process pool. Restricting the pool's parent process
+    again can make Windows schedule its spawned children poorly; the fixed
+    worker count remains the CPU cap in that case.
     """
 
     with _TASK_LIMIT_LOCK:
@@ -270,7 +275,7 @@ def limit_slicer_task() -> Iterator[CpuLimitInfo]:
         max_cores = configured_max_cpu_cores(available)
         selected = original_affinity[:max_cores] if original_affinity else ()
         affinity_applied = False
-        if selected and len(selected) < len(original_affinity):
+        if apply_affinity and selected and len(selected) < len(original_affinity):
             try:
                 affinity_applied = _set_cpu_affinity(selected)
             except OSError:

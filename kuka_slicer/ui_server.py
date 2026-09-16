@@ -1536,7 +1536,11 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             )
 
         try:
-            with limit_slicer_task() as cpu_limit:
+            # Core itself owns this workflow's CPU budget through a bounded
+            # per-layer process pool. Avoid constraining the parent process
+            # affinity too: Windows children otherwise inherit a scheduling
+            # restriction that can serialize the intended parallel export.
+            with limit_slicer_task(apply_affinity=False) as cpu_limit:
                 result = self._handle_conformal_slice(
                     query,
                     request_data=request_data,

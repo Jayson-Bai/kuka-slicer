@@ -303,6 +303,11 @@ def export_npz_parallel_by_layer(
     completed_commands = 0
     total_commands = max(1, len(parsed_commands))
     try:
+        # Signal that Core has accepted the job before waiting for the first
+        # whole layer. Otherwise a long first worker leaves the UI displaying
+        # the preceding SourceJob phase even though all Core workers run.
+        if progress_callback is not None:
+            progress_callback(0.0)
         with _single_thread_worker_numeric_environment():
             with ProcessPoolExecutor(max_workers=min(int(max_workers), len(payloads))) as executor:
                 future_to_payload = {
