@@ -112,6 +112,39 @@ def test_server_process_uses_cim_when_job_rejects_breakaway(monkeypatch) -> None
     assert calls == [{"creationflags": 0x01000000, "cwd": app_session._PROJECT_ROOT}]
 
 
+def test_server_process_uses_cim_when_breakaway_child_remains_in_job(monkeypatch) -> None:
+    server = _Process()
+    detached = _Process()
+    monkeypatch.setattr(app_session.sys, "platform", "win32")
+    monkeypatch.setattr(app_session.subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+    monkeypatch.setattr(app_session.subprocess, "Popen", lambda *_args, **_kwargs: server)
+    monkeypatch.setattr(app_session, "_windows_process_is_in_job", lambda _pid: True)
+    monkeypatch.setattr(app_session, "_launch_server_process_via_cim", lambda _command: detached)
+
+    assert app_session._launch_server_process(["python", "-m", "kuka_slicer"]) is detached
+    assert server.terminated
+
+
+def test_direct_server_command_bypasses_windows_venv_launcher(monkeypatch, tmp_path: Path) -> None:
+    venv = tmp_path / "venv"
+    launcher = venv / "Scripts" / "pythonw.exe"
+    base = tmp_path / "base" / "pythonw.exe"
+    site_packages = venv / "Lib" / "site-packages"
+    monkeypatch.setattr(app_session.sys, "platform", "win32")
+    monkeypatch.setattr(app_session.sys, "executable", str(launcher))
+    monkeypatch.setattr(app_session.sys, "_base_executable", str(base), raising=False)
+    monkeypatch.setattr(app_session.sys, "prefix", str(venv))
+    monkeypatch.setattr(app_session.sys, "path", [str(site_packages), str(tmp_path / "other")])
+
+    command = app_session._direct_server_command(
+        [str(launcher), "-m", "kuka_slicer", "ui", "--port", "1234"]
+    )
+
+    assert command[:2] == [str(base.resolve()), "-c"]
+    assert repr(str(site_packages)) in command[2]
+    assert command[3:] == ["ui", "--port", "1234"]
+
+
 def test_app_session_prefers_google_chrome_over_edge(monkeypatch, tmp_path: Path) -> None:
     chrome = tmp_path / "Google" / "Chrome" / "Application" / "chrome.exe"
     edge = tmp_path / "Microsoft" / "Edge" / "Application" / "msedge.exe"

@@ -180,6 +180,7 @@ def _launch_server_process(command: list[str]) -> _ManagedProcess:
     outside the launcher's Job, instead of silently retaining its CPU cap.
     """
 
+    command = _direct_server_command(command)
     kwargs = {"cwd": _PROJECT_ROOT}
     breakaway_flag = (
         getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
@@ -203,6 +204,46 @@ def _launch_server_process(command: list[str]) -> _ManagedProcess:
                 raise
             return _launch_server_process_via_cim(command)
     return subprocess.Popen(command, **kwargs)
+
+
+def _direct_server_command(command: list[str]) -> list[str]:
+    """Avoid the Windows venv launcher reattaching the real server to a Job.
+
+    A Windows virtual-environment ``pythonw.exe`` is a launcher process.  It
+    can successfully break away while the base interpreter it subsequently
+    starts is placed back in the desktop launcher's Job.  Run that base
+    interpreter directly, while explicitly restoring the venv-only import
+    paths, so the PID verified and managed below is the actual UI server.
+    """
+
+    if sys.platform != "win32" or len(command) < 3:
+        return command
+    try:
+        launcher = Path(sys.executable).resolve()
+        requested = Path(command[0]).resolve()
+        base = Path(getattr(sys, "_base_executable", sys.executable)).resolve()
+    except OSError:
+        return command
+    if requested != launcher or base == launcher or command[1:3] != ["-m", "kuka_slicer"]:
+        return command
+
+    venv_root = Path(sys.prefix).resolve()
+    venv_paths: list[str] = []
+    for entry in sys.path:
+        if not entry:
+            continue
+        try:
+            Path(entry).resolve().relative_to(venv_root)
+        except ValueError:
+            continue
+        venv_paths.append(entry)
+    bootstrap = (
+        "import runpy,sys;"
+        f"sys.path[:0]={venv_paths!r};"
+        "sys.argv=['kuka_slicer',*sys.argv[1:]];"
+        "runpy.run_module('kuka_slicer',run_name='__main__')"
+    )
+    return [str(base), "-c", bootstrap, *command[3:]]
 
 
 def _windows_process_is_in_job(pid: int | None) -> bool | None:
