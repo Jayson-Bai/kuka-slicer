@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import os
 from pathlib import Path
 
 import numpy as np
@@ -13,6 +14,7 @@ from path_processing_core.head_calibration import (
     load_head_calibration,
 )
 from path_processing_core.npz_exporter import export_npz
+from path_processing_core.parallel_npz_exporter import export_npz_parallel_by_layer
 
 from .converter import source_job_to_parsed_commands
 from .process_params import ProcessParams
@@ -23,6 +25,19 @@ from .source_npz import SourceJob, load_source_npz
 _SURFACE_MAPPED_DEFAULT_DENSITY = 4
 _SOURCE_E_PROFILE_MODE = "piecewise_preserve_v1"
 _ZERO_E_CONNECTOR_SEMANTICS = "print_context_constant_e"
+
+
+def _parallel_worker_budget() -> int:
+    """Use at most the CPU allowance configured by the desktop launcher."""
+
+    available = max(1, os.cpu_count() or 1)
+    requested = os.environ.get("KUKA_SLICER_MAX_CPU_CORES", "").strip()
+    if requested:
+        try:
+            return max(1, min(available, int(requested)))
+        except ValueError:
+            pass
+    return max(1, available * 85 // 100)
 
 
 def _uses_preserved_source_e_profile(job: SourceJob) -> bool:
@@ -234,8 +249,17 @@ def convert_source_job(
     }
     if export_params.fiber_retract_length_mm is not None:
         export_kwargs["fiber_retract_length_mm"] = export_params.fiber_retract_length_mm
-    return export_npz(
-        commands,
-        str(resolved_output),
-        **export_kwargs,
+    use_parallel_layers = (
+        job.meta.get("conformal_lattice_path_bridge") is not None
+        and len(job.layers) > 1
+        and not any(abs(float(value)) > 1e-12 for value in tool_offset)
+        and abs(float(resin_z_print_compensation_mm)) <= 1e-12
     )
+    if use_parallel_layers:
+        return export_npz_parallel_by_layer(
+            commands,
+            str(resolved_output),
+            max_workers=_parallel_worker_budget(),
+            **export_kwargs,
+        )
+    return export_npz(commands, str(resolved_output), **export_kwargs)
