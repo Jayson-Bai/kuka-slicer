@@ -1171,6 +1171,23 @@ def run_ui_server(host: str, port: int, output_dir: Path) -> None:
         )
 
     server = ThreadingHTTPServer((host, port), SlicerUiHandler)
+
+    def warm_core_workers() -> None:
+        try:
+            _ensure_offline_planner_import_paths()
+            export_runner = importlib.import_module("external_npz_preprocessor.export_runner")
+            parallel_exporter = importlib.import_module("path_processing_core.parallel_npz_exporter")
+            parallel_exporter.warm_parallel_worker_pool(export_runner._parallel_worker_budget())
+        except Exception:
+            # Warming is an optimisation only. A later export keeps the
+            # existing on-demand worker creation and reports its own failure.
+            return
+
+    threading.Thread(
+        target=warm_core_workers,
+        daemon=True,
+        name="core-worker-warmup",
+    ).start()
     print(f"KUKA slicer UI running at http://{host}:{port}")
     try:
         server.serve_forever()
@@ -1178,6 +1195,13 @@ def run_ui_server(host: str, port: int, output_dir: Path) -> None:
         print("stopped")
     finally:
         server.server_close()
+        try:
+            _ensure_offline_planner_import_paths()
+            importlib.import_module(
+                "path_processing_core.parallel_npz_exporter"
+            ).shutdown_parallel_worker_pool()
+        except Exception:
+            pass
 
 
 class _SlicerUiHandler(BaseHTTPRequestHandler):
@@ -1905,6 +1929,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             params=core_params,
             progress_callback=core_progress,
             chunk_size=5_000_000,
+            reuse_parallel_workers=True,
         )
         phase_timings["core_export_s"] = time.perf_counter() - phase_started_at
         progress(97, "正在生成主界面三维预览")

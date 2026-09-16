@@ -122,6 +122,7 @@ def convert_external_npz(
     cut_wait_s: float | None = None,
     chunk_size: int = 100000,
     commands_callback=None,
+    reuse_parallel_workers: bool = False,
 ) -> dict:
     job = load_source_npz(source_path, default_abc=params.default_abc)
     return convert_source_job(
@@ -260,6 +261,7 @@ def convert_source_job(
             commands,
             str(resolved_output),
             max_workers=_parallel_worker_budget(),
+            reuse_workers=reuse_parallel_workers,
             **export_kwargs,
         )
     return export_npz(commands, str(resolved_output), **export_kwargs)

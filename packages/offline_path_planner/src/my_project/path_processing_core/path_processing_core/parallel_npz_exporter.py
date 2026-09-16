@@ -9,13 +9,14 @@ layer order.  No trajectory math is recomputed during the merge.
 from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 import json
 import os
 from pathlib import Path
 import shutil
 import tempfile
+import threading
 import time
 from typing import Any
 
@@ -51,6 +52,9 @@ _WORKER_NUMERIC_THREAD_ENVS = (
     "NUMEXPR_MAX_THREADS",
     "VECLIB_MAXIMUM_THREADS",
 )
+_PERSISTENT_POOL_LOCK = threading.Lock()
+_PERSISTENT_POOL: ProcessPoolExecutor | None = None
+_PERSISTENT_POOL_WORKERS = 0
 
 
 @contextmanager
@@ -92,6 +96,53 @@ def _export_layer_worker(payload: tuple) -> dict[str, Any]:
         "output_path": output_path,
         "stats": stats,
     }
+
+
+def _worker_ready() -> int:
+    """Force a spawned worker to finish importing this module before a job."""
+
+    # A short delay keeps all submitted warm-up jobs pending long enough for
+    # ``ProcessPoolExecutor`` to spawn every requested worker, not just one.
+    time.sleep(0.05)
+    return os.getpid()
+
+
+def _persistent_worker_pool(max_workers: int) -> tuple[ProcessPoolExecutor, bool]:
+    """Return the UI-owned Core pool and whether it was just created."""
+
+    global _PERSISTENT_POOL, _PERSISTENT_POOL_WORKERS
+    requested = max(1, int(max_workers))
+    with _PERSISTENT_POOL_LOCK:
+        if _PERSISTENT_POOL is None or _PERSISTENT_POOL_WORKERS != requested:
+            if _PERSISTENT_POOL is not None:
+                _PERSISTENT_POOL.shutdown(wait=True, cancel_futures=True)
+            _PERSISTENT_POOL = ProcessPoolExecutor(max_workers=requested)
+            _PERSISTENT_POOL_WORKERS = requested
+            return _PERSISTENT_POOL, True
+        return _PERSISTENT_POOL, False
+
+
+def warm_parallel_worker_pool(max_workers: int) -> None:
+    """Pre-spawn the UI Core pool without changing any export output."""
+
+    pool, created = _persistent_worker_pool(max_workers)
+    if not created:
+        return
+    with _single_thread_worker_numeric_environment():
+        futures = [pool.submit(_worker_ready) for _ in range(int(max_workers))]
+        for future in futures:
+            future.result()
+
+
+def shutdown_parallel_worker_pool() -> None:
+    """Release UI-owned Core workers during server shutdown."""
+
+    global _PERSISTENT_POOL, _PERSISTENT_POOL_WORKERS
+    with _PERSISTENT_POOL_LOCK:
+        if _PERSISTENT_POOL is not None:
+            _PERSISTENT_POOL.shutdown(wait=True, cancel_futures=True)
+        _PERSISTENT_POOL = None
+        _PERSISTENT_POOL_WORKERS = 0
 
 
 def _command_layers(parsed_commands) -> list[tuple[int, int, int, list]]:
@@ -258,6 +309,7 @@ def export_npz_parallel_by_layer(
     *,
     max_workers: int,
     progress_callback=None,
+    reuse_workers: bool = False,
     **export_kwargs,
 ) -> dict[str, Any]:
     """Export independent logical layers concurrently and merge deterministically."""
@@ -325,19 +377,31 @@ def export_npz_parallel_by_layer(
         # the preceding SourceJob phase even though all Core workers run.
         if progress_callback is not None:
             progress_callback(0.0)
+        worker_count = min(int(max_workers), len(payloads))
         worker_pool_started = time.perf_counter()
-        with _single_thread_worker_numeric_environment():
-            with ProcessPoolExecutor(max_workers=min(int(max_workers), len(payloads))) as executor:
-                future_to_payload = {
-                    executor.submit(_export_layer_worker, payload): payload
-                    for payload in payloads
-                }
-                for future in as_completed(future_to_payload):
-                    result = future.result()
-                    results_by_start[int(result["target_layer"])] = result
-                    completed_commands += int(result["target_command_count"])
-                    if progress_callback is not None:
-                        progress_callback(min(0.98, completed_commands / total_commands))
+
+        def collect_worker_results(executor: ProcessPoolExecutor) -> None:
+            nonlocal completed_commands
+            future_to_payload = {
+                executor.submit(_export_layer_worker, payload): payload
+                for payload in payloads
+            }
+            for future in as_completed(future_to_payload):
+                result = future.result()
+                results_by_start[int(result["target_layer"])] = result
+                completed_commands += int(result["target_command_count"])
+                if progress_callback is not None:
+                    progress_callback(min(0.98, completed_commands / total_commands))
+
+        if reuse_workers:
+            executor, created = _persistent_worker_pool(worker_count)
+            environment = _single_thread_worker_numeric_environment() if created else nullcontext()
+            with environment:
+                collect_worker_results(executor)
+        else:
+            with _single_thread_worker_numeric_environment():
+                with ProcessPoolExecutor(max_workers=worker_count) as executor:
+                    collect_worker_results(executor)
 
         worker_pool_s = time.perf_counter() - worker_pool_started
         merge_started = time.perf_counter()
@@ -539,7 +603,7 @@ def export_npz_parallel_by_layer(
             ),
             "timing_sidecar": str(timing_path),
             "planned_total_time_s": clock,
-            "parallel_workers": min(int(max_workers), len(payloads)),
+            "parallel_workers": worker_count,
             "parallel_layers": len(payloads),
             # Diagnostics only: returned to the UI response, never embedded
             # in the final NPZ or its sidecars.

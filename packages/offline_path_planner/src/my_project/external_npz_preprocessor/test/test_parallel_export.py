@@ -13,6 +13,7 @@ from path_processing_core.parallel_npz_exporter import (
     _WORKER_NUMERIC_THREAD_ENVS,
     _single_thread_worker_numeric_environment,
     export_npz_parallel_by_layer,
+    shutdown_parallel_worker_pool,
 )
 
 
@@ -79,13 +80,17 @@ def test_layer_parallel_export_is_byte_identical_to_serial_export(tmp_path: Path
     }
 
     export_npz(commands, str(serial), **kwargs)
-    export_npz_parallel_by_layer(
-        commands,
-        str(parallel),
-        max_workers=2,
-        progress_callback=progress.append,
-        **kwargs,
-    )
+    try:
+        export_npz_parallel_by_layer(
+            commands,
+            str(parallel),
+            max_workers=2,
+            progress_callback=progress.append,
+            reuse_workers=True,
+            **kwargs,
+        )
+    finally:
+        shutdown_parallel_worker_pool()
 
     assert progress[0] == 0.0
     assert serial.read_bytes() == parallel.read_bytes()
