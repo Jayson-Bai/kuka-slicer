@@ -564,6 +564,16 @@ def test_ui_uses_pre_core_source_preview_and_exposes_core_export_progress():
     assert 'flex-wrap: nowrap;' in html
 
 
+def test_ui_exposes_live_core_worker_warmup_progress():
+    html = _index_html()
+
+    assert 'id="coreWarmup"' in html
+    assert 'id="coreWarmupBar"' in html
+    assert 'aria-label="Core worker 预热进度"' in html
+    assert "fetch('/core-warmup-status'" in html
+    assert "window.setTimeout(pollCoreWarmup, 250)" in html
+
+
 def test_ui_local_core_preview_uses_final_npz_trajectory(tmp_path: Path, monkeypatch):
     output = tmp_path / "ordinary_core.npz"
     np.savez_compressed(

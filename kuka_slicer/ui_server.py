@@ -1169,6 +1169,13 @@ def run_ui_server(host: str, port: int, output_dir: Path) -> None:
         core_preview_last_directory = _load_surface_preview_last_directory(
             core_preview_picker_state_path
         )
+        core_warmup_lock = threading.Lock()
+        core_warmup_status: dict[str, object] = {
+            "state": "starting",
+            "ready_workers": 0,
+            "total_workers": 0,
+            "message": "正在启动 Core 预热",
+        }
 
     server = ThreadingHTTPServer((host, port), SlicerUiHandler)
 
@@ -1177,11 +1184,40 @@ def run_ui_server(host: str, port: int, output_dir: Path) -> None:
             _ensure_offline_planner_import_paths()
             export_runner = importlib.import_module("external_npz_preprocessor.export_runner")
             parallel_exporter = importlib.import_module("path_processing_core.parallel_npz_exporter")
-            parallel_exporter.warm_parallel_worker_pool(export_runner._parallel_worker_budget())
-        except Exception:
+            worker_count = export_runner._parallel_worker_budget()
+            with SlicerUiHandler.core_warmup_lock:
+                SlicerUiHandler.core_warmup_status.update(
+                    state="warming",
+                    ready_workers=0,
+                    total_workers=worker_count,
+                    message=f"正在预热 Core worker：0/{worker_count}",
+                )
+
+            def report_warmup(ready_workers: int, total_workers: int) -> None:
+                with SlicerUiHandler.core_warmup_lock:
+                    SlicerUiHandler.core_warmup_status.update(
+                        state="warming" if ready_workers < total_workers else "ready",
+                        ready_workers=int(ready_workers),
+                        total_workers=int(total_workers),
+                        message=(
+                            f"正在预热 Core worker：{ready_workers}/{total_workers}"
+                            if ready_workers < total_workers
+                            else f"Core worker 已就绪：{ready_workers}/{total_workers}"
+                        ),
+                    )
+
+            parallel_exporter.warm_parallel_worker_pool(
+                worker_count,
+                progress_callback=report_warmup,
+            )
+        except Exception as exc:
             # Warming is an optimisation only. A later export keeps the
             # existing on-demand worker creation and reports its own failure.
-            return
+            with SlicerUiHandler.core_warmup_lock:
+                SlicerUiHandler.core_warmup_status.update(
+                    state="error",
+                    message=f"Core 预热失败，将在任务开始时重试：{exc}",
+                )
 
     threading.Thread(
         target=warm_core_workers,
@@ -1216,6 +1252,13 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
     surface_preview_selected_path: Path | None = None
     core_preview_last_directory: Path | None = None
     core_preview_picker_state_path: Path | None = None
+    core_warmup_lock = threading.Lock()
+    core_warmup_status: dict[str, object] = {
+        "state": "idle",
+        "ready_workers": 0,
+        "total_workers": 0,
+        "message": "Core 预热尚未开始",
+    }
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -1224,6 +1267,9 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/slice-status":
             self._send_slice_status(parse_qs(parsed.query))
+            return
+        if parsed.path == "/core-warmup-status":
+            self._send_core_warmup_status()
             return
         if parsed.path.startswith("/outputs/"):
             self._send_output_file(parsed.path.removeprefix("/outputs/"))
@@ -1614,6 +1660,19 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             return
         self._send_json({"ok": True, "job_id": job_id, **job})
 
+    def _send_core_warmup_status(self) -> None:
+        cls = type(self)
+        with cls.core_warmup_lock:
+            status = dict(cls.core_warmup_status)
+        total_workers = int(status.get("total_workers", 0) or 0)
+        ready_workers = int(status.get("ready_workers", 0) or 0)
+        progress = (
+            round(100.0 * ready_workers / total_workers, 1)
+            if total_workers > 0
+            else 0.0
+        )
+        self._send_json({"ok": True, "progress": progress, **status})
+
     def _handle_slice(
         self,
         query: str,
@@ -1966,7 +2025,28 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                     "parallel_worker_pool_s",
                     "parallel_worker_sum_s",
                     "parallel_worker_max_s",
+                    "parallel_worker_floor_s",
+                    "parallel_schedule_gap_s",
+                    "parallel_worker_utilization",
+                    "parallel_first_wave_start_span_s",
+                    "parallel_max_queue_delay_s",
+                    "parallel_layer_timings",
                     "parallel_merge_s",
+                )
+                if key in core_stats
+            },
+            "core_profile_timing": {
+                key: float(core_stats[key])
+                for key in (
+                    "fit_s",
+                    "fit_lsq_total_s",
+                    "sample_s",
+                    "sample_arc_map_s",
+                    "sample_lookup_s",
+                    "sample_deboor_s",
+                    "sample_pose_s",
+                    "sample_extrude_s",
+                    "write_s",
                 )
                 if key in core_stats
             },
@@ -4447,6 +4527,29 @@ def _index_html() -> str:
       font-variant-numeric: tabular-nums;
     }}
     .exportProgress.visible {{ display: grid; }}
+    .coreWarmup {{
+      display: grid;
+      grid-template-columns: auto minmax(120px, 1fr) auto;
+      align-items: center;
+      gap: var(--space-2);
+      min-width: 0;
+      padding: 6px 10px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-sm);
+      background: var(--panel);
+      color: var(--muted);
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+    }}
+    .coreWarmup[data-state="ready"] {{ color: var(--success); }}
+    .coreWarmup[data-state="error"] {{ color: var(--danger); }}
+    .coreWarmup progress {{
+      width: 100%;
+      height: 7px;
+      accent-color: var(--accent);
+    }}
+    .coreWarmupState {{ color: var(--ink); font-weight: 650; white-space: nowrap; }}
+    .coreWarmupValue {{ white-space: nowrap; }}
     .exportProgressHeader {{
       grid-area: state;
       display: flex;
@@ -4773,6 +4876,11 @@ def _index_html() -> str:
           <progress id="exportProgressBar" max="100" value="0" aria-label="任务阶段进度"></progress>
           <span id="exportElapsed" class="exportElapsed">已用时 0.0 秒</span>
           <span id="exportProgressMessage" class="exportProgressDetail">等待处理任务</span>
+        </div>
+        <div id="coreWarmup" class="coreWarmup" data-state="starting" aria-live="polite">
+          <span id="coreWarmupState" class="coreWarmupState">Core 预热</span>
+          <progress id="coreWarmupBar" max="100" value="0" aria-label="Core worker 预热进度"></progress>
+          <output id="coreWarmupValue" class="coreWarmupValue">正在启动…</output>
         </div>
       </div>
     </div>
@@ -5776,9 +5884,16 @@ def _index_html() -> str:
           const parallel = result.core_parallel_timing || {{}};
           const poolSeconds = Number(parallel.parallel_worker_pool_s);
           const longestWorkerSeconds = Number(parallel.parallel_worker_max_s);
+          const workerFloorSeconds = Number(parallel.parallel_worker_floor_s);
+          const scheduleGapSeconds = Number(parallel.parallel_schedule_gap_s);
+          const workerUtilization = Number(parallel.parallel_worker_utilization);
           const mergeSeconds = Number(parallel.parallel_merge_s);
           const parallelText = Number.isFinite(poolSeconds) && Number.isFinite(longestWorkerSeconds) && Number.isFinite(mergeSeconds)
-            ? '；worker 池 ' + poolSeconds.toFixed(1) + ' 秒，最慢层 ' + longestWorkerSeconds.toFixed(1) + ' 秒，合并 ' + mergeSeconds.toFixed(1) + ' 秒'
+            ? '；worker 池 ' + poolSeconds.toFixed(1) + ' 秒，最慢层 ' + longestWorkerSeconds.toFixed(1) + ' 秒'
+              + (Number.isFinite(workerFloorSeconds) ? '，调度下限 ' + workerFloorSeconds.toFixed(1) + ' 秒' : '')
+              + (Number.isFinite(scheduleGapSeconds) ? '，调度损失 ' + scheduleGapSeconds.toFixed(1) + ' 秒' : '')
+              + (Number.isFinite(workerUtilization) ? '，并行利用率 ' + (workerUtilization * 100).toFixed(0) + '%' : '')
+              + '，合并 ' + mergeSeconds.toFixed(1) + ' 秒'
             : '';
           exportProgressMessageEl.textContent = 'Core ' + coreSeconds.toFixed(1) + ' 秒' + previewText + parallelText + '；阶段进度不等同于剩余时间估算';
         }}
@@ -5859,6 +5974,10 @@ def _index_html() -> str:
     const exportProgressMessageEl = document.getElementById('exportProgressMessage');
     const exportProgressValueEl = document.getElementById('exportProgressValue');
     const exportElapsedEl = document.getElementById('exportElapsed');
+    const coreWarmupEl = document.getElementById('coreWarmup');
+    const coreWarmupBarEl = document.getElementById('coreWarmupBar');
+    const coreWarmupStateEl = document.getElementById('coreWarmupState');
+    const coreWarmupValueEl = document.getElementById('coreWarmupValue');
     const downloadEl = document.getElementById('download');
     const layersEl = document.getElementById('layers');
     const outputNameEl = document.getElementById('outputName');
@@ -6661,6 +6780,33 @@ def _index_html() -> str:
       const elapsed = Number(job.elapsed_s);
       exportElapsedEl.textContent = '已用时 ' + (Number.isFinite(elapsed) ? elapsed.toFixed(1) : '0.0') + ' 秒';
     }}
+
+    async function pollCoreWarmup() {{
+      try {{
+        const response = await fetch('/core-warmup-status', {{ cache: 'no-store' }});
+        const status = await response.json();
+        if (!response.ok || !status.ok) throw new Error(status.error || '无法读取预热状态');
+        const progress = Math.max(0, Math.min(100, Number(status.progress) || 0));
+        const state = String(status.state || 'starting');
+        coreWarmupEl.dataset.state = state;
+        coreWarmupBarEl.value = progress;
+        coreWarmupStateEl.textContent = state === 'ready'
+          ? 'Core 已就绪'
+          : state === 'error'
+            ? 'Core 预热异常'
+            : 'Core 预热';
+        coreWarmupValueEl.textContent = String(status.message || `${{progress.toFixed(0)}}%`);
+        if (state === 'starting' || state === 'warming') {{
+          window.setTimeout(pollCoreWarmup, 250);
+        }}
+      }} catch (error) {{
+        coreWarmupEl.dataset.state = 'error';
+        coreWarmupStateEl.textContent = 'Core 预热异常';
+        coreWarmupValueEl.textContent = error.message;
+      }}
+    }}
+
+    pollCoreWarmup();
 
     async function waitForSliceJob(jobId) {{
       while (true) {{
