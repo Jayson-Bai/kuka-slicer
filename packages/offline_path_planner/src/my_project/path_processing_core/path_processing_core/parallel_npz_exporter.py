@@ -9,8 +9,10 @@ layer order.  No trajectory math is recomputed during the merge.
 from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import contextmanager
 from copy import deepcopy
 import json
+import os
 from pathlib import Path
 import shutil
 import tempfile
@@ -42,13 +44,45 @@ _TIMING_SUM_KEYS = (
     "sample_pose_s", "sample_extrude_s", "write_s", "manifest_s", "plot_s",
 )
 
+_WORKER_NUMERIC_THREAD_ENVS = (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_MAX_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+)
+
+
+@contextmanager
+def _single_thread_worker_numeric_environment():
+    """Let each layer process own one numerical-library thread.
+
+    Layer export is process-parallel.  Inheriting the UI's workstation-wide
+    numeric thread limit in every child turns ``N`` workers into roughly
+    ``N²`` competing BLAS/OpenMP threads.  The variables are set only while
+    children are created: on Windows ``spawn`` reads them before NumPy/SciPy
+    import, and the parent environment is restored before the executor's
+    results are consumed.
+    """
+
+    previous = {name: os.environ.get(name) for name in _WORKER_NUMERIC_THREAD_ENVS}
+    try:
+        for name in _WORKER_NUMERIC_THREAD_ENVS:
+            os.environ[name] = "1"
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
 
 def _export_layer_worker(payload: tuple) -> dict[str, Any]:
     command_start, target_layer, target_command_count, commands, output_path, export_kwargs = payload
-    # Deliberately keep the numerical-library environment identical to the
-    # serial exporter. Changing BLAS thread counts can change the final few
-    # floating-point bits of a least-squares fit, which violates the strict
-    # NPZ-equivalence contract for this optimization.
+    # The parent establishes one BLAS/OpenMP thread before this spawned
+    # process imports the numerical stack.  Export itself remains the
+    # unchanged serial algorithm so the merged archive stays deterministic.
     stats = export_npz(commands, output_path, **export_kwargs)
     return {
         "command_start": int(command_start),
@@ -269,17 +303,18 @@ def export_npz_parallel_by_layer(
     completed_commands = 0
     total_commands = max(1, len(parsed_commands))
     try:
-        with ProcessPoolExecutor(max_workers=min(int(max_workers), len(payloads))) as executor:
-            future_to_payload = {
-                executor.submit(_export_layer_worker, payload): payload
-                for payload in payloads
-            }
-            for future in as_completed(future_to_payload):
-                result = future.result()
-                results_by_start[int(result["target_layer"])] = result
-                completed_commands += int(result["target_command_count"])
-                if progress_callback is not None:
-                    progress_callback(min(0.98, completed_commands / total_commands))
+        with _single_thread_worker_numeric_environment():
+            with ProcessPoolExecutor(max_workers=min(int(max_workers), len(payloads))) as executor:
+                future_to_payload = {
+                    executor.submit(_export_layer_worker, payload): payload
+                    for payload in payloads
+                }
+                for future in as_completed(future_to_payload):
+                    result = future.result()
+                    results_by_start[int(result["target_layer"])] = result
+                    completed_commands += int(result["target_command_count"])
+                    if progress_callback is not None:
+                        progress_callback(min(0.98, completed_commands / total_commands))
 
         results = sorted(results_by_start.values(), key=lambda result: result["target_layer"])
         row_counts = []

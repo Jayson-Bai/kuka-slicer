@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import numpy as np
@@ -8,7 +9,25 @@ from external_npz_preprocessor.converter import source_job_to_parsed_commands
 from external_npz_preprocessor.process_params import ProcessParams
 from external_npz_preprocessor.source_npz import LayerPaths, MaterialPath, SourceJob
 from path_processing_core.npz_exporter import export_npz
-from path_processing_core.parallel_npz_exporter import export_npz_parallel_by_layer
+from path_processing_core.parallel_npz_exporter import (
+    _WORKER_NUMERIC_THREAD_ENVS,
+    _single_thread_worker_numeric_environment,
+    export_npz_parallel_by_layer,
+)
+
+
+def test_parallel_worker_numeric_environment_is_scoped(monkeypatch) -> None:
+    for index, name in enumerate(_WORKER_NUMERIC_THREAD_ENVS):
+        monkeypatch.setenv(name, str(index + 2))
+
+    with _single_thread_worker_numeric_environment():
+        assert {name: os.environ[name] for name in _WORKER_NUMERIC_THREAD_ENVS} == {
+            name: "1" for name in _WORKER_NUMERIC_THREAD_ENVS
+        }
+
+    assert {name: os.environ[name] for name in _WORKER_NUMERIC_THREAD_ENVS} == {
+        name: str(index + 2) for index, name in enumerate(_WORKER_NUMERIC_THREAD_ENVS)
+    }
 
 
 def _path(material: str, order: int, x: float, z: float) -> MaterialPath:
