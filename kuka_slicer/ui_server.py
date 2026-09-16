@@ -1933,6 +1933,18 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             "core_export_seconds": float(core_stats.get("total_s", 0.0)),
             "core_rows": int(core_stats.get("rows", 0)),
             "core_parts": int(core_stats.get("parts", 0)),
+            "core_parallel_timing": {
+                key: core_stats[key]
+                for key in (
+                    "parallel_workers",
+                    "parallel_layers",
+                    "parallel_worker_pool_s",
+                    "parallel_worker_sum_s",
+                    "parallel_worker_max_s",
+                    "parallel_merge_s",
+                )
+                if key in core_stats
+            },
             "core_runtime": _core_runtime_info(),
         }
         if _bool_param(params, "conformal_debug_export", False):
@@ -5736,7 +5748,14 @@ def _index_html() -> str:
         }}
         if (Number.isFinite(coreSeconds)) {{
           const previewText = Number.isFinite(previewSeconds) ? '，预览 ' + previewSeconds.toFixed(1) + ' 秒' : '';
-          exportProgressMessageEl.textContent = 'Core ' + coreSeconds.toFixed(1) + ' 秒' + previewText + '；阶段进度不等同于剩余时间估算';
+          const parallel = result.core_parallel_timing || {{}};
+          const poolSeconds = Number(parallel.parallel_worker_pool_s);
+          const longestWorkerSeconds = Number(parallel.parallel_worker_max_s);
+          const mergeSeconds = Number(parallel.parallel_merge_s);
+          const parallelText = Number.isFinite(poolSeconds) && Number.isFinite(longestWorkerSeconds) && Number.isFinite(mergeSeconds)
+            ? '；worker 池 ' + poolSeconds.toFixed(1) + ' 秒，最慢层 ' + longestWorkerSeconds.toFixed(1) + ' 秒，合并 ' + mergeSeconds.toFixed(1) + ' 秒'
+            : '';
+          exportProgressMessageEl.textContent = 'Core ' + coreSeconds.toFixed(1) + ' 秒' + previewText + parallelText + '；阶段进度不等同于剩余时间估算';
         }}
       }} catch (error) {{
         statusEl.className = 'status error';

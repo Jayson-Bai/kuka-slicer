@@ -203,13 +203,30 @@ def _merge_manifests(results: list[dict[str, Any]]) -> tuple[dict[str, Any], lis
     return merged, mappings
 
 
-def _load_concat(results: list[dict[str, Any]], field: str) -> np.ndarray:
-    arrays = []
+def _load_row_arrays(
+    results: list[dict[str, Any]],
+) -> tuple[dict[str, np.ndarray], list[int]]:
+    """Load every row field once per worker archive, in layer order.
+
+    A worker archive is a compressed ``.npz``. Loading it separately for
+    each field turns a 13-layer job into hundreds of archive opens and member
+    decompressions. Copies are retained exactly as before, but the archive is
+    opened only once per layer.
+    """
+
+    field_parts: dict[str, list[np.ndarray]] = {field: [] for field in _ROW_FIELDS}
+    row_counts: list[int] = []
     for result in results:
         with np.load(result["output_path"], allow_pickle=False) as data:
             selected = data["preview_layer_index"] == result["target_layer"]
-            arrays.append(np.array(data[field][selected], copy=True))
-    return np.concatenate(arrays) if len(arrays) > 1 else arrays[0]
+            row_counts.append(int(np.count_nonzero(selected)))
+            for field in _ROW_FIELDS:
+                field_parts[field].append(np.array(data[field][selected], copy=True))
+    arrays = {
+        field: np.concatenate(parts) if len(parts) > 1 else parts[0]
+        for field, parts in field_parts.items()
+    }
+    return arrays, row_counts
 
 
 def _write_offset_sidecar(
@@ -308,6 +325,7 @@ def export_npz_parallel_by_layer(
         # the preceding SourceJob phase even though all Core workers run.
         if progress_callback is not None:
             progress_callback(0.0)
+        worker_pool_started = time.perf_counter()
         with _single_thread_worker_numeric_environment():
             with ProcessPoolExecutor(max_workers=min(int(max_workers), len(payloads))) as executor:
                 future_to_payload = {
@@ -321,21 +339,16 @@ def export_npz_parallel_by_layer(
                     if progress_callback is not None:
                         progress_callback(min(0.98, completed_commands / total_commands))
 
+        worker_pool_s = time.perf_counter() - worker_pool_started
+        merge_started = time.perf_counter()
         results = sorted(results_by_start.values(), key=lambda result: result["target_layer"])
-        row_counts = []
-        for result in results:
-            with np.load(result["output_path"], allow_pickle=False) as data:
-                selected = data["preview_layer_index"] == result["target_layer"]
-                row_counts.append(int(np.count_nonzero(selected)))
+        arrays, row_counts = _load_row_arrays(results)
         total_rows = sum(row_counts)
         if total_rows <= 0:
             raise ValueError("parallel Core workers produced no rows")
 
         manifest, injection_mappings = _merge_manifests(results)
         manifest_json = json.dumps(manifest, ensure_ascii=False, separators=(",", ":"))
-        arrays: dict[str, np.ndarray] = {
-            field: _load_concat(results, field) for field in _ROW_FIELDS
-        }
         arrays["seq"] = np.arange(total_rows, dtype=np.uint32)
         arrays["total_layers"] = np.full(
             total_rows,
@@ -397,9 +410,19 @@ def export_npz_parallel_by_layer(
                     int(local_path_id): int(local_path_id) + path_id_offset
                     for local_path_id in positive_ids
                 }
-                original_local_paths = local_paths.copy()
-                for local_path_id, global_path_id in path_mapping.items():
-                    local_paths[original_local_paths == local_path_id] = global_path_id
+                # ``positive_ids`` is sorted by ``np.unique``.  The former
+                # per-id boolean assignment scanned every trajectory row once
+                # for every path in the layer.  One lookup maps all positive
+                # IDs while preserving the exact integer mapping.
+                positive_mask = local_paths > 0
+                if np.any(positive_mask):
+                    mapped_ids = np.asarray(
+                        [path_mapping[int(path_id)] for path_id in positive_ids],
+                        dtype=local_paths.dtype,
+                    )
+                    local_paths[positive_mask] = mapped_ids[
+                        np.searchsorted(positive_ids, local_paths[positive_mask])
+                    ]
                 path_mappings.append(path_mapping)
                 path_parts.append(local_paths)
                 local_blocks = np.array(data["core_injection_block_id"][selected], copy=True)
@@ -518,6 +541,16 @@ def export_npz_parallel_by_layer(
             "planned_total_time_s": clock,
             "parallel_workers": min(int(max_workers), len(payloads)),
             "parallel_layers": len(payloads),
+            # Diagnostics only: returned to the UI response, never embedded
+            # in the final NPZ or its sidecars.
+            "parallel_worker_pool_s": worker_pool_s,
+            "parallel_worker_sum_s": sum(
+                float(result["stats"].get("total_s", 0.0)) for result in results
+            ),
+            "parallel_worker_max_s": max(
+                float(result["stats"].get("total_s", 0.0)) for result in results
+            ),
+            "parallel_merge_s": time.perf_counter() - merge_started,
         })
         if progress_callback is not None:
             progress_callback(1.0)
