@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from typing import Protocol
 
 
 _TOOLS: dict[str, tuple[str, tuple[str, ...]]] = {
@@ -19,6 +20,120 @@ _TOOLS: dict[str, tuple[str, tuple[str, ...]]] = {
 }
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _BREAKAWAY_FALLBACK_WINERRORS = {5, 87}
+
+
+class _ManagedProcess(Protocol):
+    pid: int
+    returncode: int | None
+
+    def poll(self) -> int | None: ...
+    def wait(self, timeout: float | None = None) -> int: ...
+    def terminate(self) -> None: ...
+    def kill(self) -> None: ...
+
+
+class _WindowsDetachedProcess:
+    """Small Popen-compatible handle for a process created by Win32 CIM."""
+
+    _SYNCHRONIZE = 0x00100000
+    _PROCESS_TERMINATE = 0x0001
+    _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    _WAIT_OBJECT_0 = 0
+    _WAIT_TIMEOUT = 258
+    _INFINITE = 0xFFFFFFFF
+    _STILL_ACTIVE = 259
+
+    def __init__(self, pid: int, command: list[str]):
+        import ctypes
+        from ctypes import wintypes
+
+        self.pid = int(pid)
+        self.args = list(command)
+        self.returncode: int | None = None
+        self._ctypes = ctypes
+        self._wintypes = wintypes
+        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._kernel32.OpenProcess.argtypes = [
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+        ]
+        self._kernel32.OpenProcess.restype = wintypes.HANDLE
+        self._kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        self._kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        self._kernel32.GetExitCodeProcess.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        self._kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        self._kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        self._kernel32.TerminateProcess.restype = wintypes.BOOL
+        self._kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        self._kernel32.CloseHandle.restype = wintypes.BOOL
+        access = (
+            self._SYNCHRONIZE
+            | self._PROCESS_TERMINATE
+            | self._PROCESS_QUERY_LIMITED_INFORMATION
+        )
+        self._handle = self._kernel32.OpenProcess(access, False, self.pid)
+        if not self._handle:
+            raise OSError(
+                ctypes.get_last_error(),
+                f"cannot open detached server process {self.pid}",
+            )
+
+    def _read_returncode(self) -> int | None:
+        code = self._wintypes.DWORD()
+        if not self._kernel32.GetExitCodeProcess(self._handle, self._ctypes.byref(code)):
+            raise OSError(self._ctypes.get_last_error(), "GetExitCodeProcess failed")
+        if int(code.value) == self._STILL_ACTIVE:
+            return None
+        self.returncode = int(code.value)
+        return self.returncode
+
+    def poll(self) -> int | None:
+        if self.returncode is not None:
+            return self.returncode
+        result = int(self._kernel32.WaitForSingleObject(self._handle, 0))
+        if result == self._WAIT_TIMEOUT:
+            return None
+        if result != self._WAIT_OBJECT_0:
+            raise OSError(self._ctypes.get_last_error(), "WaitForSingleObject failed")
+        return self._read_returncode()
+
+    def wait(self, timeout: float | None = None) -> int:
+        if self.returncode is not None:
+            return self.returncode
+        milliseconds = (
+            self._INFINITE
+            if timeout is None
+            else max(0, min(self._INFINITE - 1, int(float(timeout) * 1000)))
+        )
+        result = int(self._kernel32.WaitForSingleObject(self._handle, milliseconds))
+        if result == self._WAIT_TIMEOUT:
+            raise subprocess.TimeoutExpired(self.args, timeout)
+        if result != self._WAIT_OBJECT_0:
+            raise OSError(self._ctypes.get_last_error(), "WaitForSingleObject failed")
+        return int(self._read_returncode() or 0)
+
+    def terminate(self) -> None:
+        if self.poll() is None and not self._kernel32.TerminateProcess(self._handle, 1):
+            raise OSError(self._ctypes.get_last_error(), "TerminateProcess failed")
+
+    def kill(self) -> None:
+        self.terminate()
+
+    def close(self) -> None:
+        handle = getattr(self, "_handle", None)
+        if handle:
+            self._kernel32.CloseHandle(handle)
+            self._handle = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 def spawn_app_session(tool: str) -> subprocess.Popen[bytes]:
@@ -54,14 +169,15 @@ def run_app_session(tool: str) -> int:
             shutil.rmtree(profile_dir, ignore_errors=True)
 
 
-def _launch_server_process(command: list[str]) -> subprocess.Popen[bytes]:
+def _launch_server_process(command: list[str]) -> _ManagedProcess:
     """Start the compute server outside a restrictive launcher Job when possible.
 
     Windows may attach a GUI-launched ``pythonw`` process tree to a Job Object
     with a CPU-rate cap.  The browser-bound supervisor remains in that Job,
     while the explicitly managed server breaks away so the project's own CPU
-    and memory limits remain authoritative.  Older or locked-down Jobs may
-    reject breakaway; in that case normal launch is preserved.
+    and memory limits remain authoritative.  Locked-down Jobs reject the
+    breakaway flag; Win32 CIM then creates the server through the WMI service,
+    outside the launcher's Job, instead of silently retaining its CPU cap.
     """
 
     kwargs = {"cwd": _PROJECT_ROOT}
@@ -72,15 +188,98 @@ def _launch_server_process(command: list[str]) -> subprocess.Popen[bytes]:
     )
     if breakaway_flag:
         try:
-            return subprocess.Popen(
+            process = subprocess.Popen(
                 command,
                 creationflags=breakaway_flag,
                 **kwargs,
             )
+            in_job = _windows_process_is_in_job(getattr(process, "pid", None))
+            if in_job is not True:
+                return process
+            _stop_process(process)
+            return _launch_server_process_via_cim(command)
         except OSError as exc:
             if getattr(exc, "winerror", None) not in _BREAKAWAY_FALLBACK_WINERRORS:
                 raise
+            return _launch_server_process_via_cim(command)
     return subprocess.Popen(command, **kwargs)
+
+
+def _windows_process_is_in_job(pid: int | None) -> bool | None:
+    """Return a verified Job membership state for one Windows process."""
+
+    if sys.platform != "win32" or pid is None:
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.IsProcessInJob.argtypes = [
+        wintypes.HANDLE,
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.BOOL),
+    ]
+    kernel32.IsProcessInJob.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.OpenProcess(0x1000, False, int(pid))
+    if not handle:
+        return None
+    try:
+        result = wintypes.BOOL()
+        if not kernel32.IsProcessInJob(handle, None, ctypes.byref(result)):
+            return None
+        return bool(result.value)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _launch_server_process_via_cim(command: list[str]) -> _WindowsDetachedProcess:
+    """Create the compute server outside the caller's Windows Job Object."""
+
+    import base64
+    import json
+
+    command_line = subprocess.list2cmdline(command)
+    encoded_command = base64.b64encode(command_line.encode("utf-16-le")).decode("ascii")
+    encoded_cwd = base64.b64encode(str(_PROJECT_ROOT).encode("utf-16-le")).decode("ascii")
+    script = (
+        "$ErrorActionPreference='Stop';"
+        f"$cmd=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('{encoded_command}'));"
+        f"$cwd=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('{encoded_cwd}'));"
+        "$r=Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
+        "-Arguments @{CommandLine=$cmd;CurrentDirectory=$cwd};"
+        "if($r.ReturnValue -ne 0){throw ('Win32_Process.Create failed: '+$r.ReturnValue)};"
+        "$r.ProcessId"
+    )
+    encoded_script = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    completed = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-EncodedCommand",
+            encoded_script,
+        ],
+        cwd=_PROJECT_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=20.0,
+    )
+    output_lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    try:
+        pid = int(output_lines[-1])
+    except (IndexError, ValueError) as exc:
+        detail = json.dumps(
+            {"stdout": completed.stdout, "stderr": completed.stderr},
+            ensure_ascii=False,
+        )
+        raise RuntimeError(f"CIM did not return a server process id: {detail}") from exc
+    return _WindowsDetachedProcess(pid, command)
 
 
 def _tool_spec(tool: str) -> tuple[str, tuple[str, ...]]:
@@ -98,7 +297,7 @@ def _find_available_port() -> int:
         return int(probe.getsockname()[1])
 
 
-def _wait_for_port(port: int, server: subprocess.Popen[bytes], timeout_s: float = 15.0) -> None:
+def _wait_for_port(port: int, server: _ManagedProcess, timeout_s: float = 60.0) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if server.poll() is not None:
@@ -150,7 +349,7 @@ def _find_browser() -> Path:
     raise RuntimeError("未找到 Microsoft Edge 或 Google Chrome，无法创建受控界面窗口")
 
 
-def _stop_process(process: subprocess.Popen[bytes]) -> None:
+def _stop_process(process: _ManagedProcess) -> None:
     if process.poll() is not None:
         return
     process.terminate()

@@ -89,27 +89,27 @@ def test_server_process_requests_windows_job_breakaway(monkeypatch) -> None:
     assert calls == [{"creationflags": 0x01000000, "cwd": app_session._PROJECT_ROOT}]
 
 
-def test_server_process_falls_back_when_job_rejects_breakaway(monkeypatch) -> None:
+def test_server_process_uses_cim_when_job_rejects_breakaway(monkeypatch) -> None:
     server = _Process()
     calls: list[dict[str, object]] = []
 
     def fake_popen(_command, **kwargs):
         calls.append(kwargs)
-        if "creationflags" in kwargs:
-            error = OSError("breakaway denied")
-            error.winerror = 5
-            raise error
-        return server
+        error = OSError("breakaway denied")
+        error.winerror = 5
+        raise error
 
     monkeypatch.setattr(app_session.sys, "platform", "win32")
     monkeypatch.setattr(app_session.subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
     monkeypatch.setattr(app_session.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        app_session,
+        "_launch_server_process_via_cim",
+        lambda _command: server,
+    )
 
     assert app_session._launch_server_process(["python", "-m", "kuka_slicer"]) is server
-    assert calls == [
-        {"creationflags": 0x01000000, "cwd": app_session._PROJECT_ROOT},
-        {"cwd": app_session._PROJECT_ROOT},
-    ]
+    assert calls == [{"creationflags": 0x01000000, "cwd": app_session._PROJECT_ROOT}]
 
 
 def test_app_session_prefers_google_chrome_over_edge(monkeypatch, tmp_path: Path) -> None:
