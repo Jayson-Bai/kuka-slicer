@@ -75,6 +75,11 @@ def test_conformal_design_json_generates_core_output_without_source_npz_round_tr
     assert any(layer["fiber_paths"] for layer in result["preview"]["layers"])
     assert result["preview"]["preview_source"] == "final_core_npz"
     assert result["preview"]["tool_orientation"]["available"] is True
+    assert result["core_runtime"]["source"] == "workspace"
+    assert result["core_runtime"]["cubic_sampler_fast_path"] is True
+    assert result["workflow_timing"]["core_export_s"] >= 0.0
+    assert result["workflow_timing"]["preview_s"] >= 0.0
+    assert result["workflow_timing"]["total_s"] >= result["workflow_timing"]["core_export_s"]
     job_dir = tmp_path / result["download_url"].split("/")[-2]
     assert not (job_dir / "external_layer_paths_v1.npz").exists()
     assert not (job_dir / "conformal_lattice_geometry_v1.npz").exists()
@@ -493,7 +498,13 @@ def test_ui_uses_pre_core_source_preview_and_exposes_core_export_progress():
     assert 'id="exportProgressBar"' in html
     assert '<div class="exportActionRow">' in html
     assert 'id="exportProgress" class="exportProgress"' in html
-    assert '.exportProgress.visible { display: inline-flex; }' in html
+    assert '.exportProgress.visible { display: grid; }' in html
+    assert html.index('id="exportProgress"') < html.index("<main>")
+    assert 'id="exportProgressState"' in html
+    assert "String(job.message || '等待处理任务')" in html
+    assert "阶段进度不等同于剩余时间估算" in html
+    assert "exportElapsedEl.textContent = '总用时 '" in html
+    assert 'Core：仓库源码 · 三次样条优化已启用' in html
     assert "slice-status?job_id=" in html
     assert 'id="coreDt" type="number" min="0.0001" step="0.0001" value="0.004"' in html
     assert 'id="coreMaxTcpOrientationSpeed"' in html
@@ -525,8 +536,9 @@ def test_ui_uses_pre_core_source_preview_and_exposes_core_export_progress():
     assert "coreTravelPanel" in html
     assert 'id="coreNpzPreviewButton"' in html
     assert 'id="conformalDebugExportButton"' in html
-    assert 'aria-pressed="false">共形调试导出：关' in html
+    assert 'aria-pressed="false">调试导出：关' in html
     assert "formData.append('conformal_debug_export'" in html
+    assert "'corePrimelineLength', 'coreDt', 'coreMaxTcpOrientationSpeed'" in html
     assert 'id="conformalDebugDownload"' in html
     assert "/choose-core-npz-preview" in html
     assert "applyFinalCorePreview" in html

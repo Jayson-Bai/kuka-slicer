@@ -1038,6 +1038,32 @@ def _ensure_offline_planner_import_paths() -> None:
             sys.path.insert(0, str(package_path))
 
 
+def _core_runtime_info() -> dict[str, object]:
+    """Describe the exact Core sampler imported by the integrated UI."""
+
+    _ensure_offline_planner_import_paths()
+    module = importlib.import_module("path_processing_core.polynomial_interpolator")
+    module_path = Path(module.__file__).resolve()
+    expected_root = (
+        Path(__file__).resolve().parent.parent
+        / "packages"
+        / "offline_path_planner"
+        / "src"
+        / "my_project"
+        / "path_processing_core"
+    ).resolve()
+    try:
+        module_path.relative_to(expected_root)
+        source = "workspace"
+    except ValueError:
+        source = "external"
+    return {
+        "module_path": str(module_path),
+        "source": source,
+        "cubic_sampler_fast_path": hasattr(module, "_basis_funs_cubic"),
+    }
+
+
 def _load_core_print_params():
     """Load the persisted process_core defaults used by the integrated UI."""
 
@@ -1743,6 +1769,9 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
     ) -> dict[str, object]:
         """Generate the STL-free rectangular conformal workflow and run Core."""
 
+        workflow_started_at = time.perf_counter()
+        phase_started_at = workflow_started_at
+        phase_timings: dict[str, float] = {}
         params, files = request_data or self._read_slice_request(query)
 
         def progress(value: int, message: str) -> None:
@@ -1758,6 +1787,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         spec = load_conformal_lattice_spec(source_bytes)
         if not spec.part or not spec.manufacturing:
             raise ValueError("共形蜂窝路径仅支持矩形实体设计 JSON")
+        phase_timings["spec_validation_s"] = time.perf_counter() - phase_started_at
 
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         job_dir = self.server_output_dir / stamp
@@ -1779,6 +1809,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         from .conformal_lattice.pipeline import run_conformal_lattice_pipeline
 
         progress(12, "正在计算双正弦曲面、共形蜂窝结构与一笔画分区")
+        phase_started_at = time.perf_counter()
         run = run_conformal_lattice_pipeline(
             spec,
             physical_layer_height_mm=layer_height,
@@ -1798,7 +1829,9 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         )
         if run.path_graph is None:
             raise RuntimeError("共形蜂窝路径桥接未生成一笔画路径")
+        phase_timings["geometry_and_pathing_s"] = time.perf_counter() - phase_started_at
         progress(55, "正在将连续路径适配为 Core SourceJob")
+        phase_started_at = time.perf_counter()
         # The legacy structural macro partitions are replaced unconditionally
         # by continuous courses below.  Start from the retained perimeter and
         # grip material instead of rendering/deleting that large temporary
@@ -1831,6 +1864,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             conformal_source_job,
             default_abc=core_params.default_abc,
         )
+        phase_timings["core_source_preparation_s"] = time.perf_counter() - phase_started_at
 
         export_runner = importlib.import_module("external_npz_preprocessor.export_runner")
         core_npz_path = job_dir / "conformal_lattice_core.npz"
@@ -1838,6 +1872,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         def core_progress(ratio: float) -> None:
             progress(60 + int(max(0.0, min(1.0, float(ratio))) * 35), "正在执行 path_processing_core 并写出系统 NPZ")
 
+        phase_started_at = time.perf_counter()
         core_stats = export_runner.convert_source_job(
             core_source_job,
             source_path=job_dir / source_filename,
@@ -1846,14 +1881,17 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             progress_callback=core_progress,
             chunk_size=5_000_000,
         )
+        phase_timings["core_export_s"] = time.perf_counter() - phase_started_at
         progress(97, "正在生成主界面三维预览")
         # This branch has already passed through Core.  Use the final NPZ for
         # the visible result so the browser never presents the pre-Core source
         # graph as if it were the exported trajectory.
+        phase_started_at = time.perf_counter()
         preview = _preview_payload_from_final_core_npz(
             core_npz_path,
             SliceConfig(line_width=2.0),
         )
+        phase_timings["preview_s"] = time.perf_counter() - phase_started_at
         download_path = _core_output_download_path(core_npz_path)
         path_count = sum(len(group.paths) for group in conformal_source_job.material_paths)
         result: dict[str, object] = {
@@ -1870,6 +1908,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             "core_export_seconds": float(core_stats.get("total_s", 0.0)),
             "core_rows": int(core_stats.get("rows", 0)),
             "core_parts": int(core_stats.get("parts", 0)),
+            "core_runtime": _core_runtime_info(),
         }
         if _bool_param(params, "conformal_debug_export", False):
             from .conformal_lattice.pipeline import write_conformal_lattice_outputs
@@ -1888,6 +1927,8 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                     "debug_filename": debug_path.name,
                 }
             )
+        phase_timings["total_s"] = time.perf_counter() - workflow_started_at
+        result["workflow_timing"] = phase_timings
         return result
 
     def _read_slice_request(
@@ -3425,6 +3466,7 @@ def _expand_bounds(bounds: dict[str, float | None], x: float, y: float, z: float
 
 def _index_html() -> str:
     core_defaults = _load_core_print_params()
+    core_runtime = _core_runtime_info()
     prusa_saved = _load_prusa_params()
 
     def prusa_value(name: str, fallback: object) -> object:
@@ -3481,15 +3523,30 @@ def _index_html() -> str:
       background: #f5f7f9;
       line-height: 1.5;
     }}
-    header {{
-      min-height: 68px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: var(--space-4);
-      padding: 14px max(20px, calc((100vw - 960px) / 2));
+    .appHeader {{
       border-bottom: 1px solid var(--line);
       background: #ffffff;
+    }}
+    .appHeaderInner {{
+      width: min(1180px, calc(100% - 40px));
+      margin: 0 auto;
+      padding: var(--space-4) 0;
+      display: grid;
+      grid-template-columns: minmax(230px, 300px) minmax(0, 1fr);
+      gap: var(--space-5);
+      align-items: start;
+    }}
+    .brandBlock {{
+      min-width: 0;
+      padding-top: 2px;
+    }}
+    .brandEyebrow {{
+      display: block;
+      margin-bottom: var(--space-1);
+      color: var(--accent-dark);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
     }}
     h1 {{
       margin: 0;
@@ -3497,7 +3554,21 @@ def _index_html() -> str:
       font-weight: 650;
       line-height: 1.35;
       letter-spacing: 0;
-      text-wrap: balance;
+    }}
+    .coreRuntime {{
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      margin-top: var(--space-2);
+      color: var(--muted);
+      font-size: 12px;
+    }}
+    .coreRuntime::before {{
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--ok);
+      content: "";
     }}
     main {{
       max-width: 960px;
@@ -3679,11 +3750,30 @@ def _index_html() -> str:
       outline-offset: 2px;
       border-color: var(--accent);
     }}
-    .surfaceTools {{
+    .surfaceWorkspace {{
+      min-width: 0;
+      display: grid;
+      gap: var(--space-3);
+    }}
+    .surfaceToolGroups {{
+      display: grid;
+      grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
+      gap: var(--space-3);
+      align-items: start;
+    }}
+    .surfaceToolGroup {{
+      min-width: 0;
       display: flex;
       flex-wrap: wrap;
-      gap: var(--space-2);
-      justify-content: flex-end;
+      gap: 6px;
+      align-items: center;
+    }}
+    .surfaceToolGroupLabel {{
+      flex: 1 0 100%;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
     }}
     .surfaceToolButton {{
       min-height: 34px;
@@ -3696,17 +3786,58 @@ def _index_html() -> str:
       font-size: 13px;
       cursor: pointer;
     }}
-      .surfaceToolButton:hover {{ background: #eef6ff; }}
-      .surfaceToolButton:disabled {{ cursor: wait; opacity: 0.7; }}
-      .surfaceCollisionResult {{
-        flex: 1 1 100%;
-        min-height: 18px;
-        color: var(--muted);
-        font-size: 12px;
-        line-height: 1.35;
-      }}
-      .surfaceCollisionResult.ok {{ color: var(--ok); }}
-      .surfaceCollisionResult.error {{ color: var(--error); }}
+    .surfaceToolButton:hover {{ background: #eef6ff; }}
+    .surfaceToolButton:disabled {{ cursor: not-allowed; opacity: 0.55; }}
+    .surfaceToolButton.primary {{
+      border-color: var(--accent);
+      background: var(--accent);
+      color: #ffffff;
+      font-weight: 650;
+    }}
+    .surfaceToolButton.primary:hover {{ background: var(--accent-dark); }}
+    .surfaceToolButton.quiet {{ border-color: var(--line); color: var(--muted); }}
+    .surfaceContext {{
+      width: min(1180px, calc(100% - 40px));
+      margin: 0 auto;
+      padding: 0 0 var(--space-3);
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: var(--space-3);
+      align-items: center;
+    }}
+    .surfaceContextText {{ min-width: 0; }}
+    .surfaceCollisionResult {{
+      display: block;
+      min-height: 18px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }}
+    .surfaceCollisionResult.ok {{ color: var(--ok); }}
+    .surfaceCollisionResult.error {{ color: var(--error); }}
+    .surfaceCollisionResult.secondary {{ margin-top: 2px; }}
+    .fiberStrategyToggle {{
+      margin: 0;
+      padding: 0;
+      border: 0;
+      white-space: nowrap;
+    }}
+    .fiberStrategyToggle legend {{
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip: rect(0 0 0 0);
+    }}
+    .fiberStrategyToggle label {{
+      display: inline-flex;
+      gap: 6px;
+      align-items: center;
+      margin: 0;
+      color: var(--ink);
+      font-size: 12px;
+      font-weight: 650;
+    }}
     .inputBand input[type="file"] {{
       padding: 0;
       line-height: calc(var(--control-height) - 2px);
@@ -4238,28 +4369,49 @@ def _index_html() -> str:
     .download.visible {{ display: inline-block; }}
     .exportProgress {{
       display: none;
+      grid-template-columns: auto minmax(160px, 1fr) auto;
+      grid-template-areas:
+        "state bar elapsed"
+        "detail detail detail";
       align-items: center;
-      gap: var(--space-2);
+      gap: 4px var(--space-3);
       min-width: 0;
-      flex: 0 1 auto;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-sm);
+      background: var(--panel);
       color: var(--muted);
-      font-size: 13px;
+      font-size: 12px;
       font-variant-numeric: tabular-nums;
     }}
-    .exportProgress.visible {{ display: inline-flex; }}
+    .exportProgress.visible {{ display: grid; }}
     .exportProgressHeader {{
+      grid-area: state;
       display: flex;
-      gap: var(--space-1);
+      align-items: baseline;
+      gap: 6px;
       white-space: nowrap;
     }}
+    .exportProgressState {{ color: var(--ink); font-weight: 650; }}
+    .exportProgressValue {{ color: var(--accent-dark); }}
     .exportProgress progress {{
-      width: 120px;
+      grid-area: bar;
+      width: 100%;
       height: 8px;
       accent-color: var(--accent);
     }}
     .exportElapsed {{
+      grid-area: elapsed;
       white-space: nowrap;
       color: var(--muted);
+    }}
+    .exportProgressDetail {{
+      grid-area: detail;
+      min-width: 0;
+      overflow: hidden;
+      color: var(--muted);
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }}
     .viewerControls {{
       margin-top: var(--space-5);
@@ -4444,6 +4596,12 @@ def _index_html() -> str:
     }}
     @media (max-width: 820px) {{
       main {{ padding: 24px 18px 32px; }}
+      .appHeaderInner {{
+        width: calc(100% - 36px);
+        grid-template-columns: 1fr;
+        gap: var(--space-3);
+      }}
+      .surfaceContext {{ width: calc(100% - 36px); }}
       .bandGrid {{ grid-template-columns: repeat(6, minmax(0, 1fr)); }}
       .inputBand .bandGrid {{ grid-template-columns: repeat(6, minmax(0, 1fr)); }}
       .inputBand .bandGrid > .fieldGroup {{ grid-column: span 3; }}
@@ -4482,11 +4640,24 @@ def _index_html() -> str:
       }}
       .summary {{ grid-template-columns: 1fr; }}
       .viewerControls {{ grid-template-columns: 1fr; }}
-      header {{ padding: 14px 18px; }}
       .preview {{ height: 460px; min-height: 420px; }}
     }}
     @media (max-width: 520px) {{
       main {{ padding: 20px 12px 28px; }}
+      .appHeaderInner,
+      .surfaceContext {{ width: calc(100% - 24px); }}
+      .surfaceToolGroups,
+      .surfaceContext {{ grid-template-columns: 1fr; }}
+      .surfaceToolGroup {{ align-items: stretch; }}
+      .surfaceToolButton {{ flex: 1 1 100%; }}
+      .exportProgress {{
+        grid-template-columns: 1fr auto;
+        grid-template-areas:
+          "state elapsed"
+          "bar bar"
+          "detail detail";
+      }}
+      .fiberStrategyToggle {{ white-space: normal; }}
       .panel {{ padding: var(--space-4); }}
       .bandGrid {{ grid-template-columns: 1fr; }}
       .inputBand .bandGrid {{ grid-template-columns: 1fr; }}
@@ -4504,33 +4675,57 @@ def _index_html() -> str:
         grid-template-columns: 1fr;
       }}
       h1 {{ font-size: 18px; }}
-      header {{ align-items: flex-start; flex-direction: column; }}
-      .surfaceTools {{ justify-content: flex-start; }}
       .preview {{ height: 380px; min-height: 340px; }}
     }}
   </style>
 </head>
 <body>
-  <header>
-    <h1>机械臂空间复合材料增材制造系统切片器</h1>
-    <div class="surfaceTools" aria-label="曲面工具">
-      <button id="surfacePreviewButton" class="surfaceToolButton" type="button">启动蜂窝网格共形设计器</button>
-      <button id="conformalSpecButton" class="surfaceToolButton" type="button">导入共形设计 JSON</button>
-      <button id="conformalSliceButton" class="surfaceToolButton" type="button" disabled>生成共形蜂窝并送入 Core</button>
-      <button id="conformalDebugExportButton" class="surfaceToolButton" type="button" aria-pressed="false">共形调试导出：关</button>
-      <button id="coreNpzPreviewButton" class="surfaceToolButton" type="button">导入 Core NPZ 预览</button>
-      <button id="surfaceNpzPreviewButton" class="surfaceToolButton" type="button">导入曲面/共形 NPZ 预览</button>
-      <button id="surfaceNpzCollisionButton" class="surfaceToolButton" type="button" disabled>检查当前 NPZ 碰撞</button>
-      <output id="surfaceNpzCollisionResult" class="surfaceCollisionResult" aria-live="polite">请先导入本地映射 NPZ。</output>
-      <input id="surfaceNpzInput" type="file" accept=".npz,application/octet-stream" hidden>
-      <input id="conformalSpecInput" type="file" accept=".json,application/json" hidden>
-      <output id="conformalSpecResult" class="surfaceCollisionResult" aria-live="polite">尚未导入共形蜂窝设计 JSON。</output>
-      <fieldset class="surfaceCollisionResult" aria-label="共形蜂窝连续纤维策略">
-        <legend>连续纤维（主 UI 工艺策略）</legend>
+  <header class="appHeader">
+    <div class="appHeaderInner">
+      <div class="brandBlock">
+        <span class="brandEyebrow">KUKA 共形制造工作站</span>
+        <h1>空间复合材料增材制造切片器</h1>
+        <span class="coreRuntime" title="{html.escape(str(core_runtime['module_path']), quote=True)}">Core：{'仓库源码' if core_runtime['source'] == 'workspace' else '外部安装'} · {'三次样条优化已启用' if core_runtime['cubic_sampler_fast_path'] else '通用采样器'}</span>
+      </div>
+      <div class="surfaceWorkspace">
+        <div class="surfaceToolGroups">
+          <div class="surfaceToolGroup" aria-label="共形蜂窝流程">
+            <span class="surfaceToolGroupLabel">共形蜂窝</span>
+            <button id="surfacePreviewButton" class="surfaceToolButton" type="button">打开设计器</button>
+            <button id="conformalSpecButton" class="surfaceToolButton" type="button">导入设计 JSON</button>
+            <button id="conformalSliceButton" class="surfaceToolButton primary" type="button" disabled>生成并导入 Core</button>
+            <button id="conformalDebugExportButton" class="surfaceToolButton quiet" type="button" aria-pressed="false">调试导出：关</button>
+          </div>
+          <div class="surfaceToolGroup" aria-label="文件预览与检查">
+            <span class="surfaceToolGroupLabel">文件与检查</span>
+            <button id="coreNpzPreviewButton" class="surfaceToolButton" type="button">导入 Core NPZ</button>
+            <button id="surfaceNpzPreviewButton" class="surfaceToolButton" type="button">导入曲面 NPZ</button>
+            <button id="surfaceNpzCollisionButton" class="surfaceToolButton" type="button" disabled>碰撞检查</button>
+          </div>
+        </div>
+        <div id="exportProgress" class="exportProgress" aria-live="polite">
+          <div class="exportProgressHeader">
+            <span id="exportProgressState" class="exportProgressState">准备中</span>
+            <strong id="exportProgressValue" class="exportProgressValue">0%</strong>
+          </div>
+          <progress id="exportProgressBar" max="100" value="0" aria-label="任务阶段进度"></progress>
+          <span id="exportElapsed" class="exportElapsed">已用时 0.0 秒</span>
+          <span id="exportProgressMessage" class="exportProgressDetail">等待处理任务</span>
+        </div>
+      </div>
+    </div>
+    <div class="surfaceContext">
+      <div class="surfaceContextText">
+        <output id="conformalSpecResult" class="surfaceCollisionResult" aria-live="polite">尚未导入共形蜂窝设计 JSON。</output>
+        <output id="surfaceNpzCollisionResult" class="surfaceCollisionResult secondary" aria-live="polite"></output>
+      </div>
+      <fieldset class="fiberStrategyToggle" aria-label="共形蜂窝连续纤维策略" title="纤维层范围由设计 JSON 的起始层与终止层规则自动确定；纤维复用共形蜂窝连续路径拓扑。">
+        <legend>连续纤维策略</legend>
         <label><input id="conformalFiberEnabled" type="checkbox" checked> 启用连续纤维路径</label>
-        <small>首个与末个纤维界面由设计 JSON 自动确定：以“首个非零曲率层（物理层）”前的树脂层为起点，并相对实际树脂层数镜像结束。纤维直接复用共形蜂窝的连续路径拓扑，树脂蜂窝几何不会改变。</small>
       </fieldset>
     </div>
+    <input id="surfaceNpzInput" type="file" accept=".npz,application/octet-stream" hidden>
+    <input id="conformalSpecInput" type="file" accept=".json,application/json" hidden>
   </header>
   <main>
     <section class="resultsColumn">
@@ -5248,14 +5443,6 @@ def _index_html() -> str:
             <div class="actions span-3">
               <div class="exportActionRow">
                 <button id="sliceButton" type="submit">生成并导出 Core NPZ</button>
-                <div id="exportProgress" class="exportProgress" aria-live="polite">
-                <div class="exportProgressHeader">
-                  <span id="exportProgressMessage">等待处理</span>
-                  <strong id="exportProgressValue">0%</strong>
-                </div>
-                <progress id="exportProgressBar" max="100" value="0"></progress>
-                <span id="exportElapsed" class="exportElapsed">已用时 0.0 秒</span>
-                </div>
                 <span id="status" class="status" aria-live="polite"></span>
               </div>
             </div>
@@ -5439,8 +5626,8 @@ def _index_html() -> str:
       conformalDebugExportEnabled = !conformalDebugExportEnabled;
       conformalDebugExportButton.setAttribute('aria-pressed', String(conformalDebugExportEnabled));
       conformalDebugExportButton.textContent = conformalDebugExportEnabled
-        ? '共形调试导出：开'
-        : '共形调试导出：关';
+        ? '调试导出：开'
+        : '调试导出：关';
     }});
     function appendCurrentCoreSettings(formData) {{
       const coreFieldIds = [
@@ -5453,7 +5640,7 @@ def _index_html() -> str:
         'coreFiberRetractSpeed', 'coreFiberStartAccel', 'coreTravelFeed',
         'coreFirstLayerTravelFeed', 'corePrimeSettle', 'coreDefaultA',
         'coreDefaultB', 'coreDefaultC', 'corePrimelineX', 'corePrimelineY',
-        'corePrimelineLength', 'coreDt', 'coreCornerAngle',
+        'corePrimelineLength', 'coreDt', 'coreMaxTcpOrientationSpeed', 'coreCornerAngle',
         'coreCornerRetreatRatio', 'coreSplineMaxError', 'coreSplineMaxAngle',
         'coreSourceMergeDistance', 'coreCornerRetreatMax', 'coreCornerBlendSegments',
         'coreDensity', 'coreDegree', 'coreMaxFitPoints',
@@ -5515,8 +5702,17 @@ def _index_html() -> str:
           ? `；已生成与树脂连续路径同拓扑的 F 路径，共 ${{fiberReport.total_fiber_path_count}} 条，并已按纤维层高抬高后续树脂层`
           : '；本次未启用连续纤维策略';
         statusEl.textContent = '完成：共形连续路径已生成，并已写出 Core NPZ。' + fiberInterfaceText;
-        const coreSeconds = Number(result.core_export_seconds);
-        if (Number.isFinite(coreSeconds)) exportElapsedEl.textContent = 'core 最终 NPZ 处理耗时 ' + coreSeconds.toFixed(1) + ' 秒';
+        const workflowTiming = result.workflow_timing || {{}};
+        const totalSeconds = Number(workflowTiming.total_s);
+        const coreSeconds = Number(workflowTiming.core_export_s ?? result.core_export_seconds);
+        const previewSeconds = Number(workflowTiming.preview_s);
+        if (Number.isFinite(totalSeconds)) {{
+          exportElapsedEl.textContent = '总用时 ' + totalSeconds.toFixed(1) + ' 秒';
+        }}
+        if (Number.isFinite(coreSeconds)) {{
+          const previewText = Number.isFinite(previewSeconds) ? '，预览 ' + previewSeconds.toFixed(1) + ' 秒' : '';
+          exportProgressMessageEl.textContent = 'Core ' + coreSeconds.toFixed(1) + ' 秒' + previewText + '；阶段进度不等同于剩余时间估算';
+        }}
       }} catch (error) {{
         statusEl.className = 'status error';
         statusEl.textContent = error.message;
@@ -5590,6 +5786,7 @@ def _index_html() -> str:
     }});
     const exportProgressEl = document.getElementById('exportProgress');
     const exportProgressBarEl = document.getElementById('exportProgressBar');
+    const exportProgressStateEl = document.getElementById('exportProgressState');
     const exportProgressMessageEl = document.getElementById('exportProgressMessage');
     const exportProgressValueEl = document.getElementById('exportProgressValue');
     const exportElapsedEl = document.getElementById('exportElapsed');
@@ -6384,13 +6581,14 @@ def _index_html() -> str:
       exportProgressEl.classList.add('visible');
       exportProgressBarEl.value = progress;
       exportProgressValueEl.textContent = progress + '%';
-      exportProgressMessageEl.textContent = job.state === 'complete'
+      exportProgressStateEl.textContent = job.state === 'complete'
         ? '完成'
         : job.state === 'error'
           ? '失败'
           : progress > 0
             ? '处理中'
             : '准备中';
+      exportProgressMessageEl.textContent = String(job.message || '等待处理任务');
       const elapsed = Number(job.elapsed_s);
       exportElapsedEl.textContent = '已用时 ' + (Number.isFinite(elapsed) ? elapsed.toFixed(1) : '0.0') + ' 秒';
     }}
