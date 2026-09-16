@@ -7077,7 +7077,18 @@ def _index_html() -> str:
         const role = kind === 'travel' ? 'travel' : (rawEntry.role || 'infill');
         const points = rawEntry.points || rawEntry;
         if (points && points.length >= 1) {{
-          entries.push({{ kind, role, points, extrusion: rawEntry.extrusion || null }});
+          // Keep the Core path identity on the normalized display entry.
+          // Fiber CUT markers are associated with their deposited course by
+          // path_id; dropping it here made every marker fail the visibility
+          // filter even though the final NPZ and preview payload contained
+          // the correct CUT coordinates.
+          entries.push({{
+            kind,
+            role,
+            points,
+            extrusion: rawEntry.extrusion || null,
+            path_id: rawEntry.path_id,
+          }});
         }}
       }}
       const hasOrderedFiber = motionEntries.some((entry) =>

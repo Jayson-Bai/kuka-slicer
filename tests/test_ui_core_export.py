@@ -516,6 +516,7 @@ def test_ui_uses_pre_core_source_preview_and_exposes_core_export_progress():
     assert "conformal_fiber_double_wall_axis" not in html
     assert 'id="showFiberCutEvents" type="checkbox" checked' in html
     assert '纤维剪切点（CUT）' in html
+    assert "path_id: rawEntry.path_id" in html
     assert "kuka.conformalContinuousCourseFiber.v2" in html
     assert "const firstFiberLayerPosition = layers.findIndex" in html
     assert "layerSlider.value = firstFiberLayerPosition >= 0 ? firstFiberLayerPosition : 0" in html
