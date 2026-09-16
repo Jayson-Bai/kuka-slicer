@@ -1455,15 +1455,26 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         request_data: tuple[dict[str, list[str]], dict[str, tuple[str | None, bytes]]],
     ) -> None:
         started_at = time.perf_counter()
+        started_cpu_at = time.process_time()
+
+        def runtime_metrics() -> dict[str, float]:
+            elapsed_s = time.perf_counter() - started_at
+            cpu_time_s = time.process_time() - started_cpu_at
+            return {
+                "elapsed_s": elapsed_s,
+                "cpu_time_s": cpu_time_s,
+                "cpu_execution_rate_percent": (
+                    cpu_time_s / elapsed_s * 100.0 if elapsed_s > 0.0 else 0.0
+                ),
+            }
 
         def update_progress(progress: int, message: str) -> None:
-            elapsed_s = time.perf_counter() - started_at
             self._update_slice_job(
                 job_id,
                 state="running",
                 progress=max(0, min(99, int(progress))),
                 message=message,
-                elapsed_s=elapsed_s,
+                **runtime_metrics(),
             )
 
         try:
@@ -1477,24 +1488,22 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                     progress_callback=update_progress,
                 )
             result["cpu_limit"] = cpu_limit.to_metadata()
-            elapsed_s = time.perf_counter() - started_at
             self._update_slice_job(
                 job_id,
                 state="complete",
                 progress=100,
                 message="导出完成",
-                elapsed_s=elapsed_s,
                 result=result,
+                **runtime_metrics(),
             )
         except Exception as exc:  # noqa: BLE001
-            elapsed_s = time.perf_counter() - started_at
             self._update_slice_job(
                 job_id,
                 state="error",
                 progress=0,
                 message="导出失败",
-                elapsed_s=elapsed_s,
                 error=str(exc),
+                **runtime_metrics(),
             )
 
     def _run_conformal_slice_job(
@@ -1504,6 +1513,18 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         request_data: tuple[dict[str, list[str]], dict[str, tuple[str | None, bytes]]],
     ) -> None:
         started_at = time.perf_counter()
+        started_cpu_at = time.process_time()
+
+        def runtime_metrics() -> dict[str, float]:
+            elapsed_s = time.perf_counter() - started_at
+            cpu_time_s = time.process_time() - started_cpu_at
+            return {
+                "elapsed_s": elapsed_s,
+                "cpu_time_s": cpu_time_s,
+                "cpu_execution_rate_percent": (
+                    cpu_time_s / elapsed_s * 100.0 if elapsed_s > 0.0 else 0.0
+                ),
+            }
 
         def update_progress(progress: int, message: str) -> None:
             self._update_slice_job(
@@ -1511,7 +1532,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                 state="running",
                 progress=max(0, min(99, int(progress))),
                 message=message,
-                elapsed_s=time.perf_counter() - started_at,
+                **runtime_metrics(),
             )
 
         try:
@@ -1527,8 +1548,8 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                 state="complete",
                 progress=100,
                 message="共形蜂窝已生成并送入 Core",
-                elapsed_s=time.perf_counter() - started_at,
                 result=result,
+                **runtime_metrics(),
             )
         except Exception as exc:  # noqa: BLE001
             self._update_slice_job(
@@ -1536,8 +1557,8 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                 state="error",
                 progress=0,
                 message="共形蜂窝导出失败",
-                elapsed_s=time.perf_counter() - started_at,
                 error=str(exc),
+                **runtime_metrics(),
             )
 
     def _update_slice_job(self, job_id: str, **updates: object) -> None:

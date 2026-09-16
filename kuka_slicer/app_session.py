@@ -18,6 +18,7 @@ _TOOLS: dict[str, tuple[str, tuple[str, ...]]] = {
     "surface-map": ("surface-map", ()),
 }
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_BREAKAWAY_FALLBACK_WINERRORS = {5, 87}
 
 
 def spawn_app_session(tool: str) -> subprocess.Popen[bytes]:
@@ -38,9 +39,8 @@ def run_app_session(tool: str) -> int:
 
     command, extra_args = _tool_spec(tool)
     port = _find_available_port()
-    server = subprocess.Popen(
-        [sys.executable, "-m", "kuka_slicer", command, "--host", "127.0.0.1", "--port", str(port), *extra_args],
-        cwd=_PROJECT_ROOT,
+    server = _launch_server_process(
+        [sys.executable, "-m", "kuka_slicer", command, "--host", "127.0.0.1", "--port", str(port), *extra_args]
     )
     profile_dir: Path | None = None
     try:
@@ -52,6 +52,35 @@ def run_app_session(tool: str) -> int:
         _stop_process(server)
         if profile_dir is not None:
             shutil.rmtree(profile_dir, ignore_errors=True)
+
+
+def _launch_server_process(command: list[str]) -> subprocess.Popen[bytes]:
+    """Start the compute server outside a restrictive launcher Job when possible.
+
+    Windows may attach a GUI-launched ``pythonw`` process tree to a Job Object
+    with a CPU-rate cap.  The browser-bound supervisor remains in that Job,
+    while the explicitly managed server breaks away so the project's own CPU
+    and memory limits remain authoritative.  Older or locked-down Jobs may
+    reject breakaway; in that case normal launch is preserved.
+    """
+
+    kwargs = {"cwd": _PROJECT_ROOT}
+    breakaway_flag = (
+        getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+        if sys.platform == "win32"
+        else 0
+    )
+    if breakaway_flag:
+        try:
+            return subprocess.Popen(
+                command,
+                creationflags=breakaway_flag,
+                **kwargs,
+            )
+        except OSError as exc:
+            if getattr(exc, "winerror", None) not in _BREAKAWAY_FALLBACK_WINERRORS:
+                raise
+    return subprocess.Popen(command, **kwargs)
 
 
 def _tool_spec(tool: str) -> tuple[str, tuple[str, ...]]:

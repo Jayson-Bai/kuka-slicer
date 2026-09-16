@@ -73,6 +73,45 @@ def test_app_session_uses_a_fresh_port_for_each_server(monkeypatch, tmp_path: Pa
     assert "43210" in launched[0]
 
 
+def test_server_process_requests_windows_job_breakaway(monkeypatch) -> None:
+    server = _Process()
+    calls: list[dict[str, object]] = []
+
+    def fake_popen(_command, **kwargs):
+        calls.append(kwargs)
+        return server
+
+    monkeypatch.setattr(app_session.sys, "platform", "win32")
+    monkeypatch.setattr(app_session.subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+    monkeypatch.setattr(app_session.subprocess, "Popen", fake_popen)
+
+    assert app_session._launch_server_process(["python", "-m", "kuka_slicer"]) is server
+    assert calls == [{"creationflags": 0x01000000, "cwd": app_session._PROJECT_ROOT}]
+
+
+def test_server_process_falls_back_when_job_rejects_breakaway(monkeypatch) -> None:
+    server = _Process()
+    calls: list[dict[str, object]] = []
+
+    def fake_popen(_command, **kwargs):
+        calls.append(kwargs)
+        if "creationflags" in kwargs:
+            error = OSError("breakaway denied")
+            error.winerror = 5
+            raise error
+        return server
+
+    monkeypatch.setattr(app_session.sys, "platform", "win32")
+    monkeypatch.setattr(app_session.subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+    monkeypatch.setattr(app_session.subprocess, "Popen", fake_popen)
+
+    assert app_session._launch_server_process(["python", "-m", "kuka_slicer"]) is server
+    assert calls == [
+        {"creationflags": 0x01000000, "cwd": app_session._PROJECT_ROOT},
+        {"cwd": app_session._PROJECT_ROOT},
+    ]
+
+
 def test_app_session_prefers_google_chrome_over_edge(monkeypatch, tmp_path: Path) -> None:
     chrome = tmp_path / "Google" / "Chrome" / "Application" / "chrome.exe"
     edge = tmp_path / "Microsoft" / "Edge" / "Application" / "msedge.exe"

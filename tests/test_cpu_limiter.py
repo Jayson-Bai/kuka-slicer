@@ -5,10 +5,10 @@ from types import SimpleNamespace
 from kuka_slicer import cpu_limiter
 
 
-def test_default_cpu_cap_uses_at_most_seventy_percent_of_available_cores(monkeypatch) -> None:
+def test_default_cpu_cap_uses_at_most_eighty_five_percent_of_available_cores(monkeypatch) -> None:
     monkeypatch.delenv(cpu_limiter.MAX_CPU_CORES_ENV, raising=False)
 
-    assert cpu_limiter.configured_max_cpu_cores(16) == 11
+    assert cpu_limiter.configured_max_cpu_cores(16) == 13
     assert cpu_limiter.configured_max_cpu_cores(3) == 2
     assert cpu_limiter.configured_max_cpu_cores(1) == 1
 
@@ -18,10 +18,10 @@ def test_cpu_cap_environment_override_is_bounded_by_available_cores(monkeypatch)
     assert cpu_limiter.configured_max_cpu_cores(16) == 6
 
     monkeypatch.setenv(cpu_limiter.MAX_CPU_CORES_ENV, "999")
-    assert cpu_limiter.configured_max_cpu_cores(8) == 5
+    assert cpu_limiter.configured_max_cpu_cores(8) == 6
 
     monkeypatch.setenv(cpu_limiter.MAX_CPU_CORES_ENV, "not-a-number")
-    assert cpu_limiter.configured_max_cpu_cores(8) == 5
+    assert cpu_limiter.configured_max_cpu_cores(8) == 6
 
 
 def test_task_limiter_applies_and_restores_affinity(monkeypatch) -> None:
@@ -40,11 +40,11 @@ def test_task_limiter_applies_and_restores_affinity(monkeypatch) -> None:
 
     with cpu_limiter.limit_slicer_task() as info:
         assert info.available_cores == 16
-        assert info.max_cores == 11
+        assert info.max_cores == 13
         assert info.affinity_applied is True
         assert info.priority_lowered is False
 
-    assert calls == [available_cpus[:11], available_cpus]
+    assert calls == [available_cpus[:13], available_cpus]
 
 
 def test_low_priority_is_opt_in(monkeypatch) -> None:
@@ -55,15 +55,15 @@ def test_low_priority_is_opt_in(monkeypatch) -> None:
     assert cpu_limiter.low_priority_requested() is True
 
 
-def test_memory_percent_defaults_to_seventy_and_can_only_be_lowered(monkeypatch) -> None:
+def test_memory_percent_defaults_to_eighty_and_can_only_be_lowered(monkeypatch) -> None:
     monkeypatch.delenv(cpu_limiter.MAX_MEMORY_PERCENT_ENV, raising=False)
-    assert cpu_limiter.configured_max_memory_percent() == 70
+    assert cpu_limiter.configured_max_memory_percent() == 80
 
     monkeypatch.setenv(cpu_limiter.MAX_MEMORY_PERCENT_ENV, "45")
     assert cpu_limiter.configured_max_memory_percent() == 45
 
     monkeypatch.setenv(cpu_limiter.MAX_MEMORY_PERCENT_ENV, "90")
-    assert cpu_limiter.configured_max_memory_percent() == 70
+    assert cpu_limiter.configured_max_memory_percent() == 80
 
 
 def test_windows_api_declarations_are_pointer_width_safe(monkeypatch) -> None:

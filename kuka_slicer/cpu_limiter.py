@@ -22,7 +22,8 @@ from typing import Iterator
 MAX_CPU_CORES_ENV = "KUKA_SLICER_MAX_CPU_CORES"
 LOW_PRIORITY_ENV = "KUKA_SLICER_LOW_PRIORITY"
 MAX_MEMORY_PERCENT_ENV = "KUKA_SLICER_MAX_MEMORY_PERCENT"
-DEFAULT_RESOURCE_PERCENT = 70
+DEFAULT_CPU_PERCENT = 85
+DEFAULT_MEMORY_PERCENT = 80
 _NUMERIC_THREAD_ENVS = (
     "OMP_NUM_THREADS",
     "OPENBLAS_NUM_THREADS",
@@ -58,10 +59,10 @@ class CpuLimitInfo:
 
 
 def configured_max_cpu_cores(available_cores: int | None = None) -> int:
-    """Return a core cap that never exceeds 70% of local logical CPUs."""
+    """Return a core cap that never exceeds 85% of local logical CPUs."""
 
     available = max(1, int(available_cores if available_cores is not None else (os.cpu_count() or 1)))
-    budget = max(1, available * DEFAULT_RESOURCE_PERCENT // 100)
+    budget = max(1, available * DEFAULT_CPU_PERCENT // 100)
     requested = os.environ.get(MAX_CPU_CORES_ENV, "").strip()
     if requested:
         try:
@@ -85,8 +86,8 @@ def configured_max_memory_percent() -> int:
         except ValueError:
             value = 0
         if value > 0:
-            return min(DEFAULT_RESOURCE_PERCENT, max(1, value))
-    return DEFAULT_RESOURCE_PERCENT
+            return min(DEFAULT_MEMORY_PERCENT, max(1, value))
+    return DEFAULT_MEMORY_PERCENT
 
 
 def low_priority_requested() -> bool:

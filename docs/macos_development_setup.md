@@ -482,8 +482,8 @@ git status --short
 | 变量 | 用途 | Mac 行为 |
 | --- | --- | --- |
 | `KUKA_SLICER_BROWSER` | 指定 Chrome/Chromium 可执行文件 | 推荐设为 `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome` |
-| `KUKA_SLICER_MAX_CPU_CORES` | 把数值库线程数限制到指定值，但代码仍不会允许超过逻辑 CPU 的 70% | 有效；应用导入时也会为未显式设置的 OMP/OpenBLAS/MKL/NumExpr/VecLib 线程变量写默认值 |
-| `KUKA_SLICER_MAX_MEMORY_PERCENT` | 请求不高于 70% 的 working-set 上限 | 当前只通过 Windows API 实施，Mac 上不会形成硬内存上限 |
+| `KUKA_SLICER_MAX_CPU_CORES` | 把数值库线程数限制到指定值，但代码仍不会允许超过逻辑 CPU 的 85% | 有效；应用导入时也会为未显式设置的 OMP/OpenBLAS/MKL/NumExpr/VecLib 线程变量写默认值 |
+| `KUKA_SLICER_MAX_MEMORY_PERCENT` | 请求不高于 80% 的 working-set 上限 | 当前只通过 Windows API 实施，Mac 上不会形成硬内存上限 |
 | `KUKA_SLICER_LOW_PRIORITY` | 以 `1/true/yes/on` 请求后台优先级 | 当前只在 Windows 生效 |
 | `KUKA_SLICER_HONEYCOMB_REFERENCE_ROOT` | 指向可选的真实蜂窝回归数据集 | 数据不在可移植仓库内；不设置时相关测试应 skip，不影响普通 UI/Core |
 
