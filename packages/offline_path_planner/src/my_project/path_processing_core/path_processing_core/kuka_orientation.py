@@ -61,8 +61,16 @@ def quaternion_inverse(q: Quaternion) -> Quaternion:
 
 
 def quaternion_slerp(q0: Quaternion, q1: Quaternion, t: float) -> Quaternion:
-    w0, x0, y0, z0 = _normalize(q0)
-    w1, x1, y1, z1 = _normalize(q1)
+    return quaternion_slerp_normalized(_normalize(q0), _normalize(q1), t)
+
+
+def quaternion_slerp_normalized(
+    q0: Quaternion, q1: Quaternion, t: float
+) -> Quaternion:
+    """SLERP for inputs already normalized with this module's contract."""
+
+    w0, x0, y0, z0 = q0
+    w1, x1, y1, z1 = q1
     dot = w0 * w1 + x0 * x1 + y0 * y1 + z0 * z1
     if dot < 0.0:
         w1, x1, y1, z1, dot = -w1, -x1, -y1, -z1, -dot
@@ -73,6 +81,12 @@ def quaternion_slerp(q0: Quaternion, q1: Quaternion, t: float) -> Quaternion:
     s0 = math.sin((1.0 - t) * theta) / sin_theta
     s1 = math.sin(t * theta) / sin_theta
     return _normalize((s0 * w0 + s1 * w1, s0 * x0 + s1 * x1, s0 * y0 + s1 * y1, s0 * z0 + s1 * z1))
+
+
+def normalize_quaternion(q: Quaternion) -> Quaternion:
+    """Normalize once for repeated internal interpolation."""
+
+    return _normalize(q)
 
 
 def rotation_vector_from_quaternion(q: Quaternion) -> Tuple[float, float, float]:
@@ -99,10 +113,18 @@ def quaternion_from_rotation_vector(vector: Iterable[float]) -> Quaternion:
 
 
 def _normalize(q: Quaternion) -> Quaternion:
-    norm = math.sqrt(sum(value * value for value in q))
+    # This function is on the 4 ms orientation sampling hot path. Explicit
+    # component access avoids generator allocations while preserving the same
+    # component order and normalization contract.
+    w, x, y, z = q
+    # Keep Python 3.13's improved ``sum`` rounding path exactly: changing it
+    # to chained addition can perturb the angular-speed retiming boundary and
+    # therefore the number of 4 ms frames. A fixed tuple still removes the
+    # hot-path generator allocation without changing numerical results.
+    norm = math.sqrt(sum((w * w, x * x, y * y, z * z)))
     if norm < 1e-15:
         raise ValueError("zero-length quaternion is not a valid KUKA orientation")
-    return tuple(value / norm for value in q)  # type: ignore[return-value]
+    return w / norm, x / norm, y / norm, z / norm
 
 
 def _nearest_equivalent(value: float, near: float) -> float:

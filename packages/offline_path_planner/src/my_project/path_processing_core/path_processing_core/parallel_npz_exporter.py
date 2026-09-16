@@ -55,6 +55,7 @@ _WORKER_NUMERIC_THREAD_ENVS = (
 _PERSISTENT_POOL_LOCK = threading.Lock()
 _PERSISTENT_POOL: ProcessPoolExecutor | None = None
 _PERSISTENT_POOL_WORKERS = 0
+_PERSISTENT_POOL_READY_PIDS: set[int] = set()
 
 
 @contextmanager
@@ -83,11 +84,22 @@ def _single_thread_worker_numeric_environment():
 
 
 def _export_layer_worker(payload: tuple) -> dict[str, Any]:
-    command_start, target_layer, target_command_count, commands, output_path, export_kwargs = payload
+    (
+        command_start,
+        target_layer,
+        target_command_count,
+        commands,
+        output_path,
+        export_kwargs,
+        dispatch_order,
+        submitted_at,
+    ) = payload
+    worker_started_at = time.perf_counter()
     # The parent establishes one BLAS/OpenMP thread before this spawned
     # process imports the numerical stack.  Export itself remains the
     # unchanged serial algorithm so the merged archive stays deterministic.
     stats = export_npz(commands, output_path, **export_kwargs)
+    worker_finished_at = time.perf_counter()
     return {
         "command_start": int(command_start),
         "target_layer": int(target_layer),
@@ -95,6 +107,11 @@ def _export_layer_worker(payload: tuple) -> dict[str, Any]:
         "target_command_count": int(target_command_count),
         "output_path": output_path,
         "stats": stats,
+        "worker_pid": os.getpid(),
+        "worker_started_at": worker_started_at,
+        "worker_finished_at": worker_finished_at,
+        "queue_delay_s": worker_started_at - float(submitted_at),
+        "dispatch_order": int(dispatch_order),
     }
 
 
@@ -110,7 +127,7 @@ def _worker_ready() -> int:
 def _persistent_worker_pool(max_workers: int) -> tuple[ProcessPoolExecutor, bool]:
     """Return the UI-owned Core pool and whether it was just created."""
 
-    global _PERSISTENT_POOL, _PERSISTENT_POOL_WORKERS
+    global _PERSISTENT_POOL, _PERSISTENT_POOL_WORKERS, _PERSISTENT_POOL_READY_PIDS
     requested = max(1, int(max_workers))
     with _PERSISTENT_POOL_LOCK:
         if _PERSISTENT_POOL is None or _PERSISTENT_POOL_WORKERS != requested:
@@ -118,31 +135,51 @@ def _persistent_worker_pool(max_workers: int) -> tuple[ProcessPoolExecutor, bool
                 _PERSISTENT_POOL.shutdown(wait=True, cancel_futures=True)
             _PERSISTENT_POOL = ProcessPoolExecutor(max_workers=requested)
             _PERSISTENT_POOL_WORKERS = requested
+            _PERSISTENT_POOL_READY_PIDS = set()
             return _PERSISTENT_POOL, True
         return _PERSISTENT_POOL, False
 
 
-def warm_parallel_worker_pool(max_workers: int) -> None:
+def warm_parallel_worker_pool(max_workers: int, progress_callback=None) -> dict[str, int]:
     """Pre-spawn the UI Core pool without changing any export output."""
 
+    global _PERSISTENT_POOL_READY_PIDS
+    requested = max(1, int(max_workers))
     pool, created = _persistent_worker_pool(max_workers)
     if not created:
-        return
+        ready = min(requested, len(_PERSISTENT_POOL_READY_PIDS) or requested)
+        if progress_callback is not None:
+            progress_callback(ready, requested)
+        return {"ready_workers": ready, "total_workers": requested}
     with _single_thread_worker_numeric_environment():
-        futures = [pool.submit(_worker_ready) for _ in range(int(max_workers))]
-        for future in futures:
-            future.result()
+        ready_pids: set[int] = set()
+        for _attempt in range(4):
+            futures = [pool.submit(_worker_ready) for _ in range(requested)]
+            for future in as_completed(futures):
+                ready_pids.add(int(future.result()))
+                if progress_callback is not None:
+                    progress_callback(min(len(ready_pids), requested), requested)
+            if len(ready_pids) >= requested:
+                break
+        if len(ready_pids) < requested:
+            raise RuntimeError(
+                f"Core worker warm-up reached {len(ready_pids)}/{requested} processes"
+            )
+    with _PERSISTENT_POOL_LOCK:
+        _PERSISTENT_POOL_READY_PIDS = ready_pids
+    return {"ready_workers": len(ready_pids), "total_workers": requested}
 
 
 def shutdown_parallel_worker_pool() -> None:
     """Release UI-owned Core workers during server shutdown."""
 
-    global _PERSISTENT_POOL, _PERSISTENT_POOL_WORKERS
+    global _PERSISTENT_POOL, _PERSISTENT_POOL_WORKERS, _PERSISTENT_POOL_READY_PIDS
     with _PERSISTENT_POOL_LOCK:
         if _PERSISTENT_POOL is not None:
             _PERSISTENT_POOL.shutdown(wait=True, cancel_futures=True)
         _PERSISTENT_POOL = None
         _PERSISTENT_POOL_WORKERS = 0
+        _PERSISTENT_POOL_READY_PIDS = set()
 
 
 def _command_layers(parsed_commands) -> list[tuple[int, int, int, list]]:
@@ -368,11 +405,12 @@ def export_npz_parallel_by_layer(
             kwargs,
         ))
 
-    # Submit the largest independent layers first.  The final merge below is
-    # explicitly sorted by target layer, so dispatch order cannot affect the
-    # NPZ contract; it only prevents light leading layers from leaving a
-    # heavy trailing layer as the lone CPU-bound worker.
-    payloads.sort(key=lambda payload: (-len(payload[3]), int(payload[1])))
+    # Keep logical layer order. With more layers than workers the symmetric
+    # conformal stack naturally pairs its light outer layers with the heavy
+    # centre layers. Sorting the centre layers first made all workers enter
+    # the memory-bandwidth-heavy phase together and created a slow second
+    # wave on Windows. Merge order is still resolved explicitly below.
+    payloads.sort(key=lambda payload: int(payload[1]))
 
     results_by_start: dict[int, dict[str, Any]] = {}
     completed_commands = 0
@@ -388,10 +426,12 @@ def export_npz_parallel_by_layer(
 
         def collect_worker_results(executor: ProcessPoolExecutor) -> None:
             nonlocal completed_commands
-            future_to_payload = {
-                executor.submit(_export_layer_worker, payload): payload
-                for payload in payloads
-            }
+            future_to_payload = {}
+            for dispatch_order, payload in enumerate(payloads):
+                submitted_payload = (*payload, dispatch_order, time.perf_counter())
+                future_to_payload[
+                    executor.submit(_export_layer_worker, submitted_payload)
+                ] = submitted_payload
             for future in as_completed(future_to_payload):
                 result = future.result()
                 results_by_start[int(result["target_layer"])] = result
@@ -600,6 +640,22 @@ def export_npz_parallel_by_layer(
             for key in _TIMING_SUM_KEYS:
                 stats[key] += float(result["stats"].get(key, 0.0))
         stats["write_s"] += merge_write_s
+        worker_sum_s = sum(
+            float(result["stats"].get("total_s", 0.0)) for result in results
+        )
+        worker_max_s = max(
+            float(result["stats"].get("total_s", 0.0)) for result in results
+        )
+        theoretical_worker_floor_s = max(worker_sum_s / worker_count, worker_max_s)
+        first_wave = [
+            result for result in results if int(result["dispatch_order"]) < worker_count
+        ]
+        first_wave_start_span_s = (
+            max(float(result["worker_started_at"]) for result in first_wave)
+            - min(float(result["worker_started_at"]) for result in first_wave)
+            if first_wave
+            else 0.0
+        )
         stats.update({
             "total_s": time.perf_counter() - started,
             "rows": total_rows,
@@ -614,12 +670,46 @@ def export_npz_parallel_by_layer(
             # Diagnostics only: returned to the UI response, never embedded
             # in the final NPZ or its sidecars.
             "parallel_worker_pool_s": worker_pool_s,
-            "parallel_worker_sum_s": sum(
-                float(result["stats"].get("total_s", 0.0)) for result in results
+            "parallel_worker_sum_s": worker_sum_s,
+            "parallel_worker_max_s": worker_max_s,
+            "parallel_worker_floor_s": theoretical_worker_floor_s,
+            "parallel_schedule_gap_s": max(0.0, worker_pool_s - theoretical_worker_floor_s),
+            "parallel_worker_utilization": min(
+                1.0, worker_sum_s / max(worker_count * worker_pool_s, 1e-9)
             ),
-            "parallel_worker_max_s": max(
-                float(result["stats"].get("total_s", 0.0)) for result in results
+            "parallel_first_wave_start_span_s": first_wave_start_span_s,
+            "parallel_max_queue_delay_s": max(
+                float(result["queue_delay_s"]) for result in results
             ),
+            "parallel_layer_timings": [
+                {
+                    "layer": int(result["target_layer"]),
+                    "worker_pid": int(result["worker_pid"]),
+                    "dispatch_order": int(result["dispatch_order"]),
+                    "queue_delay_s": float(result["queue_delay_s"]),
+                    "worker_s": float(result["stats"].get("total_s", 0.0)),
+                    "rows": int(result["stats"].get("rows", 0)),
+                    "fit_s": float(result["stats"].get("fit_s", 0.0)),
+                    "sample_s": float(result["stats"].get("sample_s", 0.0)),
+                    "write_s": float(result["stats"].get("write_s", 0.0)),
+                    "sample_arc_map_s": float(
+                        result["stats"].get("sample_arc_map_s", 0.0)
+                    ),
+                    "sample_lookup_s": float(
+                        result["stats"].get("sample_lookup_s", 0.0)
+                    ),
+                    "sample_deboor_s": float(
+                        result["stats"].get("sample_deboor_s", 0.0)
+                    ),
+                    "sample_pose_s": float(
+                        result["stats"].get("sample_pose_s", 0.0)
+                    ),
+                    "sample_extrude_s": float(
+                        result["stats"].get("sample_extrude_s", 0.0)
+                    ),
+                }
+                for result in results
+            ],
             "parallel_merge_s": time.perf_counter() - merge_started,
         })
         if progress_callback is not None:

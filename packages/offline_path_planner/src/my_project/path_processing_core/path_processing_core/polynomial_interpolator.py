@@ -21,6 +21,8 @@ from .kuka_orientation import (
     quaternion_multiply,
     rotation_vector_from_quaternion,
     quaternion_slerp,
+    quaternion_slerp_normalized,
+    normalize_quaternion,
     quaternion_to_kuka_abc,
 )
 
@@ -201,7 +203,12 @@ def _eval_bspline_point(
 
 
 def _sample_kuka_orientation(
-    normalized_u: float, parameters, quaternions, tangents=None
+    normalized_u: float,
+    parameters,
+    quaternions,
+    tangents=None,
+    *,
+    normalized_inputs: bool = False,
 ):
     """Evaluate a local, interpolating KUKA quaternion curve."""
 
@@ -215,16 +222,27 @@ def _sample_kuka_orientation(
     span = parameters[right] - parameters[left]
     local = 0.0 if span <= 1e-12 else (normalized_u - parameters[left]) / span
     if not tangents:
-        return quaternion_slerp(quaternions[left], quaternions[right], local)
+        slerp = quaternion_slerp_normalized if normalized_inputs else quaternion_slerp
+        return slerp(quaternions[left], quaternions[right], local)
     return _quaternion_squad(
         quaternions[left], quaternions[right],
         tangents[left], tangents[right], local,
+        normalized_inputs=normalized_inputs,
     )
 
 
-def _quaternion_squad(start, end, start_tangent, end_tangent, ratio):
-    endpoints = quaternion_slerp(start, end, ratio)
-    controls = quaternion_slerp(start_tangent, end_tangent, ratio)
+def _quaternion_squad(
+    start,
+    end,
+    start_tangent,
+    end_tangent,
+    ratio,
+    *,
+    normalized_inputs: bool = False,
+):
+    input_slerp = quaternion_slerp_normalized if normalized_inputs else quaternion_slerp
+    endpoints = input_slerp(start, end, ratio)
+    controls = input_slerp(start_tangent, end_tangent, ratio)
     return quaternion_slerp(
         endpoints, controls, 2.0 * ratio * (1.0 - ratio)
     )
@@ -1097,6 +1115,16 @@ def sample_global_curve_iter(
         if orientation_parameters and orientation_quaternions
         else None
     )
+    sampling_orientation_quaternions = (
+        [normalize_quaternion(value) for value in orientation_quaternions]
+        if orientation_parameters and orientation_quaternions
+        else None
+    )
+    sampling_orientation_tangents = (
+        [normalize_quaternion(value) for value in orientation_tangents]
+        if orientation_tangents
+        else None
+    )
     end_pos = ctrl[-1]
     start_q = kuka_abc_to_quaternion(
         curve.start_pos.a, curve.start_pos.b, curve.start_pos.c,
@@ -1122,8 +1150,9 @@ def sample_global_curve_iter(
             current_q = _sample_kuka_orientation(
                 normalized_u,
                 orientation_parameters,
-                orientation_quaternions,
-                orientation_tangents,
+                sampling_orientation_quaternions,
+                sampling_orientation_tangents,
+                normalized_inputs=True,
             )
         elif constant_orientation:
             current_q = start_q
@@ -1212,8 +1241,9 @@ def sample_global_curve_iter(
             q = _sample_kuka_orientation(
                 normalized_u,
                 orientation_parameters,
-                orientation_quaternions,
-                orientation_tangents,
+                sampling_orientation_quaternions,
+                sampling_orientation_tangents,
+                normalized_inputs=True,
             )
             p.a, p.b, p.c = quaternion_to_kuka_abc(q, near_deg=previous_abc)
         elif constant_orientation:
