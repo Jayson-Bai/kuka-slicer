@@ -368,6 +368,12 @@ def export_npz_parallel_by_layer(
             kwargs,
         ))
 
+    # Submit the largest independent layers first.  The final merge below is
+    # explicitly sorted by target layer, so dispatch order cannot affect the
+    # NPZ contract; it only prevents light leading layers from leaving a
+    # heavy trailing layer as the lone CPU-bound worker.
+    payloads.sort(key=lambda payload: (-len(payload[3]), int(payload[1])))
+
     results_by_start: dict[int, dict[str, Any]] = {}
     completed_commands = 0
     total_commands = max(1, len(parsed_commands))
