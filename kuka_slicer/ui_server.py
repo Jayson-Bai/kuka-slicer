@@ -2028,6 +2028,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                     "parallel_worker_floor_s",
                     "parallel_schedule_gap_s",
                     "parallel_worker_utilization",
+                    "parallel_full_execution_speed_workers",
                     "parallel_first_wave_start_span_s",
                     "parallel_max_queue_delay_s",
                     "parallel_layer_timings",

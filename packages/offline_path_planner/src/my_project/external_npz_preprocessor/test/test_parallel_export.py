@@ -11,10 +11,17 @@ from external_npz_preprocessor.source_npz import LayerPaths, MaterialPath, Sourc
 from path_processing_core.npz_exporter import export_npz
 from path_processing_core.parallel_npz_exporter import (
     _WORKER_NUMERIC_THREAD_ENVS,
+    _request_full_execution_speed,
     _single_thread_worker_numeric_environment,
     export_npz_parallel_by_layer,
     shutdown_parallel_worker_pool,
 )
+
+
+def test_worker_execution_speed_request_is_a_noop_off_windows(monkeypatch) -> None:
+    monkeypatch.setattr(os, "name", "posix")
+
+    assert _request_full_execution_speed() is False
 
 
 def test_parallel_worker_numeric_environment_is_scoped(monkeypatch) -> None:

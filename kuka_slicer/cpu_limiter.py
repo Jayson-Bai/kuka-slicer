@@ -45,6 +45,7 @@ class CpuLimitInfo:
     total_memory_bytes: int | None = None
     max_memory_bytes: int | None = None
     memory_cap_applied: bool = False
+    full_execution_speed_applied: bool = False
 
     def to_metadata(self) -> dict[str, int | bool]:
         return {
@@ -55,6 +56,7 @@ class CpuLimitInfo:
             "total_memory_bytes": self.total_memory_bytes,
             "max_memory_bytes": self.max_memory_bytes,
             "memory_cap_applied": self.memory_cap_applied,
+            "full_execution_speed_applied": self.full_execution_speed_applied,
         }
 
 
@@ -154,6 +156,44 @@ def _set_windows_priority(priority: int) -> bool:
     return bool(kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), priority))
 
 
+def request_full_execution_speed() -> bool:
+    """Opt this process out of Windows EcoQoS execution-speed throttling.
+
+    The browser-bound compute server has no visible top-level window. Windows
+    can therefore classify its long-lived ``pythonw`` process tree as
+    background work even while the UI is actively waiting for a result.  This
+    process-scoped request keeps normal scheduling priority and does not alter
+    the user's system power plan; it only states that execution speed matters
+    for the current compute process.
+    """
+
+    if sys.platform != "win32":
+        return False
+
+    class ProcessPowerThrottlingState(ctypes.Structure):
+        _fields_ = [
+            ("Version", wintypes.DWORD),
+            ("ControlMask", wintypes.DWORD),
+            ("StateMask", wintypes.DWORD),
+        ]
+
+    execution_speed = 0x1
+    state = ProcessPowerThrottlingState(
+        Version=1,
+        ControlMask=execution_speed,
+        StateMask=0,
+    )
+    kernel32 = _windows_kernel32()
+    return bool(
+        kernel32.SetProcessInformation(
+            kernel32.GetCurrentProcess(),
+            4,  # ProcessPowerThrottling
+            ctypes.byref(state),
+            ctypes.sizeof(state),
+        )
+    )
+
+
 def _windows_total_physical_memory_bytes() -> int | None:
     """Return installed physical RAM through the native Windows API."""
 
@@ -236,6 +276,13 @@ def _windows_kernel32():
     kernel32.GetPriorityClass.restype = wintypes.DWORD
     kernel32.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
     kernel32.SetPriorityClass.restype = wintypes.BOOL
+    kernel32.SetProcessInformation.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    kernel32.SetProcessInformation.restype = wintypes.BOOL
     kernel32.GlobalMemoryStatusEx.argtypes = [ctypes.c_void_p]
     kernel32.GlobalMemoryStatusEx.restype = wintypes.BOOL
     kernel32.GetProcessWorkingSetSizeEx.argtypes = [
@@ -270,6 +317,10 @@ def limit_slicer_task(*, apply_affinity: bool = True) -> Iterator[CpuLimitInfo]:
     """
 
     with _TASK_LIMIT_LOCK:
+        try:
+            full_execution_speed_applied = request_full_execution_speed()
+        except OSError:
+            full_execution_speed_applied = False
         original_affinity = _get_cpu_affinity()
         available = len(original_affinity) if original_affinity else max(1, os.cpu_count() or 1)
         max_cores = configured_max_cpu_cores(available)
@@ -317,6 +368,7 @@ def limit_slicer_task(*, apply_affinity: bool = True) -> Iterator[CpuLimitInfo]:
             total_memory_bytes=total_memory_bytes,
             max_memory_bytes=max_memory_bytes,
             memory_cap_applied=memory_cap_applied,
+            full_execution_speed_applied=full_execution_speed_applied,
         )
         try:
             yield info

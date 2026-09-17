@@ -11,6 +11,7 @@ from __future__ import annotations
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
+import ctypes
 import json
 import os
 from pathlib import Path
@@ -58,6 +59,40 @@ _PERSISTENT_POOL_WORKERS = 0
 _PERSISTENT_POOL_READY_PIDS: set[int] = set()
 
 
+def _request_full_execution_speed() -> bool:
+    """Keep one Windows worker out of background EcoQoS throttling."""
+
+    if os.name != "nt":
+        return False
+
+    class ProcessPowerThrottlingState(ctypes.Structure):
+        _fields_ = [
+            ("Version", ctypes.c_ulong),
+            ("ControlMask", ctypes.c_ulong),
+            ("StateMask", ctypes.c_ulong),
+        ]
+
+    state = ProcessPowerThrottlingState(1, 0x1, 0)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.argtypes = []
+    kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+    kernel32.SetProcessInformation.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+    ]
+    kernel32.SetProcessInformation.restype = ctypes.c_int
+    return bool(
+        kernel32.SetProcessInformation(
+            kernel32.GetCurrentProcess(),
+            4,  # ProcessPowerThrottling
+            ctypes.byref(state),
+            ctypes.sizeof(state),
+        )
+    )
+
+
 @contextmanager
 def _single_thread_worker_numeric_environment():
     """Let each layer process own one numerical-library thread.
@@ -94,6 +129,7 @@ def _export_layer_worker(payload: tuple) -> dict[str, Any]:
         dispatch_order,
         submitted_at,
     ) = payload
+    full_execution_speed_applied = _request_full_execution_speed()
     worker_started_at = time.perf_counter()
     # The parent establishes one BLAS/OpenMP thread before this spawned
     # process imports the numerical stack.  Export itself remains the
@@ -112,12 +148,14 @@ def _export_layer_worker(payload: tuple) -> dict[str, Any]:
         "worker_finished_at": worker_finished_at,
         "queue_delay_s": worker_started_at - float(submitted_at),
         "dispatch_order": int(dispatch_order),
+        "full_execution_speed_applied": full_execution_speed_applied,
     }
 
 
 def _worker_ready() -> int:
     """Force a spawned worker to finish importing this module before a job."""
 
+    _request_full_execution_speed()
     # A short delay keeps all submitted warm-up jobs pending long enough for
     # ``ProcessPoolExecutor`` to spawn every requested worker, not just one.
     time.sleep(0.05)
@@ -677,6 +715,11 @@ def export_npz_parallel_by_layer(
             "parallel_worker_utilization": min(
                 1.0, worker_sum_s / max(worker_count * worker_pool_s, 1e-9)
             ),
+            "parallel_full_execution_speed_workers": len({
+                int(result["worker_pid"])
+                for result in results
+                if result.get("full_execution_speed_applied")
+            }),
             "parallel_first_wave_start_span_s": first_wave_start_span_s,
             "parallel_max_queue_delay_s": max(
                 float(result["queue_delay_s"]) for result in results

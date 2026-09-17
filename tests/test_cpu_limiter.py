@@ -67,6 +67,54 @@ def test_task_limiter_can_preserve_process_affinity_for_bounded_process_pools(mo
     assert calls == []
 
 
+def test_task_limiter_requests_full_execution_speed_without_changing_priority(monkeypatch) -> None:
+    monkeypatch.setattr(cpu_limiter, "request_full_execution_speed", lambda: True)
+    monkeypatch.setattr(cpu_limiter, "_get_cpu_affinity", lambda: (0, 1))
+    monkeypatch.setattr(cpu_limiter, "_set_cpu_affinity", lambda _cpus: True)
+    monkeypatch.setattr(cpu_limiter, "_get_windows_priority", lambda: None)
+    monkeypatch.setattr(cpu_limiter, "_windows_total_physical_memory_bytes", lambda: None)
+    monkeypatch.setattr(cpu_limiter, "_get_windows_working_set_limits", lambda: None)
+
+    with cpu_limiter.limit_slicer_task(apply_affinity=False) as info:
+        assert info.full_execution_speed_applied is True
+        assert info.priority_lowered is False
+
+    assert info.to_metadata()["full_execution_speed_applied"] is True
+
+
+def test_windows_full_execution_speed_request_disables_only_execution_throttling(monkeypatch) -> None:
+    captured: dict[str, int] = {}
+
+    def set_process_information(handle, info_class, state_pointer, state_size):
+        state = state_pointer._obj
+        captured.update(
+            handle=int(handle),
+            info_class=int(info_class),
+            version=int(state.Version),
+            control_mask=int(state.ControlMask),
+            state_mask=int(state.StateMask),
+            state_size=int(state_size),
+        )
+        return 1
+
+    fake = SimpleNamespace(
+        GetCurrentProcess=lambda: 123,
+        SetProcessInformation=set_process_information,
+    )
+    monkeypatch.setattr(cpu_limiter.sys, "platform", "win32")
+    monkeypatch.setattr(cpu_limiter, "_windows_kernel32", lambda: fake)
+
+    assert cpu_limiter.request_full_execution_speed() is True
+    assert captured == {
+        "handle": 123,
+        "info_class": 4,
+        "version": 1,
+        "control_mask": 1,
+        "state_mask": 0,
+        "state_size": cpu_limiter.ctypes.sizeof(cpu_limiter.wintypes.DWORD) * 3,
+    }
+
+
 def test_low_priority_is_opt_in(monkeypatch) -> None:
     monkeypatch.delenv(cpu_limiter.LOW_PRIORITY_ENV, raising=False)
     assert cpu_limiter.low_priority_requested() is False
@@ -93,6 +141,7 @@ def test_windows_api_declarations_are_pointer_width_safe(monkeypatch) -> None:
         SetProcessAffinityMask=lambda *_args: 1,
         GetPriorityClass=lambda *_args: 1,
         SetPriorityClass=lambda *_args: 1,
+        SetProcessInformation=lambda *_args: 1,
         GlobalMemoryStatusEx=lambda *_args: 1,
         GetProcessWorkingSetSizeEx=lambda *_args: 1,
         SetProcessWorkingSetSizeEx=lambda *_args: 1,
@@ -102,6 +151,7 @@ def test_windows_api_declarations_are_pointer_width_safe(monkeypatch) -> None:
     assert cpu_limiter._windows_kernel32() is fake
     assert fake.GetProcessAffinityMask.argtypes[0] is cpu_limiter.wintypes.HANDLE
     assert fake.SetProcessAffinityMask.argtypes[1] is cpu_limiter.ctypes.c_size_t
+    assert fake.SetProcessInformation.argtypes[2] is cpu_limiter.ctypes.c_void_p
     assert fake.GetProcessWorkingSetSizeEx.argtypes[1] == cpu_limiter.ctypes.POINTER(
         cpu_limiter.ctypes.c_size_t
     )
