@@ -32,6 +32,7 @@ from .external_npz import (
 )
 from .cpu_limiter import limit_slicer_task
 from .conformal_lattice.contracts import load_conformal_lattice_spec
+from .fiber_interlayers import plan_flat_resin_interlayers
 from .gcode_legacy_postprocess import apply_legacy_resin_optimization
 from .honeycomb_pathing import HoneycombPathingConfig
 
@@ -1965,9 +1966,14 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         if not run.continuous_course_paths_by_layer:
             raise RuntimeError("当前共形工作区不能生成连续填充路径")
         if is_planar:
-            first_fiber_interface = 1
-            last_fiber_interface = max(1, len(run.layer_embedding.node_positions_xyz) - 1)
-            fiber_interface_source = "planar_all_resin_interfaces_except_top_cap"
+            planar_schedule = plan_flat_resin_interlayers(
+                group.layer_index
+                for group in conformal_source_job.material_paths
+                if group.material == "R"
+            )
+            planar_window = planar_schedule.physical_interface_window
+            first_fiber_interface, last_fiber_interface = planar_window or (1, 1)
+            fiber_interface_source = planar_schedule.source
         else:
             first_fiber_interface, last_fiber_interface = derive_symmetric_curvature_fiber_interfaces(
                 run.layer_embedding
@@ -2968,6 +2974,10 @@ def expand_fiber_template_for_resin_layers(
             roles = roles_by_layer.get(str(part_resin_groups[0].layer_index), [])
             first_part_has_brim = isinstance(roles, list) and "brim" in roles
     skipped_fiber_layers = 1 if first_part_has_brim else 0
+    interlayer_schedule = plan_flat_resin_interlayers(
+        (group.layer_index for group in part_resin_groups),
+        skip_initial_interfaces=skipped_fiber_layers,
+    )
 
     # The fiber is physically printed between resin layers.  Include its
     # thickness in the exported Z schedule instead of letting every resin
@@ -2976,8 +2986,11 @@ def expand_fiber_template_for_resin_layers(
     # below so their endpoints remain continuous with the deposited paths.
     fiber_layer_height = DEFAULT_FIBER_LAYER_HEIGHT_MM
     z_offset_by_resin_layer: dict[int, float] = {}
-    for layer_order, group in enumerate(part_resin_groups):
-        z_offset = max(0, layer_order - skipped_fiber_layers) * fiber_layer_height
+    for group in part_resin_groups:
+        z_offset = (
+            interlayer_schedule.insertion_count_before(group.layer_index)
+            * fiber_layer_height
+        )
         z_offset_by_resin_layer[int(group.layer_index)] = z_offset
         if z_offset == 0.0:
             continue
@@ -3008,10 +3021,11 @@ def expand_fiber_template_for_resin_layers(
     if isinstance(slicing_metadata, dict) and part_resin_groups:
         z_max = slicing_metadata.get("z_max")
         if isinstance(z_max, (int, float)):
-            inserted_fiber_layers = max(0, len(part_resin_groups) - 1 - skipped_fiber_layers)
+            inserted_fiber_layers = len(interlayer_schedule.after_resin_layer_indices)
             slicing_metadata["z_max"] = float(z_max) + inserted_fiber_layers * fiber_layer_height
         slicing_metadata["fiber_layer_height_applied_mm"] = fiber_layer_height
         slicing_metadata["fiber_layers_skipped_for_brim"] = skipped_fiber_layers
+        slicing_metadata["fiber_layer_interface_policy"] = interlayer_schedule.source
 
     # The physical fiber Z accumulates earlier fiber courses.  Routing must
     # inspect the same unshifted STL section that produced the resin layer,
@@ -3022,7 +3036,10 @@ def expand_fiber_template_for_resin_layers(
     }
 
     # Fiber is printed between resin layers; the final resin layer is a cap.
-    for group in part_resin_groups[skipped_fiber_layers:-1]:
+    selected_interfaces = set(interlayer_schedule.after_resin_layer_indices)
+    for group in part_resin_groups:
+        if group.layer_index not in selected_interfaces:
+            continue
         z = _group_layer_z(group) + fiber_layer_height
         layer_paths = []
         for template_path in template_paths:

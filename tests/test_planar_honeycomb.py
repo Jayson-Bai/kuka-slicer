@@ -149,7 +149,7 @@ def test_main_ui_processes_planar_json_through_core_with_optional_fiber(tmp_path
     assert result["effective_infill_pattern"] == "平面蜂窝连续路径"
     assert result["fiber_reinforcement"]["enabled"] is True
     assert result["fiber_reinforcement"]["layer_interface_source"] == (
-        "planar_all_resin_interfaces_except_top_cap"
+        "flat_resin_interlayer_policy_v1"
     )
     assert result["fiber_reinforcement"]["resin_layer_indices"] == [0, 1, 2]
     assert any(layer["fiber_paths"] for layer in result["preview"]["layers"])
