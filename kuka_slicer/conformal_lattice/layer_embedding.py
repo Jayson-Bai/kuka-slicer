@@ -13,7 +13,7 @@ from .mesh_domain import SurfaceMeshDomain
 from .orientation_field import OrientationField
 
 
-LayerEmbeddingMode = Literal["target_surface_normal_stack", "symmetric_shape_morphing"]
+LayerEmbeddingMode = Literal["target_surface_normal_stack", "symmetric_shape_morphing", "planar_stack"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,7 +50,7 @@ def embed_lattice_layers(
     flat_reference_nodes_xyz: np.ndarray | None = None,
     base_z_by_layer_mm: np.ndarray | tuple[float, ...] | None = None,
 ) -> LayerEmbedding:
-    """Embed one lattice topology into normal-stack or compatibility layers.
+    """Embed one lattice topology into normal-stack, morphology, or planar layers.
 
     Normal-stack layers are the research mode: every layer shares node/edge
     identities and offsets the target surface along interpolated vertex normals.
@@ -97,6 +97,18 @@ def embed_lattice_layers(
             "alpha_by_layer": alphas.tolist(),
             "base_z_by_layer_mm": base_z.tolist(),
         }
+    elif mode == "planar_stack":
+        offsets = _offsets(layer_offsets_mm)
+        positions = geometry.lattice_nodes_xyz[None, :, :] + offsets[:, None, None] * normals[None, :, :]
+        report = {
+            "mode": mode,
+            "strict_conformal_claim": "not_applicable; all layers are parallel to the print plane",
+            "topology_shared_across_layers": True,
+            "node_count_per_layer": int(len(geometry.lattice_nodes_xyz)),
+            "alpha_by_layer": np.zeros(len(offsets), dtype=np.float64).tolist(),
+            "base_z_by_layer_mm": offsets.tolist(),
+            "fiber_interface_policy": "all_resin_interfaces_except_top_cap",
+        }
     else:
         raise ValueError("unsupported layer embedding mode")
     return LayerEmbedding(
@@ -116,7 +128,7 @@ def _validate_inputs(
     geometry: ConformalLatticeGeometry,
     mode: str,
 ) -> None:
-    if mode not in ("target_surface_normal_stack", "symmetric_shape_morphing"):
+    if mode not in ("target_surface_normal_stack", "symmetric_shape_morphing", "planar_stack"):
         raise ValueError("unsupported layer embedding mode")
     if orientation.vertex_normals_xyz.shape != domain.vertices.shape:
         raise ValueError("orientation must belong to the supplied domain")

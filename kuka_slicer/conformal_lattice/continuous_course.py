@@ -16,7 +16,7 @@ import numpy as np
 
 from .contracts import ConformalLatticeSpec
 from .layer_embedding import LayerEmbedding
-from ..surface_preview.model import DoubleSineSurface
+from .surface_field import height_field_from_spec
 
 
 _TOW_WIDTH_MM = 2.0
@@ -152,17 +152,7 @@ def embed_continuous_course_plan(
 ) -> tuple[tuple[tuple[np.ndarray, np.ndarray], ...], ...]:
     """Map already-final planar courses to every physical layer once."""
 
-    source = spec.source_surface.get("double_sine")
-    if not isinstance(source, dict):
-        raise ValueError("continuous course embedding requires double-sine source metadata")
-    surface = DoubleSineSurface(
-        amplitude_mm=float(source["amplitude_mm"]),
-        wavelength_x_mm=float(source["wavelength_x_mm"]),
-        wavelength_y_mm=float(source["wavelength_y_mm"]),
-        phase_x_rad=float(source["phase_x_rad"]),
-        phase_y_rad=float(source["phase_y_rad"]),
-        z_reference_mm=float(source["z_reference_mm"]),
-    )
+    surface = height_field_from_spec(spec)
     alpha = np.asarray(layer_embedding.report.get("alpha_by_layer"), dtype=np.float64)
     base_z = np.asarray(layer_embedding.report.get("base_z_by_layer_mm"), dtype=np.float64)
     if alpha.ndim != 1 or alpha.shape != base_z.shape:

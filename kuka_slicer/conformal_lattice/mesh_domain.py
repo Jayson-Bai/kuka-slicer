@@ -17,7 +17,11 @@ import numpy as np
 
 from ..stl_io import load_stl_bytes
 from ..surface_preview.model import DoubleSineSurface
-from .contracts import ConformalLatticeSpec, double_sine_source_sha256
+from .contracts import (
+    ConformalLatticeSpec,
+    double_sine_source_sha256,
+    generated_surface_source_sha256,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,6 +249,57 @@ def build_double_sine_surface_domain(
         domain,
         {
             "provider": "double_sine",
+            "source_file": spec.source_file,
+            "generated": True,
+            "global_xy_bounds_mm": list(global_bounds),
+            "generated_xy_bounds_mm": [x_min, y_min, x_max, y_max],
+        },
+    )
+
+
+def build_planar_surface_domain(
+    spec: ConformalLatticeSpec,
+    *,
+    xy_bounds_mm: Sequence[float] | None = None,
+) -> SurfaceMeshDomain:
+    """Build a minimal rectangular print-plane domain from a planar design."""
+
+    if spec.source_provider != "planar":
+        raise ValueError("planar domain construction requires a planar source")
+    source = spec.source_surface
+    expected_hash = generated_surface_source_sha256(source)
+    if spec.source_sha256 != expected_hash:
+        raise ValueError("planar source_surface.sha256 does not match its canonical configuration")
+    global_bounds = tuple(float(value) for value in source["xy_bounds_mm"])
+    x_min, y_min, x_max, y_max = global_bounds
+    if xy_bounds_mm is not None:
+        requested = tuple(float(value) for value in xy_bounds_mm)
+        if len(requested) != 4 or not all(np.isfinite(requested)):
+            raise ValueError("xy_bounds_mm override must contain four finite values")
+        x_min, y_min, x_max, y_max = requested
+        gx_min, gy_min, gx_max, gy_max = global_bounds
+        if not (gx_min <= x_min < x_max <= gx_max and gy_min <= y_min < y_max <= gy_max):
+            raise ValueError("xy_bounds_mm override must be a positive rectangle inside the global print plane")
+    vertices = np.asarray(
+        (
+            (x_min, y_min, 0.0),
+            (x_max, y_min, 0.0),
+            (x_max, y_max, 0.0),
+            (x_min, y_max, 0.0),
+        ),
+        dtype=np.float64,
+    )
+    faces = np.asarray(((0, 1, 2), (0, 2, 3)), dtype=np.int64)
+    domain = prepare_surface_mesh_domain(
+        vertices,
+        faces,
+        input_sha256=spec.source_sha256,
+        validate_self_intersections=False,
+    )
+    return _with_report(
+        domain,
+        {
+            "provider": "planar",
             "source_file": spec.source_file,
             "generated": True,
             "global_xy_bounds_mm": list(global_bounds),

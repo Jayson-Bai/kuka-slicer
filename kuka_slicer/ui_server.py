@@ -94,8 +94,12 @@ def _conformal_spec_ui_summary(payload: bytes, filename: str) -> dict[str, objec
         and "first_after_resin_layer_physical" in fiber
         and "last_after_resin_layer_physical" in fiber
     )
+    is_planar = spec.source_provider == "planar"
     return {
         "format": "conformal_lattice_spec_v1",
+        "source_provider": spec.source_provider,
+        "design_kind": "planar_honeycomb" if is_planar else "conformal_honeycomb",
+        "design_label": "平面蜂窝" if is_planar else "共形蜂窝",
         "file_name": _safe_filename(filename or "conformal_lattice_spec_v1.json"),
         "part": {
             "length_mm": float(part["length_mm"]),
@@ -1888,13 +1892,15 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
 
         uploaded = files.get("conformal_spec")
         if uploaded is None:
-            raise ValueError("请选择共形蜂窝设计 JSON")
+            raise ValueError("请选择曲面或平面蜂窝结构 JSON")
         source_name, source_bytes = uploaded
         source_filename = _safe_filename(source_name or "conformal_lattice_spec_v1.json")
-        progress(3, "正在校验共形蜂窝设计 JSON")
+        progress(3, "正在校验蜂窝结构设计 JSON")
         spec = load_conformal_lattice_spec(source_bytes)
         if not spec.part or not spec.manufacturing:
-            raise ValueError("共形蜂窝路径仅支持矩形实体设计 JSON")
+            raise ValueError("蜂窝结构路径仅支持矩形实体设计 JSON")
+        is_planar = spec.source_provider == "planar"
+        design_label = "平面蜂窝" if is_planar else "共形蜂窝"
         phase_timings["spec_validation_s"] = time.perf_counter() - phase_started_at
 
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -1916,7 +1922,12 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         from .conformal_lattice.path_bridge import ExtrusionVolumeModel
         from .conformal_lattice.pipeline import run_conformal_lattice_pipeline
 
-        progress(12, "正在计算双正弦曲面、共形蜂窝结构与一笔画分区")
+        progress(
+            12,
+            "正在计算平面蜂窝结构与一笔画分区"
+            if is_planar
+            else "正在计算双正弦曲面、共形蜂窝结构与一笔画分区",
+        )
         phase_started_at = time.perf_counter()
         run = run_conformal_lattice_pipeline(
             spec,
@@ -1953,9 +1964,15 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
 
         if not run.continuous_course_paths_by_layer:
             raise RuntimeError("当前共形工作区不能生成连续填充路径")
-        first_fiber_interface, last_fiber_interface = derive_symmetric_curvature_fiber_interfaces(
-            run.layer_embedding
-        )
+        if is_planar:
+            first_fiber_interface = 1
+            last_fiber_interface = max(1, len(run.layer_embedding.node_positions_xyz) - 1)
+            fiber_interface_source = "planar_all_resin_interfaces_except_top_cap"
+        else:
+            first_fiber_interface, last_fiber_interface = derive_symmetric_curvature_fiber_interfaces(
+                run.layer_embedding
+            )
+            fiber_interface_source = "design_json_symmetric_nonzero_curvature"
         fiber_reinforcement = apply_continuous_course_fiber_strategy(
             source_job=conformal_source_job,
             graph=run.path_graph,
@@ -1964,6 +1981,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                 enabled=_bool_param(params, "conformal_fiber_enabled", True),
                 first_after_resin_layer_physical=first_fiber_interface,
                 last_after_resin_layer_physical=last_fiber_interface,
+                layer_interface_source=fiber_interface_source,
             ),
             fiber_layer_height_mm=float(core_params.fiber.layer_height_mm),
             fiber_e_per_mm=float(core_params.fiber.e_per_mm()),
@@ -1975,7 +1993,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         phase_timings["core_source_preparation_s"] = time.perf_counter() - phase_started_at
 
         export_runner = importlib.import_module("external_npz_preprocessor.export_runner")
-        core_npz_path = job_dir / "conformal_lattice_core.npz"
+        core_npz_path = job_dir / ("planar_honeycomb_core.npz" if is_planar else "conformal_lattice_core.npz")
 
         def core_progress(ratio: float) -> None:
             progress(60 + int(max(0.0, min(1.0, float(ratio))) * 35), "正在执行 path_processing_core 并写出系统 NPZ")
@@ -2009,7 +2027,9 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             "layers": len(preview["layers"]),
             "paths": path_count,
             "preview": preview,
-            "effective_infill_pattern": "共形蜂窝连续路径",
+            "effective_infill_pattern": f"{design_label}连续路径",
+            "design_kind": "planar_honeycomb" if is_planar else "conformal_honeycomb",
+            "design_label": design_label,
             "infill_pattern_execution": {"applied": True, "mode": "continuous_course_network_v1"},
             "conformal_lattice": run.report,
             "fiber_reinforcement": fiber_reinforcement.report,
@@ -4855,8 +4875,8 @@ def _index_html() -> str:
       </div>
       <div class="surfaceWorkspace">
         <div class="surfaceToolGroups">
-          <div class="surfaceToolGroup" aria-label="共形蜂窝流程">
-            <span class="surfaceToolGroupLabel">共形蜂窝</span>
+          <div class="surfaceToolGroup" aria-label="蜂窝结构 JSON 流程">
+            <span class="surfaceToolGroupLabel">蜂窝结构</span>
             <button id="surfacePreviewButton" class="surfaceToolButton" type="button">打开设计器</button>
             <button id="conformalSpecButton" class="surfaceToolButton" type="button">导入设计 JSON</button>
             <button id="conformalSliceButton" class="surfaceToolButton primary" type="button" disabled>生成并导入 Core</button>
@@ -4887,10 +4907,10 @@ def _index_html() -> str:
     </div>
     <div class="surfaceContext">
       <div class="surfaceContextText">
-        <output id="conformalSpecResult" class="surfaceCollisionResult" aria-live="polite">尚未导入共形蜂窝设计 JSON。</output>
+        <output id="conformalSpecResult" class="surfaceCollisionResult" aria-live="polite">尚未导入曲面或平面蜂窝结构 JSON。</output>
         <output id="surfaceNpzCollisionResult" class="surfaceCollisionResult secondary" aria-live="polite"></output>
       </div>
-      <fieldset class="fiberStrategyToggle" aria-label="共形蜂窝连续纤维策略" title="纤维层范围由设计 JSON 的起始层与终止层规则自动确定；纤维复用共形蜂窝连续路径拓扑。">
+      <fieldset class="fiberStrategyToggle" aria-label="蜂窝结构连续纤维策略" title="曲面模式下，首个与末个纤维界面由设计 JSON 自动确定；纤维层范围由设计 JSON 的起始层与终止层规则自动确定。平面模式在除顶盖外的树脂层间生成纤维层；两者复用同一连续路径拓扑。">
         <legend>连续纤维策略</legend>
         <label><input id="conformalFiberEnabled" type="checkbox" checked> 启用连续纤维路径</label>
       </fieldset>
@@ -5644,6 +5664,7 @@ def _index_html() -> str:
     const statusEl = document.getElementById('status');
     const conformalFiberEnabled = document.getElementById('conformalFiberEnabled');
     let selectedConformalSpec = null;
+    let selectedLatticeDesignLabel = '蜂窝结构';
     let conformalDebugExportEnabled = false;
     // v2 intentionally starts conformal jobs with continuous fiber enabled.
     // Do not restore the retired v1 default-off mixed-wall state.
@@ -5759,28 +5780,31 @@ def _index_html() -> str:
       const originalLabel = conformalSpecButton.textContent;
       conformalSpecButton.textContent = '正在识别…';
       conformalSpecResult.className = 'surfaceCollisionResult';
-      conformalSpecResult.textContent = '正在检查共形蜂窝设计参数…';
+      conformalSpecResult.textContent = '正在检查蜂窝结构设计参数…';
       try {{
         const payload = new FormData();
         payload.append('conformal_spec', file, file.name);
         const response = await fetch('/inspect-conformal-spec', {{ method: 'POST', body: payload }});
         const result = await response.json();
-        if (!response.ok || !result.ok) throw new Error(result.error || '无法识别共形设计 JSON');
+        if (!response.ok || !result.ok) throw new Error(result.error || '无法识别蜂窝结构 JSON');
         const summary = result.summary;
         const part = summary.part;
         const lattice = summary.lattice;
-        const fiberText = '；连续纤维由主 UI 的混合壁工艺策略生成';
+        selectedLatticeDesignLabel = summary.design_label || '蜂窝结构';
+        const fiberText = summary.design_kind === 'planar_honeycomb'
+          ? '；启用纤维时覆盖除顶盖外的树脂层间界面'
+          : '；启用纤维时按设计曲率区间自动确定层间界面';
         conformalSpecResult.className = 'surfaceCollisionResult ok';
-        conformalSpecResult.textContent = `已识别共形蜂窝模式：${{part.length_mm}} × ${{part.width_mm}} × ${{part.final_height_mm}} mm；${{lattice.wall_width_mm}} mm 墙体（${{lattice.wall_bead_count}} 条 2 mm 沉积道），单元边长 ${{lattice.base_cell_size_mm}} mm${{fiberText}}。实际树脂/纤维层高由当前 Core 工艺参数决定。`;
+        conformalSpecResult.textContent = `已识别${{selectedLatticeDesignLabel}}模式：${{part.length_mm}} × ${{part.width_mm}} × ${{part.final_height_mm}} mm；${{lattice.wall_width_mm}} mm 墙体（${{lattice.wall_bead_count}} 条 2 mm 沉积道），单元边长 ${{lattice.base_cell_size_mm}} mm${{fiberText}}。实际树脂/纤维层高由当前 Core 工艺参数决定。`;
         selectedConformalSpec = file;
         conformalSliceButton.disabled = false;
         statusEl.className = 'status ok';
-        statusEl.textContent = '共形设计已载入。可直接生成一笔画分区路径，并写入 Core NPZ。';
+        statusEl.textContent = selectedLatticeDesignLabel + '设计已载入。可直接生成连续路径，并写入 Core NPZ。';
       }} catch (error) {{
         selectedConformalSpec = null;
         conformalSliceButton.disabled = true;
         conformalSpecResult.className = 'surfaceCollisionResult error';
-        conformalSpecResult.textContent = '共形设计 JSON 无法使用：' + error.message;
+        conformalSpecResult.textContent = '蜂窝结构 JSON 无法使用：' + error.message;
         statusEl.className = 'status error';
         statusEl.textContent = conformalSpecResult.textContent;
       }} finally {{
@@ -5838,10 +5862,10 @@ def _index_html() -> str:
       conformalSliceButton.disabled = true;
       conformalSliceButton.textContent = '处理中…';
       statusEl.className = 'status';
-      statusEl.textContent = '正在生成共形蜂窝并送入 Core…';
+      statusEl.textContent = '正在生成' + selectedLatticeDesignLabel + '路径并送入 Core…';
       downloadEl.className = 'download';
       conformalDebugDownload.className = 'download';
-      updateExportProgress({{ progress: 0, message: '正在提交共形蜂窝任务', elapsed_s: 0 }});
+      updateExportProgress({{ progress: 0, message: '正在提交' + selectedLatticeDesignLabel + '任务', elapsed_s: 0 }});
       try {{
         const formData = new FormData();
         formData.append('conformal_spec', selectedConformalSpec, selectedConformalSpec.name);
@@ -5850,11 +5874,11 @@ def _index_html() -> str:
         appendCurrentCoreSettings(formData);
         const response = await fetch('/conformal-slice', {{ method: 'POST', body: formData }});
         const queued = await response.json();
-        if (!response.ok || !queued.ok) throw new Error(queued.error || '共形蜂窝任务提交失败');
+        if (!response.ok || !queued.ok) throw new Error(queued.error || '蜂窝结构任务提交失败');
         const result = await waitForSliceJob(queued.job_id);
         layersEl.textContent = result.layers;
         outputNameEl.textContent = result.filename;
-        executedInfillPatternEl.textContent = '共形蜂窝连续路径';
+        executedInfillPatternEl.textContent = result.effective_infill_pattern || (selectedLatticeDesignLabel + '连续路径');
         previewData = result.preview;
         updatePreviewLineWidthValue();
         configureViewer();
@@ -5872,7 +5896,7 @@ def _index_html() -> str:
         const fiberInterfaceText = fiberReport?.enabled
           ? `；已生成与树脂连续路径同拓扑的 F 路径，共 ${{fiberReport.total_fiber_path_count}} 条，并已按纤维层高抬高后续树脂层`
           : '；本次未启用连续纤维策略';
-        statusEl.textContent = '完成：共形连续路径已生成，并已写出 Core NPZ。' + fiberInterfaceText;
+        statusEl.textContent = '完成：' + (result.design_label || selectedLatticeDesignLabel) + '连续路径已生成，并已写出 Core NPZ。' + fiberInterfaceText;
         const workflowTiming = result.workflow_timing || {{}};
         const totalSeconds = Number(workflowTiming.total_s);
         const coreSeconds = Number(workflowTiming.core_export_s ?? result.core_export_seconds);

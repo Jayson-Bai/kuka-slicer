@@ -18,14 +18,14 @@ from .lattice_generator import (
     choose_boundary_safe_phase_origin,
     generate_conformal_lattice_geometry,
 )
-from .mesh_domain import SurfaceMeshDomain, build_double_sine_surface_domain
+from .mesh_domain import SurfaceMeshDomain, build_double_sine_surface_domain, build_planar_surface_domain
 from .orientation_field import OrientationField, build_orientation_field
 from .parameterization import LSCMParameterization, parameterize_spec_lscm
 from .path_bridge import ConformalLatticePathGraph, ExtrusionVolumeModel, build_conformal_lattice_path_graph, write_conformal_lattice_external_npz
 from .phase_coordinates import PhaseCoordinates, solve_phase_coordinates
 from .preview import conformal_lattice_preview_payload
 from .scalar_fields import DesignFieldResult, compose_design_fields_from_spec
-from ..surface_preview.model import DoubleSineSurface
+from .surface_field import HeightField, height_field_from_spec
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +99,20 @@ class ConformalLatticeRun:
         }
 
 
+def _build_generated_surface_domain(
+    spec: ConformalLatticeSpec,
+    *,
+    xy_bounds_mm: tuple[float, float, float, float] | None = None,
+) -> SurfaceMeshDomain:
+    """Dispatch generated geometry without leaking provider checks downstream."""
+
+    if spec.source_provider == "double_sine":
+        return build_double_sine_surface_domain(spec, xy_bounds_mm=xy_bounds_mm)
+    if spec.source_provider == "planar":
+        return build_planar_surface_domain(spec, xy_bounds_mm=xy_bounds_mm)
+    raise ValueError(f"unsupported generated source provider: {spec.source_provider}")
+
+
 def run_conformal_lattice_pipeline(
     config: ConformalLatticeSpec | bytes | str | Mapping[str, object],
     *,
@@ -108,7 +122,7 @@ def run_conformal_lattice_pipeline(
     validate_fill_ratio: bool = False,
     fill_samples_per_triangle_side: int = 6,
 ) -> ConformalLatticeRun:
-    """Run Gates 1--8 in order for the supported double-sine UI workflow.
+    """Run Gates 1--8 for generated curved or planar honeycomb designs.
 
     ``logical_layer_count`` belongs to the slicer/process side of the interface,
     not to the analytical surface definition.  Path export stays unavailable
@@ -118,8 +132,8 @@ def run_conformal_lattice_pipeline(
     """
 
     spec = config if isinstance(config, ConformalLatticeSpec) else load_conformal_lattice_spec(config)
-    if spec.source_provider != "double_sine":
-        raise ValueError("first-version UI pipeline supports only source_surface.provider=double_sine")
+    if spec.source_provider not in ("double_sine", "planar"):
+        raise ValueError("UI lattice pipeline supports source_surface.provider=double_sine or planar")
     reference = spec.source_surface.get("reference_stl")
     if spec.part:
         logical_layer_count, base_z_by_layer = _physical_layer_schedule(
@@ -127,6 +141,8 @@ def run_conformal_lattice_pipeline(
             logical_layer_count,
             physical_layer_height_mm=physical_layer_height_mm,
         )
+    elif spec.source_provider == "planar":
+        raise ValueError("planar lattice workflow requires a rectangular part")
     elif not isinstance(reference, Mapping) or reference.get("build_axis") != "z":
         raise ValueError("first-version double-sine conformal workflow requires reference_stl.build_axis=z")
     else:
@@ -139,12 +155,12 @@ def run_conformal_lattice_pipeline(
         raise ValueError("validate_fill_ratio must be a boolean")
 
     grip_end_length_mm = _symmetric_grip_end_length(spec)
-    # The source double-sine field is always global.  Only the honeycomb
-    # generator is restricted to the central working region; perimeter and
-    # grip paths below still sample the original whole-part field.
-    full_domain = build_double_sine_surface_domain(spec)
+    # The generated source field is always global. Only the honeycomb generator
+    # is restricted to the central working region; perimeter and grip paths
+    # below still use the original whole-part field.
+    full_domain = _build_generated_surface_domain(spec)
     lattice_bounds = _central_lattice_bounds(spec, grip_end_length_mm)
-    domain = full_domain if lattice_bounds is None else build_double_sine_surface_domain(
+    domain = full_domain if lattice_bounds is None else _build_generated_surface_domain(
         spec,
         xy_bounds_mm=lattice_bounds,
     )
@@ -215,7 +231,14 @@ def run_conformal_lattice_pipeline(
             wall_width_mm=float(spec.lattice["wall_width_mm"]),
             samples_per_triangle_side=fill_samples_per_triangle_side,
         )
-    layer_embedding = _symmetric_layer_embedding(domain, orientation, geometry, spec, logical_layer_count, base_z_by_layer)
+    layer_embedding = _layer_embedding_for_spec(
+        domain,
+        orientation,
+        geometry,
+        spec,
+        logical_layer_count,
+        base_z_by_layer,
+    )
     continuous_course_plan = build_continuous_course_plan(spec) if spec.part else None
     continuous_course_paths_by_layer = (
         embed_continuous_course_plan(continuous_course_plan, spec, layer_embedding)
@@ -226,11 +249,11 @@ def run_conformal_lattice_pipeline(
     layer_tool_normals = _symmetric_tool_normals(target_node_normals, layer_embedding)
     boundary_orientation = orientation if domain is full_domain else _orientation_from_spec(full_domain, spec)
     outer_boundary, outer_boundary_tool_normals = (
-        _symmetric_outer_boundary(full_domain, boundary_orientation, spec, layer_embedding)
+        _layered_outer_boundary(full_domain, boundary_orientation, spec, layer_embedding)
         if spec.part
         else (None, None)
     )
-    auxiliary_paths = _symmetric_partition_paths(spec, layer_embedding) if grip_end_length_mm > 0.0 else None
+    auxiliary_paths = _layered_partition_paths(spec, layer_embedding) if grip_end_length_mm > 0.0 else None
     path_graph = None if extrusion is None else build_conformal_lattice_path_graph(
         geometry,
         extrusion,
@@ -327,7 +350,7 @@ def _central_lattice_bounds(spec: ConformalLatticeSpec, grip_end_length_mm: floa
     return bounds
 
 
-def _symmetric_partition_paths(
+def _layered_partition_paths(
     spec: ConformalLatticeSpec,
     layer_embedding: LayerEmbedding,
 ) -> tuple[tuple[tuple[str, np.ndarray, np.ndarray], ...], ...]:
@@ -362,7 +385,7 @@ def _symmetric_partition_paths(
     base_z = np.asarray(layer_embedding.report.get("base_z_by_layer_mm"), dtype=np.float64)
     if alpha.shape != base_z.shape or alpha.ndim != 1:
         raise ValueError("symmetric layer embedding is missing per-layer alpha/base-Z data")
-    surface = _double_sine_surface(spec)
+    surface = height_field_from_spec(spec)
     result: list[tuple[tuple[str, np.ndarray, np.ndarray], ...]] = []
     for layer_alpha, layer_base_z in zip(alpha, base_z):
         result.append(
@@ -397,23 +420,9 @@ def _horizontal_one_stroke_zigzag(bounds: tuple[float, float, float, float], bea
     return np.asarray(paths[0], dtype=np.float64)
 
 
-def _double_sine_surface(spec: ConformalLatticeSpec) -> DoubleSineSurface:
-    values = spec.source_surface.get("double_sine")
-    if not isinstance(values, Mapping):
-        raise ValueError("double-sine source metadata is malformed")
-    return DoubleSineSurface(
-        amplitude_mm=float(values["amplitude_mm"]),
-        wavelength_x_mm=float(values["wavelength_x_mm"]),
-        wavelength_y_mm=float(values["wavelength_y_mm"]),
-        phase_x_rad=float(values["phase_x_rad"]),
-        phase_y_rad=float(values["phase_y_rad"]),
-        z_reference_mm=float(values["z_reference_mm"]),
-    )
-
-
 def _embed_planar_path(
     points_xy: np.ndarray,
-    surface: DoubleSineSurface,
+    surface: HeightField,
     alpha: float,
     base_z_mm: float,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -549,7 +558,7 @@ def _phase_at_planar_point(
     return weights @ phase_vertices
 
 
-def _symmetric_layer_embedding(
+def _layer_embedding_for_spec(
     domain: SurfaceMeshDomain,
     orientation: OrientationField,
     geometry: ConformalLatticeGeometry,
@@ -558,6 +567,18 @@ def _symmetric_layer_embedding(
     base_z_by_layer: np.ndarray | None,
 ) -> LayerEmbedding:
     embedding = spec.layer_embedding
+    if spec.source_provider == "planar":
+        if embedding.get("mode") != "planar_stack":
+            raise ValueError("planar lattice pipeline requires layer_embedding.mode=planar_stack")
+        if base_z_by_layer is None:
+            raise ValueError("planar lattice pipeline requires physical layer Z positions")
+        return embed_lattice_layers(
+            domain,
+            orientation,
+            geometry,
+            mode="planar_stack",
+            layer_offsets_mm=base_z_by_layer,
+        )
     if embedding.get("mode") != "symmetric_shape_morphing" or embedding.get("transition") != "smoothstep":
         raise ValueError("first-version UI pipeline supports only symmetric_shape_morphing with smoothstep")
     surface = spec.source_surface["double_sine"]
@@ -594,19 +615,17 @@ def _lattice_node_normals(
     return normals
 
 
-def _symmetric_outer_boundary(
+def _layered_outer_boundary(
     domain: SurfaceMeshDomain,
     orientation: OrientationField,
     spec: ConformalLatticeSpec,
     layer_embedding: LayerEmbedding,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Embed the rectangular XY boundary with the same legacy smoothstep law."""
+    """Embed the rectangular XY boundary with the selected layer schedule."""
 
     if len(domain.boundary_loops) != 1:
         raise ValueError("rectangular conformal production requires exactly one surface boundary loop")
-    surface = spec.source_surface.get("double_sine")
-    if not isinstance(surface, Mapping):
-        raise ValueError("double-sine source metadata is malformed")
+    surface = height_field_from_spec(spec)
     alpha = np.asarray(layer_embedding.report.get("alpha_by_layer"), dtype=np.float64)
     base_z = np.asarray(layer_embedding.report.get("base_z_by_layer_mm"), dtype=np.float64)
     if alpha.shape != (len(layer_embedding.node_positions_xyz),) or base_z.shape != alpha.shape:
@@ -614,7 +633,7 @@ def _symmetric_outer_boundary(
     boundary_surface = np.asarray(domain.vertices[domain.boundary_loops[0]], dtype=np.float64)
     boundary_target_normals = np.asarray(orientation.vertex_normals_xyz[domain.boundary_loops[0]], dtype=np.float64)
     boundary_flat = np.array(boundary_surface, copy=True)
-    boundary_flat[:, 2] = float(surface["z_reference_mm"])
+    boundary_flat[:, 2] = float(surface.z_reference_mm)
     paths = boundary_flat[None, :, :] + alpha[:, None, None] * (boundary_surface[None, :, :] - boundary_flat[None, :, :])
     paths[:, :, 2] += base_z[:, None]
     closed_paths = np.concatenate((paths, paths[:, :1, :]), axis=1)

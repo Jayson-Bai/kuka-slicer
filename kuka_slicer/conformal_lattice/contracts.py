@@ -19,11 +19,11 @@ class ConformalLatticeSpec:
     """Validated, serialisable input for the independent geometry pipeline.
 
     ``source_surface.double_sine`` is used only when ``provider`` is
-    ``double_sine``.  It contains the six analytical height-field parameters,
-    ``xy_bounds_mm`` (``[xmin, ymin, xmax, ymax]``), and ``samples``
-    (``[x_count, y_count]``).  A ``triangle_mesh`` source is supplied later as
-    an STL byte stream or an indexed-NPZ byte stream (``vertices`` and
-    ``faces``); its SHA-256 is checked before mesh preparation.
+    ``double_sine``.  A ``planar`` source carries only its rectangular XY
+    bounds, so portable flat-honeycomb designs do not retain any analytical
+    surface parameters.  A ``triangle_mesh`` source is supplied later as an
+    STL byte stream or an indexed-NPZ byte stream (``vertices`` and ``faces``);
+    its SHA-256 is checked before mesh preparation.
     """
 
     source_surface: dict[str, object]
@@ -75,12 +75,18 @@ def canonical_json_sha256(value: Mapping[str, object]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def double_sine_source_sha256(source_surface: Mapping[str, object]) -> str:
-    """Return the reproducible source hash for a generated double-sine mesh."""
+def generated_surface_source_sha256(source_surface: Mapping[str, object]) -> str:
+    """Hash a generated surface declaration without its self-referential digest."""
 
     value = dict(source_surface)
     value.pop("sha256", None)
     return canonical_json_sha256(value)
+
+
+def double_sine_source_sha256(source_surface: Mapping[str, object]) -> str:
+    """Return the reproducible source hash for a generated double-sine mesh."""
+
+    return generated_surface_source_sha256(source_surface)
 
 
 def load_conformal_lattice_spec(data: bytes | str | Mapping[str, object]) -> ConformalLatticeSpec:
@@ -94,8 +100,8 @@ def load_conformal_lattice_spec(data: bytes | str | Mapping[str, object]) -> Con
 
     source = _object(raw, "source_surface")
     provider = source.get("provider")
-    if provider not in ("double_sine", "triangle_mesh"):
-        raise ValueError("source_surface.provider must be double_sine or triangle_mesh")
+    if provider not in ("double_sine", "planar", "triangle_mesh"):
+        raise ValueError("source_surface.provider must be double_sine, planar, or triangle_mesh")
     if source.get("domain") != "outer_boundary_only":
         raise ValueError("source_surface.domain must be outer_boundary_only")
     if not isinstance(source.get("source_file"), str) or not source["source_file"].strip():
@@ -105,6 +111,8 @@ def load_conformal_lattice_spec(data: bytes | str | Mapping[str, object]) -> Con
         raise ValueError("source_surface.sha256 must be a lowercase SHA-256 hex digest")
     if provider == "double_sine":
         _validate_double_sine_source(source)
+    elif provider == "planar":
+        _validate_planar_source(source)
 
     part = _optional_object(raw, "part")
     manufacturing = _optional_object(raw, "manufacturing")
@@ -165,14 +173,24 @@ def load_conformal_lattice_spec(data: bytes | str | Mapping[str, object]) -> Con
     if orientation_field.get("mode") not in ("global_axis", "principal_curvature", "user", "stress", "external"):
         raise ValueError("orientation_field.mode is unsupported")
     _finite(orientation_field.get("angle_deg", 0.0), "orientation_field.angle_deg")
-    if layer_embedding.get("mode") not in ("target_surface_normal_stack", "symmetric_shape_morphing"):
+    embedding_mode = layer_embedding.get("mode")
+    if embedding_mode not in ("target_surface_normal_stack", "symmetric_shape_morphing", "planar_stack"):
         raise ValueError("layer_embedding.mode is unsupported")
-    if layer_embedding.get("mode") == "symmetric_shape_morphing":
+    if embedding_mode == "symmetric_shape_morphing":
         if layer_embedding.get("transition") != "smoothstep":
             raise ValueError("symmetric_shape_morphing requires transition=smoothstep")
         start_layer = layer_embedding.get("surface_start_layer")
         if not isinstance(start_layer, int) or isinstance(start_layer, bool) or start_layer < 0:
             raise ValueError("symmetric_shape_morphing requires a non-negative integer surface_start_layer")
+    if provider == "planar" and embedding_mode != "planar_stack":
+        raise ValueError("planar source_surface requires layer_embedding.mode=planar_stack")
+    if provider != "planar" and embedding_mode == "planar_stack":
+        raise ValueError("layer_embedding.mode=planar_stack requires source_surface.provider=planar")
+    if provider == "planar" and part:
+        bounds = tuple(float(value) for value in source["xy_bounds_mm"])
+        expected_bounds = (0.0, 0.0, float(part["length_mm"]), float(part["width_mm"]))
+        if bounds != expected_bounds:
+            raise ValueError("planar source_surface.xy_bounds_mm must match the rectangular part")
     seed = raw.get("random_seed")
     if not isinstance(seed, int) or isinstance(seed, bool) or seed < 0:
         raise ValueError("random_seed must be a non-negative integer")
@@ -334,6 +352,14 @@ def _validate_double_sine_source(source: Mapping[str, object]) -> None:
     samples = surface.get("samples")
     if not isinstance(samples, list) or len(samples) != 2 or any(not isinstance(value, int) or value < 2 for value in samples):
         raise ValueError("source_surface.double_sine.samples must contain two integers >= 2")
+
+
+def _validate_planar_source(source: Mapping[str, object]) -> None:
+    if "double_sine" in source:
+        raise ValueError("planar source_surface must not contain double_sine parameters")
+    bounds = _vector(source.get("xy_bounds_mm"), "source_surface.xy_bounds_mm", length=4)
+    if bounds[2] <= bounds[0] or bounds[3] <= bounds[1]:
+        raise ValueError("source_surface.xy_bounds_mm must have positive dimensions")
 
 
 def _validate_rectangular_part(part: Mapping[str, object], manufacturing: Mapping[str, object]) -> None:

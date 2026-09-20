@@ -50,6 +50,7 @@ class ContinuousCourseFiberSettings:
     enabled: bool
     first_after_resin_layer_physical: int
     last_after_resin_layer_physical: int
+    layer_interface_source: str = "design_json_symmetric_nonzero_curvature"
 
 
 def derive_symmetric_curvature_fiber_interfaces(
@@ -490,6 +491,7 @@ def apply_continuous_course_fiber_strategy(
         "enabled": True,
         "mode": "continuous_course_network_v1",
         "configured_in": "main_ui_runtime",
+        "layer_interface_source": settings.layer_interface_source,
         "active_resin_layer_indices": list(selected_layers),
         "course_semantics": "every rectangle-clipped continuous-course fragment is an independent resin/F path with normal Core travel/cut boundaries",
         "planar_skeleton_then_surface_embedding": True,
@@ -501,7 +503,7 @@ def apply_continuous_course_fiber_strategy(
         "mode": "continuous_course_network_v1",
         "configured_in": "main_ui_runtime",
         "after_resin_physical_layers": [settings.first_after_resin_layer_physical, settings.last_after_resin_layer_physical],
-        "layer_interface_source": "design_json_symmetric_nonzero_curvature",
+        "layer_interface_source": settings.layer_interface_source,
         "resin_layer_indices": list(selected_layers),
         "paths_per_fiber_layer": resin_paths_per_layer,
         "total_fiber_path_count": resin_paths_per_layer * len(selected_layers),

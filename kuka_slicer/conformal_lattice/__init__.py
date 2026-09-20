@@ -10,6 +10,7 @@ from .distortion import ConformalQuality, evaluate_conformal_quality, nonadjacen
 from .mesh_domain import (
     SurfaceMeshDomain,
     build_double_sine_surface_domain,
+    build_planar_surface_domain,
     cut_mesh_along_edges,
     load_triangle_mesh_domain,
     prepare_surface_mesh_domain,
@@ -74,6 +75,7 @@ __all__ = [
     "PhaseQuality",
     "SurfaceMeshDomain",
     "build_double_sine_surface_domain",
+    "build_planar_surface_domain",
     "build_orientation_field",
     "build_conformal_lattice_path_graph",
     "compose_design_fields",

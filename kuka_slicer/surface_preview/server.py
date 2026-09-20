@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from ..conformal_lattice.contracts import (
     CONFORMAL_LATTICE_SPEC_V1,
     double_sine_source_sha256,
+    generated_surface_source_sha256,
     load_conformal_lattice_spec,
 )
 from .model import DoubleSineSurface
@@ -516,6 +517,22 @@ def graded_surface_config_payload(
 def conformal_lattice_config_payload(params: dict[str, list[str]]) -> dict[str, object]:
     """Build the STL-free rectangular conformal-design contract."""
 
+    return _rectangular_lattice_config_payload(params, source_provider="double_sine")
+
+
+def planar_lattice_config_payload(params: dict[str, list[str]]) -> dict[str, object]:
+    """Build the flat-print contract without retaining double-sine parameters."""
+
+    return _rectangular_lattice_config_payload(params, source_provider="planar")
+
+
+def _rectangular_lattice_config_payload(
+    params: dict[str, list[str]],
+    *,
+    source_provider: str,
+) -> dict[str, object]:
+    if source_provider not in {"double_sine", "planar"}:
+        raise ValueError("source_provider must be double_sine or planar")
     length_mm = _query_float(params, "part_length_mm", 150.0, positive=True)
     width_mm = _query_float(params, "part_width_mm", 50.0, positive=True)
     final_height_mm = _query_float(params, "part_height_mm", 10.0, positive=True)
@@ -528,12 +545,6 @@ def conformal_lattice_config_payload(params: dict[str, list[str]]) -> dict[str, 
     # Keep one stable reference for validating a layer-index start value; the
     # actual physical layer height is supplied later by the slicer/Core UI.
     layer_height_mm = CONFORMAL_MAPPING_REFERENCE_LAYER_HEIGHT_MM
-    surface_params = {**params, "width_mm": [str(length_mm)], "height_mm": [str(width_mm)]}
-    surface = surface_payload(
-        surface_params,
-        include_projection_geometry=False,
-        rectangle_origin_lower_left=True,
-    )["surface"]
     wall_width_mm = _query_float(params, "wall_width_mm", 2.0, positive=True)
     wall_bead_count = round(wall_width_mm / 2.0)
     if wall_bead_count < 1 or not math.isclose(wall_width_mm, 2.0 * wall_bead_count, rel_tol=0.0, abs_tol=1e-9):
@@ -545,16 +556,6 @@ def conformal_lattice_config_payload(params: dict[str, list[str]]) -> dict[str, 
             "wall_width_mm and base_cell_size_mm produce a nominal fill ratio of at least 1; "
             "reduce wall_width_mm or increase base_cell_size_mm"
         )
-    logical_layer_count = math.ceil(final_height_mm / layer_height_mm)
-    surface_start_layer, first_curved_layer = _resolve_surface_progression_start(
-        params, logical_layer_count=logical_layer_count
-    )
-    samples_x = _query_nonnegative_int(
-        params, "samples_x", DEFAULT_PREVIEW_SAMPLES, minimum=2, maximum=MAX_CONFORMAL_SAMPLES
-    )
-    samples_y = _query_nonnegative_int(
-        params, "samples_y", DEFAULT_PREVIEW_SAMPLES, minimum=2, maximum=MAX_CONFORMAL_SAMPLES
-    )
     boundary_mode = params.get("boundary_mode", ["clip"])[0]
     if boundary_mode not in {"clip", "inset"}:
         raise ValueError("boundary_mode must be clip or inset")
@@ -581,17 +582,50 @@ def conformal_lattice_config_payload(params: dict[str, list[str]]) -> dict[str, 
         params, "orientation_angle_deg", 0.0
     )
     random_seed = _query_nonnegative_int(params, "random_seed", 0)
-    source_surface: dict[str, object] = {
-        "provider": "double_sine",
-        "source_file": "generated://double-sine-rectangular-part",
-        "domain": "outer_boundary_only",
-        "double_sine": {
-            **surface,
+    if source_provider == "double_sine":
+        surface_params = {**params, "width_mm": [str(length_mm)], "height_mm": [str(width_mm)]}
+        surface = surface_payload(
+            surface_params,
+            include_projection_geometry=False,
+            rectangle_origin_lower_left=True,
+        )["surface"]
+        logical_layer_count = math.ceil(final_height_mm / layer_height_mm)
+        surface_start_layer, first_curved_layer = _resolve_surface_progression_start(
+            params, logical_layer_count=logical_layer_count
+        )
+        samples_x = _query_nonnegative_int(
+            params, "samples_x", DEFAULT_PREVIEW_SAMPLES, minimum=2, maximum=MAX_CONFORMAL_SAMPLES
+        )
+        samples_y = _query_nonnegative_int(
+            params, "samples_y", DEFAULT_PREVIEW_SAMPLES, minimum=2, maximum=MAX_CONFORMAL_SAMPLES
+        )
+        source_surface: dict[str, object] = {
+            "provider": "double_sine",
+            "source_file": "generated://double-sine-rectangular-part",
+            "domain": "outer_boundary_only",
+            "double_sine": {
+                **surface,
+                "xy_bounds_mm": [0.0, 0.0, length_mm, width_mm],
+                "samples": [samples_x, samples_y],
+            },
+        }
+        source_surface["sha256"] = double_sine_source_sha256(source_surface)
+        layer_embedding: dict[str, object] = {
+            "mode": "symmetric_shape_morphing",
+            "transition": "smoothstep",
+            "surface_start_layer": surface_start_layer,
+            "surface_start_layer_semantics": "legacy_zero_alpha_zero_based",
+            "first_nonzero_curvature_layer_physical": first_curved_layer,
+        }
+    else:
+        source_surface = {
+            "provider": "planar",
+            "source_file": "generated://planar-rectangular-part",
+            "domain": "outer_boundary_only",
             "xy_bounds_mm": [0.0, 0.0, length_mm, width_mm],
-            "samples": [samples_x, samples_y],
-        },
-    }
-    source_surface["sha256"] = double_sine_source_sha256(source_surface)
+        }
+        source_surface["sha256"] = generated_surface_source_sha256(source_surface)
+        layer_embedding = {"mode": "planar_stack"}
     config: dict[str, object] = {
         "format": CONFORMAL_LATTICE_SPEC_V1,
         "units": "mm",
@@ -637,13 +671,7 @@ def conformal_lattice_config_payload(params: dict[str, list[str]]) -> dict[str, 
         },
         "fill_field": {"mode": "fixed_cell_size", "drivers": []},
         "orientation_field": {"mode": "global_axis", "angle_deg": orientation_angle_deg, "constraints": []},
-        "layer_embedding": {
-            "mode": "symmetric_shape_morphing",
-            "transition": "smoothstep",
-            "surface_start_layer": surface_start_layer,
-            "surface_start_layer_semantics": "legacy_zero_alpha_zero_based",
-            "first_nonzero_curvature_layer_physical": first_curved_layer,
-        },
+        "layer_embedding": layer_embedding,
         "quality_limits": {},
         "random_seed": random_seed,
     }
@@ -720,6 +748,18 @@ class SurfacePreviewHandler(BaseHTTPRequestHandler):
             self._send_json(
                 config,
                 attachment_name="conformal_lattice_spec_v1.json",
+            )
+            return
+        if parsed.path == "/api/export-planar-lattice-config":
+            try:
+                params = parse_qs(parsed.query)
+                config = planar_lattice_config_payload(params)
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(
+                config,
+                attachment_name="planar_honeycomb_spec_v1.json",
             )
             return
         self.send_error(HTTPStatus.NOT_FOUND, "Not found")
@@ -948,8 +988,9 @@ def surface_preview_html() -> str:
         <div class="divider"></div>
         <h2>下一步</h2>
         <button type="button" id="exportConformalConfig">导出连续路径 JSON</button>
+        <button type="button" class="secondary" id="exportPlanarConfig">导出平面蜂窝结构 JSON</button>
         <button type="button" class="secondary" id="reset">恢复示例参数</button>
-        <p class="hint">方程：H(x,y)=A·sin(2πx/λx+φx)·sin(2πy/λy+φy)+Zref。导出的 JSON 可直接导入主切片器，连续路径会作为树脂与可选纤维的正式路径拓扑。</p>
+        <p class="hint">曲面 JSON 包含双正弦参数；平面 JSON 只保留当前零件尺寸、分区和蜂窝路径/形状样式。两者都可直接导入主切片器，并复用同一套树脂、可选纤维及 Core 工艺参数。</p>
       </form>
       <section class="panel preview">
         <div class="previewHead"><h2 id="previewTitle">α=1 完整曲率层（物理 Z）</h2><div class="stats" id="stats"></div></div>
@@ -971,6 +1012,7 @@ def surface_preview_html() -> str:
     const statusEl = document.getElementById('status');
     const statsEl = document.getElementById('stats');
     const exportConformalConfigButton = document.getElementById('exportConformalConfig');
+    const exportPlanarConfigButton = document.getElementById('exportPlanarConfig');
     const previewMode = document.getElementById('previewMode');
     const surfaceZScale = document.getElementById('surfaceZScale');
     const sectionZScale = document.getElementById('sectionZScale');
@@ -2593,6 +2635,26 @@ def surface_preview_html() -> str:
         URL.revokeObjectURL(link.href);
         statusEl.className = 'status';
         statusEl.textContent = '已导出连续路径设计 JSON；回到主切片器导入该文件以生成正式路径。';
+      } catch (error) {
+        statusEl.className = 'status error';
+        statusEl.textContent = error.message;
+      }
+    });
+    exportPlanarConfigButton.addEventListener('click', async () => {
+      try {
+        const response = await fetch(`/api/export-planar-lattice-config?${conformalParameters().toString()}`);
+        if (!response.ok) {
+          const result = await response.json();
+          throw new Error(result.error || '无法导出平面蜂窝结构配置');
+        }
+        const blob = await response.blob();
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(blob);
+        link.download = 'planar_honeycomb_spec_v1.json';
+        link.click();
+        URL.revokeObjectURL(link.href);
+        statusEl.className = 'status';
+        statusEl.textContent = '已导出平面蜂窝结构 JSON；文件不包含双正弦曲面参数，可在主切片器中按平面路径生成 Core NPZ。';
       } catch (error) {
         statusEl.className = 'status error';
         statusEl.textContent = error.message;
