@@ -241,6 +241,91 @@ def test_honeycomb_slice_exports_to_core_without_retracing_or_crossing_holes(
     assert system_path.is_file()
 
 
+def test_honeycomb_planner_retains_native_one_stroke_brim_before_regenerated_frame(
+    monkeypatch,
+) -> None:
+    """A honeycomb replacement must not discard the first-layer adhesion path."""
+
+    class NativePrusa:
+        def slice_print_paths(self, vertices, faces, **kwargs):
+            min_x, min_y = np.min(vertices[:, :2], axis=0)
+
+            def frame(z: float):
+                return [
+                    [min_x, min_y, z],
+                    [min_x + 20.0, min_y, z],
+                    [min_x + 20.0, min_y + 18.0, z],
+                    [min_x, min_y + 18.0, z],
+                    [min_x, min_y, z],
+                ]
+
+            def layer(z: float, *, with_brim: bool):
+                paths = [frame(z)]
+                extrusion = [[10.0, 16.0, 22.0, 28.0, 34.0]]
+                roles = ["outer_contour"]
+                motions = [{"kind": "deposit", "index": 0}]
+                if with_brim:
+                    paths = [
+                        [[min_x - 2.0, min_y - 2.0, z], [min_x + 8.0, min_y - 2.0, z]],
+                        [[min_x + 8.0, min_y - 2.0, z], [min_x + 20.0, min_y - 2.0, z]],
+                        *paths,
+                    ]
+                    extrusion = [[0.0, 5.0], [5.0, 11.0], *extrusion]
+                    roles = ["brim", "brim", *roles]
+                    motions = [
+                        {"kind": "deposit", "index": 0},
+                        {"kind": "deposit", "index": 1},
+                        {"kind": "deposit", "index": 2},
+                    ]
+                return {
+                    "z": z,
+                    "paths": paths,
+                    "extrusion": extrusion,
+                    "roles": roles,
+                    "travel": [],
+                    "motions": motions,
+                }
+
+            return {"layers": [layer(1.0, with_brim=True), layer(2.0, with_brim=False)]}
+
+    monkeypatch.setattr(
+        "kuka_slicer.prusa_backend.require_native", lambda: NativePrusa()
+    )
+    monkeypatch.setattr(
+        "kuka_slicer.prusa_backend._connect_brim_paths_one_stroke",
+        lambda paths, line_width, tolerance: [np.vstack(paths)],
+    )
+    job = slice_mesh_to_job(
+        _honeycomb_mesh(_honeycomb_hole_rings()),
+        SliceConfig(
+            slicing_kernel="prusa",
+            material="R",
+            layer_height=1.0,
+            first_layer_height=1.0,
+            line_width=2.0,
+            infill_pattern="none",
+            brim_enabled=True,
+            brim_one_stroke=True,
+            honeycomb_pathing=HoneycombPathingConfig(enabled=True),
+        ),
+    )
+
+    first_layer = next(group for group in job.material_paths if group.layer_index == 0)
+    assert job.meta["path_roles"]["R"]["0"][0] == "brim"
+    assert job.meta["path_roles"]["R"]["0"][1] == "outer_contour"
+    assert len(first_layer.paths[0]) == 4
+    assert first_layer.extrusion is not None
+    assert np.all(np.diff(first_layer.extrusion[0]) >= 0.0)
+    assert job.meta["honeycomb_centerline_pathing"]["brim_path_count_by_layer"] == {
+        "0": 1,
+        "1": 0,
+    }
+    assert job.meta["motion_order"]["0"][:2] == [
+        {"kind": "deposit", "index": 0},
+        {"kind": "deposit", "index": 1},
+    ]
+
+
 def _honeycomb_mesh(hole_rings: list[list[tuple[float, float]]]) -> Mesh:
     outer_ring = [(0.0, 0.0), (20.0, 0.0), (20.0, 18.0), (0.0, 18.0)]
     triangles = []
