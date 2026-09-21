@@ -20,6 +20,10 @@ _TOOLS: dict[str, tuple[str, tuple[str, ...]]] = {
 }
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _BREAKAWAY_FALLBACK_WINERRORS = {5, 87}
+_MACOS_BROWSER_PATHS = (
+    Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+    Path("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+)
 
 
 class _ManagedProcess(Protocol):
@@ -375,15 +379,18 @@ def _launch_browser_app(url: str, tool: str) -> tuple[subprocess.Popen[bytes], P
 def _find_browser() -> Path:
     configured = os.environ.get("KUKA_SLICER_BROWSER")
     candidates = [Path(configured)] if configured else []
-    candidates.extend(
-        Path(root) / relative
-        for root in (os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles"))
-        if root
-        for relative in (
-            Path("Google/Chrome/Application/chrome.exe"),
-            Path("Microsoft/Edge/Application/msedge.exe"),
+    if sys.platform == "darwin":
+        candidates.extend(_MACOS_BROWSER_PATHS)
+    else:
+        candidates.extend(
+            Path(root) / relative
+            for root in (os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles"))
+            if root
+            for relative in (
+                Path("Google/Chrome/Application/chrome.exe"),
+                Path("Microsoft/Edge/Application/msedge.exe"),
+            )
         )
-    )
     for candidate in candidates:
         if candidate.is_file():
             return candidate

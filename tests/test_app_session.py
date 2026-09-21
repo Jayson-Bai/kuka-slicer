@@ -82,7 +82,9 @@ def test_server_process_requests_windows_job_breakaway(monkeypatch) -> None:
         return server
 
     monkeypatch.setattr(app_session.sys, "platform", "win32")
-    monkeypatch.setattr(app_session.subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+    monkeypatch.setattr(
+        app_session.subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000, raising=False
+    )
     monkeypatch.setattr(app_session.subprocess, "Popen", fake_popen)
 
     assert app_session._launch_server_process(["python", "-m", "kuka_slicer"]) is server
@@ -100,7 +102,9 @@ def test_server_process_uses_cim_when_job_rejects_breakaway(monkeypatch) -> None
         raise error
 
     monkeypatch.setattr(app_session.sys, "platform", "win32")
-    monkeypatch.setattr(app_session.subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+    monkeypatch.setattr(
+        app_session.subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000, raising=False
+    )
     monkeypatch.setattr(app_session.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(
         app_session,
@@ -116,7 +120,9 @@ def test_server_process_uses_cim_when_breakaway_child_remains_in_job(monkeypatch
     server = _Process()
     detached = _Process()
     monkeypatch.setattr(app_session.sys, "platform", "win32")
-    monkeypatch.setattr(app_session.subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+    monkeypatch.setattr(
+        app_session.subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000, raising=False
+    )
     monkeypatch.setattr(app_session.subprocess, "Popen", lambda *_args, **_kwargs: server)
     monkeypatch.setattr(app_session, "_windows_process_is_in_job", lambda _pid: True)
     monkeypatch.setattr(app_session, "_launch_server_process_via_cim", lambda _command: detached)
@@ -155,6 +161,21 @@ def test_app_session_prefers_google_chrome_over_edge(monkeypatch, tmp_path: Path
     monkeypatch.delenv("KUKA_SLICER_BROWSER", raising=False)
     monkeypatch.setenv("ProgramFiles", str(tmp_path))
     monkeypatch.delenv("ProgramFiles(x86)", raising=False)
+    monkeypatch.setattr(app_session.sys, "platform", "win32")
+
+    assert app_session._find_browser() == chrome
+
+
+def test_app_session_finds_macos_chrome_for_designer_window(monkeypatch, tmp_path: Path) -> None:
+    chrome = tmp_path / "Google Chrome.app" / "Contents" / "MacOS" / "Google Chrome"
+    edge = tmp_path / "Microsoft Edge.app" / "Contents" / "MacOS" / "Microsoft Edge"
+    chrome.parent.mkdir(parents=True)
+    edge.parent.mkdir(parents=True)
+    chrome.touch()
+    edge.touch()
+    monkeypatch.delenv("KUKA_SLICER_BROWSER", raising=False)
+    monkeypatch.setattr(app_session.sys, "platform", "darwin")
+    monkeypatch.setattr(app_session, "_MACOS_BROWSER_PATHS", (chrome, edge))
 
     assert app_session._find_browser() == chrome
 
