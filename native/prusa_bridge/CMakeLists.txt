@@ -17,7 +17,14 @@ endif()
 # belong to this extension build.
 set(SLIC3R_GUI OFF CACHE BOOL "" FORCE)
 set(SLIC3R_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(SLIC3R_ENABLE_FORMAT_STEP OFF CACHE BOOL "" FORCE)
+# On macOS, libslic3r unconditionally links OCCTWrapper.  PrusaSlicer's
+# source tree only defines that target when STEP support is enabled, so keep
+# the minimal wrapper target available for the native bridge.
+if(APPLE)
+    set(SLIC3R_ENABLE_FORMAT_STEP ON CACHE BOOL "" FORCE)
+else()
+    set(SLIC3R_ENABLE_FORMAT_STEP OFF CACHE BOOL "" FORCE)
+endif()
 
 add_subdirectory("${PRUSA_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/PrusaSlicer")
 
