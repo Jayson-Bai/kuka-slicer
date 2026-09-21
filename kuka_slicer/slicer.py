@@ -1125,16 +1125,30 @@ def normalize_job_xy_origin(
     *,
     target_xy: tuple[float, float] = (0.0, 0.0),
     reference_material: str | None = None,
+    reference_point: str = "min",
 ) -> tuple[float, float]:
-    """Translate all paths so a material bound's lower-left reaches target_xy."""
+    """Translate all paths so a material reference point reaches ``target_xy``.
+
+    ``min`` retains the historical lower-left behavior.  Core jobs can use
+    ``center`` for parts whose local origin is their XY center, so the UI
+    position is measured from the print-plane origin rather than a bounding
+    box corner.
+    """
 
     bounds = _job_xy_bounds(job, material=reference_material)
     if bounds is None:
         return (0.0, 0.0)
-    min_x, min_y, _, _ = bounds
+    min_x, min_y, max_x, max_y = bounds
+    if reference_point == "center":
+        reference_x = (min_x + max_x) * 0.5
+        reference_y = (min_y + max_y) * 0.5
+    elif reference_point == "min":
+        reference_x, reference_y = min_x, min_y
+    else:
+        raise ValueError("reference_point must be 'min' or 'center'")
     target_x, target_y = (float(target_xy[0]), float(target_xy[1]))
-    translation_x = target_x - min_x
-    translation_y = target_y - min_y
+    translation_x = target_x - reference_x
+    translation_y = target_y - reference_y
     if abs(translation_x) <= 1e-7 and abs(translation_y) <= 1e-7:
         return (0.0, 0.0)
 
@@ -1151,6 +1165,9 @@ def normalize_job_xy_origin(
         "applied": True,
         "source_min_x": float(min_x),
         "source_min_y": float(min_y),
+        "source_reference_x": float(reference_x),
+        "source_reference_y": float(reference_y),
+        "reference_point": reference_point,
         "target_x": target_x,
         "target_y": target_y,
         "translation_x": float(translation_x),

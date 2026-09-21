@@ -12,6 +12,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -33,6 +34,7 @@ from .external_npz import (
 from .cpu_limiter import limit_slicer_task
 from .conformal_lattice.contracts import load_conformal_lattice_spec
 from .fiber_interlayers import plan_flat_resin_interlayers
+from .fiber_travel import plan_fiber_interpath_travels
 from .gcode_legacy_postprocess import apply_legacy_resin_optimization
 from .honeycomb_pathing import HoneycombPathingConfig
 
@@ -286,6 +288,41 @@ def _core_output_download_path(core_npz_path: Path) -> Path:
     return package_path
 
 
+def _core_download_filename(*, is_surface: bool, honeycomb_cell_size_mm: float | None) -> str:
+    """Build the user-facing Core download name.
+
+    Windows does not allow ``/`` in filenames, so the requested month/day
+    portion uses a hyphen separator.  ``无蜂窝`` is explicit for ordinary
+    planar exports that do not carry a conformal honeycomb cell size.
+    """
+
+    date_part = datetime.now().strftime("%m-%d")
+    surface_part = "曲面" if is_surface else "平面"
+    if honeycomb_cell_size_mm is not None and math.isfinite(float(honeycomb_cell_size_mm)):
+        cell_part = f"{float(honeycomb_cell_size_mm):g}mm"
+    else:
+        cell_part = "无蜂窝"
+    return f"{date_part}-{surface_part}-{cell_part}.npz"
+
+
+def _materialize_core_download(
+    download_path: Path,
+    job_dir: Path,
+    *,
+    is_surface: bool,
+    honeycomb_cell_size_mm: float | None,
+) -> Path:
+    """Expose the Core artifact under the stable, user-facing filename."""
+
+    target = job_dir / _core_download_filename(
+        is_surface=is_surface,
+        honeycomb_cell_size_mm=honeycomb_cell_size_mm,
+    )
+    if target != download_path:
+        shutil.copyfile(download_path, target)
+    return target
+
+
 def _conformal_debug_download_path(outputs: dict[str, Path], job_dir: Path) -> Path:
     """Package optional conformal intermediates without making them Core input.
 
@@ -526,7 +563,14 @@ def _planning_mesh_for_gcode_source(mesh, config: SliceConfig):
     return orient_mesh_for_build_axis(mesh, config.build_axis)
 
 
-def _preview_payload_from_core_source_job(mesh, config: SliceConfig, source_job) -> dict[str, object]:
+def _preview_payload_from_core_source_job(
+    mesh,
+    config: SliceConfig,
+    source_job,
+    *,
+    hide_startup_source_travel: bool = False,
+    hide_initial_prusa_travel: bool = False,
+) -> dict[str, object]:
     """Render the exact G-code SourceJob that is handed to Core."""
 
     material_paths = []
@@ -556,12 +600,18 @@ def _preview_payload_from_core_source_job(mesh, config: SliceConfig, source_job)
         mesh,
         config,
         ExternalSourceJob(material_paths=material_paths, travel_paths=travel_paths, meta=source_job.meta),
+        hide_startup_source_travel=hide_startup_source_travel,
+        hide_initial_prusa_travel=hide_initial_prusa_travel,
     )
 
 
 def _preview_payload_from_final_core_npz(
     core_npz_path: Path,
     config: SliceConfig,
+    *,
+    primeline_enabled: bool = False,
+    primeline_origin: tuple[float, float] | None = None,
+    primeline_length_mm: float = 0.0,
 ) -> dict[str, object]:
     """Build the browser payload from the final Core NPZ, never from its source.
 
@@ -591,6 +641,10 @@ def _preview_payload_from_final_core_npz(
     source_preview_points = 0
     display_preview_points = 0
     order = 0
+    # Candidate runs locate the Primeline that Core placed in the final NPZ.
+    # The preview replaces only that run with the configured canonical path:
+    # from the configured start point along global +X for its fixed length.
+    primeline_candidates: list[tuple[float, int, int, int, np.ndarray]] = []
 
     for path in _final_core_npz_parts(core_npz_path):
         with np.load(path, allow_pickle=False) as data:
@@ -704,7 +758,53 @@ def _preview_payload_from_final_core_npz(
             has_tool_orientation = has_tool_orientation or include_abc
             print_codes = _core_move_type_codes(data)
             is_print = np.isin(move_type, list(print_codes))
-
+            if (
+                primeline_enabled
+                and primeline_origin is not None
+                and float(primeline_length_mm) > 1e-6
+            ):
+                # Do not draw a requested straight line here.  Instead find a
+                # contiguous PRINT run that is already present in the NPZ and
+                # ends at the configured Primeline endpoint.  This preserves
+                # Core's real sampled/smoothed points, even when Core merges
+                # the Primeline and the next source path under one path_id.
+                x0, y0 = (float(primeline_origin[0]), float(primeline_origin[1]))
+                expected_endpoint = np.array(
+                    [x0 + float(primeline_length_mm), y0], dtype=np.float64
+                )
+                candidate_indices = np.flatnonzero(valid & is_print & (tool_id != 1))
+                run_start = 0
+                while run_start < len(candidate_indices):
+                    run_end = run_start + 1
+                    first_index = int(candidate_indices[run_start])
+                    while run_end < len(candidate_indices):
+                        previous = int(candidate_indices[run_end - 1])
+                        current = int(candidate_indices[run_end])
+                        if (
+                            current != previous + 1
+                            or layer[current] != layer[first_index]
+                            or path_id[current] != path_id[first_index]
+                        ):
+                            break
+                        run_end += 1
+                    run = candidate_indices[run_start:run_end]
+                    if len(run) >= 2:
+                        endpoint = np.array([x[run[-1]], y[run[-1]]], dtype=np.float64)
+                        endpoint_error = float(np.linalg.norm(endpoint - expected_endpoint))
+                        if endpoint_error <= 1.0:
+                            columns = [x[run], y[run], z[run]]
+                            if include_abc:
+                                columns.extend((a[run], b[run], c[run]))
+                            primeline_candidates.append(
+                                (
+                                    endpoint_error,
+                                    -len(run),
+                                    int(layer[first_index]),
+                                    int(path_id[first_index]),
+                                    np.column_stack(columns),
+                                )
+                            )
+                    run_start = run_end
             indices = np.flatnonzero(valid)
             start = 0
             while start < len(indices):
@@ -760,7 +860,7 @@ def _preview_payload_from_final_core_npz(
                         has_curved_deposition = True
                     segment_extrusion = (
                         extrusion[segment_indices]
-                        if role == "final_resin" and extrusion is not None
+                        if role in {"final_resin", "primeline"} and extrusion is not None
                         else None
                     )
                     mandatory = _preview_mandatory_indices(
@@ -806,6 +906,87 @@ def _preview_payload_from_final_core_npz(
     all_entries = [entry for entries in entries_by_layer.values() for entry in entries]
     if not all_entries:
         raise ValueError("final Core NPZ contains no displayable trajectory rows")
+    if (
+        primeline_enabled
+        and primeline_origin is not None
+        and float(primeline_length_mm) > 1e-6
+    ):
+        candidate_layer = min(entries_by_layer)
+        candidate_path_id: int | None = None
+        z_level = float(bounds["min_z"] or 0.0)
+        if primeline_candidates:
+            _, _, candidate_layer, candidate_path_id, candidate_points = min(
+                primeline_candidates,
+                key=lambda item: (item[0], item[1]),
+            )
+            # The original Core run is already represented as final_resin.
+            # Replace it in the browser payload so it is shown once, with the
+            # configured start coordinate and +X direction.
+            entries_by_layer[candidate_layer] = [
+                entry
+                for entry in entries_by_layer.get(candidate_layer, [])
+                if not (
+                    entry["role"] == "final_resin"
+                    and int(entry["path_id"]) == candidate_path_id
+                )
+            ]
+            z_level = float(candidate_points[-1, 2])
+        x0, y0 = float(primeline_origin[0]), float(primeline_origin[1])
+        primeline_start = [x0, y0, z_level]
+        primeline_end = [x0 + float(primeline_length_mm), y0, z_level]
+        # Preserve the execution order around the first-layer Primeline.
+        # The start travel is explicit because its old Core PRINT run has
+        # been removed from this display payload.
+        if math.hypot(x0, y0) > 1e-6:
+            entries_by_layer.setdefault(candidate_layer, []).append(
+                {
+                    "kind": "travel",
+                    "role": "travel",
+                    "points": [[0.0, 0.0, z_level], primeline_start],
+                    "path_id": -1,
+                    "order": -2,
+                }
+            )
+        entries_by_layer.setdefault(candidate_layer, []).append(
+            {
+                "kind": "deposit",
+                "role": "final_resin",
+                "points": [primeline_start, primeline_end],
+                "path_id": candidate_path_id if candidate_path_id is not None else -1,
+                "order": -1,
+            }
+        )
+        # Core normally supplies the outbound travel after the Primeline.
+        # When that run is absent from an imported final NPZ, add the direct
+        # display travel to the first formal resin path so the preview remains
+        # continuous and has no implied deposited connector.
+        layer_entries = entries_by_layer[candidate_layer]
+        has_outbound_travel = any(
+            entry["role"] == "travel"
+            and len(entry["points"]) >= 2
+            and math.dist(entry["points"][0][:2], primeline_end[:2]) <= 0.25
+            for entry in layer_entries
+        )
+        formal_resin_entries = [
+            entry
+            for entry in layer_entries
+            if entry["role"] == "final_resin" and int(entry["order"]) >= 0
+        ]
+        if not has_outbound_travel and formal_resin_entries:
+            first_formal = min(formal_resin_entries, key=lambda entry: int(entry["order"]))
+            first_formal_start = first_formal["points"][0]
+            layer_entries.append(
+                {
+                    "kind": "travel",
+                    "role": "travel",
+                    "points": [primeline_end, first_formal_start],
+                    "path_id": -1,
+                    "order": int(first_formal["order"]) - 0.5,
+                }
+            )
+        _expand_bounds(bounds, x0, y0, z_level)
+        _expand_bounds(bounds, x0 + float(primeline_length_mm), y0, z_level)
+
     layers = []
     for layer_index in sorted(entries_by_layer):
         entries = entries_by_layer[layer_index]
@@ -839,9 +1020,27 @@ def _preview_payload_from_final_core_npz(
         if config.slicing_kernel != "legacy" or config.planning_line_width is None
         else config.planning_line_width
     )
+    # The part origin is an explicit Core parameter: it is the geometric
+    # center of the part in print-plane coordinates.  Do not infer it from
+    # final PRINT rows because the same NPZ also contains Primeline and other
+    # startup paths, which would shift the marker away from the requested
+    # part placement.
+    part_origin = [float(config.start_x_mm), float(config.start_y_mm)]
+    if bounds["min_x"] is not None:
+        _expand_bounds(bounds, part_origin[0], part_origin[1], float(bounds["min_z"] or 0.0))
+        bounds["min_x"] = min(float(bounds["min_x"]), 0.0)
+        bounds["max_x"] = max(float(bounds["max_x"]), 0.0)
+        bounds["min_y"] = min(float(bounds["min_y"]), 0.0)
+        bounds["max_y"] = max(float(bounds["max_y"]), 0.0)
     return {
         "bounds": bounds,
         "origin": [0.0, 0.0],
+        "part_origin": part_origin,
+        "primeline_origin": (
+            [float(primeline_origin[0]), float(primeline_origin[1])]
+            if primeline_enabled and primeline_origin is not None
+            else None
+        ),
         "geometry_mode": "surface_3d" if has_curved_deposition else "planar_2d",
         "tool_orientation": {
             "available": has_tool_orientation,
@@ -892,6 +1091,7 @@ def _core_preview_overlay_from_commands(
         "primeline_paths": [],
         "core_travel_paths": [],
         "layer_lift_paths": [],
+        "primeline_origin": None,
         "sequence": [],
     }
     primeline_paths = overlay["primeline_paths"]
@@ -905,10 +1105,12 @@ def _core_preview_overlay_from_commands(
         layer = int(getattr(command, "layer", 0))
         raw = getattr(command, "raw", None)
         subtype = getattr(command, "subtype", None)
-        if raw in {"external_npz_start_xy_travel", "external_npz_prusa_travel"}:
-            if raw == "external_npz_start_xy_travel" or previous_prusa_travel_layer != layer:
+        if raw == "external_npz_start_xy_travel":
+            previous_prusa_travel_layer = None
+        elif raw == "external_npz_prusa_travel":
+            if previous_prusa_travel_layer != layer:
                 resin_base_counts[layer] = resin_base_counts.get(layer, 0) + 1
-            previous_prusa_travel_layer = layer if raw == "external_npz_prusa_travel" else None
+            previous_prusa_travel_layer = layer
         elif getattr(command, "type", None) == "PRINT":
             previous_prusa_travel_layer = None
             if subtype != "FIBER_PRINT" and raw != "external_npz_primeline":
@@ -930,17 +1132,41 @@ def _core_preview_overlay_from_commands(
         raw = getattr(command, "raw", None)
         layer = int(getattr(command, "layer", 0))
         subtype = getattr(command, "subtype", None)
-        if raw == "external_npz_primeline":
+        if raw == "external_npz_start_xy_travel":
             points = [
                 _preview_position(getattr(command, "start_pos"), xy_offset),
-                *[
-                    _preview_position(point, xy_offset)
-                    for point in getattr(command, "control_points", [])
-                ],
+                _preview_position(getattr(command, "pos"), xy_offset),
             ]
+            core_travel_paths.append({"layer": layer, "points": points})
+            sequence.append(
+                {
+                    "layer": layer,
+                    "kind": "travel",
+                    "role": "core_travel",
+                    "points": points,
+                    "anchor": display_index(layer),
+                    "order": sequence_order,
+                }
+            )
+            previous_prusa_travel_layer = None
+        elif raw == "external_npz_primeline":
+            end_point = getattr(command, "pos", None)
+            control_points = getattr(command, "control_points", None)
+            points = [
+                _preview_position(getattr(command, "start_pos"), xy_offset),
+                *[_preview_position(point, xy_offset) for point in (control_points or [])],
+            ]
+            # The source converter represents a Primeline as ordinary
+            # MoveCommands (Core owns the later spline fitting), so those
+            # commands do not have ``control_points``.  Keep their endpoint
+            # visible in the source preview as a straight Primeline segment.
+            if len(points) == 1 and end_point is not None:
+                points.append(_preview_position(end_point, xy_offset))
             if len(points) >= 2:
                 item = {"layer": layer, "points": points}
                 primeline_paths.append(item)
+                if overlay["primeline_origin"] is None:
+                    overlay["primeline_origin"] = [points[0][0], points[0][1]]
                 sequence.append(
                     {
                         "layer": layer,
@@ -972,10 +1198,10 @@ def _core_preview_overlay_from_commands(
                     "order": sequence_order,
                 }
             )
-        elif raw in {"external_npz_start_xy_travel", "external_npz_prusa_travel"}:
-            if raw == "external_npz_start_xy_travel" or previous_prusa_travel_layer != layer:
+        elif raw == "external_npz_prusa_travel":
+            if previous_prusa_travel_layer != layer:
                 source_index[layer] = source_index.get(layer, 0) + 1
-            previous_prusa_travel_layer = layer if raw == "external_npz_prusa_travel" else None
+            previous_prusa_travel_layer = layer
         elif getattr(command, "type", None) == "PRINT":
             previous_prusa_travel_layer = None
             if subtype == "FIBER_PRINT":
@@ -1711,8 +1937,14 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         npz_path = job_dir / f"{Path(filename).stem}_source.npz"
         stl_path.write_bytes(stl_bytes)
 
+        fiber_json_name = None
+        fiber_template_paths: list[list[list[float]]] = []
         if "fiber_json" in files:
-            raise ValueError("旧版纤维路径 JSON 已停用，等待新的纤维铺设策略接入")
+            fiber_filename, fiber_bytes = files["fiber_json"]
+            fiber_json_name = _safe_filename(fiber_filename or "fiber_paths.json")
+            fiber_json_path = job_dir / fiber_json_name
+            fiber_json_path.write_bytes(fiber_bytes)
+            fiber_template_paths = load_fiber_template_json(fiber_json_path)
 
         mesh = load_stl(stl_path)
         progress(8, "正在准备 Prusa 路径")
@@ -1756,13 +1988,55 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         if isinstance(slicing_meta, dict):
             slicing_meta["resolved_config"] = resolved_config
         fiber_preview_paths = {}
+        fiber_travel_paths = {}
+        if fiber_template_paths:
+            # Keep the historical ordinary-slicer contract: align the JSON
+            # in the unnormalized resin frame, expand one course between
+            # resin layers, route only its inter-path travels, then attach
+            # the same geometry to both preview and Core SourceJob.
+            fiber_template_paths = align_fiber_template_paths_to_resin(
+                job,
+                fiber_template_paths,
+            )
+            fiber_preview_paths = expand_fiber_template_for_resin_layers(
+                job, fiber_template_paths
+            )
+            fiber_travel_paths = plan_fiber_interpath_travels(
+                mesh,
+                config,
+                fiber_preview_paths,
+                reference_z_by_layer=job.meta.get("fiber_interpath_reference_z_mm"),
+            )
+            merge_fiber_paths_into_job(
+                job,
+                fiber_preview_paths,
+                fiber_travel_paths,
+            )
+            if core_source_job is not None and source_gcode_module is not None:
+                core_source_job = source_gcode_module.with_fiber_paths(
+                    core_source_job,
+                    fiber_preview_paths,
+                    fiber_travel_paths_by_layer=fiber_travel_paths,
+                )
         if raft_layers:
             z_shift = add_raft_to_job(job, mesh, config, raft_layers, DEFAULT_RAFT_TOP_GAP_MM)
-        normalize_job_xy_origin(
+            fiber_preview_paths = _shift_fiber_preview_paths(
+                fiber_preview_paths,
+                len(raft_layers),
+                z_shift,
+            )
+        xy_translation = normalize_job_xy_origin(
             job,
             target_xy=(float(config.start_x_mm), float(config.start_y_mm)),
             reference_material="R",
+            reference_point="center",
         )
+        # The Core converter must preserve this already translated print-plane
+        # frame.  It is not a source-NPZ frame whose lower-left is remapped.
+        job.meta["core_input_frame"] = "print_plane"
+        if core_source_job is not None:
+            _translate_source_gcode_job_xy(core_source_job, xy_translation)
+            core_source_job.meta["core_input_frame"] = "print_plane"
         primeline_enabled = _bool_param(params, "core_primeline_enabled", True)
         if slicing_kernel == "prusa":
             _prepend_prusa_startup_travel(
@@ -1770,9 +2044,10 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                 start_xy=(float(config.start_x_mm), float(config.start_y_mm)),
                 primeline_enabled=primeline_enabled,
                 primeline_xy=(
-                    _float_param(params, "core_primeline_x_mm", 0.0),
-                    _float_param(params, "core_primeline_y_mm", -10.0),
+                    _core_xy_param(params, "core_primeline_position_x", 0.0),
+                    _core_xy_param(params, "core_primeline_position_y", -10.0),
                 ),
+                return_xy=(float(config.start_x_mm), float(config.start_y_mm)),
             )
             if core_source_job is not None and source_gcode_module is not None:
                 core_source_job = source_gcode_module.prepend_prusa_startup_travel(
@@ -1780,9 +2055,10 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                     start_xy=(float(config.start_x_mm), float(config.start_y_mm)),
                     primeline_enabled=primeline_enabled,
                     primeline_xy=(
-                        _float_param(params, "core_primeline_x_mm", 0.0),
-                        _float_param(params, "core_primeline_y_mm", -10.0),
+                        _core_xy_param(params, "core_primeline_position_x", 0.0),
+                        _core_xy_param(params, "core_primeline_position_y", -10.0),
                     ),
+                    return_xy=(float(config.start_x_mm), float(config.start_y_mm)),
                 )
         fiber_preview_paths = _fiber_preview_paths_from_job(job)
         if core_source_job is None:
@@ -1805,6 +2081,10 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         core_params = _parse_core_process_params(params, process_params_module)
 
         core_npz_path = job_dir / f"{Path(filename).stem}_core.npz"
+        preview_commands = []
+
+        def capture_preview_commands(commands) -> None:
+            preview_commands.extend(commands)
 
         def core_progress(ratio: float) -> None:
             bounded = max(0.0, min(1.0, float(ratio)))
@@ -1820,6 +2100,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                 core_params,
                 progress_callback=core_progress,
                 chunk_size=5_000_000,
+                commands_callback=capture_preview_commands,
             )
         else:
             core_stats = export_runner.convert_source_job(
@@ -1829,6 +2110,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                 params=core_params,
                 progress_callback=core_progress,
                 chunk_size=5_000_000,
+                commands_callback=capture_preview_commands,
             )
         progress(98, "正在完成系统 NPZ 和时间元数据写入")
         # The browser is a source-trajectory inspector: it must show the
@@ -1837,11 +2119,39 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         # remains visibly routed around its avoidance vertices while Core
         # applies one zero-speed-endpoint profile to that complete route.
         preview = (
-            _preview_payload_from_core_source_job(mesh, config, core_source_job)
+            _preview_payload_from_core_source_job(
+                mesh,
+                config,
+                core_source_job,
+                hide_startup_source_travel=True,
+                hide_initial_prusa_travel=primeline_enabled,
+            )
             if core_source_job is not None
-            else _preview_payload(mesh, config, job, fiber_preview_paths)
+            else _preview_payload(
+                mesh,
+                config,
+                job,
+                fiber_preview_paths,
+                hide_startup_source_travel=True,
+                hide_initial_prusa_travel=primeline_enabled,
+            )
         )
+        if preview_commands:
+            # Primeline and Core travel are generated during command
+            # conversion, so add the exact command geometry to the source
+            # preview.  This keeps the overlay in the same print-plane frame
+            # as the translated part and makes the legend actionable.
+            preview["core_overlay"] = _core_preview_overlay_from_commands(
+                preview_commands,
+                xy_offset=(0.0, 0.0),
+            )
         download_path = _core_output_download_path(core_npz_path)
+        download_path = _materialize_core_download(
+            download_path,
+            job_dir,
+            is_surface=getattr(config, "curve_mode", "flat") == "sinusoidal",
+            honeycomb_cell_size_mm=None,
+        )
         return {
             "download_url": f"/outputs/{quote(stamp)}/{quote(download_path.name)}",
             "filename": download_path.name,
@@ -1849,7 +2159,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             "paths": path_count,
             "preview": preview,
             "recommendation": recommendation,
-            "fiber_json": None,
+            "fiber_json": fiber_json_name,
             "build_axis": build_axis,
             "slicing_kernel": config.slicing_kernel,
             "resolved_config": resolved_config,
@@ -1992,10 +2302,28 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             fiber_layer_height_mm=float(core_params.fiber.layer_height_mm),
             fiber_e_per_mm=float(core_params.fiber.e_per_mm()),
         )
+        normalize_job_xy_origin(
+            conformal_source_job,
+            target_xy=(float(core_params.start_x_mm), float(core_params.start_y_mm)),
+            reference_material="R",
+            reference_point="center",
+        )
+        conformal_source_job.meta["core_input_frame"] = "print_plane"
+        # Conformal XYZABC paths already carry their real per-point surface
+        # orientation.  The fallback ABC is therefore reserved for generated
+        # flat-reference moves (notably the first-layer primeline), which must
+        # remain at the calibrated flat pose regardless of the main-UI default.
+        conformal_core_params = replace(
+            core_params,
+            default_a=0.0,
+            default_b=0.0,
+            default_c=0.0,
+        )
         core_source_job = external_source_job_to_core_source_job(
             conformal_source_job,
-            default_abc=core_params.default_abc,
+            default_abc=conformal_core_params.default_abc,
         )
+        core_source_job.meta["core_input_frame"] = "print_plane"
         phase_timings["core_source_preparation_s"] = time.perf_counter() - phase_started_at
 
         export_runner = importlib.import_module("external_npz_preprocessor.export_runner")
@@ -2009,7 +2337,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             core_source_job,
             source_path=job_dir / source_filename,
             output_path=core_npz_path,
-            params=core_params,
+            params=conformal_core_params,
             progress_callback=core_progress,
             chunk_size=5_000_000,
             reuse_parallel_workers=True,
@@ -2022,10 +2350,30 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         phase_started_at = time.perf_counter()
         preview = _preview_payload_from_final_core_npz(
             core_npz_path,
-            SliceConfig(line_width=2.0),
+            SliceConfig(
+                line_width=2.0,
+                start_x_mm=float(core_params.start_x_mm),
+                start_y_mm=float(core_params.start_y_mm),
+            ),
+            primeline_enabled=bool(core_params.primeline_enabled),
+            primeline_origin=(
+                float(core_params.primeline_x_mm),
+                float(core_params.primeline_y_mm),
+            ),
+            primeline_length_mm=float(core_params.primeline_length_mm),
         )
+        if preview.get("primeline_origin") is not None:
+            preview["core_overlay"] = {
+                "primeline_origin": preview["primeline_origin"],
+            }
         phase_timings["preview_s"] = time.perf_counter() - phase_started_at
         download_path = _core_output_download_path(core_npz_path)
+        download_path = _materialize_core_download(
+            download_path,
+            job_dir,
+            is_surface=True,
+            honeycomb_cell_size_mm=float(spec.lattice["base_cell_size_mm"]),
+        )
         path_count = sum(len(group.paths) for group in conformal_source_job.material_paths)
         result: dict[str, object] = {
             "download_url": f"/outputs/{quote(stamp)}/{quote(download_path.name)}",
@@ -2151,7 +2499,16 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             core_form_values = _coerce_form_params(core_values)
             params = _parse_core_process_params(core_form_values, process_module)
             prusa_values = raw.get("prusa", {})
-            if isinstance(prusa_values, dict):
+            # ``start_x_mm``/``start_y_mm`` now belong to the Core part-origin
+            # fields.  Older browsers still submit the retired Prusa aliases;
+            # only use those aliases when the new Core fields are absent, so
+            # a stale hidden Prusa value cannot overwrite the user's 60/85
+            # placement while settings are being persisted.
+            has_core_part_position = (
+                "core_part_position_x" in core_form_values
+                or "core_part_position_y" in core_form_values
+            )
+            if isinstance(prusa_values, dict) and not has_core_part_position:
                 existing = _load_core_print_params()
                 start_x = prusa_values.get("prusa_start_x_mm", existing.start_x_mm)
                 start_y = prusa_values.get("prusa_start_y_mm", existing.start_y_mm)
@@ -2178,7 +2535,16 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         data = target.read_bytes()
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/octet-stream")
-        self.send_header("Content-Disposition", f'attachment; filename="{html.escape(target.name)}"')
+        # ``send_header`` writes Latin-1 bytes.  Keep an ASCII fallback for
+        # legacy clients and carry the real Chinese filename via RFC 5987;
+        # putting the Unicode name directly in ``filename`` closes the local
+        # connection with ``ERR_EMPTY_RESPONSE`` on Windows.
+        fallback_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", target.name) or "download.npz"
+        encoded_name = quote(target.name, safe="")
+        self.send_header(
+            "Content-Disposition",
+            f"attachment; filename=\"{fallback_name}\"; filename*=UTF-8''{encoded_name}",
+        )
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -2209,6 +2575,12 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
 def _float_param(params: dict[str, list[str]], name: str, default: float) -> float:
     raw = params.get(name, [str(default)])[0]
     return float(raw if raw != "" else default)
+
+
+def _core_xy_param(params: dict[str, list[str]], name: str, default: float) -> float:
+    """Read a Core XY field from the current UI name and old ``_mm`` alias."""
+
+    return _float_param(params, name, _float_param(params, f"{name}_mm", default))
 
 
 def _optional_float_param(params: dict[str, list[str]], name: str) -> float | None:
@@ -2357,11 +2729,19 @@ def _parse_core_process_params(
         # is written. Pass the same placement into Core so the converter's
         # source-minimum normalization preserves the requested machine frame
         # instead of translating the material paths back to (0, 0).
-        start_x_mm=_float_param(params, "prusa_start_x_mm", defaults.start_x_mm),
-        start_y_mm=_float_param(params, "prusa_start_y_mm", defaults.start_y_mm),
+        start_x_mm=_core_xy_param(
+            params,
+            "core_part_position_x",
+            _float_param(params, "prusa_start_x_mm", defaults.start_x_mm),
+        ),
+        start_y_mm=_core_xy_param(
+            params,
+            "core_part_position_y",
+            _float_param(params, "prusa_start_y_mm", defaults.start_y_mm),
+        ),
         primeline_enabled=_bool_param(params, "core_primeline_enabled", defaults.primeline_enabled),
-        primeline_x_mm=_float_param(params, "core_primeline_x_mm", defaults.primeline_x_mm),
-        primeline_y_mm=_float_param(params, "core_primeline_y_mm", defaults.primeline_y_mm),
+        primeline_x_mm=_core_xy_param(params, "core_primeline_position_x", 0.0),
+        primeline_y_mm=_core_xy_param(params, "core_primeline_position_y", -10.0),
         primeline_length_mm=_float_param(params, "core_primeline_length", defaults.primeline_length_mm),
         prime_settle_s=_float_param(params, "core_prime_settle", defaults.prime_settle_s),
         dt=_float_param(params, "core_dt", defaults.dt),
@@ -2386,12 +2766,38 @@ def _parse_core_process_params(
     )
 
 
+def _translate_source_gcode_job_xy(source_job, translation: tuple[float, float]) -> None:
+    """Apply the slicer's part placement to the native-G-code SourceJob.
+
+    The Prusa preview job and the native G-code bridge are two representations
+    of the same paths.  They must remain in the same print-plane frame before
+    the Core startup/Primeline commands are added.
+    """
+
+    dx, dy = (float(translation[0]), float(translation[1]))
+    if abs(dx) <= 1e-12 and abs(dy) <= 1e-12:
+        return
+    for layer in getattr(source_job, "layers", []):
+        for path_group in (
+            getattr(layer, "resin_paths", []),
+            getattr(layer, "fiber_paths", []),
+            getattr(layer, "travel_paths", []),
+        ):
+            for path in path_group:
+                points = getattr(path, "points", None)
+                if points is None:
+                    continue
+                points[:, 0] += dx
+                points[:, 1] += dy
+
+
 def _prepend_prusa_startup_travel(
     job,
     *,
     start_xy: tuple[float, float],
     primeline_enabled: bool,
     primeline_xy: tuple[float, float],
+    return_xy: tuple[float, float],
 ) -> None:
     """Add the user-visible origin-to-first-motion travel to the Prusa source job."""
 
@@ -2412,8 +2818,8 @@ def _prepend_prusa_startup_travel(
     if primeline_enabled:
         target = np.array(
             [
-                float(start_xy[0]) + float(primeline_xy[0]),
-                float(start_xy[1]) + float(primeline_xy[1]),
+                float(primeline_xy[0]),
+                float(primeline_xy[1]),
                 first_z,
             ],
             dtype=np.float64,
@@ -2423,14 +2829,26 @@ def _prepend_prusa_startup_travel(
     else:
         target = np.asarray(first_material.paths[0][0, :3], dtype=np.float64)
     start = np.array([0.0, 0.0, target[2]], dtype=np.float64)
-    if float(np.linalg.norm(target - start)) <= 1e-7:
+    return_target = (
+        np.array([float(return_xy[0]), float(return_xy[1]), first_z], dtype=np.float64)
+        if primeline_enabled
+        else None
+    )
+    if (
+        float(np.linalg.norm(target - start)) <= 1e-7
+        and (return_target is None or float(np.linalg.norm(return_target - target)) <= 1e-7)
+    ):
         return
     startup = np.vstack((start, target))
+    injected_travels = [startup]
+    if return_target is not None:
+        injected_travels.append(np.vstack((target, return_target)))
     if first_layer_travel is None:
         first_layer_travel = TravelPaths(first_layer_index, [])
         job.travel_paths.insert(0, first_layer_travel)
-    first_layer_travel.paths.insert(0, startup)
+    first_layer_travel.paths[0:0] = injected_travels
     job.meta["startup_travel_count"] = 1
+    job.meta["preview_startup_travel_count"] = len(injected_travels)
     job.meta["startup_travel_source_frame"] = "normalized_prusa"
     motion_order = job.meta.get("motion_order")
     if isinstance(motion_order, dict):
@@ -2439,11 +2857,19 @@ def _prepend_prusa_startup_travel(
             shifted = []
             for record in records:
                 if isinstance(record, dict) and record.get("kind") == "travel":
-                    shifted.append({**record, "index": int(record.get("index", 0)) + 1})
+                    shifted.append(
+                        {
+                            **record,
+                            "index": int(record.get("index", 0)) + len(injected_travels),
+                        }
+                    )
                 else:
                     shifted.append(record)
             motion_order[str(first_layer_index)] = [
-                {"kind": "travel", "index": 0},
+                *(
+                    {"kind": "travel", "index": index}
+                    for index in range(len(injected_travels))
+                ),
                 *shifted,
             ]
 
@@ -2558,8 +2984,16 @@ def _parse_prusa_slice_config(
         brim_type=params.get("prusa_brim_type", ["outer_only"])[0],  # type: ignore[arg-type]
         brim_separation_mm=_float_param(params, "prusa_brim_separation", 0.0),
         brim_one_stroke=_bool_param(params, "prusa_brim_one_stroke", False),
-        start_x_mm=_float_param(params, "prusa_start_x_mm", 0.0),
-        start_y_mm=_float_param(params, "prusa_start_y_mm", 0.0),
+        start_x_mm=_core_xy_param(
+            params,
+            "core_part_position_x",
+            _float_param(params, "prusa_start_x_mm", 0.0),
+        ),
+        start_y_mm=_core_xy_param(
+            params,
+            "core_part_position_y",
+            _float_param(params, "prusa_start_y_mm", 0.0),
+        ),
     )
 
 
@@ -3158,6 +3592,7 @@ def _preview_payload(
     job,
     fiber_paths_by_layer: dict[int, list[list[list[float]]]] | None = None,
     *,
+    hide_startup_source_travel: bool = False,
     hide_initial_prusa_travel: bool = False,
 ) -> dict[str, object]:
     layers_by_index: dict[int, dict[str, object]] = {}
@@ -3198,6 +3633,13 @@ def _preview_payload(
         startup_travel_count = max(0, int(job.meta.get("startup_travel_count", 0)))
     except (TypeError, ValueError):
         startup_travel_count = 0
+    try:
+        preview_startup_travel_count = max(
+            startup_travel_count,
+            int(job.meta.get("preview_startup_travel_count", startup_travel_count)),
+        )
+    except (TypeError, ValueError):
+        preview_startup_travel_count = startup_travel_count
 
     for layer_index in sorted(layer_indices):
         resin_paths: list[dict[str, object]] = []
@@ -3271,7 +3713,15 @@ def _preview_payload(
                 [_serialize_preview_point(point) for point in path]
                 for path in group.paths
             )
-        for travel_path in serialized_travel_paths:
+        hidden_travel_indices: set[int] = set()
+        if layer_index == first_material_layer and preview_startup_travel_count > 0:
+            if hide_startup_source_travel:
+                hidden_travel_indices.update(range(preview_startup_travel_count))
+            if hide_initial_prusa_travel:
+                hidden_travel_indices.add(preview_startup_travel_count)
+        for travel_index, travel_path in enumerate(serialized_travel_paths):
+            if travel_index in hidden_travel_indices:
+                continue
             for point in travel_path:
                 _expand_bounds(bounds, point[0], point[1], point[2])
 
@@ -3305,11 +3755,7 @@ def _preview_payload(
                         }
                     )
                 elif kind == "travel" and 0 <= index < len(serialized_travel_paths):
-                    if (
-                        hide_initial_prusa_travel
-                        and layer_index == first_material_layer
-                        and index == startup_travel_count
-                    ):
+                    if index in hidden_travel_indices:
                         continue
                     motion_paths.append(
                         {"kind": "travel", "points": serialized_travel_paths[index]}
@@ -3333,11 +3779,7 @@ def _preview_payload(
                 for path in resin_paths
             )
             for travel_index, path in enumerate(serialized_travel_paths):
-                if (
-                    hide_initial_prusa_travel
-                    and layer_index == first_material_layer
-                    and travel_index == startup_travel_count
-                ):
+                if travel_index in hidden_travel_indices:
                     continue
                 motion_paths.append({"kind": "travel", "points": path})
 
@@ -3345,7 +3787,11 @@ def _preview_payload(
             "index": layer_index,
             "resin_paths": resin_paths,
             "fiber_paths": serialized_fiber_paths,
-            "travel_paths": serialized_travel_paths,
+            "travel_paths": [
+                path
+                for travel_index, path in enumerate(serialized_travel_paths)
+                if travel_index not in hidden_travel_indices
+            ],
             "motion_paths": motion_paths,
         }
 
@@ -3354,9 +3800,18 @@ def _preview_payload(
         if config.slicing_kernel != "legacy" or config.planning_line_width is None
         else config.planning_line_width
     )
+    if bounds["min_x"] is not None:
+        bounds["min_x"] = min(float(bounds["min_x"]), 0.0)
+        bounds["max_x"] = max(float(bounds["max_x"]), 0.0)
+        bounds["min_y"] = min(float(bounds["min_y"]), 0.0)
+        bounds["max_y"] = max(float(bounds["max_y"]), 0.0)
+    part_origin = [float(config.start_x_mm), float(config.start_y_mm)]
+    if bounds["min_x"] is not None:
+        _expand_bounds(bounds, part_origin[0], part_origin[1], float(bounds["min_z"] or 0.0))
     return {
         "bounds": bounds,
         "origin": [0.0, 0.0],
+        "part_origin": part_origin,
         # A flat job may span many layers in Z.  The view changes only when a
         # depositing path itself varies in Z, which is the signature of a
         # mapped surface rather than ordinary planar slicing.
@@ -3937,7 +4392,7 @@ def _index_html() -> str:
     }}
     .surfaceToolGroups {{
       display: grid;
-      grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
+      grid-template-columns: minmax(520px, 1.6fr) minmax(290px, 0.9fr);
       gap: var(--space-3);
       align-items: start;
     }}
@@ -3948,6 +4403,33 @@ def _index_html() -> str:
       gap: 6px;
       align-items: center;
     }}
+    .surfaceToolGroup[aria-label="共形蜂窝流程"] {{
+      display: grid;
+      grid-template-columns: repeat(4, max-content);
+      flex-wrap: nowrap;
+      overflow: visible;
+      align-items: center;
+    }}
+    .surfaceToolGroup[aria-label="共形蜂窝流程"] .surfaceToolGroupLabel {{
+      grid-column: 1 / -1;
+    }}
+    .surfaceToolGroup #coreProcessSettings {{
+      margin-top: 0;
+      padding-top: 0;
+      border-top: 0;
+    }}
+    .surfaceToolGroup #coreSettingsToolbarHost {{
+      display: contents;
+    }}
+    .surfaceToolGroup #coreProcessSettings .advancedPopupTrigger {{
+      width: max-content;
+      min-height: 34px;
+      height: 34px;
+      box-sizing: border-box;
+      padding: 6px 10px;
+      font-size: 13px;
+      line-height: 20px;
+    }}
     .surfaceToolGroupLabel {{
       flex: 1 0 100%;
       color: var(--muted);
@@ -3957,6 +4439,8 @@ def _index_html() -> str:
     }}
     .surfaceToolButton {{
       min-height: 34px;
+      height: 34px;
+      box-sizing: border-box;
       padding: 6px 10px;
       border: 1px solid #8aa0b8;
       border-radius: var(--radius-sm);
@@ -3964,6 +4448,7 @@ def _index_html() -> str:
       background: #ffffff;
       font: inherit;
       font-size: 13px;
+      line-height: 20px;
       cursor: pointer;
     }}
     .surfaceToolButton:hover {{ background: #eef6ff; }}
@@ -4370,10 +4855,7 @@ def _index_html() -> str:
       text-align: left;
     }}
     .advancedPopupTrigger::after {{
-      content: '打开窗口';
-      margin-left: var(--space-1);
-      font-size: 11px;
-      font-weight: 600;
+      content: none;
     }}
     .advancedPopupTrigger:hover {{
       color: var(--accent-dark);
@@ -4428,8 +4910,8 @@ def _index_html() -> str:
     .advancedPopup.coreAdvancedPopup {{
       position: absolute;
       height: auto;
-      max-height: none;
-      overflow: visible;
+      max-height: calc(100vh - 24px);
+      overflow: hidden;
       transform: none;
     }}
     .advancedPopupHeader {{
@@ -4477,7 +4959,8 @@ def _index_html() -> str:
       padding: var(--space-4);
     }}
     .coreAdvancedPopup .advancedPopupBody {{
-      overflow: visible;
+      max-height: calc(100vh - 110px);
+      overflow: auto;
       padding: 10px 12px;
     }}
     .coreAdvancedPopup .coreMaterialColumns {{
@@ -4540,13 +5023,32 @@ def _index_html() -> str:
       font-variant-numeric: tabular-nums;
     }}
     .download {{
-      margin-top: var(--space-4);
+      margin-top: var(--space-2);
       display: none;
-      color: var(--accent-dark);
-      font-weight: 650;
+      align-items: center;
+      justify-content: center;
+      min-height: 38px;
+      padding: 8px 14px;
+      border: 1px solid var(--accent);
+      border-radius: var(--radius-sm);
+      background: var(--accent);
+      color: #fff;
+      font-weight: 700;
       text-decoration: none;
     }}
-    .download.visible {{ display: inline-block; }}
+    .download.visible {{ display: inline-flex; }}
+    .download:hover {{ background: var(--accent-dark); color: #fff; }}
+    .downloadActions {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--space-2);
+      margin-top: var(--space-3);
+    }}
+    .slicerDisclosure > summary {{
+      font-size: 18px;
+      font-weight: 750;
+    }}
+    .slicerDisclosure[open] > summary {{ margin-bottom: var(--space-4); }}
     .exportProgress {{
       display: none;
       grid-template-columns: auto minmax(160px, 1fr) auto;
@@ -4621,6 +5123,16 @@ def _index_html() -> str:
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: var(--space-4);
+      align-items: stretch;
+    }}
+    .viewerStack {{
+      display: grid;
+      grid-template-rows: repeat(2, minmax(0, 1fr));
+      gap: var(--space-4);
+      min-width: 0;
+    }}
+    .viewerStack > div {{
+      min-height: 38px;
     }}
     .viewerControls label {{
       margin-top: 0;
@@ -4641,11 +5153,18 @@ def _index_html() -> str:
       color: var(--muted);
     }}
     .pathPlaybackControls {{
-      margin-top: var(--space-2);
+      min-height: 100%;
+      height: 100%;
+      box-sizing: border-box;
       display: grid;
       grid-template-columns: auto auto minmax(110px, 1fr) auto;
       gap: var(--space-2);
       align-items: center;
+      align-content: center;
+      padding: 0 var(--space-3);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-sm);
+      background: var(--panel);
     }}
     .pathPlaybackControls button {{
       min-height: 30px;
@@ -4713,13 +5232,19 @@ def _index_html() -> str:
       height: 4px;
       background: repeating-linear-gradient(90deg, #c2410c 0 5px, transparent 5px 9px);
     }}
-    .primelineSwatch {{ background: #b91c1c; }}
     .originSwatch {{
       width: 10px;
       height: 10px;
       border: 2px solid #b91c1c;
       background: #ffffff;
       transform: rotate(45deg);
+    }}
+    .partOriginSwatch {{
+      width: 10px;
+      height: 10px;
+      border: 2px solid #047857;
+      border-radius: 50%;
+      background: #ecfdf5;
     }}
     .viewOptions {{
       margin-top: var(--space-3);
@@ -4843,6 +5368,8 @@ def _index_html() -> str:
       }}
       .summary {{ grid-template-columns: 1fr; }}
       .viewerControls {{ grid-template-columns: 1fr; }}
+      .viewerStack {{ gap: var(--space-3); }}
+      .pathPlaybackControls {{ min-height: 70px; }}
       .preview {{ height: 460px; min-height: 420px; }}
     }}
     @media (max-width: 520px) {{
@@ -4889,6 +5416,10 @@ def _index_html() -> str:
         <span class="brandEyebrow">KUKA 共形制造工作站</span>
         <h1>空间复合材料增材制造切片器</h1>
         <span class="coreRuntime" title="{html.escape(str(core_runtime['module_path']), quote=True)}">Core：{'仓库源码' if core_runtime['source'] == 'workspace' else '外部安装'} · {'三次样条优化已启用' if core_runtime['cubic_sampler_fast_path'] else '通用采样器'}</span>
+        <div class="downloadActions" aria-label="Core 导出文件">
+          <a id="download" class="download" href="#">下载 Core NPZ</a>
+          <a id="conformalDebugDownload" class="download" href="#">下载共形调试中间结果</a>
+        </div>
       </div>
       <div class="surfaceWorkspace">
         <div class="surfaceToolGroups">
@@ -4896,6 +5427,7 @@ def _index_html() -> str:
             <span class="surfaceToolGroupLabel">蜂窝结构</span>
             <button id="surfacePreviewButton" class="surfaceToolButton" type="button">打开设计器</button>
             <button id="conformalSpecButton" class="surfaceToolButton" type="button">导入设计 JSON</button>
+            <div id="coreSettingsToolbarHost"></div>
             <button id="conformalSliceButton" class="surfaceToolButton primary" type="button" disabled>生成并导入 Core</button>
             <button id="conformalDebugExportButton" class="surfaceToolButton quiet" type="button" aria-pressed="false">调试导出：关</button>
           </div>
@@ -4942,28 +5474,28 @@ def _index_html() -> str:
         <div class="metric"><span>输出</span><strong id="outputName">-</strong></div>
         <div class="metric"><span>实际填充策略</span><strong id="executedInfillPattern">-</strong></div>
       </div>
-      <a id="download" class="download" href="#">下载 Core NPZ</a>
-      <a id="conformalDebugDownload" class="download" href="#">下载共形调试中间结果</a>
       <div class="viewerControls">
-        <div>
-          <label for="layerSlider">层</label>
-          <div class="rangeRow">
-            <input id="layerSlider" type="range" min="0" max="0" value="0" disabled>
-            <output id="layerLabel">-</output>
+        <div class="viewerStack">
+          <div>
+            <label for="layerSlider">层</label>
+            <div class="rangeRow">
+              <input id="layerSlider" type="range" min="0" max="0" value="0" disabled>
+              <output id="layerLabel">-</output>
+            </div>
+          </div>
+          <div id="pathProgressControl">
+            <label for="pathProgressSlider">所选路径进度</label>
+            <div class="rangeRow">
+              <input id="pathProgressSlider" type="range" min="0" max="0" value="0" disabled>
+              <output id="pathProgressLabel">-</output>
+            </div>
           </div>
         </div>
-        <div id="pathProgressControl">
-          <label for="pathProgressSlider">所选路径进度</label>
-          <div class="rangeRow">
-            <input id="pathProgressSlider" type="range" min="0" max="0" value="0" disabled>
-            <output id="pathProgressLabel">-</output>
-          </div>
-          <div id="pathPlaybackControl" class="pathPlaybackControls" hidden>
-            <button id="playCurrentPath" type="button" disabled aria-pressed="false">播放当前路径</button>
-            <label for="pathPlaybackRate">播放速率</label>
-            <input id="pathPlaybackRate" type="range" min="0" max="1" step="0.05" value="1" aria-label="当前路径播放速率">
-            <output id="pathPlaybackRateLabel">1.00</output>
-          </div>
+        <div id="pathPlaybackControl" class="pathPlaybackControls" hidden>
+          <button id="playCurrentPath" type="button" disabled aria-pressed="false">播放当前路径</button>
+          <label for="pathPlaybackRate">播放速率</label>
+          <input id="pathPlaybackRate" type="range" min="0" max="10" step="0.05" value="1" aria-label="当前路径播放速率">
+          <output id="pathPlaybackRateLabel">1.00</output>
         </div>
       </div>
       <div class="legend" aria-label="预览图例">
@@ -4975,8 +5507,8 @@ def _index_html() -> str:
         <label class="legendItem"><input id="showFiberCutEvents" type="checkbox" checked><span class="swatch fiberCutSwatch"></span>纤维剪切点（CUT）</label>
         <label class="legendItem"><input id="showTravelPaths" type="checkbox" checked><span class="swatch travelSwatch"></span>空移 Travel</label>
         <label class="legendItem"><input id="showCoreTravelPaths" type="checkbox" checked><span class="swatch coreTravelSwatch"></span>Core 转场空走</label>
-        <label class="legendItem"><input id="showPrimeline" type="checkbox" checked><span class="swatch primelineSwatch"></span>Core Primeline</label>
         <span class="legendItem"><span class="swatch originSwatch"></span>打印平面原点 (0, 0)</span>
+        <span class="legendItem"><span class="swatch partOriginSwatch"></span>零件原点（形状中心）</span>
       </div>
       <div class="viewOptions" aria-label="显示选项">
         <label title="开启后同时绘制当前层及此前各层的完整路径；每层保留自身实际 Z 高度。"><input id="showLayerOverlay" type="checkbox">叠加层显示</label>
@@ -4992,8 +5524,10 @@ def _index_html() -> str:
     </section>
 
     <section class="panel">
-      <h2>模型切片</h2>
-      <form id="sliceForm">
+      <details id="slicerDisclosure" class="advancedSettings slicerDisclosure">
+        <summary>Prusa 平面切片与导出</summary>
+        <h2>模型切片</h2>
+        <form id="sliceForm">
         <div class="formSection inputBand" data-layout-band="input-layer">
           <div class="sectionTitleRow">
             <h3>输入与分层</h3>
@@ -5005,8 +5539,8 @@ def _index_html() -> str:
               <input id="stlFile" name="stlFile" type="file" accept=".stl" required>
             </div>
             <div class="fieldGroup span-4">
-              <label for="fiberJsonFile">纤维路径 JSON（待接入）</label>
-              <input id="fiberJsonFile" name="fiberJsonFile" type="file" accept=".json,application/json" disabled>
+              <label for="fiberJsonFile">纤维路径 JSON</label>
+              <input id="fiberJsonFile" name="fiberJsonFile" type="file" accept=".json,application/json">
             </div>
             <div class="fieldGroup compactDimensionField">
               <label for="layerHeight">树脂层高 mm</label>
@@ -5455,7 +5989,7 @@ def _index_html() -> str:
         </div>
 
         <details id="coreProcessSettings" class="advancedSettings processCoreSettings">
-          <summary>process_core 处理参数（不属于 Prusa 切片内核）</summary>
+          <summary>core处理参数</summary>
           <p class="notice">这些参数在路径进入 process_core 后生效；Prusa 区域只负责几何、层高、打印路径和 Prusa 空走。</p>
 
           <div class="coreMaterialColumns">
@@ -5555,17 +6089,19 @@ def _index_html() -> str:
 
           <section class="prusaAdvancedGroup">
             <h4>Primeline</h4>
-            <p class="notice">仅在勾选后启用下方的 Primeline 起点和长度参数；预览和导出会按命令顺序显示。</p>
+            <p class="notice">X/Y 均相对于打印平面原点；零件原点固定为形状正中心，Primeline 位置是 Primeline 起点。预览和导出会按命令顺序显示。</p>
             <div class="prusaSettingsGrid">
               <div class="fieldGroup compactOptions"><label class="checkboxLabel" for="corePrimelineEnabled"><input id="corePrimelineEnabled" type="checkbox" checked> 打印 Primeline</label></div>
-              <div class="fieldGroup"><label for="corePrimelineX">起点 X mm</label><input id="corePrimelineX" type="number" step="0.001" value="0" disabled></div>
-              <div class="fieldGroup"><label for="corePrimelineY">起点 Y mm</label><input id="corePrimelineY" type="number" step="0.001" value="-10" disabled></div>
-              <div class="fieldGroup"><label for="corePrimelineLength">长度 mm</label><input id="corePrimelineLength" type="number" min="0" step="0.001" value="100" disabled></div>
+              <div class="fieldGroup"><label for="corePartPositionX">零件原点 X（相对打印平面原点）mm</label><input id="corePartPositionX" type="number" step="0.001" value="0"></div>
+              <div class="fieldGroup"><label for="corePartPositionY">零件原点 Y（相对打印平面原点）mm</label><input id="corePartPositionY" type="number" step="0.001" value="0"></div>
+              <div class="fieldGroup"><label for="corePrimelinePositionX">Primeline 起点 X（相对打印平面原点）mm</label><input id="corePrimelinePositionX" type="number" step="0.001" value="0"></div>
+              <div class="fieldGroup"><label for="corePrimelinePositionY">Primeline 起点 Y（相对打印平面原点）mm</label><input id="corePrimelinePositionY" type="number" step="0.001" value="-10"></div>
+              <div class="fieldGroup"><label>Primeline 后 Travel</label><span class="fieldHint">移动到零件位置</span></div>
             </div>
           </section>
 
           <section class="prusaAdvancedGroup">
-            <h4>路径平滑与七阶采样</h4>
+            <h4>姿态与路径平滑</h4>
             <p class="notice">TCP 姿态角速度按 KUKA A-Z / B-Y / C-X 对应的四元数最短转角计算；25 °/s 是离线 Core 的工程默认值，不代表机器人厂家额定上限。</p>
             <div class="prusaSettingsGrid">
               <div class="fieldGroup"><label for="coreDt">采样周期 dt s</label><input id="coreDt" type="number" min="0.0001" step="0.0001" value="0.004"></div>
@@ -5656,7 +6192,8 @@ def _index_html() -> str:
             </div>
           </div>
         </div>
-      </form>
+        </form>
+      </details>
     </section>
 
   </main>
@@ -5851,8 +6388,9 @@ def _index_html() -> str:
         'coreFiberPrimeLength', 'coreFiberPrimeSpeed', 'coreFiberRetractLength',
         'coreFiberRetractSpeed', 'coreFiberStartAccel', 'coreTravelFeed',
         'coreFirstLayerTravelFeed', 'corePrimeSettle', 'coreDefaultA',
-        'coreDefaultB', 'coreDefaultC', 'corePrimelineX', 'corePrimelineY',
-        'corePrimelineLength', 'coreDt', 'coreMaxTcpOrientationSpeed', 'coreCornerAngle',
+        'coreDefaultB', 'coreDefaultC', 'corePartPositionX', 'corePartPositionY',
+        'corePrimelinePositionX', 'corePrimelinePositionY',
+        'coreDt', 'coreMaxTcpOrientationSpeed', 'coreCornerAngle',
         'coreCornerRetreatRatio', 'coreSplineMaxError', 'coreSplineMaxAngle',
         'coreSourceMergeDistance', 'coreCornerRetreatMax', 'coreCornerBlendSegments',
         'coreDensity', 'coreDegree', 'coreMaxFitPoints',
@@ -5861,7 +6399,7 @@ def _index_html() -> str:
       ];
       for (const id of coreFieldIds) {{
         const input = document.getElementById(id);
-        const name = 'core_' + id.slice(4).replace(/[A-Z]/g, m => '_' + m.toLowerCase());
+        const name = coreFieldParamName(id);
         formData.append(name, input.value);
       }}
       formData.append('core_primeline_enabled', corePrimelineEnabledInput.checked ? 'true' : 'false');
@@ -6067,7 +6605,6 @@ def _index_html() -> str:
     const showFiberCutEventsInput = document.getElementById('showFiberCutEvents');
     const showTravelPathsInput = document.getElementById('showTravelPaths');
     const showCoreTravelPathsInput = document.getElementById('showCoreTravelPaths');
-    const showPrimelineInput = document.getElementById('showPrimeline');
     const slicingKernelInput = document.getElementById('slicingKernel');
     const layerHeightInput = document.getElementById('layerHeight');
     const firstLayerHeightInput = document.getElementById('firstLayerHeight');
@@ -6084,7 +6621,6 @@ def _index_html() -> str:
     document.getElementById('prusaSkirtSettings')?.remove();
     const prusaQuickFields = document.querySelectorAll('.prusaQuickField');
     const corePrimelineEnabledInput = document.getElementById('corePrimelineEnabled');
-    const corePrimelineParameterIds = ['corePrimelineX', 'corePrimelineY', 'corePrimelineLength'];
     const prusaRaftEnabledInput = document.getElementById('prusaRaftEnabled');
     const prusaRaftAutoContactInput = document.getElementById('prusaRaftAutoContact');
     const prusaRaftSettings = document.getElementById('prusaRaftSettings');
@@ -6155,9 +6691,10 @@ def _index_html() -> str:
       ['coreDefaultA', 'core_default_a', 'root', 'default_a'],
       ['coreDefaultB', 'core_default_b', 'root', 'default_b'],
       ['coreDefaultC', 'core_default_c', 'root', 'default_c'],
-      ['corePrimelineX', 'core_primeline_x_mm', 'root', 'primeline_x_mm'],
-      ['corePrimelineY', 'core_primeline_y_mm', 'root', 'primeline_y_mm'],
-      ['corePrimelineLength', 'core_primeline_length', 'root', 'primeline_length_mm'],
+      ['corePartPositionX', 'core_part_position_x', 'root', 'start_x_mm'],
+      ['corePartPositionY', 'core_part_position_y', 'root', 'start_y_mm'],
+      ['corePrimelinePositionX', 'core_primeline_position_x', 'root', 'primeline_x_mm'],
+      ['corePrimelinePositionY', 'core_primeline_position_y', 'root', 'primeline_y_mm'],
       ['coreDt', 'core_dt', 'root', 'dt'],
       ['coreMaxTcpOrientationSpeed', 'core_max_tcp_orientation_speed', 'root', 'max_tcp_orientation_speed_deg_s'],
       ['coreCornerAngle', 'core_corner_angle', 'root', 'corner_angle_deg'],
@@ -6235,6 +6772,12 @@ def _index_html() -> str:
       }}
       setInitialValue('prusaStartX', initialPrusaParams.prusa_start_x_mm ?? core.start_x_mm);
       setInitialValue('prusaStartY', initialPrusaParams.prusa_start_y_mm ?? core.start_y_mm);
+      // Core owns the part origin now.  Prefer its persisted value over the
+      // retired Prusa aliases, which may remain at their old 10/10 defaults.
+      setInitialValue('corePartPositionX', core.start_x_mm ?? initialPrusaParams.prusa_start_x_mm);
+      setInitialValue('corePartPositionY', core.start_y_mm ?? initialPrusaParams.prusa_start_y_mm);
+      setInitialValue('corePrimelinePositionX', core.primeline_x_mm ?? 0);
+      setInitialValue('corePrimelinePositionY', core.primeline_y_mm ?? -10);
       setInitialValue('layerHeight', initialPrusaParams.layer_height ?? core.resin?.layer_height_mm);
       setInitialValue('firstLayerHeight', initialPrusaParams.first_layer_height ?? core.resin?.layer_height_mm);
       for (const [id, key] of prusaNumberSettings) setInitialValue(id, initialPrusaParams[key]);
@@ -6269,6 +6812,19 @@ def _index_html() -> str:
       }}
       return {{ core, prusa }};
     }}
+
+    function coreFieldParamName(id) {{
+      // ``corePrimelinePositionY`` must become
+      // ``core_primeline_position_y``.  Removing five fixed characters loses
+      // the first field letter, while replacing capitals before normalizing
+      // the first one produces a double underscore.
+      const field = String(id || '').replace(/^core/, '');
+      const normalized = field
+        .replace(/^[A-Z]/, letter => letter.toLowerCase())
+        .replace(/[A-Z]/g, letter => '_' + letter.toLowerCase());
+      return 'core_' + normalized;
+    }}
+
     function scheduleSettingsSave() {{
       window.clearTimeout(settingsSaveTimer);
       settingsSaveTimer = window.setTimeout(() => {{
@@ -6414,7 +6970,7 @@ def _index_html() -> str:
         if (activePopup && activePopup !== popup && activeSummary) closePopup(activePopup, activeSummary);
         activePopup = popup;
         activeSummary = trigger;
-        const isCorePopup = popup.closest('#coreProcessSettings') !== null;
+        const isCorePopup = popup.dataset.coreAdvanced === 'true';
         const widthLimit = isCorePopup ? 1180 : 900;
         const heightLimit = isCorePopup ? 960 : 680;
         const width = Math.min(widthLimit, window.innerWidth - 24);
@@ -6454,6 +7010,7 @@ def _index_html() -> str:
         while (summary.nextSibling) body.appendChild(summary.nextSibling);
         const popup = document.createElement('div');
         popup.className = 'advancedPopup';
+        popup.dataset.coreAdvanced = String(id === 'coreProcessSettings');
         popup.setAttribute('role', 'dialog');
         popup.setAttribute('aria-modal', 'false');
         popup.setAttribute('aria-hidden', 'true');
@@ -6469,7 +7026,7 @@ def _index_html() -> str:
         closeButton.textContent = '×';
         header.append(title, closeButton);
         popup.append(header, body);
-        host.appendChild(popup);
+        document.body.appendChild(popup);
         host.open = true;
         trigger.addEventListener('click', () => {{
           if (popup.classList.contains('visible')) closePopup(popup, trigger);
@@ -6752,10 +7309,6 @@ def _index_html() -> str:
       for (const id of prusaBrimSettingIds) {{
         document.getElementById(id).disabled = !prusaBrimEnabled;
       }}
-      const primelineEnabled = corePrimelineEnabledInput.checked;
-      for (const id of corePrimelineParameterIds) {{
-        document.getElementById(id).disabled = !primelineEnabled;
-      }}
       infillSafetyNote.textContent = isLegacy
         ? (strictLayeredFallbackPatterns[infillPatternInput.value] || '')
         : '';
@@ -6800,11 +7353,16 @@ def _index_html() -> str:
     prusaBrimEnabledInput.addEventListener('change', syncKernelControls);
     corePrimelineEnabledInput.addEventListener('change', syncKernelControls);
     applyInitialSavedSettings();
+    const coreSettingsToolbarHost = document.getElementById('coreSettingsToolbarHost');
+    const coreProcessSettings = document.getElementById('coreProcessSettings');
+    if (coreSettingsToolbarHost && coreProcessSettings) {{
+      coreSettingsToolbarHost.appendChild(coreProcessSettings);
+    }}
     installAdvancedPopups();
     syncKernelControls();
     installMagnitudeNumberStepping();
     installSettingsPersistence();
-    fiberNotice.textContent = '旧版纤维路径已停用：当前不会插入 F 路径或改变树脂层高度；新的铺设策略将在此接口接入。';
+    fiberNotice.textContent = 'JSON 中的单层纤维路径会复制到每个树脂层，纤维层高 0.1 mm 会计入后续树脂层 Z 位置，最后一层树脂封顶不打印纤维。';
 
     function updateExportProgress(job) {{
       const progress = Math.max(0, Math.min(100, Number(job.progress) || 0));
@@ -6885,8 +7443,8 @@ def _index_html() -> str:
       formData.append('first_layer_height', document.getElementById('firstLayerHeight').value);
       formData.append('line_width', document.getElementById('lineWidth').value);
       formData.append('build_axis', document.getElementById('buildAxis').value);
-       formData.append('prusa_start_x_mm', document.getElementById('prusaStartX').value);
-       formData.append('prusa_start_y_mm', document.getElementById('prusaStartY').value);
+       formData.append('prusa_start_x_mm', document.getElementById('corePartPositionX').value);
+       formData.append('prusa_start_y_mm', document.getElementById('corePartPositionY').value);
        const coreFieldIds = [
          'coreResinLayerHeight', 'coreResinExtrusionScale', 'coreResinFeed',
          'coreResinFirstLayerFeed', 'coreResinTemp', 'coreResinPrimeLength',
@@ -6896,8 +7454,9 @@ def _index_html() -> str:
          'coreFiberPrimeLength', 'coreFiberPrimeSpeed', 'coreFiberRetractLength',
          'coreFiberRetractSpeed', 'coreFiberStartAccel', 'coreTravelFeed',
          'coreFirstLayerTravelFeed', 'corePrimeSettle', 'coreDefaultA',
-         'coreDefaultB', 'coreDefaultC', 'corePrimelineX', 'corePrimelineY',
-         'corePrimelineLength', 'coreDt', 'coreMaxTcpOrientationSpeed', 'coreCornerAngle',
+         'coreDefaultB', 'coreDefaultC', 'corePartPositionX', 'corePartPositionY',
+         'corePrimelinePositionX', 'corePrimelinePositionY',
+         'coreDt', 'coreMaxTcpOrientationSpeed', 'coreCornerAngle',
          'coreCornerRetreatRatio', 'coreSplineMaxError', 'coreSplineMaxAngle',
          'coreSourceMergeDistance', 'coreCornerRetreatMax', 'coreCornerBlendSegments',
          'coreDensity', 'coreDegree', 'coreMaxFitPoints',
@@ -6906,7 +7465,7 @@ def _index_html() -> str:
        ];
        for (const id of coreFieldIds) {{
          const input = document.getElementById(id);
-         const name = 'core_' + id.slice(4).replace(/[A-Z]/g, m => '_' + m.toLowerCase());
+         const name = coreFieldParamName(id);
          formData.append(name, input.value);
        }}
        formData.append('core_primeline_enabled', corePrimelineEnabledInput.checked ? 'true' : 'false');
@@ -7061,7 +7620,10 @@ def _index_html() -> str:
           (entry) => entry?.kind !== 'travel' && entry?.role === 'fiber'
         ))
       );
-      layerSlider.value = firstFiberLayerPosition >= 0 ? firstFiberLayerPosition : 0;
+      const hasPrimeline = Boolean(previewData?.primeline_origin || previewData?.core_overlay?.primeline_origin);
+      layerSlider.value = hasPrimeline
+        ? 0
+        : firstFiberLayerPosition >= 0 ? firstFiberLayerPosition : 0;
       resetPreviewView();
       const isSurface = isSurfacePreview();
       showDirectionLabel.textContent = isSurface ? '显示路径方向/打印头' : '显示打印方向';
@@ -7100,7 +7662,6 @@ def _index_html() -> str:
       if (role === 'fiber') return showFiberPathsInput.checked;
       if (role === 'travel') return showTravelPathsInput.checked;
       if (role === 'core_travel' || role === 'layer_lift') return showCoreTravelPathsInput.checked;
-      if (role === 'primeline') return showPrimelineInput.checked;
       return showResinInfillInput.checked;
     }}
 
@@ -7114,7 +7675,10 @@ def _index_html() -> str:
             .map((entry) => ({{ ...entry, kind: 'deposit' }})),
           ...(layer.travel_paths || []).map((points) => ({{ kind: 'travel', points }}))
         ];
-      for (const rawEntry of motionEntries) {{
+      const orderedMotionEntries = [...motionEntries].sort((left, right) =>
+        Number(left?.order ?? 0) - Number(right?.order ?? 0)
+      );
+      for (const rawEntry of orderedMotionEntries) {{
         const kind = rawEntry.kind === 'travel' ? 'travel' : 'deposit';
         const role = kind === 'travel' ? 'travel' : (rawEntry.role || 'infill');
         const points = rawEntry.points || rawEntry;
@@ -7133,7 +7697,7 @@ def _index_html() -> str:
           }});
         }}
       }}
-      const hasOrderedFiber = motionEntries.some((entry) =>
+      const hasOrderedFiber = orderedMotionEntries.some((entry) =>
         entry?.kind !== 'travel' && entry?.role === 'fiber'
       );
       if (!hasOrderedFiber) {{
@@ -7189,7 +7753,6 @@ def _index_html() -> str:
         showFiberPathsInput,
         showTravelPathsInput,
         showCoreTravelPathsInput,
-        showPrimelineInput,
       ].map((input) => input.checked ? '1' : '0').join('');
       const key = `${{currentLayerPosition}}:${{visibilityKey}}`;
       if (historicalOverlayCache.preview === previewData && historicalOverlayCache.key === key) {{
@@ -7441,7 +8004,59 @@ def _index_html() -> str:
       ctx.strokeStyle = '#d5dbe0';
       ctx.lineWidth = 1;
       ctx.stroke();
-      const axisOrigin = [minimum[0], minimum[1], z];
+      // The print plane is part of the 3-D reference frame, not merely a
+      // translucent rectangle.  Draw an XY measurement grid on its actual
+      // Z plane so the spacing and labels remain meaningful while rotating.
+      const gridStep = niceGridStep(viewport.pixelsPerMm);
+      const minorStep = gridStep / 5;
+      const drawGridLine = (start, end, color, width) => {{
+        const a = project(start);
+        const b = project(end);
+        ctx.strokeStyle = color;
+        ctx.lineWidth = width;
+        ctx.beginPath();
+        ctx.moveTo(a[0], a[1]);
+        ctx.lineTo(b[0], b[1]);
+        ctx.stroke();
+      }};
+      ctx.save();
+      ctx.beginPath();
+      ctx.moveTo(corners[0][0], corners[0][1]);
+      for (let index = 1; index < corners.length; index++) ctx.lineTo(corners[index][0], corners[index][1]);
+      ctx.closePath();
+      ctx.clip();
+      forEachGridValue(minimum[0], maximum[0], minorStep, (value) =>
+        drawGridLine([value, minimum[1], z], [value, maximum[1], z], '#e5ebef', 0.7)
+      );
+      forEachGridValue(minimum[1], maximum[1], minorStep, (value) =>
+        drawGridLine([minimum[0], value, z], [maximum[0], value, z], '#e5ebef', 0.7)
+      );
+      forEachGridValue(minimum[0], maximum[0], gridStep, (value) =>
+        drawGridLine([value, minimum[1], z], [value, maximum[1], z], '#cbd5dc', 1.0)
+      );
+      forEachGridValue(minimum[1], maximum[1], gridStep, (value) =>
+        drawGridLine([minimum[0], value, z], [maximum[0], value, z], '#cbd5dc', 1.0)
+      );
+      ctx.restore();
+      ctx.fillStyle = '#5c6972';
+      ctx.font = '11px Segoe UI, Arial, sans-serif';
+      ctx.textBaseline = 'middle';
+      ctx.textAlign = 'center';
+      forEachGridValue(minimum[0], maximum[0], gridStep, (value) => {{
+        const point = project([value, minimum[1], z]);
+        ctx.fillText(formatRulerValue(value, gridStep), point[0], point[1] + 14);
+      }});
+      ctx.textAlign = 'right';
+      forEachGridValue(minimum[1], maximum[1], gridStep, (value) => {{
+        const point = project([minimum[0], value, z]);
+        ctx.fillText(formatRulerValue(value, gridStep), point[0] - 7, point[1]);
+      }});
+      ctx.fillStyle = '#172026';
+      ctx.font = '600 11px Segoe UI, Arial, sans-serif';
+      ctx.textAlign = 'left';
+      ctx.fillText('打印平面 XY 网格 · mm', plot.left + 8, plot.bottom - 8);
+      const printOrigin = previewData?.origin || [0, 0];
+      const axisOrigin = [Number(printOrigin[0]) || 0, Number(printOrigin[1]) || 0, z];
       const axisLength = Math.max(8, Math.min(30, Math.max(
         maximum[0] - minimum[0],
         maximum[1] - minimum[1],
@@ -7477,6 +8092,10 @@ def _index_html() -> str:
       ctx.textAlign = 'right';
       ctx.textBaseline = 'top';
       ctx.fillText('三维曲面预览 · 左键旋转', plot.right - 7, plot.top + 7);
+      ctx.fillStyle = '#b91c1c';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'bottom';
+      ctx.fillText('(0, 0) 打印平面原点', start[0] + 8, start[1] - 8);
     }}
 
     function surfaceLayerCurvatureText(layer) {{
@@ -7661,7 +8280,6 @@ def _index_html() -> str:
       if (role === 'raft') return '#7f5539';
       if (role === 'fiber') return '#e66f00';
       if (role === 'travel') return '#526f8c';
-      if (role === 'primeline') return '#b91c1c';
       return '#0b6bcb';
     }}
 
@@ -7686,7 +8304,10 @@ def _index_html() -> str:
 
     function drawOriginMarker(ctx, viewport) {{
       const origin = previewData?.origin || [0, 0];
-      const point = viewport.project(origin);
+      const projectOrigin = viewport.isSurface
+        ? [Number(origin[0]) || 0, Number(origin[1]) || 0, viewport.minimum[2]]
+        : origin;
+      const point = viewport.project(projectOrigin);
       const {{ plot }} = viewport;
       if (
         point[0] < plot.left - 10 || point[0] > plot.right + 10
@@ -7706,10 +8327,35 @@ def _index_html() -> str:
       ctx.beginPath();
       ctx.arc(point[0], point[1], 3, 0, Math.PI * 2);
       ctx.fill();
-      ctx.font = '600 11px Segoe UI, Arial, sans-serif';
-      ctx.textAlign = 'left';
-      ctx.textBaseline = 'bottom';
-      ctx.fillText('(0, 0)', point[0] + 9, point[1] - 8);
+      ctx.restore();
+    }}
+
+    function drawPartOriginMarker(ctx, viewport) {{
+      const origin = previewData?.part_origin;
+      if (!Array.isArray(origin) || origin.length < 2) return;
+      const projectOrigin = viewport.isSurface
+        ? [Number(origin[0]) || 0, Number(origin[1]) || 0, viewport.minimum[2]]
+        : origin;
+      const point = viewport.project(projectOrigin);
+      const {{ plot }} = viewport;
+      if (
+        point[0] < plot.left - 18 || point[0] > plot.right + 18
+        || point[1] < plot.top - 18 || point[1] > plot.bottom + 18
+      ) return;
+      ctx.save();
+      ctx.strokeStyle = '#047857';
+      ctx.fillStyle = '#047857';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.moveTo(point[0] - 7, point[1]);
+      ctx.lineTo(point[0] + 7, point[1]);
+      ctx.moveTo(point[0], point[1] - 7);
+      ctx.lineTo(point[0], point[1] + 7);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(point[0], point[1], 4, 0, Math.PI * 2);
+      ctx.stroke();
       ctx.restore();
     }}
 
@@ -8127,7 +8773,8 @@ def _index_html() -> str:
       }}
       ctx.restore();
       if (surfacePreview) drawSurfaceLayerCurvature(ctx, viewport, layer);
-      if (!surfacePreview) drawOriginMarker(ctx, viewport);
+      drawOriginMarker(ctx, viewport);
+      drawPartOriginMarker(ctx, viewport);
       updateViewerLabels();
     }}
 
@@ -8608,9 +9255,12 @@ def _index_html() -> str:
       if (isSurfacePreview()) {{
         if (viewerState.dragMode === 'rotate') {{
           viewerState.surfaceYaw += deltaX * 0.009;
-          viewerState.surfacePitch = Math.max(-1.35, Math.min(1.35,
-            viewerState.surfacePitch + deltaY * 0.009
-          ));
+          // Allow a complete 360° pitch rotation.  The previous ±1.35 rad
+          // clamp made the model stop responding once dragged near vertical.
+          const fullTurn = Math.PI * 2;
+          viewerState.surfacePitch = (
+            viewerState.surfacePitch + deltaY * 0.009 + Math.PI
+          ) % fullTurn - Math.PI;
         }} else {{
           viewerState.surfacePanX += deltaX;
           viewerState.surfacePanY += deltaY;
@@ -8673,7 +9323,6 @@ def _index_html() -> str:
       }});
     }}
     showCoreTravelPathsInput.addEventListener('change', drawPreview);
-    showPrimelineInput.addEventListener('change', drawPreview);
     showLayerOverlayInput.addEventListener('change', drawPreview);
     showLineWidthInput.addEventListener('change', drawPreview);
     showExtrusionInput.addEventListener('change', drawPreview);

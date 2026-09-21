@@ -943,9 +943,11 @@ def test_preview_payload_uses_slim_role_aware_layer_schema_and_complete_bounds()
         "line_widths",
         "layers",
         "origin",
+        "part_origin",
         "preview_source",
         "tool_orientation",
     }
+    assert preview["part_origin"] == [0.0, 0.0]
     assert preview["preview_source"] == "pre_core_source_npz"
     assert preview["geometry_mode"] == "planar_2d"
     assert preview["tool_orientation"] == {
@@ -4286,7 +4288,7 @@ def test_ui_offers_large_advanced_settings_as_draggable_resizable_popups():
     assert 'id="tolerance"' not in html
     assert "advancedPopupTrigger" in html
     assert "summary.hidden = true" in html
-    assert "const isCorePopup = popup.closest('#coreProcessSettings') !== null;" in html
+    assert "const isCorePopup = popup.dataset.coreAdvanced === 'true';" in html
     assert "const widthLimit = isCorePopup ? 1180 : 900;" in html
     assert "const heightLimit = isCorePopup ? 960 : 680;" in html
     assert ".advancedPopup.coreAdvancedPopup {" in html
@@ -4661,7 +4663,7 @@ def test_ui_can_play_the_selected_print_path_with_direction_markers():
 
     assert 'id="playCurrentPath" type="button"' in html
     assert "播放当前路径" in html
-    assert 'id="pathPlaybackRate" type="range" min="0" max="1"' in html
+    assert 'id="pathPlaybackRate" type="range" min="0" max="10"' in html
     assert 'value="1" aria-label="当前路径播放速率"' in html
     assert "PLAYBACK_MAX_SPEED_MM_PER_S = 8" in html
     assert "buildPathPlaybackTimeline" in html
@@ -4724,8 +4726,9 @@ def test_main_ui_recognizes_rectangular_conformal_design_json_before_slicing():
     assert "fetch('/conformal-slice'" in html
     assert 'id="conformalFiberFirstAfterResinLayer"' not in html
     assert 'id="conformalFiberLastAfterResinLayer"' not in html
-    assert "首个与末个纤维界面由设计 JSON 自动确定" in html
-    assert 'id="fiberJsonFile" name="fiberJsonFile" type="file" accept=".json,application/json" disabled' in html
+    assert "纤维层范围由设计 JSON 的起始层与终止层规则自动确定" in html
+    assert 'id="fiberJsonFile" name="fiberJsonFile" type="file" accept=".json,application/json">' in html
+    assert "旧版纤维路径已停用" not in html
 
 
 def test_surface_npz_picker_directory_is_persisted_in_local_ui_state(tmp_path):

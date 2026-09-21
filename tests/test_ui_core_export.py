@@ -1,6 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 import importlib
+import io
 import inspect
 import json
 import zipfile
@@ -33,6 +34,7 @@ from kuka_slicer.conformal_lattice.fiber_reinforcement import (
     apply_mixed_wall_fiber_strategy,
     derive_symmetric_curvature_fiber_interfaces,
 )
+import kuka_slicer.ui_server as ui_server
 from kuka_slicer.conformal_lattice.path_bridge import ExtrusionVolumeModel
 from kuka_slicer.conformal_lattice.pipeline import run_conformal_lattice_pipeline
 from kuka_slicer.surface_preview.server import conformal_lattice_config_payload
@@ -59,7 +61,17 @@ def test_conformal_design_json_generates_core_output_without_source_npz_round_tr
     result = handler._handle_conformal_slice(
         "",
         request_data=(
-            {"core_resin_layer_height": ["0.25"]},
+            {
+                "core_resin_layer_height": ["0.25"],
+                "core_default_a": ["71"],
+                "core_default_b": ["72"],
+                "core_default_c": ["73"],
+                "core_part_position_x": ["60"],
+                "core_part_position_y": ["85"],
+                "core_primeline_position_x": ["0"],
+                "core_primeline_position_y": ["5"],
+                "core_primeline_length": ["80"],
+            },
             {"conformal_spec": ("small_design.json", json.dumps(config).encode("utf-8"))},
         ),
         progress_callback=lambda value, _message: progress.append(value),
@@ -74,6 +86,33 @@ def test_conformal_design_json_generates_core_output_without_source_npz_round_tr
     assert result["fiber_reinforcement"]["automatic_resin_z_raise"] is True
     assert any(layer["fiber_paths"] for layer in result["preview"]["layers"])
     assert result["preview"]["preview_source"] == "final_core_npz"
+    assert result["preview"]["part_origin"] == pytest.approx([60.0, 85.0], abs=0.02)
+    assert result["preview"]["primeline_origin"] == pytest.approx([0.0, 5.0])
+    primeline_preview_paths = [
+        entry["points"]
+        for layer in result["preview"]["layers"]
+        for entry in layer["motion_paths"]
+        if entry.get("role") == "final_resin" and entry.get("order") == -1
+    ]
+    assert primeline_preview_paths
+    primeline_points = np.asarray(primeline_preview_paths[0], dtype=float)
+    np.testing.assert_allclose(
+        primeline_points[:, :3],
+        [[0.0, 5.0, primeline_points[0, 2]], [80.0, 5.0, primeline_points[0, 2]]],
+        atol=0.02,
+    )
+    preview_travels = [
+        entry["points"]
+        for layer in result["preview"]["layers"]
+        for entry in layer["motion_paths"]
+        if entry.get("role") == "travel" and len(entry.get("points", [])) >= 2
+    ]
+    assert any(
+        np.allclose(path[0][:2], [0.0, 0.0], atol=0.02)
+        and np.allclose(path[-1][:2], [0.0, 5.0], atol=0.02)
+        for path in preview_travels
+    )
+    assert any(np.allclose(path[0][:2], [80.0, 5.0], atol=0.25) for path in preview_travels)
     assert result["preview"]["tool_orientation"]["available"] is True
     assert result["core_runtime"]["source"] == "workspace"
     assert result["core_runtime"]["cubic_sampler_fast_path"] is True
@@ -94,6 +133,51 @@ def test_conformal_design_json_generates_core_output_without_source_npz_round_tr
         assert manifest["base_parameters"]["tool_offset"] == [0.0, 0.0, 0.0]
         assert manifest["base_parameters"]["resin_z_print_compensation_mm"] == 0.0
         assert "max_tcp_orientation_speed_deg_s" not in json.dumps(manifest)
+        print_job_manifest = json.loads(str(core["print_job_manifest"].item()))
+        assert print_job_manifest == {
+            "abc_convention": "KUKA_AZ_BY_CX",
+            "abc_semantics": "relative_to_calibrated_flat_printing_pose",
+            "cut_lift_frame": "surface_normal",
+            "default_abc_policy": "fallback_only_never_override_xyzabc",
+            "format": "kuka_print_job_v1",
+            "global_z_compensation_frame": "world_z",
+            "job_kind": "conformal_honeycomb",
+            "pause_lift_frame": "world_z",
+            "pose_mode": "surface_normal_xyzabc",
+            "primeline_pose_mode": "flat_reference_abc_zero",
+            "source_surface_sha256": config["source_surface"]["sha256"],
+            "tool_change_safe_lift_frame": "world_z",
+        }
+        positive_path_ids = core["path_id"][core["path_id"] > 0]
+        primeline_path_id = int(np.min(positive_path_ids))
+        primeline = core["path_id"] == primeline_path_id
+        np.testing.assert_array_equal(core["a"][primeline], 0.0)
+        np.testing.assert_array_equal(core["b"][primeline], 0.0)
+        np.testing.assert_array_equal(core["c"][primeline], 0.0)
+        surface_rows = (core["path_id"] > primeline_path_id) & (core["event_flag"] == 0)
+        surface_abc = np.column_stack(
+            (core["a"][surface_rows], core["b"][surface_rows], core["c"][surface_rows])
+        )
+        assert np.max(np.abs(surface_abc)) > 1e-3
+        assert not np.any(np.all(np.isclose(surface_abc, (71.0, 72.0, 73.0)), axis=1))
+        primeline_rows = (
+            (core["event_flag"] == 0)
+            & (core["move_type"] == 1)
+            & (np.abs(core["y"] - 5.0) < 0.02)
+            & (core["x"] >= -0.02)
+            & (core["x"] <= 80.02)
+        )
+        assert np.count_nonzero(primeline_rows) >= 2
+        # Core may merge the Primeline with the following source path and
+        # apply its cubic sampling at the junction.  The final NPZ therefore
+        # need not contain an isolated row at x=0; verify the actual endpoint
+        # and print-plane offset without imposing a synthetic straight line.
+        assert float(np.max(core["y"][primeline_rows])) == pytest.approx(5.0, abs=0.02)
+        assert float(np.max(core["x"][primeline_rows])) == pytest.approx(80.0, abs=0.25)
+        deposited = (core["event_flag"] == 0) & (core["move_type"] == 3)
+        assert np.any(deposited)
+        assert (float(np.min(core["x"][deposited])) + float(np.max(core["x"][deposited]))) * 0.5 == pytest.approx(60.0, abs=0.02)
+        assert (float(np.min(core["y"][deposited])) + float(np.max(core["y"][deposited]))) * 0.5 == pytest.approx(85.0, abs=0.02)
     assert progress[-1] == 97
 
 
@@ -519,16 +603,18 @@ def test_ui_uses_pre_core_source_preview_and_exposes_core_export_progress():
     assert "path_id: rawEntry.path_id" in html
     assert "kuka.conformalContinuousCourseFiber.v2" in html
     assert "const firstFiberLayerPosition = layers.findIndex" in html
-    assert "layerSlider.value = firstFiberLayerPosition >= 0 ? firstFiberLayerPosition : 0" in html
+    assert "const hasPrimeline = Boolean(" in html
+    assert "layerSlider.value = hasPrimeline" in html
     assert "containsFiber ? ' · 含纤维' : ''" in html
     assert 'id="showCoreTravelPaths"' in html
-    assert 'id="showPrimeline"' in html
+    assert 'id="showPrimeline"' not in html
     assert 'id="prusaRaftAutoContact"' in html
     assert 'id="prusaRaftContactLayerHeight"' in html
     assert 'id="prusaRaftContactLayerHeight" type="number" min="0.1" max="2" step="0.05" value="0.75"' in html
     assert 'id="prusaRaftContactDensity"' in html
     assert 'id="prusaRaftContactExtrusionWidth"' in html
     assert "drawOriginMarker" in html
+    assert "打印平面 XY 网格 · mm" in html
     assert "previewData?.core_overlay?.sequence" in html
     assert ".filter((entry) => entry.role !== 'layer_lift')" in html
     assert 'id="coreResinFan"' not in html
@@ -539,7 +625,13 @@ def test_ui_uses_pre_core_source_preview_and_exposes_core_export_progress():
     assert 'id="conformalDebugExportButton"' in html
     assert 'aria-pressed="false">调试导出：关' in html
     assert "formData.append('conformal_debug_export'" in html
-    assert "'corePrimelineLength', 'coreDt', 'coreMaxTcpOrientationSpeed'" in html
+    assert "'corePartPositionX', 'corePartPositionY'," in html
+    assert "function coreFieldParamName(id)" in html
+    assert "core_primeline_position_y" in html
+    assert html.count("const name = coreFieldParamName(id);") == 2
+    assert "drawPrimelineOffsetLabel" not in html
+    assert "setInitialValue('corePartPositionX', core.start_x_mm ?? initialPrusaParams.prusa_start_x_mm)" in html
+    assert "setInitialValue('corePartPositionY', core.start_y_mm ?? initialPrusaParams.prusa_start_y_mm)" in html
     assert 'id="conformalDebugDownload"' in html
     assert "/choose-core-npz-preview" in html
     assert "applyFinalCorePreview" in html
@@ -965,6 +1057,34 @@ def test_core_placement_uses_integrated_prusa_start_xy():
     assert params.start_y_mm == 10.0
 
 
+def test_ui_settings_keep_new_core_part_position_over_stale_prusa_aliases(tmp_path, monkeypatch):
+    _ensure_offline_planner_import_paths()
+    import external_npz_preprocessor.param_config as param_config
+
+    params_path = tmp_path / "print_params.json"
+    prusa_path = tmp_path / "prusa_params.json"
+    monkeypatch.setattr(ui_server, "_core_print_params_path", lambda: params_path)
+    monkeypatch.setattr(ui_server, "_prusa_params_path", lambda: prusa_path)
+    payload = json.dumps(
+        {
+            "core": {
+                "core_part_position_x": "60",
+                "core_part_position_y": "85",
+            },
+            # A stale hidden legacy Prusa form may still contain 10/10.
+            "prusa": {"prusa_start_x_mm": "10", "prusa_start_y_mm": "10"},
+        }
+    ).encode("utf-8")
+    handler = object.__new__(_SlicerUiHandler)
+    handler.headers = {"Content-Length": str(len(payload))}
+    handler.rfile = io.BytesIO(payload)
+    handler._save_ui_settings()
+
+    saved = param_config.load_print_params(params_path)
+    assert saved.start_x_mm == pytest.approx(60.0)
+    assert saved.start_y_mm == pytest.approx(85.0)
+
+
 def test_core_preview_overlay_collapses_multi_segment_prusa_travel_for_ordering():
     point = lambda x: SimpleNamespace(x=x, y=0.0, z=0.5)
     commands = [
@@ -1013,6 +1133,28 @@ def test_core_preview_overlay_maps_core_coordinates_back_to_prusa_frame():
     assert overlay["layer_lift_paths"][0]["points"] == [
         [122.605, 188.221, 0.5],
         [122.605, 188.221, 0.5],
+    ]
+
+
+def test_core_preview_overlay_exposes_primeline_print_plane_offset():
+    point = lambda x, y: SimpleNamespace(x=x, y=y, z=0.5)
+    overlay = _core_preview_overlay_from_commands(
+        [
+            SimpleNamespace(
+                raw="external_npz_primeline",
+                type="PRINT",
+                layer=0,
+                start_pos=point(12.0, -7.0),
+                pos=point(92.0, -7.0),
+                control_points=[],
+            )
+        ]
+    )
+
+    assert overlay["primeline_origin"] == [12.0, -7.0]
+    assert overlay["primeline_paths"][0]["points"] == [
+        [12.0, -7.0, 0.5],
+        [92.0, -7.0, 0.5],
     ]
 
 

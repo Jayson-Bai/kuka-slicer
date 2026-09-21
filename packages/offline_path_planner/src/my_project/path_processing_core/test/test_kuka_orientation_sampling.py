@@ -327,3 +327,24 @@ def test_exporter_aligns_abc_between_adjacent_moves_in_the_same_buffer(tmp_path)
     with np.load(output, allow_pickle=False) as data:
         b = data["b"]
     assert np.max(np.abs(np.diff(b))) < 1.0
+
+
+def test_exporter_rejects_pose_unaware_tool_offset_for_xyzabc_path(tmp_path):
+    from path_processing_core.npz_exporter import export_npz
+
+    output = tmp_path / "forbidden_direct_offset.npz"
+    command = _move(
+        0,
+        Position(0.0, 0.0, 1.0, 0.0, 12.0, -8.0),
+        Position(5.0, 0.0, 1.0, 0.0, 12.0, -8.0),
+    )
+
+    with pytest.raises(ValueError, match="zero-offset base NPZ"):
+        export_npz(
+            [command],
+            str(output),
+            dt=0.004,
+            tool_offset=(-0.34, -1.24, 3.2),
+        )
+
+    assert not output.exists()

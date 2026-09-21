@@ -302,6 +302,7 @@ def prepend_prusa_startup_travel(
     start_xy: tuple[float, float],
     primeline_enabled: bool,
     primeline_xy: tuple[float, float],
+    return_xy: tuple[float, float] | None = None,
 ) -> SourceJob:
     """Add the same origin-to-first-motion travel used by the Prusa UI path.
 
@@ -321,8 +322,9 @@ def prepend_prusa_startup_travel(
     first_z = float(first_material.points[0, 2])
     if primeline_enabled:
         target_xy = (
-            source_min[0] + float(primeline_xy[0]),
-            source_min[1] + float(primeline_xy[1]),
+            (float(primeline_xy[0]), float(primeline_xy[1]))
+            if return_xy is not None
+            else (source_min[0] + float(primeline_xy[0]), source_min[1] + float(primeline_xy[1]))
         )
     elif first_layer.travel_paths:
         target_xy = tuple(float(value) for value in first_layer.travel_paths[0].points[0, :2])
@@ -340,7 +342,16 @@ def prepend_prusa_startup_travel(
         dtype=np.float64,
     )
     target = np.asarray([target_xy[0], target_xy[1], first_z, 0.0, 0.0, 0.0], dtype=np.float64)
-    if np.linalg.norm(target[:3] - start[:3]) <= 1e-7:
+    return_target = None
+    if primeline_enabled and return_xy is not None:
+        return_target = np.asarray(
+            [float(return_xy[0]), float(return_xy[1]), first_z, 0.0, 0.0, 0.0],
+            dtype=np.float64,
+        )
+    if (
+        np.linalg.norm(target[:3] - start[:3]) <= 1e-7
+        and (return_target is None or np.linalg.norm(return_target[:3] - target[:3]) <= 1e-7)
+    ):
         return job
 
     layers: list[LayerPaths] = []
@@ -349,9 +360,12 @@ def prepend_prusa_startup_travel(
             layers.append(layer)
             continue
         travel_paths = [TravelPath(0, np.vstack((start, target)))]
+        if return_target is not None:
+            travel_paths.append(TravelPath(1, np.vstack((target, return_target))))
+        original_offset = 2 if return_target is not None else 1
         travel_paths.extend(
             TravelPath(index, path.points)
-            for index, path in enumerate(layer.travel_paths, start=1)
+            for index, path in enumerate(layer.travel_paths, start=original_offset)
         )
         layers.append(
             LayerPaths(
@@ -366,14 +380,17 @@ def prepend_prusa_startup_travel(
     records = motion_order.get(str(first_layer.index), [])
     if isinstance(records, list):
         shifted = [
-            {**record, "index": int(record.get("index", 0)) + 1}
+            {**record, "index": int(record.get("index", 0)) + original_offset}
             if isinstance(record, dict) and record.get("kind") == "travel"
             else record
             for record in records
         ]
-        motion_order[str(first_layer.index)] = [{"kind": "travel", "index": 0}, *shifted]
+        motion_order[str(first_layer.index)] = [{"kind": "travel", "index": 0}, *(
+            [{"kind": "travel", "index": 1}] if return_target is not None else []
+        ), *shifted]
     meta["motion_order"] = motion_order
     meta["startup_travel_count"] = 1
+    meta["preview_startup_travel_count"] = original_offset
     meta["startup_travel_source_frame"] = "normalized_prusa"
     return SourceJob(meta=meta, layers=layers)
 

@@ -25,6 +25,8 @@ from .source_npz import SourceJob, load_source_npz
 _SURFACE_MAPPED_DEFAULT_DENSITY = 4
 _SOURCE_E_PROFILE_MODE = "piecewise_preserve_v1"
 _ZERO_E_CONNECTOR_SEMANTICS = "print_context_constant_e"
+_PRINT_JOB_FORMAT = "kuka_print_job_v1"
+_CONFORMAL_JOB_KIND = "conformal_honeycomb"
 
 
 def _parallel_worker_budget() -> int:
@@ -67,6 +69,33 @@ def _uses_preserved_source_e_profile(job: SourceJob) -> bool:
             if len(extrusion) != len(material_path.points):
                 raise ValueError("piecewise_preserve_v1 E array length must match its path point count")
     return True
+
+
+def _print_job_manifest(job: SourceJob) -> dict[str, object] | None:
+    """Build the small runtime contract embedded only in conformal Core NPZs."""
+
+    bridge = job.meta.get("conformal_lattice_path_bridge")
+    if bridge is None:
+        return None
+    if not isinstance(bridge, dict):
+        raise ValueError("conformal_lattice_path_bridge metadata must be an object")
+    source_surface_sha256 = bridge.get("source_surface_sha256")
+    if not isinstance(source_surface_sha256, str) or len(source_surface_sha256) != 64:
+        raise ValueError("conformal Core export requires source_surface_sha256 provenance")
+    return {
+        "format": _PRINT_JOB_FORMAT,
+        "job_kind": _CONFORMAL_JOB_KIND,
+        "pose_mode": "surface_normal_xyzabc",
+        "abc_convention": "KUKA_AZ_BY_CX",
+        "abc_semantics": "relative_to_calibrated_flat_printing_pose",
+        "default_abc_policy": "fallback_only_never_override_xyzabc",
+        "primeline_pose_mode": "flat_reference_abc_zero",
+        "cut_lift_frame": "surface_normal",
+        "global_z_compensation_frame": "world_z",
+        "pause_lift_frame": "world_z",
+        "tool_change_safe_lift_frame": "world_z",
+        "source_surface_sha256": source_surface_sha256,
+    }
 
 
 def default_source_npz_template_dir(data_root: str | Path | None = None) -> Path:
@@ -253,6 +282,9 @@ def convert_source_job(
             "KUKA_CORE_DETAILED_TIMING", ""
         ).strip().lower() in {"1", "true", "yes", "on"},
     }
+    print_job_manifest = _print_job_manifest(job)
+    if print_job_manifest is not None:
+        export_kwargs["print_job_manifest"] = print_job_manifest
     if export_params.fiber_retract_length_mm is not None:
         export_kwargs["fiber_retract_length_mm"] = export_params.fiber_retract_length_mm
     use_parallel_layers = (

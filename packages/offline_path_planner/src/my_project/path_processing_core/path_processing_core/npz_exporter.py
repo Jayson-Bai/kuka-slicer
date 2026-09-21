@@ -9,7 +9,7 @@ gcode_planner 的 npz 导出器（分片）.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import List, Optional
+from typing import List, Mapping, Optional
 import os
 import time
 import json
@@ -110,6 +110,48 @@ class _PendingEvent:
     tool_id: int
 
 
+def _validated_direct_tool_offset(
+    parsed_commands: ParsedCommandList,
+    tool_offset,
+    *,
+    print_job_manifest: Mapping[str, object] | None = None,
+) -> tuple[float, float, float]:
+    try:
+        offset = tuple(float(value) for value in tool_offset)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("tool_offset must contain three finite XYZ values") from exc
+    if len(offset) != 3 or not all(math.isfinite(value) for value in offset):
+        raise ValueError("tool_offset must contain three finite XYZ values")
+    if not any(abs(value) > 1e-12 for value in offset):
+        return offset
+
+    is_conformal_job = bool(
+        print_job_manifest is not None
+        and str(print_job_manifest.get("job_kind", "")) == "conformal_honeycomb"
+    )
+    has_surface_orientation = False
+    for command in parsed_commands:
+        poses = [getattr(command, "start_pos", None), getattr(command, "pos", None)]
+        poses.extend(getattr(command, "control_points", ()) or ())
+        if any(
+            pose is not None
+            and any(
+                abs(float(getattr(pose, axis, 0.0))) > 1e-12
+                for axis in ("a", "b", "c")
+            )
+            for pose in poses
+        ):
+            has_surface_orientation = True
+            break
+    if is_conformal_job or has_surface_orientation:
+        raise ValueError(
+            "direct tool_offset export is disabled for conformal/XYZABC paths; "
+            "export a zero-offset base NPZ and apply the calibrated offset with "
+            "path_processing_core.local_injector.inject_npz()"
+        )
+    return offset
+
+
 def export_npz(
     parsed_commands: ParsedCommandList,
     output_path: str,
@@ -140,6 +182,7 @@ def export_npz(
     external_npz_cut_absolute_e: bool = False,
     preserve_source_e_profile: bool = False,
     collect_detailed_timing: bool = False,
+    print_job_manifest: Mapping[str, object] | None = None,
 ) -> dict:
     """
     导出 npz（分片）.
@@ -149,6 +192,11 @@ def export_npz(
     - 速度规划由 sample_global_curve 内部的七阶多项式完成，此处不做额外处理。
     返回耗时统计字典（秒），用于 CLI 打印。
     """
+    tool_offset = _validated_direct_tool_offset(
+        parsed_commands,
+        tool_offset,
+        print_job_manifest=print_job_manifest,
+    )
     t_total_start = time.perf_counter()
     timing = RsiTimingAccumulator(dt)
     timings = {
@@ -207,6 +255,19 @@ def export_npz(
 
     # 预先定义 vocab，确保分片一致
     import numpy as np
+    static_job_fields = {}
+    if print_job_manifest is not None:
+        if not isinstance(print_job_manifest, Mapping):
+            raise ValueError("print_job_manifest must be an object")
+        static_job_fields["print_job_manifest"] = np.asarray(
+            json.dumps(
+                dict(print_job_manifest),
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+            dtype="U",
+        )
     move_type_map = {
         "TRAVEL": 0,
         "PRINT": 1,
@@ -511,6 +572,7 @@ def export_npz(
                 core_injection_role=core_injection_role,
                 core_injection_role_vocab_keys=injection_role_keys,
                 core_injection_role_vocab_vals=injection_role_vals,
+                **static_job_fields,
             )
             self.part += 1
             self.wrote_any = True

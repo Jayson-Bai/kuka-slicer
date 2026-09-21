@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 
 import numpy as np
 
@@ -52,6 +53,18 @@ def source_job_to_parsed_commands(job: SourceJob, params: ProcessParams) -> Pars
 
     line = _append_startup_head_events(commands, params, line, job)
     source_min_x, source_min_y = _job_source_xy_min(job)
+    if job.meta.get("core_input_frame") == "print_plane":
+        # The integrated UI has already translated the part center and the
+        # startup/Primeline coordinates into print-plane coordinates.  Keep
+        # those coordinates unchanged while retaining the converter's
+        # existing source-frame formulas for external NPZ callers.
+        source_min_x = float(params.start_x_mm)
+        source_min_y = float(params.start_y_mm)
+        params = replace(
+            params,
+            primeline_x_mm=float(params.primeline_x_mm) - source_min_x,
+            primeline_y_mm=float(params.primeline_y_mm) - source_min_y,
+        )
     first_layer_indexes = _first_material_layer_indexes(job)
     source_travel_mode = any(layer.travel_paths for layer in job.layers)
     startup_travel_count = _startup_travel_count(job)

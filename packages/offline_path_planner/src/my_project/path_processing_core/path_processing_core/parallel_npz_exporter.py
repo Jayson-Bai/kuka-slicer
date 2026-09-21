@@ -608,6 +608,11 @@ def export_npz_parallel_by_layer(
 
         with np.load(results[0]["output_path"], allow_pickle=False) as first:
             vocabs = {field: np.array(first[field], copy=True) for field in _VOCAB_FIELDS}
+            static_job_fields = (
+                {"print_job_manifest": np.array(first["print_job_manifest"], copy=True)}
+                if "print_job_manifest" in first.files
+                else {}
+            )
         write_started = time.perf_counter()
         np.savez_compressed(
             destination,
@@ -630,6 +635,7 @@ def export_npz_parallel_by_layer(
             core_injection_role=arrays["core_injection_role"],
             core_injection_role_vocab_keys=vocabs["core_injection_role_vocab_keys"],
             core_injection_role_vocab_vals=vocabs["core_injection_role_vocab_vals"],
+            **static_job_fields,
         )
         merge_write_s = time.perf_counter() - write_started
 
