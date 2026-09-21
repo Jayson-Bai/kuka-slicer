@@ -105,8 +105,42 @@ def apply_honeycomb_centerline_pathing(
     travel_paths: list[TravelPaths] = []
     roles: dict[str, list[str]] = {}
     motions: dict[str, list[dict[str, object]]] = {}
+    source_roles = job.meta.get("path_roles", {})
+    source_resin_roles = (
+        source_roles.get("R", {}) if isinstance(source_roles, dict) else {}
+    )
+    source_motion_order = job.meta.get("motion_order", {})
+    native_travel_by_layer = {
+        int(group.layer_index): group
+        for group in job.travel_paths
+    }
+    brim_path_count_by_layer: dict[str, int] = {}
     for group in resin_groups:
         z = _layer_z(group)
+        layer_key = str(group.layer_index)
+        layer_roles = (
+            source_resin_roles.get(layer_key, [])
+            if isinstance(source_resin_roles, dict)
+            else []
+        )
+        layer_motions = (
+            source_motion_order.get(layer_key, [])
+            if isinstance(source_motion_order, dict)
+            else []
+        )
+        native_travel = native_travel_by_layer.get(int(group.layer_index))
+        (
+            brim_paths,
+            brim_extrusion,
+            brim_motions,
+            brim_travel,
+        ) = _preserve_native_brim(
+            group,
+            layer_roles,
+            layer_motions,
+            native_travel,
+        )
+        brim_path_count_by_layer[layer_key] = len(brim_paths)
         frame_at_z = frame.copy()
         frame_at_z[:, 2] = z
         trail_paths = [_trail_to_path(trail, z) for trail in ordered_trail_template]
@@ -133,29 +167,39 @@ def apply_honeycomb_centerline_pathing(
             )
             macro_paths.append(path)
             macro_extrusion.append(profile)
-        paths = [frame_at_z, *macro_paths]
+        paths = [*brim_paths, frame_at_z, *macro_paths]
         extrusion = [
+            *brim_extrusion,
             _extrusion_profiles([frame_at_z], _native_e_per_mm(group, tolerance_mm))[0],
             *macro_extrusion,
         ]
         material_paths.append(MaterialPaths(group.layer_index, "R", paths, extrusion))
-        roles[str(group.layer_index)] = ["outer_contour", *("honeycomb_wall" for _ in macro_paths)]
-        records: list[dict[str, object]] = [{"kind": "deposit", "index": 0}]
-        travel_index = 0
+        frame_index = len(brim_paths)
+        roles[layer_key] = [
+            *("brim" for _ in brim_paths),
+            "outer_contour",
+            *("honeycomb_wall" for _ in macro_paths),
+        ]
+        records = [*brim_motions, {"kind": "deposit", "index": frame_index}]
+        travel_index = len(brim_travel)
         for macro_index in range(len(macro_paths)):
             if macro_index:
                 records.append({"kind": "travel", "index": travel_index})
                 travel_index += 1
-            records.append({"kind": "deposit", "index": macro_index + 1})
-        motions[str(group.layer_index)] = records
+            records.append({"kind": "deposit", "index": frame_index + macro_index + 1})
+        motions[layer_key] = records
         inter_partition_routes = [
             connector_template[start]
             for start in partition_starts[1:]
         ]
-        if inter_partition_routes:
+        combined_travel = [
+            *brim_travel,
+            *[_travel_to_path(route, z) for route in inter_partition_routes],
+        ]
+        if combined_travel:
             travel_paths.append(TravelPaths(
                 group.layer_index,
-                [_travel_to_path(route, z) for route in inter_partition_routes],
+                combined_travel,
             ))
 
     job.material_paths = material_paths
@@ -182,6 +226,8 @@ def apply_honeycomb_centerline_pathing(
         "topology_change": "none; wall graph is derived from and clipped to the source STL section",
         "wall_edge_count": len(wall_edges),
         "outer_frame_policy": "one closed standalone first deposition path",
+        "brim_policy": "native Prusa brim paths are retained before the honeycomb frame; a one-stroke Brim remains the already-connected native path",
+        "brim_path_count_by_layer": brim_path_count_by_layer,
         "macro_partition_count": len(partition_starts),
         "layer_path_count": 1 + len(partition_starts),
         "motion_path_count": 1 + len(partition_starts),
@@ -202,6 +248,90 @@ def apply_honeycomb_centerline_pathing(
         slicing["path_planner"] = "honeycomb_centerline_post_prusa"
         slicing["native_gcode_reusable"] = False
     return job
+
+
+def _preserve_native_brim(
+    group: MaterialPaths,
+    layer_roles: object,
+    layer_motions: object,
+    native_travel: TravelPaths | None,
+) -> tuple[list[np.ndarray], list[np.ndarray], list[dict[str, object]], list[np.ndarray]]:
+    """Copy native Brim geometry and its ordered inter-path travels.
+
+    Honeycomb planning deliberately replaces the model contour and infill, but
+    Brim is a first-layer adhesion feature generated by Prusa.  It must remain
+    in the source job before the regenerated honeycomb frame.  In particular,
+    the Prusa adapter has already applied the optional one-stroke connector,
+    so copying the resulting paths keeps its geometry and E profile intact.
+    """
+
+    if (
+        not isinstance(layer_roles, list)
+        or group.extrusion is None
+        or len(layer_roles) != len(group.paths)
+        or len(group.extrusion) != len(group.paths)
+    ):
+        return [], [], [], []
+    brim_indices = [index for index, role in enumerate(layer_roles) if role == "brim"]
+    if not brim_indices:
+        return [], [], [], []
+
+    paths = [np.asarray(group.paths[index], dtype=np.float64).copy() for index in brim_indices]
+    extrusion = [
+        np.asarray(group.extrusion[index], dtype=np.float64).copy()
+        for index in brim_indices
+    ]
+    index_by_source = {source: target for target, source in enumerate(brim_indices)}
+    if not isinstance(layer_motions, list):
+        return (
+            paths,
+            extrusion,
+            [{"kind": "deposit", "index": index} for index in range(len(paths))],
+            [],
+        )
+
+    brim_motion_positions = [
+        position
+        for position, record in enumerate(layer_motions)
+        if isinstance(record, dict)
+        and record.get("kind") == "deposit"
+        and record.get("index") in index_by_source
+    ]
+    if not brim_motion_positions:
+        return (
+            paths,
+            extrusion,
+            [{"kind": "deposit", "index": index} for index in range(len(paths))],
+            [],
+        )
+
+    first_position = min(brim_motion_positions)
+    last_position = max(brim_motion_positions)
+    copied_travel: list[np.ndarray] = []
+    travel_index_by_source: dict[int, int] = {}
+    motions: list[dict[str, object]] = []
+    source_travel_paths = native_travel.paths if native_travel is not None else []
+    for record in layer_motions[first_position : last_position + 1]:
+        if not isinstance(record, dict):
+            continue
+        kind = record.get("kind")
+        source_index = record.get("index")
+        if kind == "deposit" and source_index in index_by_source:
+            motions.append({"kind": "deposit", "index": index_by_source[source_index]})
+        elif (
+            kind == "travel"
+            and isinstance(source_index, int)
+            and 0 <= source_index < len(source_travel_paths)
+        ):
+            target_index = travel_index_by_source.get(source_index)
+            if target_index is None:
+                target_index = len(copied_travel)
+                travel_index_by_source[source_index] = target_index
+                copied_travel.append(
+                    np.asarray(source_travel_paths[source_index], dtype=np.float64).copy()
+                )
+            motions.append({"kind": "travel", "index": target_index})
+    return paths, extrusion, motions, copied_travel
 
 
 def _native_paths_without_outer_frame(

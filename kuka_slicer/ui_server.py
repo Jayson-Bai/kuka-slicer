@@ -5147,7 +5147,7 @@ def _index_html() -> str:
               </div>
             </div>
             <div class="prusaFeatureToggle">
-              <label for="prusaBrimEnabled" class="tooltipLabel checkboxLabel" data-tooltip="在首层生成 Prusa Brim，用于增加底部附着面积；默认关闭。"><input id="prusaBrimEnabled" type="checkbox"> 启用 Prusa Brim</label>
+              <label for="prusaBrimEnabled" class="tooltipLabel checkboxLabel" data-tooltip="在首层生成 Prusa Brim，用于增加底部附着面积。启用蜂窝连续路径时，Brim 会保留在蜂窝外框之前；平面与双正弦蜂窝均可使用。默认关闭。"><input id="prusaBrimEnabled" type="checkbox"> 启用蜂窝 Brim（平面 / 双正弦）</label>
             </div>
             <div id="prusaBrimSettings" class="prusaSettingsGrid prusaSubSettings" hidden>
               <div class="fieldGroup">
@@ -5166,7 +5166,7 @@ def _index_html() -> str:
                 <label for="prusaBrimSeparation">Brim 分离间隙 mm</label>
                 <input id="prusaBrimSeparation" type="number" min="0" step="0.1" value="0">
               </div>
-              <label for="prusaBrimOneStroke" class="tooltipLabel checkboxLabel" data-tooltip="尝试复用 Core 的安全边界连接策略，将 Prusa Brim 连接为一条连续挤出路径；无法安全连接时保留原生多路径。"><input id="prusaBrimOneStroke" type="checkbox"> Brim 一笔画</label>
+              <label for="prusaBrimOneStroke" class="tooltipLabel checkboxLabel" data-tooltip="尝试复用 Core 的安全边界连接策略，将 Prusa Brim 连接为一条连续挤出路径；蜂窝规划会原样保留该一笔画及其 E 曲线。无法安全连接时保留原生多路径。"><input id="prusaBrimOneStroke" type="checkbox"> Brim 一笔画</label>
             </div>
             <div class="prusaFeatureToggle">
               <label for="honeycombCenterlineEnabled" class="tooltipLabel checkboxLabel" data-tooltip="附加于完整 Prusa 切片之后：每层先打印正式 150×100 外框，再生成原始 STL 孔壁的蜂窝路径。每个宏观分区内以不跨孔的零挤出安全换段连接，分区之间采用最短安全空走；所有沉积蜂窝壁均不重走。区内连接转角不超过 90°，三岔节点在一个线宽内渐降/渐升挤出。启用后 Core 使用该附加路径，不使用原生 Prusa G-code。"><input id="honeycombCenterlineEnabled" type="checkbox"{prusa_checked('honeycomb_centerline_enabled', False)}> 蜂窝连续路径（每层外框）</label>
