@@ -4025,16 +4025,47 @@ def _index_html() -> str:
       gap: var(--space-3);
       flex-wrap: wrap;
     }}
-    .honeycombBrimControl {{ position: relative; }}
+    .honeycombBrimControl {{
+      display: flex;
+      align-items: center;
+      gap: var(--space-2);
+    }}
     .honeycombBrimSettings {{
-      position: absolute;
-      z-index: 3;
-      top: calc(100% + var(--space-2));
-      right: 0;
-      width: min(560px, calc(100vw - 48px));
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      background: var(--panel);
-      box-shadow: 0 12px 30px rgba(15, 23, 42, 0.16);
+      width: auto;
+      margin: 0;
+      padding: 0;
+      border: 0;
+      grid-template-columns: auto auto auto auto;
+      gap: var(--space-2);
+      align-items: center;
+      background: transparent;
+    }}
+    .honeycombBrimSettings .fieldGroup {{
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }}
+    .honeycombBrimSettings .fieldGroup > label {{
+      display: block;
+      margin: 0;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 600;
+      line-height: 1;
+      white-space: nowrap;
+    }}
+    .honeycombBrimSettings input:not([type="checkbox"]),
+    .honeycombBrimSettings select {{
+      width: 68px;
+      min-height: 32px;
+      height: 32px;
+      padding: 4px 7px;
+      font-size: 12px;
+    }}
+    .honeycombBrimSettings .fieldGroup:nth-child(2) select {{ width: 98px; }}
+    .honeycombBrimSettings .checkboxLabel {{
+      font-size: 11px;
+      white-space: nowrap;
     }}
     .inputBand input[type="file"] {{
       padding: 0;
@@ -4879,11 +4910,8 @@ def _index_html() -> str:
           "detail detail";
       }}
       .fiberStrategyToggle {{ white-space: normal; }}
-      .honeycombBrimSettings {{
-        position: static;
-        width: 100%;
-        grid-template-columns: 1fr;
-      }}
+      .honeycombBrimControl {{ flex-wrap: wrap; }}
+      .honeycombBrimSettings {{ grid-template-columns: repeat(2, auto); }}
       .panel {{ padding: var(--space-4); }}
       .bandGrid {{ grid-template-columns: 1fr; }}
       .inputBand .bandGrid {{ grid-template-columns: 1fr; }}
