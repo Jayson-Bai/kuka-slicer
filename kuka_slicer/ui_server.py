@@ -4018,6 +4018,24 @@ def _index_html() -> str:
       font-size: 12px;
       font-weight: 650;
     }}
+    .honeycombStrategyControls {{
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: var(--space-3);
+      flex-wrap: wrap;
+    }}
+    .honeycombBrimControl {{ position: relative; }}
+    .honeycombBrimSettings {{
+      position: absolute;
+      z-index: 3;
+      top: calc(100% + var(--space-2));
+      right: 0;
+      width: min(560px, calc(100vw - 48px));
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      background: var(--panel);
+      box-shadow: 0 12px 30px rgba(15, 23, 42, 0.16);
+    }}
     .inputBand input[type="file"] {{
       padding: 0;
       line-height: calc(var(--control-height) - 2px);
@@ -4861,6 +4879,11 @@ def _index_html() -> str:
           "detail detail";
       }}
       .fiberStrategyToggle {{ white-space: normal; }}
+      .honeycombBrimSettings {{
+        position: static;
+        width: 100%;
+        grid-template-columns: 1fr;
+      }}
       .panel {{ padding: var(--space-4); }}
       .bandGrid {{ grid-template-columns: 1fr; }}
       .inputBand .bandGrid {{ grid-template-columns: 1fr; }}
@@ -4927,10 +4950,35 @@ def _index_html() -> str:
         <output id="conformalSpecResult" class="surfaceCollisionResult" aria-live="polite">尚未导入曲面或平面蜂窝结构 JSON。</output>
         <output id="surfaceNpzCollisionResult" class="surfaceCollisionResult secondary" aria-live="polite"></output>
       </div>
-      <fieldset class="fiberStrategyToggle" aria-label="蜂窝结构连续纤维策略" title="曲面模式下，首个与末个纤维界面由设计 JSON 自动确定；纤维层范围由设计 JSON 的起始层与终止层规则自动确定。平面模式在除顶盖外的树脂层间生成纤维层；两者复用同一连续路径拓扑。">
-        <legend>连续纤维策略</legend>
-        <label><input id="conformalFiberEnabled" type="checkbox" checked> 启用连续纤维路径</label>
-      </fieldset>
+      <div class="honeycombStrategyControls">
+        <fieldset class="fiberStrategyToggle" aria-label="蜂窝结构连续纤维策略" title="曲面模式下，首个与末个纤维界面由设计 JSON 自动确定；纤维层范围由设计 JSON 的起始层与终止层规则自动确定。平面模式在除顶盖外的树脂层间生成纤维层；两者复用同一连续路径拓扑。">
+          <legend>连续纤维策略</legend>
+          <label><input id="conformalFiberEnabled" type="checkbox" checked> 启用连续纤维路径</label>
+        </fieldset>
+        <fieldset class="fiberStrategyToggle honeycombBrimControl" aria-label="蜂窝 Brim 设置">
+          <legend>蜂窝 Brim</legend>
+          <label for="prusaBrimEnabled" class="tooltipLabel" data-tooltip="在首层生成 Brim，用于增加平面或双正弦蜂窝的底部附着面积；默认关闭。"><input id="prusaBrimEnabled" type="checkbox"{prusa_checked('prusa_brim_enabled', False)}> 启用蜂窝 Brim</label>
+          <div id="prusaBrimSettings" class="prusaSettingsGrid prusaSubSettings honeycombBrimSettings" hidden>
+            <div class="fieldGroup">
+              <label for="prusaBrimWidth">Brim 宽度 mm</label>
+              <input id="prusaBrimWidth" type="number" min="0" step="0.1" value="{prusa_num('prusa_brim_width', 5.0)}">
+            </div>
+            <div class="fieldGroup">
+              <label for="prusaBrimType">Brim 类型</label>
+              <select id="prusaBrimType">
+                <option value="outer_only"{prusa_selected('prusa_brim_type', 'outer_only', 'outer_only')}>仅外侧</option>
+                <option value="outer_and_inner"{prusa_selected('prusa_brim_type', 'outer_only', 'outer_and_inner')}>外侧和内侧</option>
+                <option value="no_brim"{prusa_selected('prusa_brim_type', 'outer_only', 'no_brim')}>不生成</option>
+              </select>
+            </div>
+            <div class="fieldGroup">
+              <label for="prusaBrimSeparation">Brim 分离间隙 mm</label>
+              <input id="prusaBrimSeparation" type="number" min="0" step="0.1" value="{prusa_num('prusa_brim_separation', 0.0)}">
+            </div>
+            <label for="prusaBrimOneStroke" class="tooltipLabel checkboxLabel" data-tooltip="尝试将 Brim 连接为一条连续挤出路径；无法安全连接时保留原生多路径。"><input id="prusaBrimOneStroke" type="checkbox"{prusa_checked('prusa_brim_one_stroke', False)}> Brim 一笔画</label>
+          </div>
+        </fieldset>
+      </div>
     </div>
     <input id="surfaceNpzInput" type="file" accept=".npz,application/octet-stream" hidden>
     <input id="conformalSpecInput" type="file" accept=".json,application/json" hidden>
@@ -5145,28 +5193,6 @@ def _index_html() -> str:
                 <label for="prusaMinSkirtLength">最小裙边长度 mm</label>
                 <input id="prusaMinSkirtLength" type="number" min="0" step="1" value="10">
               </div>
-            </div>
-            <div class="prusaFeatureToggle">
-              <label for="prusaBrimEnabled" class="tooltipLabel checkboxLabel" data-tooltip="在首层生成 Prusa Brim，用于增加底部附着面积。启用蜂窝连续路径时，Brim 会保留在蜂窝外框之前；平面与双正弦蜂窝均可使用。默认关闭。"><input id="prusaBrimEnabled" type="checkbox"> 启用蜂窝 Brim（平面 / 双正弦）</label>
-            </div>
-            <div id="prusaBrimSettings" class="prusaSettingsGrid prusaSubSettings" hidden>
-              <div class="fieldGroup">
-                <label for="prusaBrimWidth">Brim 宽度 mm</label>
-                <input id="prusaBrimWidth" type="number" min="0" step="0.1" value="5">
-              </div>
-              <div class="fieldGroup">
-                <label for="prusaBrimType">Brim 类型</label>
-                <select id="prusaBrimType">
-                  <option value="outer_only" selected>仅外侧</option>
-                  <option value="outer_and_inner">外侧和内侧</option>
-                  <option value="no_brim">不生成</option>
-                </select>
-              </div>
-              <div class="fieldGroup">
-                <label for="prusaBrimSeparation">Brim 分离间隙 mm</label>
-                <input id="prusaBrimSeparation" type="number" min="0" step="0.1" value="0">
-              </div>
-              <label for="prusaBrimOneStroke" class="tooltipLabel checkboxLabel" data-tooltip="尝试复用 Core 的安全边界连接策略，将 Prusa Brim 连接为一条连续挤出路径；蜂窝规划会原样保留该一笔画及其 E 曲线。无法安全连接时保留原生多路径。"><input id="prusaBrimOneStroke" type="checkbox"> Brim 一笔画</label>
             </div>
             <div class="prusaFeatureToggle">
               <label for="honeycombCenterlineEnabled" class="tooltipLabel checkboxLabel" data-tooltip="附加于完整 Prusa 切片之后：每层先打印正式 150×100 外框，再生成原始 STL 孔壁的蜂窝路径。每个宏观分区内以不跨孔的零挤出安全换段连接，分区之间采用最短安全空走；所有沉积蜂窝壁均不重走。区内连接转角不超过 90°，三岔节点在一个线宽内渐降/渐升挤出。启用后 Core 使用该附加路径，不使用原生 Prusa G-code。"><input id="honeycombCenterlineEnabled" type="checkbox"{prusa_checked('honeycomb_centerline_enabled', False)}> 蜂窝连续路径（每层外框）</label>
@@ -6747,7 +6773,7 @@ def _index_html() -> str:
       for (const id of ['prusaRaftContactLayerHeight', 'prusaRaftContactDensity', 'prusaRaftContactExtrusionWidth']) {{
         document.getElementById(id).disabled = !manualContactEnabled;
       }}
-      const prusaBrimEnabled = !isPyslm && !isLegacy && prusaBrimEnabledInput.checked;
+      const prusaBrimEnabled = prusaBrimEnabledInput.checked;
       prusaBrimSettings.hidden = !prusaBrimEnabled;
       for (const id of prusaBrimSettingIds) {{
         document.getElementById(id).disabled = !prusaBrimEnabled;

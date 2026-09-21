@@ -4220,8 +4220,11 @@ def test_ui_exposes_slicing_kernel_input():
     assert 'id="prusaInfillPattern"' in html
     assert 'id="prusaBrimEnabled"' in html
     assert 'id="prusaBrimOneStroke"' in html
-    assert '启用蜂窝 Brim（平面 / 双正弦）' in html
-    assert '蜂窝规划会原样保留该一笔画及其 E 曲线' in html
+    assert '启用蜂窝 Brim' in html
+    assert 'honeycombStrategyControls' in html
+    assert 'honeycombBrimSettings' in html
+    assert html.index('id="conformalFiberEnabled"') < html.index('id="prusaBrimEnabled"')
+    assert html.index('id="prusaBrimEnabled"') < html.index('id="prusaNativeSettings"')
     assert '<div class="sectionTitleRow">' in html
     assert '<div id="fiberNotice" class="notice fiberNotice"></div>' in html
     assert '.inputBand .bandGrid {' in html
