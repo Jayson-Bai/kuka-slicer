@@ -4023,19 +4023,20 @@ def _index_html() -> str:
       align-items: center;
       justify-content: flex-end;
       gap: var(--space-3);
-      flex-wrap: wrap;
+      flex-wrap: nowrap;
     }}
     .honeycombBrimControl {{
       display: flex;
+      flex: 0 0 auto;
       align-items: center;
       gap: var(--space-2);
     }}
-    .honeycombBrimSettings {{
+    .honeycombBrimControl .honeycombBrimSettings {{
       width: auto;
       margin: 0;
       padding: 0;
       border: 0;
-      grid-template-columns: auto auto auto auto;
+      grid-template-columns: repeat(4, max-content);
       gap: var(--space-2);
       align-items: center;
       background: transparent;
@@ -4910,8 +4911,9 @@ def _index_html() -> str:
           "detail detail";
       }}
       .fiberStrategyToggle {{ white-space: normal; }}
+      .honeycombStrategyControls {{ flex-wrap: wrap; }}
       .honeycombBrimControl {{ flex-wrap: wrap; }}
-      .honeycombBrimSettings {{ grid-template-columns: repeat(2, auto); }}
+      .honeycombBrimControl .honeycombBrimSettings {{ grid-template-columns: repeat(2, max-content); }}
       .panel {{ padding: var(--space-4); }}
       .bandGrid {{ grid-template-columns: 1fr; }}
       .inputBand .bandGrid {{ grid-template-columns: 1fr; }}
