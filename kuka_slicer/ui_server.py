@@ -32,7 +32,10 @@ from .external_npz import (
 )
 from .cpu_limiter import limit_slicer_task
 from .conformal_lattice.contracts import load_conformal_lattice_spec
-from .fiber_interlayers import plan_flat_resin_interlayers
+from .fiber_interlayers import (
+    DEFAULT_INITIAL_RESIN_ONLY_LAYERS,
+    plan_flat_resin_interlayers,
+)
 from .gcode_legacy_postprocess import apply_legacy_resin_optimization
 from .honeycomb_pathing import HoneycombPathingConfig
 
@@ -2979,20 +2982,20 @@ def expand_fiber_template_for_resin_layers(
         for group in part_resin_groups
     }
 
-    # A brim is printed on the first part resin layer, but fiber should start
-    # only above the following resin layer.  Keep the normal resin/fiber
-    # schedule otherwise: skipping this one fiber layer also removes its
-    # 0.1 mm contribution from all subsequent absolute Z values.
+    # Physical layer 1 is resin-only by default.  The first fiber is inserted
+    # only after physical resin layer 2, whether or not the first layer also
+    # owns a Brim.  Retain the Brim flag as audit metadata, but do not let it
+    # change this shared material schedule.
     first_part_has_brim = False
     if part_resin_groups:
         roles_by_layer = job.meta.get("path_roles", {}).get("R", {})
         if isinstance(roles_by_layer, dict):
             roles = roles_by_layer.get(str(part_resin_groups[0].layer_index), [])
             first_part_has_brim = isinstance(roles, list) and "brim" in roles
-    skipped_fiber_layers = 1 if first_part_has_brim else 0
+    skipped_fiber_layers = DEFAULT_INITIAL_RESIN_ONLY_LAYERS
     interlayer_schedule = plan_flat_resin_interlayers(
         (group.layer_index for group in part_resin_groups),
-        skip_initial_interfaces=skipped_fiber_layers,
+        skip_initial_interfaces=DEFAULT_INITIAL_RESIN_ONLY_LAYERS,
     )
 
     # The fiber is physically printed between resin layers.  Include its
@@ -3040,7 +3043,8 @@ def expand_fiber_template_for_resin_layers(
             inserted_fiber_layers = len(interlayer_schedule.after_resin_layer_indices)
             slicing_metadata["z_max"] = float(z_max) + inserted_fiber_layers * fiber_layer_height
         slicing_metadata["fiber_layer_height_applied_mm"] = fiber_layer_height
-        slicing_metadata["fiber_layers_skipped_for_brim"] = skipped_fiber_layers
+        slicing_metadata["fiber_initial_resin_only_layer_count"] = skipped_fiber_layers
+        slicing_metadata["fiber_first_part_layer_has_brim"] = first_part_has_brim
         slicing_metadata["fiber_layer_interface_policy"] = interlayer_schedule.source
 
     # The physical fiber Z accumulates earlier fiber courses.  Routing must

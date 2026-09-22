@@ -16,6 +16,7 @@ from .contracts import ConformalLatticeSpec
 from .layer_embedding import LayerEmbedding
 from .path_bridge import ConformalLatticePathGraph, _with_kuka_surface_orientation
 from ..external_npz import ExternalSourceJob, MaterialPaths, TravelPaths
+from ..fiber_interlayers import DEFAULT_INITIAL_RESIN_ONLY_LAYERS
 from ..honeycomb_pathing.planner import _Edge, _minimum_trail_cover
 
 
@@ -78,7 +79,10 @@ def derive_symmetric_curvature_fiber_interfaces(
     # Layer index i represents physical resin layer i + 1. The first fiber
     # follows the preceding layer i; after a curvature region ending at j, its
     # matching interface follows physical layer j + 2.
-    first_after_resin_layer_physical = int(active[0])
+    first_after_resin_layer_physical = max(
+        DEFAULT_INITIAL_RESIN_ONLY_LAYERS + 1,
+        int(active[0]),
+    )
     last_after_resin_layer_physical = int(active[-1]) + 2
     if first_after_resin_layer_physical < 1:
         raise ValueError(

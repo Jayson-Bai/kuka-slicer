@@ -227,10 +227,20 @@ def test_main_ui_processes_planar_json_through_core_with_optional_fiber(tmp_path
     assert result["effective_infill_pattern"] == "平面蜂窝连续路径"
     assert result["fiber_reinforcement"]["enabled"] is True
     assert result["fiber_reinforcement"]["layer_interface_source"] == (
-        "flat_resin_interlayer_policy_v1"
+        "flat_resin_interlayer_policy_v2"
     )
-    assert result["fiber_reinforcement"]["resin_layer_indices"] == [0, 1, 2]
+    assert result["fiber_reinforcement"]["after_resin_physical_layers"] == [2, 3]
+    assert result["fiber_reinforcement"]["resin_layer_indices"] == [1, 2]
     assert any(layer["fiber_paths"] for layer in result["preview"]["layers"])
+    first_layer = next(layer for layer in result["preview"]["layers"] if layer["index"] == 0)
+    second_layer = next(layer for layer in result["preview"]["layers"] if layer["index"] == 1)
+    assert first_layer["fiber_paths"] == []
+    deposit_roles = [
+        path["role"]
+        for path in second_layer["motion_paths"]
+        if path["kind"] == "deposit"
+    ]
+    assert deposit_roles.index("final_resin") < deposit_roles.index("fiber")
 
     job_dir = tmp_path / result["download_url"].split("/")[-2]
     with np.load(job_dir / "planar_honeycomb_core.npz", allow_pickle=False) as core:

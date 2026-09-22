@@ -42,7 +42,8 @@ def test_ordinary_flat_slicer_records_the_shared_interlayer_policy():
         [[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]],
     )
 
-    assert sorted(paths) == [0, 1]
+    assert sorted(paths) == [1]
+    assert job.meta["slicing"]["fiber_initial_resin_only_layer_count"] == 1
     assert job.meta["slicing"]["fiber_layer_interface_policy"] == (
         FLAT_RESIN_INTERLAYER_POLICY_SOURCE
     )

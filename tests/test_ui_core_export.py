@@ -133,13 +133,23 @@ def test_main_ui_continuous_course_fiber_strategy_reaches_final_core_output(tmp_
     assert report["mode"] == "continuous_course_network_v1"
     assert report["course_semantics"] == "every rectangle-clipped continuous-course fragment is an independent resin/F path with normal Core travel/cut boundaries"
     assert report["layer_interface_source"] == "design_json_symmetric_nonzero_curvature"
-    assert report["after_resin_physical_layers"] == [1, 4]
+    assert report["after_resin_physical_layers"] == [2, 4]
+    assert report["resin_layer_indices"][0] == 1
     assert report["total_fiber_path_count"] > 0
     assert report["automatic_resin_z_raise"] is True
     job_dir = tmp_path / result["download_url"].split("/")[-2]
     with np.load(job_dir / "conformal_lattice_core.npz", allow_pickle=False) as core:
         assert core["x"].size > 0
     assert any(layer["fiber_paths"] for layer in result["preview"]["layers"])
+    first_layer = next(layer for layer in result["preview"]["layers"] if layer["index"] == 0)
+    second_layer = next(layer for layer in result["preview"]["layers"] if layer["index"] == 1)
+    assert first_layer["fiber_paths"] == []
+    deposit_roles = [
+        path["role"]
+        for path in second_layer["motion_paths"]
+        if path["kind"] == "deposit"
+    ]
+    assert deposit_roles.index("final_resin") < deposit_roles.index("fiber")
     assert sum(
         len(layer["fiber_cut_events"])
         for layer in result["preview"]["layers"]
