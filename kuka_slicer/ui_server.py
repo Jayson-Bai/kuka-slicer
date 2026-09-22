@@ -2597,9 +2597,31 @@ def _float_param(params: dict[str, list[str]], name: str, default: float) -> flo
 
 
 def _core_xy_param(params: dict[str, list[str]], name: str, default: float) -> float:
-    """Read a Core XY field from the current UI name and old ``_mm`` alias."""
+    """Read a Core XY field while preserving both historical coordinate contracts.
 
-    return _float_param(params, name, _float_param(params, f"{name}_mm", default))
+    Current ``*_position_[xy]`` values are absolute print-plane coordinates.
+    The older ``core_primeline_[xy]_mm`` fields were offsets from the selected
+    part position, so translate those aliases before passing them to Core.
+    """
+
+    if name in params:
+        return _float_param(params, name, default)
+    millimetre_alias = f"{name}_mm"
+    if millimetre_alias in params:
+        return _float_param(params, millimetre_alias, default)
+    prefix = "core_primeline_position_"
+    if name.startswith(prefix):
+        axis = name.removeprefix(prefix)
+        legacy_name = f"core_primeline_{axis}_mm"
+        if legacy_name in params:
+            part_default = _float_param(params, f"prusa_start_{axis}_mm", 0.0)
+            part_position = _core_xy_param(
+                params,
+                f"core_part_position_{axis}",
+                part_default,
+            )
+            return part_position + _float_param(params, legacy_name, 0.0)
+    return float(default)
 
 
 def _optional_float_param(params: dict[str, list[str]], name: str) -> float | None:
