@@ -153,11 +153,11 @@ def test_fiber_template_z_is_offset_from_resin_layer_z():
     fiber_paths_by_layer = expand_fiber_template_for_resin_layers(job, template_paths)
 
     resin_z_values = [group.paths[0][0, 2] for group in job.material_paths]
-    assert np.allclose(resin_z_values, [0.5, 1.1, 1.7])
-    assert sorted(fiber_paths_by_layer) == [0, 1]
+    assert np.allclose(resin_z_values, [0.5, 1.0, 1.6])
+    assert sorted(fiber_paths_by_layer) == [1]
     assert np.allclose(
         [fiber_paths_by_layer[layer_index][0][0][2] for layer_index in sorted(fiber_paths_by_layer)],
-        [0.6, 1.2],
+        [1.1],
     )
 
 
@@ -193,7 +193,8 @@ def test_brim_layer_skips_fiber_and_keeps_following_resin_fiber_schedule():
         [fiber_paths_by_layer[index][0][0][2] for index in (1, 2)],
         [1.0, 1.6],
     )
-    assert job.meta["slicing"]["fiber_layers_skipped_for_brim"] == 1
+    assert job.meta["slicing"]["fiber_initial_resin_only_layer_count"] == 1
+    assert job.meta["slicing"]["fiber_first_part_layer_has_brim"] is True
 
 
 def test_fiber_z_offset_keeps_prusa_travel_aligned_with_resin_layer():
@@ -250,22 +251,24 @@ def test_first_layer_height_carries_into_the_fiber_resin_schedule():
     fiber_paths_by_layer = expand_fiber_template_for_resin_layers(job, template_paths)
 
     resin_z_values = [group.paths[0][0, 2] for group in job.material_paths]
-    assert np.allclose(resin_z_values, [0.3, 0.9, 1.5])
+    assert np.allclose(resin_z_values, [0.3, 0.8, 1.4])
     assert np.allclose(
         [fiber_paths_by_layer[layer_index][0][0][2] for layer_index in sorted(fiber_paths_by_layer)],
-        [0.4, 1.0],
+        [0.9],
     )
 
 
 def test_fiber_template_skips_prusa_raft_layers():
     raft = np.asarray([[0.0, 0.0, 0.5], [1.0, 0.0, 0.5]], dtype=np.float32)
     first_part = np.asarray([[0.0, 0.0, 1.0], [1.0, 0.0, 1.0]], dtype=np.float32)
-    final_part = np.asarray([[0.0, 0.0, 1.5], [1.0, 0.0, 1.5]], dtype=np.float32)
+    second_part = np.asarray([[0.0, 0.0, 1.5], [1.0, 0.0, 1.5]], dtype=np.float32)
+    final_part = np.asarray([[0.0, 0.0, 2.0], [1.0, 0.0, 2.0]], dtype=np.float32)
     job = ExternalSourceJob(
         material_paths=[
             MaterialPaths(0, "R", [raft]),
             MaterialPaths(1, "R", [first_part]),
-            MaterialPaths(2, "R", [final_part]),
+            MaterialPaths(2, "R", [second_part]),
+            MaterialPaths(3, "R", [final_part]),
         ],
         meta={"slicing": {"prusa_raft": {"layer_count": 1}}},
     )
@@ -275,9 +278,10 @@ def test_fiber_template_skips_prusa_raft_layers():
 
     assert np.allclose(job.material_paths[0].paths[0][:, 2], 0.5)
     assert np.allclose(job.material_paths[1].paths[0][:, 2], 1.0)
-    assert np.allclose(job.material_paths[2].paths[0][:, 2], 1.6)
-    assert sorted(fiber_paths_by_layer) == [1]
-    assert np.allclose(fiber_paths_by_layer[1][0][0][2], 1.1)
+    assert np.allclose(job.material_paths[2].paths[0][:, 2], 1.5)
+    assert np.allclose(job.material_paths[3].paths[0][:, 2], 2.1)
+    assert sorted(fiber_paths_by_layer) == [2]
+    assert np.allclose(fiber_paths_by_layer[2][0][0][2], 1.6)
 
 
 def test_fiber_json_merges_multiple_path_families_at_the_same_layer_height(
@@ -305,7 +309,7 @@ def test_fiber_json_merges_multiple_path_families_at_the_same_layer_height(
         [[2.0, 0.0, 0.0], [3.0, 0.0, 0.0]],
     ]
 
-    mesh = Mesh(_cube_triangles(size=1.0))
+    mesh = Mesh(_cube_triangles(size=1.5))
     job = slice_mesh_to_job(
         mesh,
         SliceConfig(layer_height=0.5, line_width=0.1, infill_pattern="none"),
@@ -315,11 +319,11 @@ def test_fiber_json_merges_multiple_path_families_at_the_same_layer_height(
         template_paths,
     )
 
-    assert sorted(fiber_paths_by_layer) == [0]
-    assert len(fiber_paths_by_layer[0]) == 2
+    assert sorted(fiber_paths_by_layer) == [1]
+    assert len(fiber_paths_by_layer[1]) == 2
     assert all(
-        np.allclose(np.asarray(path)[:, 2], 0.6)
-        for path in fiber_paths_by_layer[0]
+        np.allclose(np.asarray(path)[:, 2], 1.1)
+        for path in fiber_paths_by_layer[1]
     )
 
 
@@ -459,11 +463,11 @@ def test_fiber_template_paths_preserve_input_vertices_before_export():
     template_paths = [[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0]]]
 
     fiber_paths_by_layer = expand_fiber_template_for_resin_layers(job, template_paths)
-    exported_path = np.asarray(fiber_paths_by_layer[0][0], dtype=np.float32)
+    exported_path = np.asarray(fiber_paths_by_layer[1][0], dtype=np.float32)
 
     assert exported_path.shape[0] == len(template_paths[0])
     assert np.allclose(exported_path[:, :2], np.asarray(template_paths[0])[:, :2])
-    assert np.allclose(exported_path[:, 2], 0.6)
+    assert np.allclose(exported_path[:, 2], 1.1)
 
 
 def test_resin_line_infill_uses_default_run_overlap_inside_fixed_contour_seam():
@@ -4222,8 +4226,11 @@ def test_ui_exposes_slicing_kernel_input():
     assert 'id="prusaInfillPattern"' in html
     assert 'id="prusaBrimEnabled"' in html
     assert 'id="prusaBrimOneStroke"' in html
-    assert '启用蜂窝 Brim（平面 / 双正弦）' in html
-    assert '蜂窝规划会原样保留该一笔画及其 E 曲线' in html
+    assert '启用蜂窝 Brim' in html
+    assert 'honeycombStrategyControls' in html
+    assert 'honeycombBrimSettings' in html
+    assert html.index('id="conformalFiberEnabled"') < html.index('id="prusaBrimEnabled"')
+    assert html.index('id="prusaBrimEnabled"') < html.index('id="prusaNativeSettings"')
     assert '<div class="sectionTitleRow">' in html
     assert '<div id="fiberNotice" class="notice fiberNotice"></div>' in html
     assert '.inputBand .bandGrid {' in html
@@ -4287,6 +4294,11 @@ def test_ui_offers_large_advanced_settings_as_draggable_resizable_popups():
 
     assert "installAdvancedPopups" in html
     assert "advancedIds = ['prusaAdvancedSettings', 'coreProcessSettings']" in html
+    assert 'id="coreProcessSettingsTopButton"' in html
+    assert "document.getElementById('coreProcessSettingsTopButton')" in html
+    assert html.index('id="coreProcessSettingsTopButton"') < html.index('id="conformalSliceButton"')
+    assert "width: min(1540px, calc(100% - 40px));" in html
+    assert "grid-template-columns: minmax(560px, 1.55fr) minmax(340px, 1fr);" in html
     assert 'id="zMin"' not in html
     assert 'id="zMax"' not in html
     assert 'id="tolerance"' not in html
@@ -4590,6 +4602,10 @@ def test_ui_preview_supports_filtered_ordered_progress_pan_zoom_and_rulers():
     for interaction in (
         "selectedPrintEntries",
         "drawMeasurementGrid",
+        "drawSurfaceMeasurementGrid",
+        "drawSurfacePrintCenter",
+        "打印平面网格",
+        "打印中心",
         "niceGridStep",
         "addEventListener('wheel'",
         "addEventListener('pointerdown'",

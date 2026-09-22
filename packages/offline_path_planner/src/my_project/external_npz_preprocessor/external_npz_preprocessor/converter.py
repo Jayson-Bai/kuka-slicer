@@ -222,7 +222,14 @@ def source_job_to_parsed_commands(job: SourceJob, params: ProcessParams) -> Pars
                     source_min_y=source_min_y,
                 )
                 initial_travel_added = True
-            elif not initial_travel_added and not source_travel_mode:
+            elif not initial_travel_added:
+                # A SourceJob can contain later Prusa/fiber travels without an
+                # explicit startup path.  The old source_travel_mode guard then
+                # skipped the machine-origin move before Primeline and merely
+                # changed the in-memory pose.  Core consequently joined its
+                # last stationary process row at (0, 0) directly to the end of
+                # Primeline as one deposited diagonal.  Always emit the missing
+                # startup move when no source travel has established a pose.
                 line = _append_initial_start_xy_travel(
                     commands,
                     params,
@@ -232,8 +239,6 @@ def source_job_to_parsed_commands(job: SourceJob, params: ProcessParams) -> Pars
                     feed_mm_s=destination_travel_feed_mm_s,
                 )
                 initial_travel_added = True
-                current_pose = first_pose
-            elif source_travel_mode and current_pose is None:
                 current_pose = first_pose
             if current_tool != tool:
                 commands.append(

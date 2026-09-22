@@ -11,7 +11,8 @@ from dataclasses import dataclass
 from typing import Iterable
 
 
-FLAT_RESIN_INTERLAYER_POLICY_SOURCE = "flat_resin_interlayer_policy_v1"
+FLAT_RESIN_INTERLAYER_POLICY_SOURCE = "flat_resin_interlayer_policy_v2"
+DEFAULT_INITIAL_RESIN_ONLY_LAYERS = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,13 +47,13 @@ class FiberInterlayerSchedule:
 def plan_flat_resin_interlayers(
     resin_layer_indices: Iterable[int],
     *,
-    skip_initial_interfaces: int = 0,
+    skip_initial_interfaces: int = DEFAULT_INITIAL_RESIN_ONLY_LAYERS,
 ) -> FiberInterlayerSchedule:
-    """Select every eligible flat resin interface while retaining a top cap.
+    """Select flat resin interfaces after a resin-only first layer and before a top cap.
 
-    ``skip_initial_interfaces`` models a process-owned prefix such as the
-    ordinary slicer's first part layer containing a Brim.  It is intentionally
-    expressed without referring to any slicing backend.
+    By default physical layer 1 is resin-only: the first fiber is emitted
+    after physical resin layer 2. ``skip_initial_interfaces`` can reserve a
+    longer process-owned prefix without referring to any slicing backend.
     """
 
     ordered = tuple(sorted(int(index) for index in resin_layer_indices))

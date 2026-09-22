@@ -33,7 +33,10 @@ from .external_npz import (
 )
 from .cpu_limiter import limit_slicer_task
 from .conformal_lattice.contracts import load_conformal_lattice_spec
-from .fiber_interlayers import plan_flat_resin_interlayers
+from .fiber_interlayers import (
+    DEFAULT_INITIAL_RESIN_ONLY_LAYERS,
+    plan_flat_resin_interlayers,
+)
 from .fiber_travel import plan_fiber_interpath_travels
 from .gcode_legacy_postprocess import apply_legacy_resin_optimization
 from .honeycomb_pathing import HoneycombPathingConfig
@@ -860,7 +863,7 @@ def _preview_payload_from_final_core_npz(
                         has_curved_deposition = True
                     segment_extrusion = (
                         extrusion[segment_indices]
-                        if role in {"final_resin", "primeline"} and extrusion is not None
+                        if role != "travel" and extrusion is not None
                         else None
                     )
                     mandatory = _preview_mandatory_indices(
@@ -886,7 +889,7 @@ def _preview_payload_from_final_core_npz(
                             source_extrusion,
                             max_points=_FINAL_CORE_PREVIEW_MAX_POINTS,
                         )
-                        if role == "final_resin"
+                        if role != "travel"
                         else [(points, None)]
                     )
                     for chunk_points, chunk_extrusion in chunks:
@@ -2267,6 +2270,21 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         # grip material instead of rendering/deleting that large temporary
         # graph, without changing the eventual Core SourceJob geometry.
         conformal_source_job = run.path_graph.to_external_base_source_job()
+        from .conformal_lattice.brim import ConformalBrimSettings, apply_conformal_brim
+
+        brim_report = apply_conformal_brim(
+            conformal_source_job,
+            ConformalBrimSettings(
+                enabled=_bool_param(params, "prusa_brim_enabled", False),
+                width_mm=_float_param(params, "prusa_brim_width", 5.0),
+                brim_type=params.get("prusa_brim_type", ["outer_only"])[0],  # type: ignore[arg-type]
+                separation_mm=_float_param(params, "prusa_brim_separation", 0.0),
+                one_stroke=_bool_param(params, "prusa_brim_one_stroke", False),
+                # The conformal bridge and its preview use this calibrated
+                # two-millimetre bead centreline.
+                line_width_mm=2.0,
+            ),
+        )
         from .conformal_lattice.fiber_reinforcement import (
             ContinuousCourseFiberSettings,
             apply_continuous_course_fiber_strategy,
@@ -2387,6 +2405,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             "infill_pattern_execution": {"applied": True, "mode": "continuous_course_network_v1"},
             "conformal_lattice": run.report,
             "fiber_reinforcement": fiber_reinforcement.report,
+            "brim": brim_report,
             "nominal_final_height_mm": fiber_reinforcement.nominal_final_height_mm,
             "core_export_seconds": float(core_stats.get("total_s", 0.0)),
             "core_rows": int(core_stats.get("rows", 0)),
@@ -3397,20 +3416,20 @@ def expand_fiber_template_for_resin_layers(
         for group in part_resin_groups
     }
 
-    # A brim is printed on the first part resin layer, but fiber should start
-    # only above the following resin layer.  Keep the normal resin/fiber
-    # schedule otherwise: skipping this one fiber layer also removes its
-    # 0.1 mm contribution from all subsequent absolute Z values.
+    # Physical layer 1 is resin-only by default.  The first fiber is inserted
+    # only after physical resin layer 2, whether or not the first layer also
+    # owns a Brim.  Retain the Brim flag as audit metadata, but do not let it
+    # change this shared material schedule.
     first_part_has_brim = False
     if part_resin_groups:
         roles_by_layer = job.meta.get("path_roles", {}).get("R", {})
         if isinstance(roles_by_layer, dict):
             roles = roles_by_layer.get(str(part_resin_groups[0].layer_index), [])
             first_part_has_brim = isinstance(roles, list) and "brim" in roles
-    skipped_fiber_layers = 1 if first_part_has_brim else 0
+    skipped_fiber_layers = DEFAULT_INITIAL_RESIN_ONLY_LAYERS
     interlayer_schedule = plan_flat_resin_interlayers(
         (group.layer_index for group in part_resin_groups),
-        skip_initial_interfaces=skipped_fiber_layers,
+        skip_initial_interfaces=DEFAULT_INITIAL_RESIN_ONLY_LAYERS,
     )
 
     # The fiber is physically printed between resin layers.  Include its
@@ -3458,7 +3477,8 @@ def expand_fiber_template_for_resin_layers(
             inserted_fiber_layers = len(interlayer_schedule.after_resin_layer_indices)
             slicing_metadata["z_max"] = float(z_max) + inserted_fiber_layers * fiber_layer_height
         slicing_metadata["fiber_layer_height_applied_mm"] = fiber_layer_height
-        slicing_metadata["fiber_layers_skipped_for_brim"] = skipped_fiber_layers
+        slicing_metadata["fiber_initial_resin_only_layer_count"] = skipped_fiber_layers
+        slicing_metadata["fiber_first_part_layer_has_brim"] = first_part_has_brim
         slicing_metadata["fiber_layer_interface_policy"] = interlayer_schedule.source
 
     # The physical fiber Z accumulates earlier fiber courses.  Routing must
@@ -4163,11 +4183,11 @@ def _index_html() -> str:
       background: #ffffff;
     }}
     .appHeaderInner {{
-      width: min(1180px, calc(100% - 40px));
+      width: min(1540px, calc(100% - 40px));
       margin: 0 auto;
       padding: var(--space-4) 0;
       display: grid;
-      grid-template-columns: minmax(230px, 300px) minmax(0, 1fr);
+      grid-template-columns: minmax(260px, 340px) minmax(0, 1fr);
       gap: var(--space-5);
       align-items: start;
     }}
@@ -4392,7 +4412,7 @@ def _index_html() -> str:
     }}
     .surfaceToolGroups {{
       display: grid;
-      grid-template-columns: minmax(520px, 1.6fr) minmax(290px, 0.9fr);
+      grid-template-columns: minmax(560px, 1.55fr) minmax(340px, 1fr);
       gap: var(--space-3);
       align-items: start;
     }}
@@ -4413,23 +4433,6 @@ def _index_html() -> str:
     .surfaceToolGroup[aria-label="共形蜂窝流程"] .surfaceToolGroupLabel {{
       grid-column: 1 / -1;
     }}
-    .surfaceToolGroup #coreProcessSettings {{
-      margin-top: 0;
-      padding-top: 0;
-      border-top: 0;
-    }}
-    .surfaceToolGroup #coreSettingsToolbarHost {{
-      display: contents;
-    }}
-    .surfaceToolGroup #coreProcessSettings .advancedPopupTrigger {{
-      width: max-content;
-      min-height: 34px;
-      height: 34px;
-      box-sizing: border-box;
-      padding: 6px 10px;
-      font-size: 13px;
-      line-height: 20px;
-    }}
     .surfaceToolGroupLabel {{
       flex: 1 0 100%;
       color: var(--muted);
@@ -4449,6 +4452,7 @@ def _index_html() -> str:
       font: inherit;
       font-size: 13px;
       line-height: 20px;
+      white-space: nowrap;
       cursor: pointer;
     }}
     .surfaceToolButton:hover {{ background: #eef6ff; }}
@@ -4462,7 +4466,7 @@ def _index_html() -> str:
     .surfaceToolButton.primary:hover {{ background: var(--accent-dark); }}
     .surfaceToolButton.quiet {{ border-color: var(--line); color: var(--muted); }}
     .surfaceContext {{
-      width: min(1180px, calc(100% - 40px));
+      width: min(1540px, calc(100% - 40px));
       margin: 0 auto;
       padding: 0 0 var(--space-3);
       display: grid;
@@ -4502,6 +4506,56 @@ def _index_html() -> str:
       color: var(--ink);
       font-size: 12px;
       font-weight: 650;
+    }}
+    .honeycombStrategyControls {{
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: var(--space-3);
+      flex-wrap: nowrap;
+    }}
+    .honeycombBrimControl {{
+      display: flex;
+      flex: 0 0 auto;
+      align-items: center;
+      gap: var(--space-2);
+    }}
+    .honeycombBrimControl .honeycombBrimSettings {{
+      width: auto;
+      margin: 0;
+      padding: 0;
+      border: 0;
+      grid-template-columns: repeat(4, max-content);
+      gap: var(--space-2);
+      align-items: center;
+      background: transparent;
+    }}
+    .honeycombBrimSettings .fieldGroup {{
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }}
+    .honeycombBrimSettings .fieldGroup > label {{
+      display: block;
+      margin: 0;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 600;
+      line-height: 1;
+      white-space: nowrap;
+    }}
+    .honeycombBrimSettings input:not([type="checkbox"]),
+    .honeycombBrimSettings select {{
+      width: 68px;
+      min-height: 32px;
+      height: 32px;
+      padding: 4px 7px;
+      font-size: 12px;
+    }}
+    .honeycombBrimSettings .fieldGroup:nth-child(2) select {{ width: 98px; }}
+    .honeycombBrimSettings .checkboxLabel {{
+      font-size: 11px;
+      white-space: nowrap;
     }}
     .inputBand input[type="file"] {{
       padding: 0;
@@ -5322,13 +5376,18 @@ def _index_html() -> str:
       height: 100%;
       display: block;
     }}
+    @media (max-width: 1180px) {{
+      .appHeaderInner {{
+        grid-template-columns: 1fr;
+      }}
+    }}
     @media (max-width: 820px) {{
       main {{ padding: 24px 18px 32px; }}
       .appHeaderInner {{
         width: calc(100% - 36px);
-        grid-template-columns: 1fr;
         gap: var(--space-3);
       }}
+      .surfaceToolGroups {{ grid-template-columns: 1fr; }}
       .surfaceContext {{ width: calc(100% - 36px); }}
       .bandGrid {{ grid-template-columns: repeat(6, minmax(0, 1fr)); }}
       .inputBand .bandGrid {{ grid-template-columns: repeat(6, minmax(0, 1fr)); }}
@@ -5388,6 +5447,9 @@ def _index_html() -> str:
           "detail detail";
       }}
       .fiberStrategyToggle {{ white-space: normal; }}
+      .honeycombStrategyControls {{ flex-wrap: wrap; }}
+      .honeycombBrimControl {{ flex-wrap: wrap; }}
+      .honeycombBrimControl .honeycombBrimSettings {{ grid-template-columns: repeat(2, max-content); }}
       .panel {{ padding: var(--space-4); }}
       .bandGrid {{ grid-template-columns: 1fr; }}
       .inputBand .bandGrid {{ grid-template-columns: 1fr; }}
@@ -5427,7 +5489,7 @@ def _index_html() -> str:
             <span class="surfaceToolGroupLabel">蜂窝结构</span>
             <button id="surfacePreviewButton" class="surfaceToolButton" type="button">打开设计器</button>
             <button id="conformalSpecButton" class="surfaceToolButton" type="button">导入设计 JSON</button>
-            <div id="coreSettingsToolbarHost"></div>
+            <button id="coreProcessSettingsTopButton" class="surfaceToolButton" type="button">Core 导出参数</button>
             <button id="conformalSliceButton" class="surfaceToolButton primary" type="button" disabled>生成并导入 Core</button>
             <button id="conformalDebugExportButton" class="surfaceToolButton quiet" type="button" aria-pressed="false">调试导出：关</button>
           </div>
@@ -5459,10 +5521,35 @@ def _index_html() -> str:
         <output id="conformalSpecResult" class="surfaceCollisionResult" aria-live="polite">尚未导入曲面或平面蜂窝结构 JSON。</output>
         <output id="surfaceNpzCollisionResult" class="surfaceCollisionResult secondary" aria-live="polite"></output>
       </div>
-      <fieldset class="fiberStrategyToggle" aria-label="蜂窝结构连续纤维策略" title="曲面模式下，首个与末个纤维界面由设计 JSON 自动确定；纤维层范围由设计 JSON 的起始层与终止层规则自动确定。平面模式在除顶盖外的树脂层间生成纤维层；两者复用同一连续路径拓扑。">
-        <legend>连续纤维策略</legend>
-        <label><input id="conformalFiberEnabled" type="checkbox" checked> 启用连续纤维路径</label>
-      </fieldset>
+      <div class="honeycombStrategyControls">
+        <fieldset class="fiberStrategyToggle" aria-label="蜂窝结构连续纤维策略" title="曲面模式下，首个与末个纤维界面由设计 JSON 自动确定；纤维层范围由设计 JSON 的起始层与终止层规则自动确定。平面模式在除顶盖外的树脂层间生成纤维层；两者复用同一连续路径拓扑。">
+          <legend>连续纤维策略</legend>
+          <label><input id="conformalFiberEnabled" type="checkbox" checked> 启用连续纤维路径</label>
+        </fieldset>
+        <fieldset class="fiberStrategyToggle honeycombBrimControl" aria-label="蜂窝 Brim 设置">
+          <legend>蜂窝 Brim</legend>
+          <label for="prusaBrimEnabled" class="tooltipLabel" data-tooltip="在首层生成 Brim，用于增加平面或双正弦蜂窝的底部附着面积；默认关闭。"><input id="prusaBrimEnabled" type="checkbox"{prusa_checked('prusa_brim_enabled', False)}> 启用蜂窝 Brim</label>
+          <div id="prusaBrimSettings" class="prusaSettingsGrid prusaSubSettings honeycombBrimSettings" hidden>
+            <div class="fieldGroup">
+              <label for="prusaBrimWidth">Brim 宽度 mm</label>
+              <input id="prusaBrimWidth" type="number" min="0" step="0.1" value="{prusa_num('prusa_brim_width', 5.0)}">
+            </div>
+            <div class="fieldGroup">
+              <label for="prusaBrimType">Brim 类型</label>
+              <select id="prusaBrimType">
+                <option value="outer_only"{prusa_selected('prusa_brim_type', 'outer_only', 'outer_only')}>仅外侧</option>
+                <option value="outer_and_inner"{prusa_selected('prusa_brim_type', 'outer_only', 'outer_and_inner')}>外侧和内侧</option>
+                <option value="no_brim"{prusa_selected('prusa_brim_type', 'outer_only', 'no_brim')}>不生成</option>
+              </select>
+            </div>
+            <div class="fieldGroup">
+              <label for="prusaBrimSeparation">Brim 分离间隙 mm</label>
+              <input id="prusaBrimSeparation" type="number" min="0" step="0.1" value="{prusa_num('prusa_brim_separation', 0.0)}">
+            </div>
+            <label for="prusaBrimOneStroke" class="tooltipLabel checkboxLabel" data-tooltip="尝试将 Brim 连接为一条连续挤出路径；无法安全连接时保留原生多路径。"><input id="prusaBrimOneStroke" type="checkbox"{prusa_checked('prusa_brim_one_stroke', False)}> Brim 一笔画</label>
+          </div>
+        </fieldset>
+      </div>
     </div>
     <input id="surfaceNpzInput" type="file" accept=".npz,application/octet-stream" hidden>
     <input id="conformalSpecInput" type="file" accept=".json,application/json" hidden>
@@ -5679,28 +5766,6 @@ def _index_html() -> str:
                 <label for="prusaMinSkirtLength">最小裙边长度 mm</label>
                 <input id="prusaMinSkirtLength" type="number" min="0" step="1" value="10">
               </div>
-            </div>
-            <div class="prusaFeatureToggle">
-              <label for="prusaBrimEnabled" class="tooltipLabel checkboxLabel" data-tooltip="在首层生成 Prusa Brim，用于增加底部附着面积。启用蜂窝连续路径时，Brim 会保留在蜂窝外框之前；平面与双正弦蜂窝均可使用。默认关闭。"><input id="prusaBrimEnabled" type="checkbox"> 启用蜂窝 Brim（平面 / 双正弦）</label>
-            </div>
-            <div id="prusaBrimSettings" class="prusaSettingsGrid prusaSubSettings" hidden>
-              <div class="fieldGroup">
-                <label for="prusaBrimWidth">Brim 宽度 mm</label>
-                <input id="prusaBrimWidth" type="number" min="0" step="0.1" value="5">
-              </div>
-              <div class="fieldGroup">
-                <label for="prusaBrimType">Brim 类型</label>
-                <select id="prusaBrimType">
-                  <option value="outer_only" selected>仅外侧</option>
-                  <option value="outer_and_inner">外侧和内侧</option>
-                  <option value="no_brim">不生成</option>
-                </select>
-              </div>
-              <div class="fieldGroup">
-                <label for="prusaBrimSeparation">Brim 分离间隙 mm</label>
-                <input id="prusaBrimSeparation" type="number" min="0" step="0.1" value="0">
-              </div>
-              <label for="prusaBrimOneStroke" class="tooltipLabel checkboxLabel" data-tooltip="尝试复用 Core 的安全边界连接策略，将 Prusa Brim 连接为一条连续挤出路径；蜂窝规划会原样保留该一笔画及其 E 曲线。无法安全连接时保留原生多路径。"><input id="prusaBrimOneStroke" type="checkbox"> Brim 一笔画</label>
             </div>
             <div class="prusaFeatureToggle">
               <label for="honeycombCenterlineEnabled" class="tooltipLabel checkboxLabel" data-tooltip="附加于完整 Prusa 切片之后：每层先打印正式 150×100 外框，再生成原始 STL 孔壁的蜂窝路径。每个宏观分区内以不跨孔的零挤出安全换段连接，分区之间采用最短安全空走；所有沉积蜂窝壁均不重走。区内连接转角不超过 90°，三岔节点在一个线宽内渐降/渐升挤出。启用后 Core 使用该附加路径，不使用原生 Prusa G-code。"><input id="honeycombCenterlineEnabled" type="checkbox"{prusa_checked('honeycomb_centerline_enabled', False)}> 蜂窝连续路径（每层外框）</label>
@@ -6426,6 +6491,17 @@ def _index_html() -> str:
         formData.append('conformal_spec', selectedConformalSpec, selectedConformalSpec.name);
         formData.append('conformal_debug_export', conformalDebugExportEnabled ? 'true' : 'false');
         formData.append('conformal_fiber_enabled', conformalFiberEnabled.checked ? 'true' : 'false');
+        formData.append('prusa_brim_enabled', prusaBrimEnabledInput.checked ? 'true' : 'false');
+        formData.append('prusa_brim_width', document.getElementById('prusaBrimWidth').value);
+        formData.append('prusa_brim_type', document.getElementById('prusaBrimType').value);
+        formData.append('prusa_brim_separation', document.getElementById('prusaBrimSeparation').value);
+        formData.append('prusa_brim_one_stroke', document.getElementById('prusaBrimOneStroke').checked ? 'true' : 'false');
+        // The conformal source job follows the same Core placement contract as
+        // a Prusa job.  Without these values it falls back to the local Core
+        // print_params.json, which moves the primeline away from the visible
+        // design placement (and differs between development machines).
+        formData.append('prusa_start_x_mm', document.getElementById('prusaStartX').value);
+        formData.append('prusa_start_y_mm', document.getElementById('prusaStartY').value);
         appendCurrentCoreSettings(formData);
         const response = await fetch('/conformal-slice', {{ method: 'POST', body: formData }});
         const queued = await response.json();
@@ -6997,14 +7073,21 @@ def _index_html() -> str:
         if (!host) continue;
         const summary = host.querySelector(':scope > summary');
         if (!summary) continue;
-        const trigger = document.createElement('button');
+        const providedTrigger = id === 'coreProcessSettings'
+          ? document.getElementById('coreProcessSettingsTopButton')
+          : null;
+        const trigger = providedTrigger || document.createElement('button');
         trigger.type = 'button';
-        trigger.className = 'advancedPopupTrigger';
-        trigger.textContent = summary.textContent.trim();
+        if (!providedTrigger) {{
+          trigger.className = 'advancedPopupTrigger';
+          trigger.textContent = summary.textContent.trim();
+          host.insertBefore(trigger, summary);
+        }} else {{
+          trigger.title = summary.textContent.trim();
+        }}
         trigger.setAttribute('aria-haspopup', 'dialog');
         trigger.setAttribute('aria-expanded', 'false');
         summary.hidden = true;
-        host.insertBefore(trigger, summary);
         const body = document.createElement('div');
         body.className = 'advancedPopupBody';
         while (summary.nextSibling) body.appendChild(summary.nextSibling);
@@ -7304,7 +7387,7 @@ def _index_html() -> str:
       for (const id of ['prusaRaftContactLayerHeight', 'prusaRaftContactDensity', 'prusaRaftContactExtrusionWidth']) {{
         document.getElementById(id).disabled = !manualContactEnabled;
       }}
-      const prusaBrimEnabled = !isPyslm && !isLegacy && prusaBrimEnabledInput.checked;
+      const prusaBrimEnabled = prusaBrimEnabledInput.checked;
       prusaBrimSettings.hidden = !prusaBrimEnabled;
       for (const id of prusaBrimSettingIds) {{
         document.getElementById(id).disabled = !prusaBrimEnabled;
@@ -7353,11 +7436,6 @@ def _index_html() -> str:
     prusaBrimEnabledInput.addEventListener('change', syncKernelControls);
     corePrimelineEnabledInput.addEventListener('change', syncKernelControls);
     applyInitialSavedSettings();
-    const coreSettingsToolbarHost = document.getElementById('coreSettingsToolbarHost');
-    const coreProcessSettings = document.getElementById('coreProcessSettings');
-    if (coreSettingsToolbarHost && coreProcessSettings) {{
-      coreSettingsToolbarHost.appendChild(coreProcessSettings);
-    }}
     installAdvancedPopups();
     syncKernelControls();
     installMagnitudeNumberStepping();
@@ -7986,6 +8064,104 @@ def _index_html() -> str:
       return {{ plot, baseScale, pixelsPerMm, plotCenterX, plotCenterY, project, minimum, maximum, isSurface: true }};
     }}
 
+    function drawSurfaceMeasurementGrid(ctx, viewport) {{
+      const {{ plot, minimum, maximum, project, pixelsPerMm }} = viewport;
+      const z = minimum[2];
+      const majorStep = niceGridStep(pixelsPerMm);
+      const minorStep = majorStep / 5;
+      const corners = [
+        [minimum[0], minimum[1], z],
+        [maximum[0], minimum[1], z],
+        [maximum[0], maximum[1], z],
+        [minimum[0], maximum[1], z],
+      ].map(project);
+      ctx.save();
+      ctx.beginPath();
+      ctx.moveTo(corners[0][0], corners[0][1]);
+      for (let index = 1; index < corners.length; index++) ctx.lineTo(corners[index][0], corners[index][1]);
+      ctx.closePath();
+      ctx.clip();
+      const drawLines = (step, color, width) => {{
+        ctx.strokeStyle = color;
+        ctx.lineWidth = width;
+        forEachGridValue(minimum[0], maximum[0], step, (value) => {{
+          const start = project([value, minimum[1], z]);
+          const end = project([value, maximum[1], z]);
+          ctx.beginPath();
+          ctx.moveTo(start[0], start[1]);
+          ctx.lineTo(end[0], end[1]);
+          ctx.stroke();
+        }});
+        forEachGridValue(minimum[1], maximum[1], step, (value) => {{
+          const start = project([minimum[0], value, z]);
+          const end = project([maximum[0], value, z]);
+          ctx.beginPath();
+          ctx.moveTo(start[0], start[1]);
+          ctx.lineTo(end[0], end[1]);
+          ctx.stroke();
+        }});
+      }};
+      drawLines(minorStep, 'rgba(174, 184, 192, 0.22)', 0.7);
+      drawLines(majorStep, 'rgba(117, 139, 156, 0.50)', 1.0);
+      ctx.restore();
+
+      // Project ruler labels on the two near print-plane edges.  Values are
+      // world millimetres, so zooming or rotating never changes the scale.
+      ctx.save();
+      ctx.fillStyle = '#5c6972';
+      ctx.font = '11px Segoe UI, Arial, sans-serif';
+      ctx.textBaseline = 'top';
+      ctx.textAlign = 'center';
+      forEachGridValue(minimum[0], maximum[0], majorStep, (value) => {{
+        const point = project([value, minimum[1], z]);
+        if (point[0] > plot.left + 12 && point[0] < plot.right - 12) {{
+          ctx.fillText(formatRulerValue(value, majorStep), point[0], point[1] + 5);
+        }}
+      }});
+      ctx.textAlign = 'right';
+      ctx.textBaseline = 'middle';
+      forEachGridValue(minimum[1], maximum[1], majorStep, (value) => {{
+        const point = project([minimum[0], value, z]);
+        if (point[1] > plot.top + 9 && point[1] < plot.bottom - 9) {{
+          ctx.fillText(formatRulerValue(value, majorStep), point[0] - 6, point[1]);
+        }}
+      }});
+      ctx.restore();
+    }}
+
+    function drawSurfacePrintCenter(ctx, viewport) {{
+      const {{ minimum, maximum, project }} = viewport;
+      const center = [
+        (minimum[0] + maximum[0]) * 0.5,
+        (minimum[1] + maximum[1]) * 0.5,
+        minimum[2],
+      ];
+      const point = project(center);
+      ctx.save();
+      ctx.strokeStyle = '#b91c1c';
+      ctx.fillStyle = '#b91c1c';
+      ctx.lineWidth = 1.8;
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.moveTo(point[0] - 7, point[1]);
+      ctx.lineTo(point[0] + 7, point[1]);
+      ctx.moveTo(point[0], point[1] - 7);
+      ctx.lineTo(point[0], point[1] + 7);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(point[0], point[1], 2.8, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.font = '600 11px Segoe UI, Arial, sans-serif';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'bottom';
+      ctx.fillText(
+        `打印中心 (${{formatDimension(center[0])}}, ${{formatDimension(center[1])}})`,
+        point[0] + 9,
+        point[1] - 7,
+      );
+      ctx.restore();
+    }}
+
     function drawSurfaceReference(ctx, viewport) {{
       const {{ plot, minimum, maximum, project }} = viewport;
       const z = minimum[2];
@@ -8001,6 +8177,7 @@ def _index_html() -> str:
       for (let index = 1; index < corners.length; index++) ctx.lineTo(corners[index][0], corners[index][1]);
       ctx.closePath();
       ctx.fill();
+      drawSurfaceMeasurementGrid(ctx, viewport);
       ctx.strokeStyle = '#d5dbe0';
       ctx.lineWidth = 1;
       ctx.stroke();
@@ -8085,13 +8262,14 @@ def _index_html() -> str:
         ctx.fill();
         ctx.fillText(axis.label, end[0] + 9, end[1] - 6);
       }}
+      drawSurfacePrintCenter(ctx, viewport);
       ctx.strokeStyle = '#aeb8c0';
       ctx.lineWidth = 1;
       ctx.strokeRect(plot.left + 0.5, plot.top + 0.5, plot.width - 1, plot.height - 1);
       ctx.fillStyle = '#5c6972';
       ctx.textAlign = 'right';
       ctx.textBaseline = 'top';
-      ctx.fillText('三维曲面预览 · 左键旋转', plot.right - 7, plot.top + 7);
+      ctx.fillText('三维曲面预览 · 左键旋转 · 打印平面网格', plot.right - 7, plot.top + 7);
       ctx.fillStyle = '#b91c1c';
       ctx.textAlign = 'left';
       ctx.textBaseline = 'bottom';
@@ -8468,7 +8646,7 @@ def _index_html() -> str:
         ctx.stroke();
       }}
 
-      function drawExtrusionPath(path, extrusion, fallbackColor) {{
+      function drawExtrusionPath(path, extrusion, fallbackColor, allowHeatmap = true) {{
         // Core records one 4 ms sample per row.  Stroking every edge
         // separately makes a large conformal job unresponsive, even with the
         // E heat map disabled.  Batch disconnected segments by their complete
@@ -8499,7 +8677,7 @@ def _index_html() -> str:
               {{ color: '#526f8c', width: Math.min(activeLineWidth, 1.5), dash: [7, 5], alpha: 0.95 }},
               path[pointIndex], path[pointIndex + 1],
             );
-          }} else if (density === null || extrusionRange === null) {{
+          }} else if (!allowHeatmap || density === null || extrusionRange === null) {{
             addSegment(
               `deposit:${{fallbackColor}}`,
               {{ color: fallbackColor, width: activeLineWidth, dash: [], alpha: 1 }},
@@ -8560,11 +8738,15 @@ def _index_html() -> str:
           ? Math.max(1.0, physicalWidth * viewport.pixelsPerMm)
           : entry.role === 'fiber' ? 2.0 : 1.7;
         if (
-          entry.role !== 'fiber'
-          && Array.isArray(entry.extrusion)
+          Array.isArray(entry.extrusion)
           && entry.extrusion.length === entry.points.length
         ) {{
-          drawExtrusionPath(entry.points, entry.extrusion, pathColor(entry.role));
+          drawExtrusionPath(
+            entry.points,
+            entry.extrusion,
+            pathColor(entry.role),
+            entry.role !== 'fiber',
+          );
         }} else {{
           ctx.strokeStyle = pathColor(entry.role);
           drawPath(entry.points);
@@ -8652,7 +8834,7 @@ def _index_html() -> str:
             addToBatch(`deposit:${{entry.role}}`, fallback, entry.points);
             continue;
           }}
-          if (!Array.isArray(extrusion) || extrusion.length !== entry.points.length || entry.role === 'fiber') {{
+          if (!Array.isArray(extrusion) || extrusion.length !== entry.points.length) {{
             addToBatch(`deposit:${{entry.role}}`, fallback, entry.points);
             continue;
           }}
@@ -8670,7 +8852,7 @@ def _index_html() -> str:
               continue;
             }}
             const density = extrusionDensity(entry.points, extrusion, pointIndex);
-            const color = showExtrusionInput.checked && density !== null && extrusionRange !== null
+            const color = entry.role !== 'fiber' && showExtrusionInput.checked && density !== null && extrusionRange !== null
               ? extrusionColorForSegment(density, extrusionRange)
               : fallback.color;
             addToBatch(

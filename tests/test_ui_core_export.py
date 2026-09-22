@@ -217,13 +217,23 @@ def test_main_ui_continuous_course_fiber_strategy_reaches_final_core_output(tmp_
     assert report["mode"] == "continuous_course_network_v1"
     assert report["course_semantics"] == "every rectangle-clipped continuous-course fragment is an independent resin/F path with normal Core travel/cut boundaries"
     assert report["layer_interface_source"] == "design_json_symmetric_nonzero_curvature"
-    assert report["after_resin_physical_layers"] == [1, 4]
+    assert report["after_resin_physical_layers"] == [2, 4]
+    assert report["resin_layer_indices"][0] == 1
     assert report["total_fiber_path_count"] > 0
     assert report["automatic_resin_z_raise"] is True
     job_dir = tmp_path / result["download_url"].split("/")[-2]
     with np.load(job_dir / "conformal_lattice_core.npz", allow_pickle=False) as core:
         assert core["x"].size > 0
     assert any(layer["fiber_paths"] for layer in result["preview"]["layers"])
+    first_layer = next(layer for layer in result["preview"]["layers"] if layer["index"] == 0)
+    second_layer = next(layer for layer in result["preview"]["layers"] if layer["index"] == 1)
+    assert first_layer["fiber_paths"] == []
+    deposit_roles = [
+        path["role"]
+        for path in second_layer["motion_paths"]
+        if path["kind"] == "deposit"
+    ]
+    assert deposit_roles.index("final_resin") < deposit_roles.index("fiber")
     assert sum(
         len(layer["fiber_cut_events"])
         for layer in result["preview"]["layers"]
@@ -987,6 +997,37 @@ def test_final_core_preview_preserves_zero_e_connector_profile(tmp_path: Path):
     # The browser uses the equal first two E values to render this segment as
     # the gray-blue dashed, zero-extrusion connector rather than deposition.
     assert resin["extrusion"][1] - resin["extrusion"][0] == 0.0
+
+
+def test_final_core_preview_preserves_fiber_zero_e_connector_profile(tmp_path: Path):
+    output = tmp_path / "fiber_zero_e_connector.npz"
+    points = np.asarray([
+        [0.0, 0.0, 0.5],
+        [1.0, 0.0, 0.5],
+        [20.0, 10.0, 0.5],
+        [21.0, 10.0, 0.5],
+    ])
+    extrusion = np.asarray([2.0, 2.4, 2.4, 2.8])
+    np.savez_compressed(
+        output,
+        x=points[:, 0], y=points[:, 1], z=points[:, 2], e=extrusion,
+        tool_id=np.full(len(points), 1),
+        move_type=np.full(len(points), 1),
+        event_flag=np.zeros(len(points), dtype=np.uint8),
+        layer_index=np.zeros(len(points), dtype=np.uint32),
+        path_id=np.full(len(points), 1),
+        path_end_flag=np.asarray([0, 0, 0, 1]),
+        move_type_vocab_keys=np.asarray(["PRINT"]),
+        move_type_vocab_vals=np.asarray([1]),
+    )
+
+    preview = _preview_payload_from_final_core_npz(output, SliceConfig(line_width=2.0))
+
+    fiber = preview["layers"][0]["motion_paths"][0]
+    assert fiber["role"] == "fiber"
+    assert fiber["points"] == points.tolist()
+    assert fiber["extrusion"] == extrusion.tolist()
+    assert fiber["extrusion"][2] - fiber["extrusion"][1] == 0.0
 
 
 def test_core_cooling_is_always_enabled_without_ui_switches():
