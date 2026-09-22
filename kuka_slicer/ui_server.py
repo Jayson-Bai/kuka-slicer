@@ -4969,6 +4969,7 @@ def _index_html() -> str:
             <span class="surfaceToolGroupLabel">蜂窝结构</span>
             <button id="surfacePreviewButton" class="surfaceToolButton" type="button">打开设计器</button>
             <button id="conformalSpecButton" class="surfaceToolButton" type="button">导入设计 JSON</button>
+            <button id="coreProcessSettingsTopButton" class="surfaceToolButton" type="button">Core 导出参数</button>
             <button id="conformalSliceButton" class="surfaceToolButton primary" type="button" disabled>生成并导入 Core</button>
             <button id="conformalDebugExportButton" class="surfaceToolButton quiet" type="button" aria-pressed="false">调试导出：关</button>
           </div>
@@ -4977,7 +4978,6 @@ def _index_html() -> str:
             <button id="coreNpzPreviewButton" class="surfaceToolButton" type="button">导入 Core NPZ</button>
             <button id="surfaceNpzPreviewButton" class="surfaceToolButton" type="button">导入曲面 NPZ</button>
             <button id="surfaceNpzCollisionButton" class="surfaceToolButton" type="button" disabled>碰撞检查</button>
-            <button id="coreProcessSettingsTopButton" class="surfaceToolButton" type="button">Core 导出参数</button>
           </div>
         </div>
         <div id="exportProgress" class="exportProgress" aria-live="polite">
