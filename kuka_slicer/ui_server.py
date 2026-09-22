@@ -1957,6 +1957,21 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         # grip material instead of rendering/deleting that large temporary
         # graph, without changing the eventual Core SourceJob geometry.
         conformal_source_job = run.path_graph.to_external_base_source_job()
+        from .conformal_lattice.brim import ConformalBrimSettings, apply_conformal_brim
+
+        brim_report = apply_conformal_brim(
+            conformal_source_job,
+            ConformalBrimSettings(
+                enabled=_bool_param(params, "prusa_brim_enabled", False),
+                width_mm=_float_param(params, "prusa_brim_width", 5.0),
+                brim_type=params.get("prusa_brim_type", ["outer_only"])[0],  # type: ignore[arg-type]
+                separation_mm=_float_param(params, "prusa_brim_separation", 0.0),
+                one_stroke=_bool_param(params, "prusa_brim_one_stroke", False),
+                # The conformal bridge and its preview use this calibrated
+                # two-millimetre bead centreline.
+                line_width_mm=2.0,
+            ),
+        )
         from .conformal_lattice.fiber_reinforcement import (
             ContinuousCourseFiberSettings,
             apply_continuous_course_fiber_strategy,
@@ -2039,6 +2054,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             "infill_pattern_execution": {"applied": True, "mode": "continuous_course_network_v1"},
             "conformal_lattice": run.report,
             "fiber_reinforcement": fiber_reinforcement.report,
+            "brim": brim_report,
             "nominal_final_height_mm": fiber_reinforcement.nominal_final_height_mm,
             "core_export_seconds": float(core_stats.get("total_s", 0.0)),
             "core_rows": int(core_stats.get("rows", 0)),
@@ -5944,6 +5960,11 @@ def _index_html() -> str:
         formData.append('conformal_spec', selectedConformalSpec, selectedConformalSpec.name);
         formData.append('conformal_debug_export', conformalDebugExportEnabled ? 'true' : 'false');
         formData.append('conformal_fiber_enabled', conformalFiberEnabled.checked ? 'true' : 'false');
+        formData.append('prusa_brim_enabled', prusaBrimEnabledInput.checked ? 'true' : 'false');
+        formData.append('prusa_brim_width', document.getElementById('prusaBrimWidth').value);
+        formData.append('prusa_brim_type', document.getElementById('prusaBrimType').value);
+        formData.append('prusa_brim_separation', document.getElementById('prusaBrimSeparation').value);
+        formData.append('prusa_brim_one_stroke', document.getElementById('prusaBrimOneStroke').checked ? 'true' : 'false');
         appendCurrentCoreSettings(formData);
         const response = await fetch('/conformal-slice', {{ method: 'POST', body: formData }});
         const queued = await response.json();

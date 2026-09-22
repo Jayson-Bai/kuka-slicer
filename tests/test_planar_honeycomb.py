@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from kuka_slicer.conformal_lattice.contracts import load_conformal_lattice_spec
+from kuka_slicer.conformal_lattice.brim import ConformalBrimSettings, apply_conformal_brim
 from kuka_slicer.conformal_lattice.path_bridge import ExtrusionVolumeModel
 from kuka_slicer.conformal_lattice.pipeline import run_conformal_lattice_pipeline
 from kuka_slicer.surface_preview.server import (
@@ -75,6 +76,79 @@ def test_planar_pipeline_reuses_lattice_paths_with_flat_layers_and_flat_orientat
     assert len(run.continuous_course_paths_by_layer) == 4
 
 
+def test_planar_conformal_brim_is_a_calibrated_first_layer_one_stroke():
+    run = run_conformal_lattice_pipeline(
+        _planar_config(),
+        physical_layer_height_mm=0.25,
+        extrusion=ExtrusionVolumeModel(0.5, 0.5, preview_line_width_mm=2.0),
+    )
+    assert run.path_graph is not None
+    source_job = run.path_graph.to_external_base_source_job()
+
+    report = apply_conformal_brim(
+        source_job,
+        ConformalBrimSettings(
+            enabled=True,
+            width_mm=3.0,
+            brim_type="outer_only",
+            separation_mm=0.2,
+            one_stroke=True,
+            line_width_mm=2.0,
+        ),
+    )
+
+    first_layer = source_job.material_paths[0]
+    roles = source_job.meta["path_roles"]["R"]["0"]
+    assert report["path_count"] == 1
+    assert report["one_stroke_applied"] is True
+    assert report["one_stroke_strategy"] == "conformal_outer_spiral"
+    assert roles[:2] == ["brim", "conformal_outer_boundary"]
+    brim = first_layer.paths[0]
+    assert brim.shape[1] == 6
+    assert np.allclose(brim[:, 3:], 0.0)
+    assert first_layer.extrusion is not None
+    assert np.all(np.diff(first_layer.extrusion[0]) >= 0.0)
+    assert float(np.min(brim[:, 0])) < 0.0
+    assert float(np.max(brim[:, 0])) > 10.0
+    assert float(np.min(brim[:, 1])) < 0.0
+    assert float(np.max(brim[:, 1])) > 8.0
+
+
+def test_double_sine_conformal_brim_emits_finite_boundary_pose_field():
+    config = conformal_lattice_config_payload(
+        {
+            "part_length_mm": ["20"],
+            "part_width_mm": ["10"],
+            "part_height_mm": ["2"],
+            "wall_width_mm": ["2"],
+            "base_cell_size_mm": ["4"],
+            "amplitude_mm": ["1.0"],
+            "wavelength_x_mm": ["20"],
+            "wavelength_y_mm": ["10"],
+            "surface_start_layer": ["0"],
+            "samples_x": ["16"],
+            "samples_y": ["12"],
+        }
+    )
+    run = run_conformal_lattice_pipeline(
+        config,
+        physical_layer_height_mm=0.5,
+        extrusion=ExtrusionVolumeModel(1.0, 1.0, preview_line_width_mm=2.0),
+    )
+    assert run.path_graph is not None
+    source_job = run.path_graph.to_external_base_source_job()
+
+    report = apply_conformal_brim(
+        source_job,
+        ConformalBrimSettings(True, 2.0, "outer_only", 0.0, True, 2.0),
+    )
+
+    assert report["path_count"] == 1
+    brim = source_job.material_paths[0].paths[0]
+    assert brim.shape[1] == 6
+    assert np.isfinite(brim).all()
+
+
 def test_planar_export_keeps_the_same_continuous_course_xy_paths_as_zero_curvature():
     planar = run_conformal_lattice_pipeline(
         _planar_config(),
@@ -126,6 +200,7 @@ def test_designer_and_main_ui_expose_one_flat_json_route_with_shared_core_contro
     assert "formData.append('conformal_spec'" in main
     assert "appendCurrentCoreSettings(formData)" in main
     assert "conformal_fiber_enabled" in main
+    assert "formData.append('prusa_brim_enabled'" in main
     assert "fetch('/conformal-slice'" in main
 
 
@@ -172,6 +247,11 @@ def test_main_ui_planar_json_honors_disabled_fiber_toggle(tmp_path: Path):
             {
                 "core_resin_layer_height": ["0.5"],
                 "conformal_fiber_enabled": ["false"],
+                "prusa_brim_enabled": ["true"],
+                "prusa_brim_width": ["3"],
+                "prusa_brim_type": ["outer_only"],
+                "prusa_brim_separation": ["0.2"],
+                "prusa_brim_one_stroke": ["true"],
             },
             {"conformal_spec": ("planar_no_fiber.json", json.dumps(config).encode("utf-8"))},
         ),
@@ -181,3 +261,8 @@ def test_main_ui_planar_json_honors_disabled_fiber_toggle(tmp_path: Path):
     assert result["fiber_reinforcement"]["enabled"] is False
     assert result["fiber_reinforcement"]["reason"] == "disabled_in_main_ui"
     assert all(not layer["fiber_paths"] for layer in result["preview"]["layers"])
+    assert result["brim"]["path_count"] == 1
+    assert result["brim"]["one_stroke_applied"] is True
+    bounds = result["preview"]["bounds"]
+    assert float(bounds["max_x"]) - float(bounds["min_x"]) > 10.0
+    assert float(bounds["max_y"]) - float(bounds["min_y"]) > 8.0
