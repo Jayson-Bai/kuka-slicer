@@ -5965,6 +5965,12 @@ def _index_html() -> str:
         formData.append('prusa_brim_type', document.getElementById('prusaBrimType').value);
         formData.append('prusa_brim_separation', document.getElementById('prusaBrimSeparation').value);
         formData.append('prusa_brim_one_stroke', document.getElementById('prusaBrimOneStroke').checked ? 'true' : 'false');
+        // The conformal source job follows the same Core placement contract as
+        // a Prusa job.  Without these values it falls back to the local Core
+        // print_params.json, which moves the primeline away from the visible
+        // design placement (and differs between development machines).
+        formData.append('prusa_start_x_mm', document.getElementById('prusaStartX').value);
+        formData.append('prusa_start_y_mm', document.getElementById('prusaStartY').value);
         appendCurrentCoreSettings(formData);
         const response = await fetch('/conformal-slice', {{ method: 'POST', body: formData }});
         const queued = await response.json();

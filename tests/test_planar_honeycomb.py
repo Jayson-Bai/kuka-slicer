@@ -201,6 +201,8 @@ def test_designer_and_main_ui_expose_one_flat_json_route_with_shared_core_contro
     assert "appendCurrentCoreSettings(formData)" in main
     assert "conformal_fiber_enabled" in main
     assert "formData.append('prusa_brim_enabled'" in main
+    assert "formData.append('prusa_start_x_mm', document.getElementById('prusaStartX').value)" in main
+    assert "formData.append('prusa_start_y_mm', document.getElementById('prusaStartY').value)" in main
     assert "fetch('/conformal-slice'" in main
 
 
