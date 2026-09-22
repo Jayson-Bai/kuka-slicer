@@ -760,7 +760,7 @@ def _preview_payload_from_final_core_npz(
                         has_curved_deposition = True
                     segment_extrusion = (
                         extrusion[segment_indices]
-                        if role == "final_resin" and extrusion is not None
+                        if role != "travel" and extrusion is not None
                         else None
                     )
                     mandatory = _preview_mandatory_indices(
@@ -786,7 +786,7 @@ def _preview_payload_from_final_core_npz(
                             source_extrusion,
                             max_points=_FINAL_CORE_PREVIEW_MAX_POINTS,
                         )
-                        if role == "final_resin"
+                        if role != "travel"
                         else [(points, None)]
                     )
                     for chunk_points, chunk_extrusion in chunks:
@@ -2010,23 +2010,6 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         core_source_job = external_source_job_to_core_source_job(
             conformal_source_job,
             default_abc=core_params.default_abc,
-        )
-        # Match the native Prusa/Core hand-off exactly: write the origin-to-
-        # primeline motion as an explicit source travel.  Leaving this to the
-        # generic converter makes its synthetic initial travel share the
-        # primeline's buffered Core segment, which turns the deposited line
-        # into a diagonal path from the machine origin.
-        source_gcode_module = importlib.import_module(
-            "external_npz_preprocessor.source_gcode"
-        )
-        core_source_job = source_gcode_module.prepend_prusa_startup_travel(
-            core_source_job,
-            start_xy=(float(core_params.start_x_mm), float(core_params.start_y_mm)),
-            primeline_enabled=bool(core_params.primeline_enabled),
-            primeline_xy=(
-                float(core_params.primeline_x_mm),
-                float(core_params.primeline_y_mm),
-            ),
         )
         phase_timings["core_source_preparation_s"] = time.perf_counter() - phase_started_at
 
@@ -4990,6 +4973,7 @@ def _index_html() -> str:
             <button id="coreNpzPreviewButton" class="surfaceToolButton" type="button">导入 Core NPZ</button>
             <button id="surfaceNpzPreviewButton" class="surfaceToolButton" type="button">导入曲面 NPZ</button>
             <button id="surfaceNpzCollisionButton" class="surfaceToolButton" type="button" disabled>碰撞检查</button>
+            <button id="coreProcessSettingsTopButton" class="surfaceToolButton" type="button">Core 导出参数</button>
           </div>
         </div>
         <div id="exportProgress" class="exportProgress" aria-live="polite">
@@ -6541,14 +6525,21 @@ def _index_html() -> str:
         if (!host) continue;
         const summary = host.querySelector(':scope > summary');
         if (!summary) continue;
-        const trigger = document.createElement('button');
+        const providedTrigger = id === 'coreProcessSettings'
+          ? document.getElementById('coreProcessSettingsTopButton')
+          : null;
+        const trigger = providedTrigger || document.createElement('button');
         trigger.type = 'button';
-        trigger.className = 'advancedPopupTrigger';
-        trigger.textContent = summary.textContent.trim();
+        if (!providedTrigger) {{
+          trigger.className = 'advancedPopupTrigger';
+          trigger.textContent = summary.textContent.trim();
+          host.insertBefore(trigger, summary);
+        }} else {{
+          trigger.title = summary.textContent.trim();
+        }}
         trigger.setAttribute('aria-haspopup', 'dialog');
         trigger.setAttribute('aria-expanded', 'false');
         summary.hidden = true;
-        host.insertBefore(trigger, summary);
         const body = document.createElement('div');
         body.className = 'advancedPopupBody';
         while (summary.nextSibling) body.appendChild(summary.nextSibling);
@@ -8022,7 +8013,7 @@ def _index_html() -> str:
         ctx.stroke();
       }}
 
-      function drawExtrusionPath(path, extrusion, fallbackColor) {{
+      function drawExtrusionPath(path, extrusion, fallbackColor, allowHeatmap = true) {{
         // Core records one 4 ms sample per row.  Stroking every edge
         // separately makes a large conformal job unresponsive, even with the
         // E heat map disabled.  Batch disconnected segments by their complete
@@ -8053,7 +8044,7 @@ def _index_html() -> str:
               {{ color: '#526f8c', width: Math.min(activeLineWidth, 1.5), dash: [7, 5], alpha: 0.95 }},
               path[pointIndex], path[pointIndex + 1],
             );
-          }} else if (density === null || extrusionRange === null) {{
+          }} else if (!allowHeatmap || density === null || extrusionRange === null) {{
             addSegment(
               `deposit:${{fallbackColor}}`,
               {{ color: fallbackColor, width: activeLineWidth, dash: [], alpha: 1 }},
@@ -8114,11 +8105,15 @@ def _index_html() -> str:
           ? Math.max(1.0, physicalWidth * viewport.pixelsPerMm)
           : entry.role === 'fiber' ? 2.0 : 1.7;
         if (
-          entry.role !== 'fiber'
-          && Array.isArray(entry.extrusion)
+          Array.isArray(entry.extrusion)
           && entry.extrusion.length === entry.points.length
         ) {{
-          drawExtrusionPath(entry.points, entry.extrusion, pathColor(entry.role));
+          drawExtrusionPath(
+            entry.points,
+            entry.extrusion,
+            pathColor(entry.role),
+            entry.role !== 'fiber',
+          );
         }} else {{
           ctx.strokeStyle = pathColor(entry.role);
           drawPath(entry.points);
@@ -8206,7 +8201,7 @@ def _index_html() -> str:
             addToBatch(`deposit:${{entry.role}}`, fallback, entry.points);
             continue;
           }}
-          if (!Array.isArray(extrusion) || extrusion.length !== entry.points.length || entry.role === 'fiber') {{
+          if (!Array.isArray(extrusion) || extrusion.length !== entry.points.length) {{
             addToBatch(`deposit:${{entry.role}}`, fallback, entry.points);
             continue;
           }}
@@ -8224,7 +8219,7 @@ def _index_html() -> str:
               continue;
             }}
             const density = extrusionDensity(entry.points, extrusion, pointIndex);
-            const color = showExtrusionInput.checked && density !== null && extrusionRange !== null
+            const color = entry.role !== 'fiber' && showExtrusionInput.checked && density !== null && extrusionRange !== null
               ? extrusionColorForSegment(density, extrusionRange)
               : fallback.color;
             addToBatch(

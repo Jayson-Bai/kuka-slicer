@@ -4288,6 +4288,8 @@ def test_ui_offers_large_advanced_settings_as_draggable_resizable_popups():
 
     assert "installAdvancedPopups" in html
     assert "advancedIds = ['prusaAdvancedSettings', 'coreProcessSettings']" in html
+    assert 'id="coreProcessSettingsTopButton"' in html
+    assert "document.getElementById('coreProcessSettingsTopButton')" in html
     assert 'id="zMin"' not in html
     assert 'id="zMax"' not in html
     assert 'id="tolerance"' not in html

@@ -187,6 +187,55 @@ def test_collinear_source_travel_is_collapsed_before_core_handoff():
     assert (travels[0].pos.x, travels[0].pos.y) == pytest.approx((10.0, 10.0))
 
 
+def test_later_source_travels_do_not_suppress_origin_to_primeline_travel():
+    commands = source_job_to_parsed_commands(
+        _job(
+            resin_paths=[_path("R", [[20, 30, 0.5], [25, 30, 0.5]])],
+            # This travel belongs to the following resin path.  Its presence
+            # must not make the converter pretend the startup pose is already
+            # at Primeline.
+            travel_paths=[
+                TravelPath(
+                    order=0,
+                    points=np.asarray(
+                        [
+                            [20.0, 30.0, 0.5, 0.0, 0.0, 0.0],
+                            [21.0, 30.0, 0.5, 0.0, 0.0, 0.0],
+                        ],
+                        dtype=np.float64,
+                    ),
+                )
+            ],
+        ),
+        ProcessParams(
+            start_x_mm=10.0,
+            start_y_mm=10.0,
+            primeline_enabled=True,
+            primeline_x_mm=0.0,
+            primeline_y_mm=-5.0,
+            primeline_length_mm=80.0,
+        ),
+    )
+
+    primeline = next(
+        command
+        for command in commands
+        if isinstance(command, MoveCommand)
+        and command.raw == "external_npz_primeline"
+    )
+    startup = next(
+        command
+        for command in commands
+        if isinstance(command, MoveCommand)
+        and command.raw == "external_npz_start_xy_travel"
+    )
+
+    assert startup.type == "TRAVEL"
+    assert (startup.start_pos.x, startup.start_pos.y) == pytest.approx((0.0, 0.0))
+    assert (startup.pos.x, startup.pos.y) == pytest.approx((10.0, 5.0))
+    assert startup.pos == primeline.start_pos
+
+
 def test_turning_source_travel_keeps_hole_avoidance_waypoints():
     commands = source_job_to_parsed_commands(
         _job(
