@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from kuka_slicer.conformal_lattice.contracts import load_conformal_lattice_spec
 from kuka_slicer.conformal_lattice.brim import ConformalBrimSettings, apply_conformal_brim
@@ -268,3 +269,41 @@ def test_main_ui_planar_json_honors_disabled_fiber_toggle(tmp_path: Path):
     bounds = result["preview"]["bounds"]
     assert float(bounds["max_x"]) - float(bounds["min_x"]) > 10.0
     assert float(bounds["max_y"]) - float(bounds["min_y"]) > 8.0
+
+
+def test_main_ui_planar_json_keeps_primeline_horizontal_after_startup_travel(tmp_path: Path):
+    handler = object.__new__(_SlicerUiHandler)
+    handler.server_output_dir = tmp_path
+
+    result = handler._handle_conformal_slice(
+        "",
+        request_data=(
+            {
+                "core_resin_layer_height": ["0.25"],
+                "conformal_fiber_enabled": ["false"],
+                "prusa_start_x_mm": ["30"],
+                "prusa_start_y_mm": ["40"],
+                "core_primeline_enabled": ["true"],
+                "core_primeline_x_mm": ["5"],
+                "core_primeline_y_mm": ["-50"],
+                "core_primeline_length": ["23"],
+            },
+            {"conformal_spec": ("planar_primeline.json", json.dumps(_planar_config()).encode("utf-8"))},
+        ),
+    )
+
+    job_dir = tmp_path / result["download_url"].split("/")[-2]
+    with np.load(job_dir / "planar_honeycomb_core.npz", allow_pickle=False) as core:
+        print_codes = {
+            int(value)
+            for key, value in zip(core["move_type_vocab_keys"], core["move_type_vocab_vals"])
+            if key.decode("utf-8") in {"PRINT", "PRINT_FIT"}
+        }
+        printing = np.isin(core["move_type"], list(print_codes))
+        # y=-10 is intentionally outside this 8 mm-tall part, so only the
+        # requested first-layer primeline can occupy it.
+        primeline = printing & np.isclose(core["y"], -10.0, atol=1e-4)
+        assert np.count_nonzero(primeline) > 2
+        np.testing.assert_allclose(core["y"][primeline], -10.0, atol=1e-4)
+        assert float(np.min(core["x"][primeline])) == pytest.approx(35.0, abs=1e-4)
+        assert float(np.max(core["x"][primeline])) == pytest.approx(58.0, abs=1e-4)

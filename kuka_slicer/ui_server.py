@@ -2011,6 +2011,23 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             conformal_source_job,
             default_abc=core_params.default_abc,
         )
+        # Match the native Prusa/Core hand-off exactly: write the origin-to-
+        # primeline motion as an explicit source travel.  Leaving this to the
+        # generic converter makes its synthetic initial travel share the
+        # primeline's buffered Core segment, which turns the deposited line
+        # into a diagonal path from the machine origin.
+        source_gcode_module = importlib.import_module(
+            "external_npz_preprocessor.source_gcode"
+        )
+        core_source_job = source_gcode_module.prepend_prusa_startup_travel(
+            core_source_job,
+            start_xy=(float(core_params.start_x_mm), float(core_params.start_y_mm)),
+            primeline_enabled=bool(core_params.primeline_enabled),
+            primeline_xy=(
+                float(core_params.primeline_x_mm),
+                float(core_params.primeline_y_mm),
+            ),
+        )
         phase_timings["core_source_preparation_s"] = time.perf_counter() - phase_started_at
 
         export_runner = importlib.import_module("external_npz_preprocessor.export_runner")
