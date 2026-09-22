@@ -3728,11 +3728,11 @@ def _index_html() -> str:
       background: #ffffff;
     }}
     .appHeaderInner {{
-      width: min(1180px, calc(100% - 40px));
+      width: min(1540px, calc(100% - 40px));
       margin: 0 auto;
       padding: var(--space-4) 0;
       display: grid;
-      grid-template-columns: minmax(230px, 300px) minmax(0, 1fr);
+      grid-template-columns: minmax(260px, 340px) minmax(0, 1fr);
       gap: var(--space-5);
       align-items: start;
     }}
@@ -3957,7 +3957,7 @@ def _index_html() -> str:
     }}
     .surfaceToolGroups {{
       display: grid;
-      grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
+      grid-template-columns: minmax(560px, 1.55fr) minmax(340px, 1fr);
       gap: var(--space-3);
       align-items: start;
     }}
@@ -3984,6 +3984,7 @@ def _index_html() -> str:
       background: #ffffff;
       font: inherit;
       font-size: 13px;
+      white-space: nowrap;
       cursor: pointer;
     }}
     .surfaceToolButton:hover {{ background: #eef6ff; }}
@@ -3997,7 +3998,7 @@ def _index_html() -> str:
     .surfaceToolButton.primary:hover {{ background: var(--accent-dark); }}
     .surfaceToolButton.quiet {{ border-color: var(--line); color: var(--muted); }}
     .surfaceContext {{
-      width: min(1180px, calc(100% - 40px));
+      width: min(1540px, calc(100% - 40px));
       margin: 0 auto;
       padding: 0 0 var(--space-3);
       display: grid;
@@ -4867,13 +4868,18 @@ def _index_html() -> str:
       height: 100%;
       display: block;
     }}
+    @media (max-width: 1180px) {{
+      .appHeaderInner {{
+        grid-template-columns: 1fr;
+      }}
+    }}
     @media (max-width: 820px) {{
       main {{ padding: 24px 18px 32px; }}
       .appHeaderInner {{
         width: calc(100% - 36px);
-        grid-template-columns: 1fr;
         gap: var(--space-3);
       }}
+      .surfaceToolGroups {{ grid-template-columns: 1fr; }}
       .surfaceContext {{ width: calc(100% - 36px); }}
       .bandGrid {{ grid-template-columns: repeat(6, minmax(0, 1fr)); }}
       .inputBand .bandGrid {{ grid-template-columns: repeat(6, minmax(0, 1fr)); }}

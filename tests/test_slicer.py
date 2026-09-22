@@ -4295,6 +4295,8 @@ def test_ui_offers_large_advanced_settings_as_draggable_resizable_popups():
     assert 'id="coreProcessSettingsTopButton"' in html
     assert "document.getElementById('coreProcessSettingsTopButton')" in html
     assert html.index('id="coreProcessSettingsTopButton"') < html.index('id="conformalSliceButton"')
+    assert "width: min(1540px, calc(100% - 40px));" in html
+    assert "grid-template-columns: minmax(560px, 1.55fr) minmax(340px, 1fr);" in html
     assert 'id="zMin"' not in html
     assert 'id="zMax"' not in html
     assert 'id="tolerance"' not in html
