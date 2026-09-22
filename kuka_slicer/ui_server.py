@@ -7500,6 +7500,104 @@ def _index_html() -> str:
       return {{ plot, baseScale, pixelsPerMm, plotCenterX, plotCenterY, project, minimum, maximum, isSurface: true }};
     }}
 
+    function drawSurfaceMeasurementGrid(ctx, viewport) {{
+      const {{ plot, minimum, maximum, project, pixelsPerMm }} = viewport;
+      const z = minimum[2];
+      const majorStep = niceGridStep(pixelsPerMm);
+      const minorStep = majorStep / 5;
+      const corners = [
+        [minimum[0], minimum[1], z],
+        [maximum[0], minimum[1], z],
+        [maximum[0], maximum[1], z],
+        [minimum[0], maximum[1], z],
+      ].map(project);
+      ctx.save();
+      ctx.beginPath();
+      ctx.moveTo(corners[0][0], corners[0][1]);
+      for (let index = 1; index < corners.length; index++) ctx.lineTo(corners[index][0], corners[index][1]);
+      ctx.closePath();
+      ctx.clip();
+      const drawLines = (step, color, width) => {{
+        ctx.strokeStyle = color;
+        ctx.lineWidth = width;
+        forEachGridValue(minimum[0], maximum[0], step, (value) => {{
+          const start = project([value, minimum[1], z]);
+          const end = project([value, maximum[1], z]);
+          ctx.beginPath();
+          ctx.moveTo(start[0], start[1]);
+          ctx.lineTo(end[0], end[1]);
+          ctx.stroke();
+        }});
+        forEachGridValue(minimum[1], maximum[1], step, (value) => {{
+          const start = project([minimum[0], value, z]);
+          const end = project([maximum[0], value, z]);
+          ctx.beginPath();
+          ctx.moveTo(start[0], start[1]);
+          ctx.lineTo(end[0], end[1]);
+          ctx.stroke();
+        }});
+      }};
+      drawLines(minorStep, 'rgba(174, 184, 192, 0.22)', 0.7);
+      drawLines(majorStep, 'rgba(117, 139, 156, 0.50)', 1.0);
+      ctx.restore();
+
+      // Project ruler labels on the two near print-plane edges.  Values are
+      // world millimetres, so zooming or rotating never changes the scale.
+      ctx.save();
+      ctx.fillStyle = '#5c6972';
+      ctx.font = '11px Segoe UI, Arial, sans-serif';
+      ctx.textBaseline = 'top';
+      ctx.textAlign = 'center';
+      forEachGridValue(minimum[0], maximum[0], majorStep, (value) => {{
+        const point = project([value, minimum[1], z]);
+        if (point[0] > plot.left + 12 && point[0] < plot.right - 12) {{
+          ctx.fillText(formatRulerValue(value, majorStep), point[0], point[1] + 5);
+        }}
+      }});
+      ctx.textAlign = 'right';
+      ctx.textBaseline = 'middle';
+      forEachGridValue(minimum[1], maximum[1], majorStep, (value) => {{
+        const point = project([minimum[0], value, z]);
+        if (point[1] > plot.top + 9 && point[1] < plot.bottom - 9) {{
+          ctx.fillText(formatRulerValue(value, majorStep), point[0] - 6, point[1]);
+        }}
+      }});
+      ctx.restore();
+    }}
+
+    function drawSurfacePrintCenter(ctx, viewport) {{
+      const {{ minimum, maximum, project }} = viewport;
+      const center = [
+        (minimum[0] + maximum[0]) * 0.5,
+        (minimum[1] + maximum[1]) * 0.5,
+        minimum[2],
+      ];
+      const point = project(center);
+      ctx.save();
+      ctx.strokeStyle = '#b91c1c';
+      ctx.fillStyle = '#b91c1c';
+      ctx.lineWidth = 1.8;
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.moveTo(point[0] - 7, point[1]);
+      ctx.lineTo(point[0] + 7, point[1]);
+      ctx.moveTo(point[0], point[1] - 7);
+      ctx.lineTo(point[0], point[1] + 7);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(point[0], point[1], 2.8, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.font = '600 11px Segoe UI, Arial, sans-serif';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'bottom';
+      ctx.fillText(
+        `打印中心 (${{formatDimension(center[0])}}, ${{formatDimension(center[1])}})`,
+        point[0] + 9,
+        point[1] - 7,
+      );
+      ctx.restore();
+    }}
+
     function drawSurfaceReference(ctx, viewport) {{
       const {{ plot, minimum, maximum, project }} = viewport;
       const z = minimum[2];
@@ -7515,6 +7613,7 @@ def _index_html() -> str:
       for (let index = 1; index < corners.length; index++) ctx.lineTo(corners[index][0], corners[index][1]);
       ctx.closePath();
       ctx.fill();
+      drawSurfaceMeasurementGrid(ctx, viewport);
       ctx.strokeStyle = '#d5dbe0';
       ctx.lineWidth = 1;
       ctx.stroke();
@@ -7547,13 +7646,14 @@ def _index_html() -> str:
         ctx.fill();
         ctx.fillText(axis.label, end[0] + 9, end[1] - 6);
       }}
+      drawSurfacePrintCenter(ctx, viewport);
       ctx.strokeStyle = '#aeb8c0';
       ctx.lineWidth = 1;
       ctx.strokeRect(plot.left + 0.5, plot.top + 0.5, plot.width - 1, plot.height - 1);
       ctx.fillStyle = '#5c6972';
       ctx.textAlign = 'right';
       ctx.textBaseline = 'top';
-      ctx.fillText('三维曲面预览 · 左键旋转', plot.right - 7, plot.top + 7);
+      ctx.fillText('三维曲面预览 · 左键旋转 · 打印平面网格', plot.right - 7, plot.top + 7);
     }}
 
     function surfaceLayerCurvatureText(layer) {{

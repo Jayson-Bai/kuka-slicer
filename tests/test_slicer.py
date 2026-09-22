@@ -4591,6 +4591,10 @@ def test_ui_preview_supports_filtered_ordered_progress_pan_zoom_and_rulers():
     for interaction in (
         "selectedPrintEntries",
         "drawMeasurementGrid",
+        "drawSurfaceMeasurementGrid",
+        "drawSurfacePrintCenter",
+        "打印平面网格",
+        "打印中心",
         "niceGridStep",
         "addEventListener('wheel'",
         "addEventListener('pointerdown'",
