@@ -75,6 +75,24 @@ def test_app_session_uses_a_fresh_port_for_each_server(monkeypatch, tmp_path: Pa
     assert "43210" in launched[0]
 
 
+def test_macos_ui_session_waits_for_heartbeat_owned_server(monkeypatch, tmp_path: Path) -> None:
+    server = _Process()
+    browser = _Process()
+    profile = tmp_path / "isolated-browser-profile"
+    profile.mkdir()
+    monkeypatch.setattr(app_session.subprocess, "Popen", lambda *args, **kwargs: server)
+    monkeypatch.setattr(app_session.sys, "platform", "darwin")
+    monkeypatch.setattr(app_session, "_wait_for_port", lambda *args, **kwargs: None)
+    monkeypatch.setattr(app_session, "_launch_browser_app", lambda *args, **kwargs: (browser, profile))
+    monkeypatch.delenv("KUKA_SLICER_BROWSER_SESSION", raising=False)
+
+    assert app_session.run_app_session("ui") == 0
+
+    assert server.waited
+    assert not browser.waited
+    assert "KUKA_SLICER_BROWSER_SESSION" not in app_session.os.environ
+
+
 def test_server_process_requests_windows_job_breakaway(monkeypatch) -> None:
     server = _Process()
     calls: list[dict[str, object]] = []
@@ -227,12 +245,8 @@ def test_macos_browser_session_uses_an_isolated_profile_without_background_mode(
 
     _browser, profile = app_session._launch_browser_app("http://127.0.0.1:45678", "surface-preview")
 
-    assert commands[0][:6] == [
-        "/usr/bin/open",
-        "-n",
-        "-a",
-        str(chrome.parents[2]),
-        "--args",
+    assert commands[0][:2] == [
+        str(chrome),
         "--app=http://127.0.0.1:45678",
     ]
     assert "--disable-background-mode" in commands[0]
@@ -272,6 +286,26 @@ def test_macos_session_ignores_a_transient_startup_profile_process(monkeypatch, 
     monkeypatch.setattr(app_session.time, "sleep", lambda _seconds: None)
 
     app_session._wait_for_macos_browser_profile(profile, tmp_path / "Google Chrome")
+
+
+def test_macos_profile_process_lookup_matches_the_browser_and_profile(monkeypatch, tmp_path: Path) -> None:
+    chrome = tmp_path / "Google Chrome.app" / "Contents" / "MacOS" / "Google Chrome"
+    profile = tmp_path / "isolated-browser-profile"
+    output = "\n".join(
+        [
+            f"  123 {chrome} --app=http://127.0.0.1:43210 --user-data-dir={profile}",
+            f"  456 {chrome} --app=http://127.0.0.1:43211 --user-data-dir={tmp_path / 'other'}",
+            "  789 /Applications/Other.app/Contents/MacOS/Other --user-data-dir=ignored",
+        ]
+    )
+
+    class _Completed:
+        returncode = 0
+        stdout = output
+
+    monkeypatch.setattr(app_session.subprocess, "run", lambda *_args, **_kwargs: _Completed())
+
+    assert app_session._macos_browser_profile_pids(profile, chrome) == (123,)
 
 
 def test_main_ui_exposes_surface_tool_launchers() -> None:

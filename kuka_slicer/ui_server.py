@@ -8,6 +8,7 @@ import html
 import importlib
 import json
 import math
+import os
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1410,8 +1411,35 @@ def run_ui_server(host: str, port: int, output_dir: Path) -> None:
             "total_workers": 0,
             "message": "正在启动 Core 预热",
         }
+        browser_session_required = os.environ.get("KUKA_SLICER_BROWSER_SESSION") == "1"
+        browser_session_started_at = time.monotonic()
+        browser_session_last_heartbeat: float | None = None
+        browser_session_lock = threading.Lock()
 
     server = ThreadingHTTPServer((host, port), SlicerUiHandler)
+
+    def stop_unattended_browser_session() -> None:
+        """Stop an app-launched UI after its browser page disappears."""
+
+        while True:
+            time.sleep(1.0)
+            now = time.monotonic()
+            with SlicerUiHandler.browser_session_lock:
+                last_heartbeat = SlicerUiHandler.browser_session_last_heartbeat
+            if last_heartbeat is None:
+                expired = now - SlicerUiHandler.browser_session_started_at >= 60.0
+            else:
+                expired = now - last_heartbeat >= 30.0
+            if expired:
+                server.shutdown()
+                return
+
+    if SlicerUiHandler.browser_session_required:
+        threading.Thread(
+            target=stop_unattended_browser_session,
+            daemon=True,
+            name="browser-session-watchdog",
+        ).start()
 
     def warm_core_workers() -> None:
         try:
@@ -1515,6 +1543,12 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/browser-session-heartbeat":
+            if type(self).browser_session_required:
+                with type(self).browser_session_lock:
+                    type(self).browser_session_last_heartbeat = time.monotonic()
+            self._send_json({"ok": True})
+            return
         if parsed.path == "/launch-tool":
             self._launch_tool(parse_qs(parsed.query))
             return
@@ -9559,6 +9593,13 @@ def _index_html() -> str:
     showPathPointsInput.addEventListener('change', drawPreview);
     showDirectionInput.addEventListener('change', drawPreview);
     window.addEventListener('resize', drawPreview);
+    if (new URLSearchParams(window.location.search).get('browser_session') === '1') {{
+      const sendBrowserSessionHeartbeat = () => {{
+        fetch('/browser-session-heartbeat', {{ method: 'POST', keepalive: true }}).catch(() => {{}});
+      }};
+      sendBrowserSessionHeartbeat();
+      window.setInterval(sendBrowserSessionHeartbeat, 5000);
+    }}
     drawPreview();
   </script>
 </body>

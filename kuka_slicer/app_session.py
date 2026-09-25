@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-import re
 import shutil
 import socket
 import subprocess
@@ -159,17 +158,35 @@ def run_app_session(tool: str) -> int:
 
     command, extra_args = _tool_spec(tool)
     port = _find_available_port()
+    browser_heartbeat_session = sys.platform == "darwin" and tool == "ui"
+    previous_browser_session = os.environ.get("KUKA_SLICER_BROWSER_SESSION")
+    if browser_heartbeat_session:
+        os.environ["KUKA_SLICER_BROWSER_SESSION"] = "1"
     server = _launch_server_process(
         [sys.executable, "-m", "kuka_slicer", command, "--host", "127.0.0.1", "--port", str(port), *extra_args]
     )
     profile_dir: Path | None = None
     try:
         _wait_for_port(port, server)
-        browser, profile_dir = _launch_browser_app(f"http://127.0.0.1:{port}", tool)
-        _wait_for_browser_session(browser, profile_dir)
+        browser_url = f"http://127.0.0.1:{port}"
+        if browser_heartbeat_session:
+            browser_url += "?browser_session=1"
+        browser, profile_dir = _launch_browser_app(browser_url, tool)
+        if browser_heartbeat_session:
+            # Chrome's macOS process tree is not a dependable window-lifetime
+            # signal. The UI server instead stops itself after its page stops
+            # sending the browser-session heartbeat.
+            server.wait()
+        else:
+            _wait_for_browser_session(browser, profile_dir)
         return 0
     finally:
         _stop_process(server)
+        if browser_heartbeat_session:
+            if previous_browser_session is None:
+                os.environ.pop("KUKA_SLICER_BROWSER_SESSION", None)
+            else:
+                os.environ["KUKA_SLICER_BROWSER_SESSION"] = previous_browser_session
         if profile_dir is not None:
             shutil.rmtree(profile_dir, ignore_errors=True)
 
@@ -371,11 +388,10 @@ def _launch_browser_app(url: str, tool: str) -> tuple[subprocess.Popen[bytes], P
             f"--user-data-dir={profile_dir}",
         ]
         if sys.platform == "darwin":
-            # ``-n`` forces a new Chrome app instance for the temporary
-            # profile instead of forwarding the URL to an unrelated existing
-            # browser. Its launcher returns promptly; the profile monitor
-            # below owns the actual window lifetime.
-            command = ["/usr/bin/open", "-n", "-a", str(browser_path.parents[2]), "--args", *browser_args]
+            # Launch Chrome's executable directly. Finder's ``open`` command
+            # returns while a Chrome app window is still alive, which leaves
+            # the UI server without a reliable owner process.
+            command = [str(browser_path), *browser_args]
         else:
             command = [str(browser_path), *browser_args]
         browser = subprocess.Popen(
@@ -391,12 +407,12 @@ def _launch_browser_app(url: str, tool: str) -> tuple[subprocess.Popen[bytes], P
 
 
 def _wait_for_browser_session(browser: _ManagedProcess, profile_dir: Path) -> None:
-    """Wait for the actual browser window lifetime on every supported OS."""
+    """Wait for the dedicated browser app instance to exit."""
 
-    if sys.platform != "darwin":
-        browser.wait()
+    if sys.platform == "darwin":
+        _wait_for_macos_browser_profile(profile_dir, _find_browser())
         return
-    _wait_for_macos_browser_profile(profile_dir, _find_browser())
+    browser.wait()
 
 
 def _wait_for_macos_browser_profile(profile_dir: Path, browser_path: Path) -> None:
@@ -409,7 +425,10 @@ def _wait_for_macos_browser_profile(profile_dir: Path, browser_path: Path) -> No
     is definitively closed and its local server may be stopped.
     """
 
-    deadline = time.monotonic() + 10.0
+    # A cold Chrome start can take noticeably longer on macOS while the
+    # system restores its app process.  Do not let the short startup probe
+    # turn that normal delay into an orphaned browser window.
+    deadline = time.monotonic() + 60.0
     profile_stable_since: float | None = None
     observed_stable_profile = False
     missing_since: float | None = None
@@ -459,12 +478,17 @@ def _macos_browser_profile_pids(profile_dir: Path, browser_path: Path) -> tuple[
     profile_argument = f"--user-data-dir={profile_dir}"
     try:
         completed = subprocess.run(
-            # Match the executable at the command-line start. This excludes
-            # the ``open`` launcher and transient Chrome helper subprocesses.
+            # BSD ``pgrep -f`` can intermittently miss a newly re-parented
+            # Chrome app process.  Read the complete command lines directly
+            # and match the executable plus the unique profile argument.
             [
-                "/usr/bin/pgrep",
-                "-f",
-                rf"^{re.escape(str(browser_path))} .*{re.escape(profile_argument)}",
+                "/bin/ps",
+                "-ax",
+                "-ww",
+                "-o",
+                "pid=",
+                "-o",
+                "command=",
             ],
             check=False,
             capture_output=True,
@@ -473,9 +497,16 @@ def _macos_browser_profile_pids(profile_dir: Path, browser_path: Path) -> tuple[
         )
     except (OSError, subprocess.TimeoutExpired):
         return ()
-    if completed.returncode not in (0, 1):
+    if completed.returncode != 0:
         return ()
-    return tuple(int(line) for line in completed.stdout.splitlines() if line.strip().isdigit())
+    pids: list[int] = []
+    for line in completed.stdout.splitlines():
+        pid_text, separator, command = line.strip().partition(" ")
+        if not separator or not pid_text.isdigit():
+            continue
+        if command.startswith(str(browser_path)) and profile_argument in command:
+            pids.append(int(pid_text))
+    return tuple(pids)
 
 
 def _activate_macos_browser_window(browser_path: Path) -> None:
