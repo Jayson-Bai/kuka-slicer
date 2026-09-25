@@ -21,10 +21,29 @@ fi
 cd "$repo_root"
 export KUKA_SLICER_MAX_CPU_CORES="${KUKA_SLICER_MAX_CPU_CORES:-4}"
 
+ui_is_healthy() {
+  curl --fail --silent --show-error --max-time 2 \
+    "$ui_url/core-warmup-status" >/dev/null 2>&1
+}
+
 if lsof -nP -iTCP:8765 -sTCP:LISTEN >/dev/null 2>&1; then
-  echo "KUKA Slicer UI is already running at $ui_url"
-  open "$ui_url"
-  exit 0
+  if ui_is_healthy; then
+    echo "KUKA Slicer UI is already running at $ui_url"
+    open "$ui_url"
+    exit 0
+  fi
+  # Do not report success for an unrelated listener or a hung former UI.
+  # A labelled launchd service can be safely replaced; an unknown process is
+  # left untouched and reported instead of being terminated blindly.
+  if /bin/launchctl print "gui/$UID/$service_label" >/dev/null 2>&1; then
+    /bin/launchctl remove "$service_label" >/dev/null 2>&1 || true
+    sleep 0.2
+  fi
+  if lsof -nP -iTCP:8765 -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "Port 8765 is occupied by a process that is not responding as KUKA Slicer."
+    echo "Close that process or select a different port before retrying."
+    exit 1
+  fi
 fi
 
 mkdir -p "$output_dir"
@@ -50,7 +69,7 @@ fi
     --output-dir "$output_dir"
 
 for _ in {1..50}; do
-  if curl --fail --silent --show-error "$ui_url/" >/dev/null 2>&1; then
+  if ui_is_healthy; then
     open "$ui_url"
     exit 0
   fi
