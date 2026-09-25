@@ -371,6 +371,18 @@ def _validate_rectangular_part(part: Mapping[str, object], manufacturing: Mappin
     bead_width = _positive(manufacturing.get("nominal_bead_width_mm"), "manufacturing.nominal_bead_width_mm")
     if not math.isclose(bead_width, 2.0, rel_tol=0.0, abs_tol=1e-9):
         raise ValueError("manufacturing.nominal_bead_width_mm must be exactly 2.0 for the configured resin nozzle")
+    # ``specimen_variant`` is intentionally independent of the analytical
+    # surface parameterization.  It controls only whether the tensile grip
+    # partition exists.  Omission remains valid for legacy zero-grip designs.
+    specimen_variant = part.get("specimen_variant")
+    if specimen_variant is not None and specimen_variant not in {"tensile", "bending"}:
+        raise ValueError("part.specimen_variant must be tensile or bending")
+    has_grip = "symmetric_grip_end_length_mm" in part
+    if specimen_variant == "bending" and has_grip:
+        raise ValueError("bending part.specimen_variant must not define symmetric_grip_end_length_mm")
+    if specimen_variant == "tensile" and not has_grip:
+        raise ValueError("tensile part.specimen_variant requires symmetric_grip_end_length_mm")
+
     # This is deliberately a geometric partition only.  Process choices such
     # as hatch pitch and E calibration stay in the slicer/Core process preset,
     # not in the portable conformal design JSON.
@@ -378,5 +390,7 @@ def _validate_rectangular_part(part: Mapping[str, object], manufacturing: Mappin
     grip_value = _finite(grip, "part.symmetric_grip_end_length_mm")
     if grip_value < 0.0:
         raise ValueError("part.symmetric_grip_end_length_mm must be non-negative")
+    if specimen_variant == "tensile" and grip_value <= 0.0:
+        raise ValueError("tensile part.specimen_variant requires symmetric_grip_end_length_mm greater than zero")
     if grip_value and 2.0 * grip_value >= float(part["length_mm"]):
         raise ValueError("part.symmetric_grip_end_length_mm must leave a positive honeycomb working length")

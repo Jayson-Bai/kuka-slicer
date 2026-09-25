@@ -370,6 +370,7 @@ def test_symmetric_grips_are_split_on_every_layer_and_reuse_x_one_stroke_zigzag(
             "part_length_mm": ["40"],
             "part_width_mm": ["20"],
             "part_height_mm": ["4"],
+            "specimen_variant": ["tensile"],
             "grip_end_length_mm": ["8"],
             "amplitude_mm": ["1.5"],
             "wavelength_x_mm": ["24"],
@@ -413,6 +414,42 @@ def test_symmetric_grips_are_split_on_every_layer_and_reuse_x_one_stroke_zigzag(
         assert np.median(np.abs(left_delta[:, 0])) > np.median(np.abs(left_delta[:, 1]))
         left_e = group.extrusion[3]
         assert np.diff(left_e) == pytest.approx(np.linalg.norm(np.diff(left[:, :3], axis=0), axis=1) * 2.0)
+
+
+def test_bending_variant_uses_the_full_rectangle_without_grip_or_partition_paths():
+    spec = conformal_lattice_config_payload(
+        {
+            "part_length_mm": ["40"],
+            "part_width_mm": ["20"],
+            "part_height_mm": ["4"],
+            "specimen_variant": ["bending"],
+            "grip_end_length_mm": ["8"],
+            "amplitude_mm": ["1.5"],
+            "wavelength_x_mm": ["24"],
+            "wavelength_y_mm": ["30"],
+            "surface_start_layer": ["0"],
+            "samples_x": ["21"],
+            "samples_y": ["11"],
+            "wall_width_mm": ["2"],
+            "base_cell_size_mm": ["5"],
+        }
+    )
+
+    run = run_conformal_lattice_pipeline(
+        spec,
+        physical_layer_height_mm=1.0,
+        extrusion=ExtrusionVolumeModel(bead_cross_section_area_mm2=0.2, e_volume_per_unit_mm3=0.1),
+    )
+
+    assert "symmetric_grip_end_length_mm" not in spec["part"]
+    assert run.domain.report["generated_xy_bounds_mm"] == [0.0, 0.0, 40.0, 20.0]
+    assert run.continuous_course_plan is not None
+    assert run.continuous_course_plan.course_bounds_mm == pytest.approx((0.0, 0.0, 40.0, 20.0))
+    job = run.path_graph.to_external_source_job()  # type: ignore[union-attr]
+    for layer, roles in job.meta["path_roles"]["R"].items():
+        assert roles.count("conformal_outer_boundary") == 1, layer
+        assert "conformal_partition_wall" not in roles
+        assert "conformal_grip_zigzag_x_one_stroke" not in roles
 
 
 def test_design_json_without_process_fiber_settings_leaves_the_resin_graph_unchanged():

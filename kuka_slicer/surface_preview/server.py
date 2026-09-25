@@ -536,11 +536,26 @@ def _rectangular_lattice_config_payload(
     length_mm = _query_float(params, "part_length_mm", 150.0, positive=True)
     width_mm = _query_float(params, "part_width_mm", 50.0, positive=True)
     final_height_mm = _query_float(params, "part_height_mm", 10.0, positive=True)
-    grip_end_length_mm = _query_float(params, "grip_end_length_mm", 0.0)
-    if grip_end_length_mm < 0.0:
-        raise ValueError("grip_end_length_mm must be non-negative")
-    if 2.0 * grip_end_length_mm >= length_mm:
-        raise ValueError("two grip_end_length_mm regions must leave a positive honeycomb working length")
+    # The specimen version controls only the optional tensile grip geometry.
+    # It deliberately does not select a surface parameterization, honeycomb
+    # alignment, fibre schedule, or any Core process setting.
+    specimen_variant = params.get("specimen_variant", [None])[0]
+    if specimen_variant is not None and specimen_variant not in {"tensile", "bending"}:
+        raise ValueError("specimen_variant must be tensile or bending")
+
+    # Preserve the optional zero-grip semantics for callers exporting legacy
+    # designs without a version field.  The designer always sends an explicit
+    # version, for which the new contract is strict: tensile has two positive
+    # grips; bending has no grip field at all.
+    grip_end_length_mm: float | None = None
+    if specimen_variant != "bending":
+        grip_end_length_mm = _query_float(params, "grip_end_length_mm", 0.0)
+        if grip_end_length_mm < 0.0:
+            raise ValueError("grip_end_length_mm must be non-negative")
+        if specimen_variant == "tensile" and grip_end_length_mm <= 0.0:
+            raise ValueError("tensile specimen_variant requires grip_end_length_mm greater than zero")
+        if 2.0 * grip_end_length_mm >= length_mm:
+            raise ValueError("two grip_end_length_mm regions must leave a positive honeycomb working length")
     # The design page describes surface morphology, not process settings.
     # Keep one stable reference for validating a layer-index start value; the
     # actual physical layer height is supplied later by the slicer/Core UI.
@@ -675,7 +690,9 @@ def _rectangular_lattice_config_payload(
         "quality_limits": {},
         "random_seed": random_seed,
     }
-    if grip_end_length_mm > 0.0:
+    if specimen_variant is not None:
+        config["part"]["specimen_variant"] = specimen_variant  # type: ignore[index]
+    if grip_end_length_mm is not None and grip_end_length_mm > 0.0:
         # A pure geometry range: the executable zigzag process settings are
         # intentionally supplied later by the resin path planner/Core preset.
         config["part"]["symmetric_grip_end_length_mm"] = grip_end_length_mm  # type: ignore[index]
@@ -911,7 +928,7 @@ def surface_preview_html() -> str:
   <main>
     <header>
       <h1>蜂窝网格共形设计器</h1>
-      <p>在矩形实体上定义双正弦共形曲面与六边形格栅；默认采用拉伸标距段策略，导出 JSON 后回到主切片器生成路径与送入 Core。</p>
+      <p>在矩形实体上定义双正弦共形曲面与六边形格栅；可独立选择拉伸或弯曲试件版本，导出 JSON 后回到主切片器生成路径与送入 Core。</p>
     </header>
     <section class="workspace">
       <form class="panel controls" id="surfaceForm">
@@ -919,7 +936,8 @@ def surface_preview_html() -> str:
         <div class="field"><label for="part_length_mm">零件长度 X（mm）</label><input id="part_length_mm" type="number" min="0.001" step="1" value="150"></div>
         <div class="field"><label for="part_width_mm">零件宽度 Y（mm）</label><input id="part_width_mm" type="number" min="0.001" step="1" value="50"></div>
         <div class="field"><label for="part_height_mm">最终物理高度 Z（mm）</label><input id="part_height_mm" type="number" min="0.001" step="0.1" value="10"></div>
-        <div class="field"><label for="grip_end_length_mm">每端夹持区 X（mm）</label><input id="grip_end_length_mm" type="number" min="0" step="0.5" value="25" aria-describedby="gripLengthHint"></div>
+        <div class="field"><label for="specimen_variant">试件版本</label><select id="specimen_variant"><option value="tensile" selected>拉伸版：两端夹持区</option><option value="bending">弯曲版：全长蜂窝工作段</option></select></div>
+        <div class="field" id="gripEndLengthField"><label for="grip_end_length_mm">每端夹持区 X（mm）</label><input id="grip_end_length_mm" type="number" min="0.001" step="0.5" value="25" aria-describedby="gripLengthHint"></div>
         <p class="hint" id="gripLengthHint">两端采用相同长度；蜂窝工作段为 X 总长 − 2 × 每端夹持区。曲面仍按完整零件 X/Y 范围计算，不会因夹持区而改变波长、相位或曲率。</p>
         <p class="modelMeta" id="modelMeta">外边界固定为矩形；新共形流程不读取 STL，也不继承 STL 中的蜂窝孔壁。</p>
         <div class="divider"></div>
@@ -1007,7 +1025,7 @@ def surface_preview_html() -> str:
   <script>
     const surfaceIds = ['surface_parameter_mode', 'amplitude_mm', 'wave_count_x', 'wave_count_y', 'wavelength_x_mm', 'wavelength_y_mm', 'phase_x_pi', 'phase_y_pi', 'z_reference_mm', 'inspection_enabled', 'check_x_mm', 'check_y_mm', 'samples'];
     const mappingReferenceLayerHeightMm = 0.5;
-    const conformalDesignIds = ['part_length_mm', 'part_width_mm', 'part_height_mm', 'grip_end_length_mm', 'wall_width_mm', 'base_cell_size_mm', 'orientation_angle_deg', 'align_load_line', 'honeycomb_align_x', 'honeycomb_align_x_mm', 'honeycomb_align_y', 'honeycomb_align_y_mm', 'surface_start_layer', 'samples_x', 'samples_y', 'boundary_mode', 'random_seed'];
+    const conformalDesignIds = ['part_length_mm', 'part_width_mm', 'part_height_mm', 'specimen_variant', 'grip_end_length_mm', 'wall_width_mm', 'base_cell_size_mm', 'orientation_angle_deg', 'align_load_line', 'honeycomb_align_x', 'honeycomb_align_x_mm', 'honeycomb_align_y', 'honeycomb_align_y_mm', 'surface_start_layer', 'samples_x', 'samples_y', 'boundary_mode', 'random_seed'];
     const canvas = document.getElementById('canvas');
     const statusEl = document.getElementById('status');
     const statsEl = document.getElementById('stats');
@@ -1048,8 +1066,11 @@ def surface_preview_html() -> str:
 
     function honeycombActiveXBounds() {
       const length = positiveNumber('part_length_mm');
+      if (document.getElementById('specimen_variant').value === 'bending') {
+        return length === null ? null : [0, length];
+      }
       const grip = nonNegativeNumber('grip_end_length_mm');
-      if (length === null || grip === null || 2 * grip >= length) return null;
+      if (length === null || grip === null || grip <= 0 || 2 * grip >= length) return null;
       return [grip, length - grip];
     }
 
@@ -1128,6 +1149,15 @@ def surface_preview_html() -> str:
       updateTensileWaveHint();
     }
 
+    function syncSpecimenVariantControls() {
+      const bending = document.getElementById('specimen_variant').value === 'bending';
+      document.getElementById('gripEndLengthField').hidden = bending;
+      document.getElementById('grip_end_length_mm').disabled = bending;
+      document.getElementById('gripLengthHint').textContent = bending
+        ? '弯曲版不导出夹持区：蜂窝骨架、树脂连续路径和纤维连续路径的有效 X 域为整个矩形。仍保留每层一条闭合外轮廓及其半线宽净空。'
+        : '两端采用相同长度；蜂窝工作段为 X 总长 − 2 × 每端夹持区。曲面仍按完整零件 X/Y 范围计算，不会因夹持区而改变波长、相位或曲率。';
+    }
+
     function updateTensileWaveHint() {
       const hint = document.getElementById('tensileWaveHint');
       const length = positiveNumber('part_length_mm');
@@ -1170,7 +1200,7 @@ def surface_preview_html() -> str:
       const latticeSummary = document.getElementById('latticeDesignSummary');
       if (activeXBounds === null) {
         latticeSummary.className = 'designSummary error';
-        latticeSummary.textContent = '每端夹持区必须为非负数，且两端夹持区之和必须小于零件长度，才能留下蜂窝工作段。';
+        latticeSummary.textContent = '拉伸版每端夹持区必须为正数，且两端夹持区之和必须小于零件长度，才能留下蜂窝工作段。';
       } else if (cellSize === null) {
         latticeSummary.className = 'designSummary error';
         latticeSummary.textContent = '目标六边形边长必须为正数。';
@@ -1179,7 +1209,8 @@ def surface_preview_html() -> str:
         const workingLength = activeXBounds[1] - activeXBounds[0];
         const width = positiveNumber('part_width_mm');
         const estimatedCourses = width === null ? '?' : Math.max(1, Math.floor(width / (Math.sqrt(3) * cellSize)));
-        latticeSummary.textContent = `连续路径工作段：X=${activeXBounds[0].toFixed(2)}–${activeXBounds[1].toFixed(2)} mm（长 ${workingLength.toFixed(2)} mm）；目标边长 ${cellSize.toFixed(2)} mm；预计约 ${estimatedCourses} 条 X 向长路径。路径数由完整单元能否落入矩形决定，不以蜂窝边数计。`;
+        const versionLabel = document.getElementById('specimen_variant').value === 'bending' ? '弯曲版全长工作段' : '拉伸版连续路径工作段';
+        latticeSummary.textContent = `${versionLabel}：X=${activeXBounds[0].toFixed(2)}–${activeXBounds[1].toFixed(2)} mm（长 ${workingLength.toFixed(2)} mm）；目标边长 ${cellSize.toFixed(2)} mm；预计约 ${estimatedCourses} 条 X 向长路径。路径数由完整单元能否落入矩形决定，不以蜂窝边数计。`;
       }
 
       const firstCurvedLayer = nonNegativeInteger('surface_start_layer');
@@ -2582,6 +2613,14 @@ def surface_preview_html() -> str:
       saveDesignerState();
       scheduleRefresh();
     });
+    document.getElementById('specimen_variant').addEventListener('change', () => {
+      syncSpecimenVariantControls();
+      saveDesignerState();
+      invalidateLatticePreview();
+      updateConformalDesignSummary();
+      updateLatticeLengthSummary();
+      if (payload) render();
+    });
     document.getElementById('inspection_enabled').addEventListener('change', () => {
       syncInspectionPointControls();
       saveDesignerState();
@@ -2707,7 +2746,7 @@ def surface_preview_html() -> str:
       render();
     });
     document.getElementById('reset').addEventListener('click', () => {
-      const defaults = { part_length_mm: 150, part_width_mm: 50, part_height_mm: 10, grip_end_length_mm: 25, surface_parameter_mode: 'tensile_centered_wave_count', amplitude_mm: 1.5, wave_count_x: 1.5, wave_count_y: 1.5, wavelength_x_mm: 100, wavelength_y_mm: 33.333, phase_x_pi: 1, phase_y_pi: 1, z_reference_mm: 0, inspection_enabled: false, check_x_mm: 75, check_y_mm: 25, wall_width_mm: 2, base_cell_size_mm: 10, orientation_angle_deg: 0, honeycomb_align_x: false, honeycomb_align_x_mm: 75, honeycomb_align_y: false, honeycomb_align_y_mm: 25, surface_start_layer: 3, samples_x: 49, samples_y: 49, boundary_mode: 'clip', random_seed: 0, samples: 49, surfaceZScale: 5, sectionZScale: 3, previewMode: 'surface' };
+      const defaults = { part_length_mm: 150, part_width_mm: 50, part_height_mm: 10, specimen_variant: 'tensile', grip_end_length_mm: 25, surface_parameter_mode: 'tensile_centered_wave_count', amplitude_mm: 1.5, wave_count_x: 1.5, wave_count_y: 1.5, wavelength_x_mm: 100, wavelength_y_mm: 33.333, phase_x_pi: 1, phase_y_pi: 1, z_reference_mm: 0, inspection_enabled: false, check_x_mm: 75, check_y_mm: 25, wall_width_mm: 2, base_cell_size_mm: 10, orientation_angle_deg: 0, honeycomb_align_x: false, honeycomb_align_x_mm: 75, honeycomb_align_y: false, honeycomb_align_y_mm: 25, surface_start_layer: 3, samples_x: 49, samples_y: 49, boundary_mode: 'clip', random_seed: 0, samples: 49, surfaceZScale: 5, sectionZScale: 3, previewMode: 'surface' };
       Object.entries(defaults).forEach(([id, value]) => {
         const element = document.getElementById(id);
         if (element.type === 'checkbox') element.checked = value;
@@ -2715,6 +2754,7 @@ def surface_preview_html() -> str:
       });
       document.getElementById('align_load_line').checked = false;
       syncSurfaceParameterControls();
+      syncSpecimenVariantControls();
       syncInspectionPointControls();
       syncLoadLineAlignmentControls();
       invalidateLatticePreview();
@@ -2727,6 +2767,7 @@ def surface_preview_html() -> str:
       restoreDesignerState();
       await restorePersistentDesignerState();
       syncSurfaceParameterControls();
+      syncSpecimenVariantControls();
       syncInspectionPointControls();
       syncLoadLineAlignmentControls();
       updateConformalDesignSummary();

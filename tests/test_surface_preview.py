@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 
 from kuka_slicer.surface_preview.model import DoubleSineSurface
+from kuka_slicer.conformal_lattice.contracts import load_conformal_lattice_spec
 from kuka_slicer.surface_preview.server import (
     _load_designer_state,
     _save_designer_state,
@@ -528,6 +529,8 @@ def test_surface_preview_html_has_an_independent_surface_api_and_controls():
 
     assert 'fetch(`/api/surface?' in html
     assert 'id="surface_parameter_mode"' in html
+    assert 'id="specimen_variant"' in html
+    assert 'value="bending">弯曲版：全长蜂窝工作段' in html
     assert 'value="tensile_centered_wave_count" selected' in html
     assert 'id="wave_count_x"' in html
     assert 'id="wave_count_y"' in html
@@ -774,6 +777,7 @@ def test_conformal_lattice_export_keeps_the_surface_global_and_records_a_geometr
             "part_length_mm": ["150"],
             "part_width_mm": ["50"],
             "part_height_mm": ["10"],
+            "specimen_variant": ["tensile"],
             "grip_end_length_mm": ["25"],
             "surface_parameter_mode": ["tensile_centered_wave_count"],
             "wave_count_x": ["1.5"],
@@ -783,8 +787,52 @@ def test_conformal_lattice_export_keeps_the_surface_global_and_records_a_geometr
 
     assert config["source_surface"]["double_sine"]["xy_bounds_mm"] == [0.0, 0.0, 150.0, 50.0]
     assert config["source_surface"]["double_sine"]["wavelength_x_mm"] == pytest.approx(100.0)
+    assert config["part"]["specimen_variant"] == "tensile"
     assert config["part"]["symmetric_grip_end_length_mm"] == 25.0
     assert "active_region" not in config["lattice"]
+
+
+def test_bending_variant_exports_a_full_rectangle_without_a_grip_field():
+    config = conformal_lattice_config_payload(
+        {
+            "part_length_mm": ["150"],
+            "part_width_mm": ["50"],
+            "part_height_mm": ["10"],
+            "specimen_variant": ["bending"],
+            # A stale hidden browser value must not leak into a bending JSON.
+            "grip_end_length_mm": ["25"],
+            "surface_parameter_mode": ["manual_wavelength_phase"],
+            "wavelength_x_mm": ["100"],
+            "wavelength_y_mm": ["40"],
+            "phase_x_pi": ["1"],
+            "phase_y_pi": ["0.5"],
+        }
+    )
+
+    assert config["part"] == {
+        "boundary": "rectangle",
+        "length_mm": 150.0,
+        "width_mm": 50.0,
+        "final_height_mm": 10.0,
+        "specimen_variant": "bending",
+    }
+    assert config["source_surface"]["double_sine"]["wavelength_x_mm"] == pytest.approx(100.0)
+    assert config["source_surface"]["double_sine"]["xy_bounds_mm"] == [0.0, 0.0, 150.0, 50.0]
+
+
+def test_contract_rejects_a_grip_field_on_an_explicit_bending_design():
+    config = conformal_lattice_config_payload(
+        {
+            "part_length_mm": ["150"],
+            "part_width_mm": ["50"],
+            "part_height_mm": ["10"],
+            "specimen_variant": ["bending"],
+        }
+    )
+    config["part"]["symmetric_grip_end_length_mm"] = 25.0
+
+    with pytest.raises(ValueError, match="bending part.specimen_variant must not define"):
+        load_conformal_lattice_spec(config)
 
 
 def test_conformal_lattice_export_disables_bending_only_load_line_alignment_by_default():
@@ -853,6 +901,8 @@ def test_conformal_lattice_export_defaults_to_49_by_49_source_sampling():
         ({"samples_y": ["513"]}, "samples_y"),
         ({"part_length_mm": ["150"], "grip_end_length_mm": ["75"]}, "positive honeycomb working length"),
         ({"grip_end_length_mm": ["-0.1"]}, "non-negative"),
+        ({"specimen_variant": ["torsion"]}, "specimen_variant must be tensile or bending"),
+        ({"specimen_variant": ["tensile"]}, "requires grip_end_length_mm greater than zero"),
     ],
 )
 def test_conformal_lattice_export_rejects_invalid_design_inputs(params, error):
