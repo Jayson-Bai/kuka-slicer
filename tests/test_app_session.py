@@ -180,6 +180,33 @@ def test_app_session_finds_macos_chrome_for_designer_window(monkeypatch, tmp_pat
     assert app_session._find_browser() == chrome
 
 
+def test_macos_designer_browser_activation_uses_its_containing_app(monkeypatch, tmp_path: Path) -> None:
+    chrome = tmp_path / "Google Chrome.app" / "Contents" / "MacOS" / "Google Chrome"
+    chrome.parent.mkdir(parents=True)
+    chrome.touch()
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+
+    monkeypatch.setattr(app_session.sys, "platform", "darwin")
+    monkeypatch.setattr(app_session.subprocess, "run", fake_run)
+
+    app_session._activate_macos_browser_window(chrome)
+
+    assert calls == [
+        (
+            ["/usr/bin/osascript", "-e", 'tell application "Google Chrome" to activate'],
+            {
+                "check": False,
+                "stdout": app_session.subprocess.DEVNULL,
+                "stderr": app_session.subprocess.DEVNULL,
+                "timeout": 5.0,
+            },
+        )
+    ]
+
+
 def test_main_ui_exposes_surface_tool_launchers() -> None:
     html = _index_html()
 

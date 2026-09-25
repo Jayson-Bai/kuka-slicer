@@ -370,10 +370,44 @@ def _launch_browser_app(url: str, tool: str) -> tuple[subprocess.Popen[bytes], P
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        _activate_macos_browser_window(browser_path)
     except Exception:
         shutil.rmtree(profile_dir, ignore_errors=True)
         raise
     return browser, profile_dir
+
+
+def _activate_macos_browser_window(browser_path: Path) -> None:
+    """Bring a newly-created macOS browser app window to the foreground.
+
+    Directly launching Chrome's executable is necessary to own the temporary
+    profile and accurately stop the matching design-server session. Unlike
+    ``open -a``, though, it may leave the app window behind the main slicer or
+    on a different Space.  Activating its containing ``.app`` makes a designer
+    launch visible without changing how Windows sessions behave.
+    """
+
+    if sys.platform != "darwin":
+        return
+    try:
+        app_bundle = browser_path.parents[2]
+        app_name = app_bundle.stem
+    except IndexError:
+        return
+    if not app_name:
+        return
+    try:
+        subprocess.run(
+            ["/usr/bin/osascript", "-e", f'tell application "{app_name}" to activate'],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        # The window may already be frontmost, and activation must never turn
+        # a working local designer session into a failed launch.
+        pass
 
 
 def _find_browser() -> Path:
