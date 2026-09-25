@@ -411,11 +411,20 @@ def _wait_for_macos_browser_profile(profile_dir: Path, browser_path: Path) -> No
 
     deadline = time.monotonic() + 10.0
     observed_profile_process = False
+    missing_since: float | None = None
     while True:
         if _macos_browser_profile_pids(profile_dir, browser_path):
             observed_profile_process = True
+            missing_since = None
         elif observed_profile_process:
-            return
+            # ``pgrep`` can momentarily miss a process during a macOS app
+            # activation or child-process change. Do not tear down a working
+            # slicer server on one transient observation.
+            now = time.monotonic()
+            if missing_since is None:
+                missing_since = now
+            elif now - missing_since >= 1.0:
+                return
         elif time.monotonic() >= deadline:
             raise RuntimeError("macOS browser session did not create its isolated window process")
         # The launcher may have exited already; keep waiting until the unique
