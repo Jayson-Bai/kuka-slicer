@@ -364,6 +364,25 @@ def test_height_guided_conformal_stack_hits_designer_height_with_and_without_fib
     )
     assert result.nominal_final_height_mm == pytest.approx(7.0)
     assert result.report["automatic_resin_z_raise"] is False
+    extrusion_height = result.report["post_fiber_resin_extrusion_height"]
+    assert extrusion_height == {
+        "enabled": True,
+        "policy": "treat_fiber_gap_as_resin_layer_height",
+        "resin_layer_height_mm": 0.5,
+        "fiber_layer_height_mm": 0.1,
+        "effective_resin_extrusion_height_mm": 0.6,
+        "e_scale": pytest.approx(1.2),
+        "affected_resin_layer_indices": list(range(2, 12)),
+    }
+    for layer_index, expected_scale in ((1, 1.0), (2, 1.2), (11, 1.2)):
+        resin_group = next(
+            group for group in source_job.material_paths
+            if group.material == "R" and group.layer_index == layer_index
+        )
+        assert resin_group.extrusion is not None
+        for path, profile in zip(resin_group.paths, resin_group.extrusion):
+            length_mm = float(np.linalg.norm(np.diff(path[:, :3], axis=0), axis=1).sum())
+            assert float(profile[-1] - profile[0]) == pytest.approx(length_mm * expected_scale)
     # The job stores bead centre-lines; its last 0.5 mm resin bead is centred
     # at 6.75 mm and therefore has a 7.0 mm physical top extent.
     assert max(float(path[:, 2].max()) for group in source_job.material_paths for path in group.paths) == pytest.approx(6.75)

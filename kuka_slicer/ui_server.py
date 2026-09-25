@@ -6564,13 +6564,18 @@ def _index_html() -> str:
         const fiberInterfaceText = fiberReport?.enabled
           ? `；已生成与树脂连续路径同拓扑的 F 路径，共 ${{fiberReport.total_fiber_path_count}} 条，并已纳入最终高度层程`
           : '；本次未启用连续纤维策略';
+        const extrusionHeight = fiberReport?.post_fiber_resin_extrusion_height;
+        const effectiveResinHeight = Number(extrusionHeight?.effective_resin_extrusion_height_mm);
+        const extrusionHeightText = extrusionHeight?.enabled && Number.isFinite(effectiveResinHeight)
+          ? `；纤维后树脂按 ${{effectiveResinHeight.toFixed(3)}} mm 基础挤出量计算`
+          : '';
         const heightPlan = result.height_plan || {{}};
         const plannedHeight = Number(heightPlan.planned_final_height_mm);
         const targetHeight = Number(heightPlan.target_final_height_mm);
         const heightText = Number.isFinite(plannedHeight) && Number.isFinite(targetHeight)
           ? `；目标最终高度 ${{targetHeight.toFixed(3)}} mm，本次层程 ${{plannedHeight.toFixed(3)}} mm`
           : '';
-        statusEl.textContent = '完成：' + (result.design_label || selectedLatticeDesignLabel) + '连续路径已生成，并已写出 Core NPZ。' + fiberInterfaceText + heightText;
+        statusEl.textContent = '完成：' + (result.design_label || selectedLatticeDesignLabel) + '连续路径已生成，并已写出 Core NPZ。' + fiberInterfaceText + extrusionHeightText + heightText;
         const workflowTiming = result.workflow_timing || {{}};
         const totalSeconds = Number(workflowTiming.total_s);
         const coreSeconds = Number(workflowTiming.core_export_s ?? result.core_export_seconds);

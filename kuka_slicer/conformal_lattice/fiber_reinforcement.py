@@ -473,6 +473,12 @@ def apply_continuous_course_fiber_strategy(
             selected_layers=selected_layers,
             fiber_layer_height_mm=float(fiber_layer_height_mm),
         )
+    post_fiber_resin_extrusion = _apply_post_fiber_resin_extrusion_height(
+        source_job,
+        selected_layers=selected_layers,
+        fiber_layer_height_mm=float(fiber_layer_height_mm),
+        enabled=settings.resin_z_preplanned_for_fiber,
+    )
     resin_roles_root = source_job.meta.get("path_roles", {}).get("R", {})
     for layer_index, paths in fiber_route_specs:
         resin_group = next(
@@ -549,6 +555,7 @@ def apply_continuous_course_fiber_strategy(
         "fiber_layer_height_mm": float(fiber_layer_height_mm),
         "automatic_resin_z_raise": not settings.resin_z_preplanned_for_fiber,
         "resin_z_preplanned_for_fiber": bool(settings.resin_z_preplanned_for_fiber),
+        "post_fiber_resin_extrusion_height": post_fiber_resin_extrusion,
         "nominal_resin_stack_height_mm": nominal_resin_height,
         "nominal_final_height_mm": final_height,
         "core_material_paths": "F",
@@ -1418,6 +1425,56 @@ def _raise_resin_and_travel_z_after_fiber_interfaces(
         group.paths = [np.asarray(path, dtype=np.float64).copy() for path in group.paths]
         for path in group.paths:
             path[:, 2] += offset
+
+
+def _apply_post_fiber_resin_extrusion_height(
+    source_job: ExternalSourceJob,
+    *,
+    selected_layers: tuple[int, ...],
+    fiber_layer_height_mm: float,
+    enabled: bool,
+) -> dict[str, object]:
+    """Scale resin E only for layers immediately following a fiber interface.
+
+    A continuous-fiber interface increases the next resin centre-to-centre
+    spacing by the fiber thickness. For this dedicated conformal workflow the
+    requested process policy is to ignore that material distinction in the
+    resin volume calculation: a 0.5 mm resin layer following 0.1 mm fiber uses
+    the same base E as a 0.6 mm resin layer. Geometry and fiber E stay intact.
+    """
+
+    if not enabled:
+        return {"enabled": False, "reason": "no_height_guided_continuous_fiber_stack"}
+    plan = source_job.meta.get("physical_stack_plan")
+    if not isinstance(plan, Mapping):
+        raise ValueError("height-guided continuous fiber requires a physical stack plan for resin extrusion")
+    resin_height = plan.get("resin_layer_height_mm")
+    if not isinstance(resin_height, (int, float)) or not np.isfinite(float(resin_height)) or float(resin_height) <= 0.0:
+        raise ValueError("physical stack plan is missing a positive resin_layer_height_mm")
+    if not np.isfinite(fiber_layer_height_mm) or fiber_layer_height_mm <= 0.0:
+        raise ValueError("fiber_layer_height_mm must be positive and finite for post-fiber resin extrusion")
+    scale = (float(resin_height) + fiber_layer_height_mm) / float(resin_height)
+    target_layers = {layer_index + 1 for layer_index in selected_layers}
+    affected: list[int] = []
+    for group in source_job.material_paths:
+        if group.material != "R" or int(group.layer_index) not in target_layers:
+            continue
+        if group.extrusion is None or len(group.extrusion) != len(group.paths):
+            raise ValueError("post-fiber resin extrusion requires a complete resin E profile per path")
+        group.extrusion = [np.asarray(profile, dtype=np.float64) * scale for profile in group.extrusion]
+        affected.append(int(group.layer_index))
+    expected = sorted(target_layers)
+    if affected != expected:
+        raise ValueError("post-fiber resin extrusion layers are missing from the conformal source job")
+    return {
+        "enabled": True,
+        "policy": "treat_fiber_gap_as_resin_layer_height",
+        "resin_layer_height_mm": float(resin_height),
+        "fiber_layer_height_mm": fiber_layer_height_mm,
+        "effective_resin_extrusion_height_mm": float(resin_height) + fiber_layer_height_mm,
+        "e_scale": scale,
+        "affected_resin_layer_indices": affected,
+    }
 
 
 def _height_guided_final_height(source_job: ExternalSourceJob) -> float:
