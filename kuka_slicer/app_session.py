@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 import shutil
 import socket
 import subprocess
@@ -165,7 +166,7 @@ def run_app_session(tool: str) -> int:
     try:
         _wait_for_port(port, server)
         browser, profile_dir = _launch_browser_app(f"http://127.0.0.1:{port}", tool)
-        browser.wait()
+        _wait_for_browser_session(browser, profile_dir)
         return 0
     finally:
         _stop_process(server)
@@ -359,14 +360,26 @@ def _launch_browser_app(url: str, tool: str) -> tuple[subprocess.Popen[bytes], P
     browser_path = _find_browser()
     profile_dir = Path(tempfile.mkdtemp(prefix=f"kuka-slicer-{tool}-"))
     try:
+        browser_args = [
+            f"--app={url}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            # A browser-bound session must terminate when its app window is
+            # closed. Otherwise Chrome can keep the temporary profile alive
+            # in the background and retain its local slicer port indefinitely.
+            "--disable-background-mode",
+            f"--user-data-dir={profile_dir}",
+        ]
+        if sys.platform == "darwin":
+            # ``-n`` forces a new Chrome app instance for the temporary
+            # profile instead of forwarding the URL to an unrelated existing
+            # browser. Its launcher returns promptly; the profile monitor
+            # below owns the actual window lifetime.
+            command = ["/usr/bin/open", "-n", "-a", str(browser_path.parents[2]), "--args", *browser_args]
+        else:
+            command = [str(browser_path), *browser_args]
         browser = subprocess.Popen(
-            [
-                str(browser_path),
-                f"--app={url}",
-                "--no-first-run",
-                "--no-default-browser-check",
-                f"--user-data-dir={profile_dir}",
-            ],
+            command,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -375,6 +388,64 @@ def _launch_browser_app(url: str, tool: str) -> tuple[subprocess.Popen[bytes], P
         shutil.rmtree(profile_dir, ignore_errors=True)
         raise
     return browser, profile_dir
+
+
+def _wait_for_browser_session(browser: _ManagedProcess, profile_dir: Path) -> None:
+    """Wait for the actual browser window lifetime on every supported OS."""
+
+    if sys.platform != "darwin":
+        browser.wait()
+        return
+    _wait_for_macos_browser_profile(profile_dir, _find_browser())
+
+
+def _wait_for_macos_browser_profile(profile_dir: Path, browser_path: Path) -> None:
+    """Wait for the main browser process carrying this session's profile.
+
+    Chrome on macOS forks its application process, so the PID returned by
+    ``Popen`` can exit while the visible app window is still open. The unique
+    user-data directory is a stable ownership marker for the real app. Once
+    that main process has appeared and subsequently disappears, the UI window
+    is definitively closed and its local server may be stopped.
+    """
+
+    deadline = time.monotonic() + 10.0
+    observed_profile_process = False
+    while True:
+        if _macos_browser_profile_pids(profile_dir, browser_path):
+            observed_profile_process = True
+        elif observed_profile_process:
+            return
+        elif time.monotonic() >= deadline:
+            raise RuntimeError("macOS browser session did not create its isolated window process")
+        # The launcher may have exited already; keep waiting until the unique
+        # profile process appears or the bounded startup deadline is reached.
+        time.sleep(0.1)
+
+
+def _macos_browser_profile_pids(profile_dir: Path, browser_path: Path) -> tuple[int, ...]:
+    """Return live main-browser PIDs using a particular temporary profile."""
+
+    profile_argument = f"--user-data-dir={profile_dir}"
+    try:
+        completed = subprocess.run(
+            # Match the executable at the command-line start. This excludes
+            # the ``open`` launcher and transient Chrome helper subprocesses.
+            [
+                "/usr/bin/pgrep",
+                "-f",
+                rf"^{re.escape(str(browser_path))} .*{re.escape(profile_argument)}",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ()
+    if completed.returncode not in (0, 1):
+        return ()
+    return tuple(int(line) for line in completed.stdout.splitlines() if line.strip().isdigit())
 
 
 def _activate_macos_browser_window(browser_path: Path) -> None:
