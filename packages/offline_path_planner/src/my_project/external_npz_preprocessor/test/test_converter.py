@@ -121,6 +121,12 @@ def test_declared_continuous_source_path_keeps_a_distinct_core_subtype():
         "CONTINUOUS_SOURCE_PRINT",
         "RESIN_PRINT",
     ]
+    assert [move.source_path_id for move in moves] == [
+        "external-source:0:R:0",
+        "external-source:0:R:0",
+        "external-source:0:R:0",
+        "external-source:0:R:1",
+    ]
 
 
 def test_fiber_paths_do_not_redefine_resin_start_xy_origin():

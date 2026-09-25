@@ -237,6 +237,7 @@ def export_npz(
     current_type: Optional[str] = None
     current_layer: Optional[int] = None
     current_subtype: Optional[str] = None
+    current_source_path_id: Optional[str] = None
     last_pose: Optional[CsvRow] = None
     last_feedrate_mm_min: Optional[float] = None
     resin_z_offset: float = 0.0
@@ -1175,9 +1176,6 @@ def export_npz(
             "internal perimeter",
         }
 
-    def _is_continuous_source_subtype(subtype: str) -> bool:
-        return (subtype or "").strip().lower() == "continuous_source_print"
-
     def _should_disable_spline_for_subtype(subtype: str) -> bool:
         return (subtype or "").strip().lower() == "solid infill"
 
@@ -1387,7 +1385,7 @@ def export_npz(
         return ctrl_len > orig_len * 4.0
 
     def flush_moves():
-        nonlocal buffer, current_type, current_layer, current_subtype, current_occ
+        nonlocal buffer, current_type, current_layer, current_subtype, current_source_path_id, current_occ
         if not buffer:
             return
 
@@ -1435,12 +1433,30 @@ def export_npz(
             # exact polyline and give the sampler one continuous time profile
             # instead of independently stopping on every short source edge.
             gc_list = [_make_polyline_gc(work_buffer, " | travel_polyline")]
-        elif work_buffer and _is_continuous_source_subtype(work_buffer[0].subtype):
-            # ``continuous_deposition_roles`` is authored upstream with the
-            # source path itself.  Its internal points are geometric samples,
-            # not material start/stop boundaries: preserve every point and E
-            # value while using one timing law for the complete stroke.
-            gc_list = [_make_polyline_gc(work_buffer, " | source_continuous_polyline")]
+        elif work_buffer and work_buffer[0].source_path_id is not None:
+            # Every externally imported MaterialPath is an authored continuous
+            # deposition stroke.  Its interior is still Core geometry.  Do not
+            # pass it through the generic short-segment partitioner: that
+            # would turn source sampling points into several independently
+            # accelerated curves.  Fit the whole source stroke once, retaining
+            # corner retreat, B-spline approximation and the shared 4 ms
+            # sampler.  A one/two-point path has no B-spline solution; its
+            # exact polyline is the only safe single-stroke fallback and still
+            # receives one timing law.
+            t0 = time.perf_counter()
+            gc = planner.fit_global_curve(
+                work_buffer,
+                corner_angle_deg=corner_angle_deg,
+                corner_retreat_ratio=corner_retreat_ratio,
+                density=density,
+                degree=degree,
+                max_fit_points=max_fit_points_per_segment,
+                preserve_source_e=preserve_source_e_profile,
+            )
+            timings["fit_s"] += time.perf_counter() - t0
+            _accumulate_fit_profile(planner.last_fit_profile)
+            gc_list = [_make_polyline_gc(work_buffer, " | source_continuous_linear_fallback")] if (
+                gc is None or _curve_is_pathological(gc, work_buffer)) else [gc]
         elif work_buffer and _is_wall_outline_subtype(work_buffer[0].subtype):
             gc_list = [_make_polyline_gc(work_buffer, " | wall_polyline")]
         elif work_buffer and _should_disable_spline_for_subtype(work_buffer[0].subtype):
@@ -1496,6 +1512,7 @@ def export_npz(
         current_type = None
         current_layer = None
         current_subtype = None
+        current_source_path_id = None
         current_occ = None
 
     def _append_resin_z_print_compensation(layer: int, line: int):
@@ -2212,13 +2229,16 @@ def export_npz(
                 current_type = cmd.type
                 current_layer = cmd.layer
                 current_subtype = cmd.subtype
+                current_source_path_id = cmd.source_path_id
                 current_occ = _ensure_segment(cmd.layer, cmd.subtype)
             if (cmd.type != current_type) or (cmd.layer !=
-                                              current_layer) or (cmd.subtype != current_subtype):
+                                              current_layer) or (cmd.subtype != current_subtype) or (
+                                                  cmd.source_path_id != current_source_path_id):
                 flush_moves()
                 current_type = cmd.type
                 current_layer = cmd.layer
                 current_subtype = cmd.subtype
+                current_source_path_id = cmd.source_path_id
                 current_occ = _ensure_segment(cmd.layer, cmd.subtype)
             buffer.append(cmd)
             if (

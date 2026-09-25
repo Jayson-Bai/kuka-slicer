@@ -26,6 +26,10 @@ class MoveCommand:
     layer: int = 0
     subtype: str = "UNKNOWN"
     raw: Optional[str] = None
+    # Stable identity of one authored deposition stroke.  The exporter uses
+    # this only to preserve its material start/stop boundary while Core still
+    # owns the geometric fit and 4 ms sampling within that stroke.
+    source_path_id: Optional[str] = None
     target_v_in: Optional[float] = None  # planned entry speed (mm/s) 七阶多项式插值边界条件
     target_v_out: Optional[float] = None  # planned exit speed (mm/s)
     is_pure_state_change: bool = False  # 标记无位移且无挤出的纯状态改变指令

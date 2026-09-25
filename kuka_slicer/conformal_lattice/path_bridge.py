@@ -295,11 +295,10 @@ class ConformalLatticePathGraph:
                 "zero_e_connector_semantics": "print_context_constant_e",
             },
             "path_roles": {material: roles_by_layer},
-            # This is intentionally role-based instead of point-count based:
-            # a round brim may legitimately have many chord points, while its
-            # authored deposition operation remains one closed continuous
-            # stroke.  The converter resolves it against ``path_roles`` for
-            # each individual source path.
+            # Roles remain an auditable operation classification.  The Core
+            # boundary itself is now the MaterialPath identity, so every
+            # authored source path stays one stroke even when it contains many
+            # sampled chord points.
             "continuous_deposition_roles": {
                 key: list(value)
                 for key, value in _CONTINUOUS_DEPOSITION_ROLES_BY_MATERIAL.items()

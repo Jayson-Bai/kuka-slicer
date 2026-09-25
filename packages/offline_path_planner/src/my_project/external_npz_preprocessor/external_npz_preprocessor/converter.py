@@ -168,7 +168,7 @@ def source_job_to_parsed_commands(job: SourceJob, params: ProcessParams) -> Pars
                 ),
             )
             primeline_inserted = True
-        for material_path in ordered_paths:
+        for source_path_index, material_path in enumerate(ordered_paths):
             is_primeline = _is_primeline_path(material_path)
             is_resin_source_path = material_path.material == "R" and not is_primeline
             is_last_resin_in_layer = (
@@ -189,6 +189,14 @@ def source_job_to_parsed_commands(job: SourceJob, params: ProcessParams) -> Pars
             )
             tool = _tool_for_material(material_path.material)
             subtype = _subtype_for_source_path(job, layer.index, material_path)
+            # Each MaterialPath is one authored deposition stroke.  Preserve
+            # that semantic boundary for every external source path (not just
+            # Brim): a disabled prime/retract wait must not merge adjacent
+            # strokes, and a source sampling point must not become an internal
+            # Core start/stop boundary.
+            source_path_id = (
+                f"external-source:{layer.index}:{material_path.material}:{source_path_index}"
+            )
             first_pose = _offset_source_position(
                 _position_from_row(material_path.points[0]),
                 params,
@@ -420,6 +428,7 @@ def source_job_to_parsed_commands(job: SourceJob, params: ProcessParams) -> Pars
                 line=line,
                 layer=layer.index,
                 subtype=subtype,
+                source_path_id=source_path_id,
             )
             # Print paths deliberately remain MoveCommand sequences.  Core is
             # the sole owner of corner handling, density refinement and global
@@ -846,6 +855,7 @@ def _print_moves_from_positions(
     line: int,
     layer: int,
     subtype: str,
+    source_path_id: str | None = None,
     source_e_profile: np.ndarray | None = None,
 ) -> tuple[list[MoveCommand], float]:
     if source_e_profile is not None:
@@ -884,6 +894,7 @@ def _print_moves_from_positions(
                 layer=layer,
                 subtype=subtype,
                 raw="external_npz_print_source",
+                source_path_id=source_path_id,
             )
         )
         previous = next_pos
