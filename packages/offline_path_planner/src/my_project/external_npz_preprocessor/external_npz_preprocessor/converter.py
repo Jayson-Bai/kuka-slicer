@@ -188,7 +188,7 @@ def source_job_to_parsed_commands(job: SourceJob, params: ProcessParams) -> Pars
                 is_fiber and fiber_path_number == fiber_path_count - 1
             )
             tool = _tool_for_material(material_path.material)
-            subtype = _subtype_for_material(material_path.material)
+            subtype = _subtype_for_source_path(job, layer.index, material_path)
             first_pose = _offset_source_position(
                 _position_from_row(material_path.points[0]),
                 params,
@@ -1304,6 +1304,61 @@ def _subtype_for_material(material: str) -> str:
     if material == "F":
         return "FIBER_PRINT"
     raise ValueError(f"unknown material: {material}")
+
+
+def _subtype_for_source_path(
+    job: SourceJob,
+    layer_index: int,
+    material_path: MaterialPath,
+) -> str:
+    """Resolve an authored continuous-stroke declaration for one source path.
+
+    Point arrays are necessarily polygonal even when their operation is one
+    continuous deposition stroke (for example, a sampled conformal brim arc).
+    The declaration is deliberately metadata-driven so legacy and Prusa source
+    jobs retain their existing generic Core fitting behaviour.
+    """
+
+    material = material_path.material
+    fallback = _subtype_for_material(material)
+    declared_roles = _continuous_deposition_roles(job, material)
+    if not declared_roles:
+        return fallback
+    role = _source_path_role(job, material, layer_index, int(material_path.order))
+    if role in declared_roles:
+        return "CONTINUOUS_SOURCE_PRINT"
+    return fallback
+
+
+def _continuous_deposition_roles(job: SourceJob, material: str) -> frozenset[str]:
+    contract = job.meta.get("continuous_deposition_roles")
+    if contract is None:
+        return frozenset()
+    if not isinstance(contract, dict):
+        raise ValueError("continuous_deposition_roles must be an object when supplied")
+    raw_roles = contract.get(material, ())
+    if not isinstance(raw_roles, (list, tuple)) or not all(isinstance(role, str) for role in raw_roles):
+        raise ValueError("continuous_deposition_roles material entries must be string lists")
+    return frozenset(raw_roles)
+
+
+def _source_path_role(
+    job: SourceJob,
+    material: str,
+    layer_index: int,
+    order: int,
+) -> str | None:
+    roles_root = job.meta.get("path_roles")
+    if not isinstance(roles_root, dict):
+        return None
+    material_roles = roles_root.get(material)
+    if not isinstance(material_roles, dict):
+        return None
+    layer_roles = material_roles.get(str(layer_index))
+    if not isinstance(layer_roles, list) or order < 0 or order >= len(layer_roles):
+        return None
+    role = layer_roles[order]
+    return role if isinstance(role, str) else None
 
 
 def _e_per_mm_for_material(material: str, params: ProcessParams) -> float:

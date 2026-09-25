@@ -26,6 +26,23 @@ from ..honeycomb_pathing.planner import _Edge, _minimum_trail_cover
 _EDGE_ID_BITS = 32
 _EDGE_ID_COMPONENT_MAX = (1 << _EDGE_ID_BITS) - 1
 
+# An ExternalSourceJob stores a route as points, so the Core adapter normally
+# expands it to one MoveCommand per point pair.  These roles additionally say
+# that the *route*, rather than each pair of adjacent points, is the authored
+# deposition stroke.  The declaration is part of the source-job contract and
+# must survive the Core hand-off; it prevents harmless arc/chord sampling
+# points from becoming stop/start boundaries.
+_CONTINUOUS_DEPOSITION_ROLES_BY_MATERIAL = {
+    "R": (
+        "brim",
+        "conformal_outer_boundary",
+        "conformal_partition_wall",
+        "conformal_grip_zigzag_x_one_stroke",
+        "conformal_continuous_course_fragment",
+    ),
+    "F": ("conformal_continuous_course_fragment",),
+}
+
 # The role travels with each non-honeycomb path so the Core hand-off remains
 # auditable after perimeter, separator and grip-fill paths are merged.
 AuxiliaryLayerPath = tuple[str, np.ndarray, np.ndarray]
@@ -278,6 +295,15 @@ class ConformalLatticePathGraph:
                 "zero_e_connector_semantics": "print_context_constant_e",
             },
             "path_roles": {material: roles_by_layer},
+            # This is intentionally role-based instead of point-count based:
+            # a round brim may legitimately have many chord points, while its
+            # authored deposition operation remains one closed continuous
+            # stroke.  The converter resolves it against ``path_roles`` for
+            # each individual source path.
+            "continuous_deposition_roles": {
+                key: list(value)
+                for key, value in _CONTINUOUS_DEPOSITION_ROLES_BY_MATERIAL.items()
+            },
             "extrusion_compensation": {
                 "format": "conformal_edge_volume_e_v1",
                 "scope": "per-path cumulative E from actual 3-D arc length and explicit bead volume",

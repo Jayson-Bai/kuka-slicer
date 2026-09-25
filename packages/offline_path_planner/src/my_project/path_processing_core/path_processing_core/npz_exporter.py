@@ -1175,6 +1175,9 @@ def export_npz(
             "internal perimeter",
         }
 
+    def _is_continuous_source_subtype(subtype: str) -> bool:
+        return (subtype or "").strip().lower() == "continuous_source_print"
+
     def _should_disable_spline_for_subtype(subtype: str) -> bool:
         return (subtype or "").strip().lower() == "solid infill"
 
@@ -1432,6 +1435,12 @@ def export_npz(
             # exact polyline and give the sampler one continuous time profile
             # instead of independently stopping on every short source edge.
             gc_list = [_make_polyline_gc(work_buffer, " | travel_polyline")]
+        elif work_buffer and _is_continuous_source_subtype(work_buffer[0].subtype):
+            # ``continuous_deposition_roles`` is authored upstream with the
+            # source path itself.  Its internal points are geometric samples,
+            # not material start/stop boundaries: preserve every point and E
+            # value while using one timing law for the complete stroke.
+            gc_list = [_make_polyline_gc(work_buffer, " | source_continuous_polyline")]
         elif work_buffer and _is_wall_outline_subtype(work_buffer[0].subtype):
             gc_list = [_make_polyline_gc(work_buffer, " | wall_polyline")]
         elif work_buffer and _should_disable_spline_for_subtype(work_buffer[0].subtype):

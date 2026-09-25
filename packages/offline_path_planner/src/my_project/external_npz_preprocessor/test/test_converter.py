@@ -93,6 +93,36 @@ def test_print_paths_remain_moves_with_source_xyz_and_material_metadata():
     assert not any(isinstance(command, GlobalCurveCommand) for command in commands)
 
 
+def test_declared_continuous_source_path_keeps_a_distinct_core_subtype():
+    continuous = _path(
+        "R",
+        [[0, 0, 0.5], [0.1, 0, 0.5], [0.2, 0.02, 0.5], [10, 0.02, 0.5]],
+        extrusion=[0.0, 0.1, 0.2, 10.0],
+    )
+    generic = MaterialPath(
+        material="R",
+        order=1,
+        points=np.asarray([[10, 0.02, 0.5, 0, 0, 0], [11, 0.02, 0.5, 0, 0, 0]], dtype=np.float32),
+        extrusion=np.asarray([0.0, 1.0], dtype=np.float32),
+    )
+    job = SourceJob(
+        meta={
+            "path_roles": {"R": {"0": ["brim", "generic"]}},
+            "continuous_deposition_roles": {"R": ["brim"]},
+        },
+        layers=[LayerPaths(index=0, resin_paths=[continuous, generic])],
+    )
+
+    moves = _print_moves(source_job_to_parsed_commands(job, ProcessParams(primeline_enabled=False)))
+
+    assert [move.subtype for move in moves] == [
+        "CONTINUOUS_SOURCE_PRINT",
+        "CONTINUOUS_SOURCE_PRINT",
+        "CONTINUOUS_SOURCE_PRINT",
+        "RESIN_PRINT",
+    ]
+
+
 def test_fiber_paths_do_not_redefine_resin_start_xy_origin():
     commands = source_job_to_parsed_commands(
         _job(

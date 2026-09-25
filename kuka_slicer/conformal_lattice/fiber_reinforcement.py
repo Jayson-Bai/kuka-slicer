@@ -517,6 +517,16 @@ def apply_continuous_course_fiber_strategy(
     source_job.material_paths.extend(fiber_groups)
     source_job.material_paths.sort(key=lambda group: (int(group.layer_index), 0 if group.material == "R" else 1))
     source_job.travel_paths.sort(key=lambda group: int(group.layer_index))
+    path_roles = source_job.meta.get("path_roles")
+    if not isinstance(path_roles, dict):
+        raise ValueError("continuous fiber strategy requires source path-role metadata")
+    fiber_roles = path_roles.setdefault("F", {})
+    if not isinstance(fiber_roles, dict):
+        raise ValueError("continuous fiber strategy requires fiber path roles to be an object")
+    for layer_index, paths in fiber_route_specs:
+        fiber_roles[str(layer_index)] = [
+            "conformal_continuous_course_fragment"
+        ] * len(paths)
     source_job.meta["fiber_travel_path_indexes"] = fiber_travel_indexes
     motion_order = source_job.meta.get("motion_order")
     if isinstance(motion_order, dict):

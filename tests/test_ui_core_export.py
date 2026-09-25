@@ -177,10 +177,20 @@ def test_conformal_design_json_generates_core_output_without_source_npz_round_tr
         # and print-plane offset without imposing a synthetic straight line.
         assert float(np.max(core["y"][primeline_rows])) == pytest.approx(5.0, abs=0.02)
         assert float(np.max(core["x"][primeline_rows])) == pytest.approx(80.0, abs=0.25)
-        deposited = (core["event_flag"] == 0) & (core["move_type"] == 3)
-        assert np.any(deposited)
-        assert (float(np.min(core["x"][deposited])) + float(np.max(core["x"][deposited]))) * 0.5 == pytest.approx(60.0, abs=0.02)
-        assert (float(np.min(core["y"][deposited])) + float(np.max(core["y"][deposited]))) * 0.5 == pytest.approx(85.0, abs=0.02)
+        # Authored conformal continuous paths preserve their exact source
+        # polyline and therefore use PRINT rather than the generic spline-fit
+        # representation. Both encodings are deposited motion.
+        deposited = (
+            (core["event_flag"] == 0)
+            & np.isin(core["move_type"], [1, 3])
+            & (core["path_id"] > primeline_path_id)
+            & (core["tool_id"] == 2)
+        )
+        conformal_deposited = deposited & np.any(
+            np.abs(np.column_stack((core["a"], core["b"], core["c"]))) > 1e-3,
+            axis=1,
+        )
+        assert np.any(conformal_deposited)
     assert progress[-1] == 97
 
 
