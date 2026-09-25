@@ -439,7 +439,11 @@ def _wait_for_macos_browser_profile(profile_dir: Path, browser_path: Path) -> No
             # slicer server on one transient observation.
                 if missing_since is None:
                     missing_since = now
-                elif now - missing_since >= 1.0:
+                # Chrome can take several seconds to replace its initial app
+                # process even after the window was already visible.  A
+                # longer grace period prevents that hand-off from leaving an
+                # orphaned app window that has no local UI server.
+                elif now - missing_since >= 5.0:
                     return
             if now >= deadline:
                 raise RuntimeError("macOS browser session did not create its isolated window process")

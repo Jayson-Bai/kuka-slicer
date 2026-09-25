@@ -244,7 +244,7 @@ def test_macos_session_waits_for_the_profile_process_to_close(monkeypatch, tmp_p
     profile = tmp_path / "isolated-browser-profile"
     profile.mkdir()
     observed = iter([(), (1234,), (1234,), (1234,), (), ()])
-    monotonic_values = iter([0.0, 0.0, 0.5, 2.1, 2.5, 3.6, 4.7])
+    monotonic_values = iter([0.0, 0.0, 0.5, 2.1, 2.5, 3.6, 8.7])
     monkeypatch.setattr(
         app_session,
         "_macos_browser_profile_pids",
@@ -262,7 +262,7 @@ def test_macos_session_ignores_a_transient_startup_profile_process(monkeypatch, 
     # The first process is the short-lived ``open -n`` startup process.  The
     # later profile process owns the actual visible app window.
     observed = iter([(), (1111,), (), (2222,), (2222,), (2222,), (), ()])
-    monotonic_values = iter([0.0, 0.0, 0.3, 0.6, 1.0, 2.8, 3.0, 4.1, 5.2])
+    monotonic_values = iter([0.0, 0.0, 0.3, 0.6, 1.0, 2.8, 3.0, 4.1, 9.2])
     monkeypatch.setattr(
         app_session,
         "_macos_browser_profile_pids",
