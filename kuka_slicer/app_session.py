@@ -410,23 +410,39 @@ def _wait_for_macos_browser_profile(profile_dir: Path, browser_path: Path) -> No
     """
 
     deadline = time.monotonic() + 10.0
-    observed_profile_process = False
+    profile_stable_since: float | None = None
+    observed_stable_profile = False
     missing_since: float | None = None
     while True:
+        now = time.monotonic()
         if _macos_browser_profile_pids(profile_dir, browser_path):
-            observed_profile_process = True
+            if profile_stable_since is None:
+                profile_stable_since = now
+            # ``open -n`` can briefly create one Chrome process for the
+            # isolated profile, then replace it with the real app process.
+            # Treating that first transient process as the window owner can
+            # make the supervisor stop the server just before the visible
+            # app window appears.  A profile must remain present briefly
+            # before its disappearance means that the user closed the UI.
+            if now - profile_stable_since >= 2.0:
+                observed_stable_profile = True
             missing_since = None
-        elif observed_profile_process:
+        else:
+            if not observed_stable_profile:
+                # A startup-only Chrome process disappeared.  Keep the
+                # server alive while the app finishes replacing it, and make
+                # the eventual real process establish its own stable window.
+                profile_stable_since = None
+            else:
             # ``pgrep`` can momentarily miss a process during a macOS app
             # activation or child-process change. Do not tear down a working
             # slicer server on one transient observation.
-            now = time.monotonic()
-            if missing_since is None:
-                missing_since = now
-            elif now - missing_since >= 1.0:
-                return
-        elif time.monotonic() >= deadline:
-            raise RuntimeError("macOS browser session did not create its isolated window process")
+                if missing_since is None:
+                    missing_since = now
+                elif now - missing_since >= 1.0:
+                    return
+            if now >= deadline:
+                raise RuntimeError("macOS browser session did not create its isolated window process")
         # The launcher may have exited already; keep waiting until the unique
         # profile process appears or the bounded startup deadline is reached.
         time.sleep(0.1)

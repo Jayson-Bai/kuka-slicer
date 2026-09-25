@@ -243,8 +243,26 @@ def test_macos_browser_session_uses_an_isolated_profile_without_background_mode(
 def test_macos_session_waits_for_the_profile_process_to_close(monkeypatch, tmp_path: Path) -> None:
     profile = tmp_path / "isolated-browser-profile"
     profile.mkdir()
-    observed = iter([(), (1234,), (), ()])
-    monotonic_values = iter([0.0, 0.0, 0.5, 1.5])
+    observed = iter([(), (1234,), (1234,), (1234,), (), ()])
+    monotonic_values = iter([0.0, 0.0, 0.5, 2.1, 2.5, 3.6, 4.7])
+    monkeypatch.setattr(
+        app_session,
+        "_macos_browser_profile_pids",
+        lambda _profile, _browser: next(observed),
+    )
+    monkeypatch.setattr(app_session.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(app_session.time, "sleep", lambda _seconds: None)
+
+    app_session._wait_for_macos_browser_profile(profile, tmp_path / "Google Chrome")
+
+
+def test_macos_session_ignores_a_transient_startup_profile_process(monkeypatch, tmp_path: Path) -> None:
+    profile = tmp_path / "isolated-browser-profile"
+    profile.mkdir()
+    # The first process is the short-lived ``open -n`` startup process.  The
+    # later profile process owns the actual visible app window.
+    observed = iter([(), (1111,), (), (2222,), (2222,), (2222,), (), ()])
+    monotonic_values = iter([0.0, 0.0, 0.3, 0.6, 1.0, 2.8, 3.0, 4.1, 5.2])
     monkeypatch.setattr(
         app_session,
         "_macos_browser_profile_pids",
