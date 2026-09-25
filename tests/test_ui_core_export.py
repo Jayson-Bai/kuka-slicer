@@ -310,6 +310,62 @@ def test_production_continuous_courses_replace_only_legacy_honeycomb_and_keep_gr
         np.testing.assert_allclose(resin_path[:, :2], fiber_path[:, :2])
 
 
+def test_bending_continuous_courses_and_fiber_use_the_full_rectangle_without_grips():
+    config = conformal_lattice_config_payload(
+        {
+            "part_length_mm": ["40"],
+            "part_width_mm": ["20"],
+            "part_height_mm": ["4"],
+            "specimen_variant": ["bending"],
+            # The bending export must ignore any stale tensile control value.
+            "grip_end_length_mm": ["8"],
+            "wall_width_mm": ["2"],
+            "base_cell_size_mm": ["5"],
+            "surface_start_layer": ["1"],
+            "samples_x": ["21"],
+            "samples_y": ["11"],
+        }
+    )
+    run = run_conformal_lattice_pipeline(
+        config,
+        physical_layer_height_mm=0.5,
+        extrusion=ExtrusionVolumeModel(1.0, 1.0),
+    )
+    assert run.path_graph is not None
+    assert run.continuous_course_plan is not None
+    assert run.continuous_course_plan.course_bounds_mm == pytest.approx((0.0, 0.0, 40.0, 20.0))
+
+    source_job = run.path_graph.to_external_base_source_job()
+    first, last = derive_symmetric_curvature_fiber_interfaces(run.layer_embedding)
+    result = apply_continuous_course_fiber_strategy(
+        source_job=source_job,
+        graph=run.path_graph,
+        course_paths_by_layer=run.continuous_course_paths_by_layer,
+        settings=ContinuousCourseFiberSettings(True, first, last),
+        fiber_layer_height_mm=0.2,
+        fiber_e_per_mm=1.0,
+    )
+
+    roles = source_job.meta["path_roles"]["R"]["0"]
+    assert roles.count("conformal_outer_boundary") == 1
+    assert "conformal_partition_wall" not in roles
+    assert "conformal_grip_zigzag_x_one_stroke" not in roles
+    resin = next(group for group in source_job.material_paths if group.material == "R" and group.layer_index == 0)
+    resin_courses = [path for path, role in zip(resin.paths, roles) if role == "conformal_continuous_course_fragment"]
+    assert resin_courses
+    course_x = np.concatenate([path[:, 0] for path in resin_courses])
+    assert np.min(course_x) == pytest.approx(0.0)
+    assert np.max(course_x) == pytest.approx(40.0)
+    selected_layer = result.resin_layer_indices[0]
+    fiber = next(group for group in source_job.material_paths if group.material == "F" and group.layer_index == selected_layer)
+    selected_resin = next(group for group in source_job.material_paths if group.material == "R" and group.layer_index == selected_layer)
+    selected_roles = source_job.meta["path_roles"]["R"][str(selected_layer)]
+    selected_courses = [path for path, role in zip(selected_resin.paths, selected_roles) if role == "conformal_continuous_course_fragment"]
+    assert len(fiber.paths) == len(selected_courses)
+    for resin_path, fiber_path in zip(selected_courses, fiber.paths):
+        np.testing.assert_allclose(resin_path[:, :2], fiber_path[:, :2])
+
+
 def test_boundary_clipped_continuous_courses_are_retained_as_independent_paths():
     config = conformal_lattice_config_payload(
         {
