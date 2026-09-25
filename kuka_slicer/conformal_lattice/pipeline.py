@@ -12,7 +12,8 @@ import numpy as np
 from .contracts import ConformalLatticeSpec, load_conformal_lattice_spec
 from .continuous_course import ContinuousCoursePlan, build_continuous_course_plan, embed_continuous_course_plan
 from .fill_ratio_validation import FillRatioValidation, validate_realized_fill_ratio
-from .layer_embedding import LayerEmbedding, embed_lattice_layers
+from .fiber_reinforcement import symmetric_curvature_fiber_schedule
+from .layer_embedding import LayerEmbedding, _symmetric_alphas, embed_lattice_layers
 from .lattice_generator import (
     ConformalLatticeGeometry,
     choose_boundary_safe_phase_origin,
@@ -118,6 +119,8 @@ def run_conformal_lattice_pipeline(
     *,
     logical_layer_count: int | None = None,
     physical_layer_height_mm: float | None = None,
+    fiber_layer_height_mm: float | None = None,
+    plan_for_continuous_fiber: bool = False,
     extrusion: ExtrusionVolumeModel | None = None,
     validate_fill_ratio: bool = False,
     fill_samples_per_triangle_side: int = 6,
@@ -136,10 +139,12 @@ def run_conformal_lattice_pipeline(
         raise ValueError("UI lattice pipeline supports source_surface.provider=double_sine or planar")
     reference = spec.source_surface.get("reference_stl")
     if spec.part:
-        logical_layer_count, base_z_by_layer = _physical_layer_schedule(
+        logical_layer_count, base_z_by_layer, physical_stack_plan = _physical_layer_schedule(
             spec,
             logical_layer_count,
             physical_layer_height_mm=physical_layer_height_mm,
+            fiber_layer_height_mm=fiber_layer_height_mm,
+            plan_for_continuous_fiber=plan_for_continuous_fiber,
         )
     elif spec.source_provider == "planar":
         raise ValueError("planar lattice workflow requires a rectangular part")
@@ -147,6 +152,7 @@ def run_conformal_lattice_pipeline(
         raise ValueError("first-version double-sine conformal workflow requires reference_stl.build_axis=z")
     else:
         base_z_by_layer = None
+        physical_stack_plan = None
     if not isinstance(logical_layer_count, int) or isinstance(logical_layer_count, bool) or logical_layer_count < 1:
         raise ValueError("logical_layer_count must be an integer >= 1")
     if not isinstance(fill_samples_per_triangle_side, int) or fill_samples_per_triangle_side < 2:
@@ -238,6 +244,7 @@ def run_conformal_lattice_pipeline(
         spec,
         logical_layer_count,
         base_z_by_layer,
+        physical_stack_plan,
     )
     continuous_course_plan = build_continuous_course_plan(spec) if spec.part else None
     continuous_course_paths_by_layer = (
@@ -565,6 +572,7 @@ def _layer_embedding_for_spec(
     spec: ConformalLatticeSpec,
     logical_layer_count: int,
     base_z_by_layer: np.ndarray | None,
+    physical_stack_plan: Mapping[str, object] | None,
 ) -> LayerEmbedding:
     embedding = spec.layer_embedding
     if spec.source_provider == "planar":
@@ -586,7 +594,7 @@ def _layer_embedding_for_spec(
         raise ValueError("double-sine source metadata is malformed")
     flat = np.array(geometry.lattice_nodes_xyz, copy=True)
     flat[:, 2] = float(surface["z_reference_mm"])
-    return embed_lattice_layers(
+    result = embed_lattice_layers(
         domain,
         orientation,
         geometry,
@@ -595,7 +603,11 @@ def _layer_embedding_for_spec(
         surface_start_layer=int(embedding["surface_start_layer"]),
         flat_reference_nodes_xyz=flat,
         base_z_by_layer_mm=base_z_by_layer,
+        symmetric_progress_z_mm=base_z_by_layer,
     )
+    if physical_stack_plan is not None:
+        result.report["physical_stack_plan"] = dict(physical_stack_plan)
+    return result
 
 
 def _lattice_node_normals(
@@ -668,17 +680,75 @@ def _physical_layer_schedule(
     requested_count: int | None,
     *,
     physical_layer_height_mm: float | None = None,
-) -> tuple[int, np.ndarray]:
+    fiber_layer_height_mm: float | None = None,
+    plan_for_continuous_fiber: bool = False,
+) -> tuple[int, np.ndarray, dict[str, object]]:
     """Return monotonic layer-centre Z values whose printed extent is the requested part height."""
 
     final_height = float(spec.part["final_height_mm"])
     nominal_height = float(spec.manufacturing["layer_height_mm"] if physical_layer_height_mm is None else physical_layer_height_mm)
     if not math.isfinite(nominal_height) or nominal_height <= 0.0:
         raise ValueError("physical_layer_height_mm must be positive and finite")
+    if plan_for_continuous_fiber:
+        if spec.source_provider != "double_sine":
+            raise ValueError("continuous-fiber physical stack planning is only available for double-sine conformal honeycomb")
+        fiber_height = float(fiber_layer_height_mm if fiber_layer_height_mm is not None else 0.0)
+        if not math.isfinite(fiber_height) or fiber_height <= 0.0:
+            raise ValueError("fiber_layer_height_mm must be positive and finite when planning continuous fiber")
+        surface_start = int(spec.layer_embedding["surface_start_layer"])
+        candidate_limit = max(1, int(math.ceil(final_height / nominal_height)))
+        candidates: list[tuple[float, float, int, tuple[int, ...]]] = []
+        for candidate_count in range(1, candidate_limit + 1):
+            try:
+                alpha = _symmetric_alphas(candidate_count, surface_start_layer=surface_start)
+                _first, _last, selected = symmetric_curvature_fiber_schedule(alpha)
+            except ValueError:
+                continue
+            actual_height = candidate_count * nominal_height + len(selected) * fiber_height
+            candidates.append((abs(actual_height - final_height), actual_height, candidate_count, selected))
+        if not candidates:
+            raise ValueError("target final height cannot accommodate the authored symmetric curvature and continuous-fiber schedule")
+        # On an exact tie retain the lower physical stack, then the thinner
+        # resin stack. Both rules avoid silently exceeding the requested part.
+        _error, actual_height, count, selected_layers = min(
+            candidates,
+            key=lambda candidate: (candidate[0], candidate[1] > final_height, candidate[1], candidate[2]),
+        )
+        if requested_count is not None and requested_count != count:
+            raise ValueError("logical_layer_count must match the height-guided continuous-fiber stack plan")
+        resin_centres = (np.arange(count, dtype=np.float64) + 0.5) * nominal_height
+        prior_fiber_count = np.asarray(
+            [sum(previous < layer_index for previous in selected_layers) for layer_index in range(count)],
+            dtype=np.float64,
+        )
+        centres = resin_centres + prior_fiber_count * fiber_height
+        return count, centres, {
+            "target_final_height_mm": final_height,
+            "planned_final_height_mm": actual_height,
+            "height_error_mm": actual_height - final_height,
+            "resin_layer_count": count,
+            "resin_layer_height_mm": nominal_height,
+            "fiber_enabled": True,
+            "fiber_layer_height_mm": fiber_height,
+            "fiber_layer_indices": list(selected_layers),
+            "fiber_layer_count": len(selected_layers),
+            "resin_z_preplanned_for_fiber": True,
+        }
+
     count = int(math.ceil(final_height / nominal_height))
     if requested_count is not None and requested_count != count:
         raise ValueError("logical_layer_count must match the rectangular part final_height_mm and active physical layer height")
     thicknesses = np.full(count, nominal_height, dtype=np.float64)
     thicknesses[-1] = final_height - nominal_height * (count - 1)
     centres = np.cumsum(thicknesses) - thicknesses * 0.5
-    return count, centres
+    return count, centres, {
+        "target_final_height_mm": final_height,
+        "planned_final_height_mm": final_height,
+        "height_error_mm": 0.0,
+        "resin_layer_count": count,
+        "resin_layer_height_mm": nominal_height,
+        "fiber_enabled": False,
+        "fiber_layer_count": 0,
+        "fiber_layer_indices": [],
+        "resin_z_preplanned_for_fiber": False,
+    }

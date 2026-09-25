@@ -77,13 +77,16 @@ def test_conformal_design_json_generates_core_output_without_source_npz_round_tr
         progress_callback=lambda value, _message: progress.append(value),
     )
 
-    assert result["layers"] == 4
+    # With 0.25 mm resin and the design-owned curvature fiber window, the
+    # closest stack to a 1 mm target is 3 resin + 1 fiber = 0.85 mm.
+    assert result["layers"] == 3
     assert result["effective_infill_pattern"] == "共形蜂窝连续路径"
     assert result["infill_pattern_execution"] == {"applied": True, "mode": "continuous_course_network_v1"}
     assert result["fiber_reinforcement"]["enabled"] is True
     assert result["fiber_reinforcement"]["reserved"] is False
     assert result["fiber_reinforcement"]["total_fiber_path_count"] > 0
-    assert result["fiber_reinforcement"]["automatic_resin_z_raise"] is True
+    assert result["fiber_reinforcement"]["automatic_resin_z_raise"] is False
+    assert result["nominal_final_height_mm"] == pytest.approx(0.85)
     assert any(layer["fiber_paths"] for layer in result["preview"]["layers"])
     assert result["preview"]["preview_source"] == "final_core_npz"
     assert result["preview"]["part_origin"] == pytest.approx([60.0, 85.0], abs=0.02)
@@ -220,7 +223,8 @@ def test_main_ui_continuous_course_fiber_strategy_reaches_final_core_output(tmp_
     assert report["after_resin_physical_layers"] == [2, 4]
     assert report["resin_layer_indices"][0] == 1
     assert report["total_fiber_path_count"] > 0
-    assert report["automatic_resin_z_raise"] is True
+    assert report["automatic_resin_z_raise"] is False
+    assert result["nominal_final_height_mm"] == pytest.approx(2.2)
     job_dir = tmp_path / result["download_url"].split("/")[-2]
     with np.load(job_dir / "conformal_lattice_core.npz", allow_pickle=False) as core:
         assert core["x"].size > 0
@@ -308,6 +312,120 @@ def test_production_continuous_courses_replace_only_legacy_honeycomb_and_keep_gr
     assert len(fiber.paths) == len(selected_courses) == 6
     for resin_path, fiber_path in zip(selected_courses, fiber.paths):
         np.testing.assert_allclose(resin_path[:, :2], fiber_path[:, :2])
+
+
+def test_height_guided_conformal_stack_hits_designer_height_with_and_without_fiber():
+    config = conformal_lattice_config_payload(
+        {
+            "part_length_mm": ["40"],
+            "part_width_mm": ["20"],
+            "part_height_mm": ["7"],
+            "specimen_variant": ["tensile"],
+            "grip_end_length_mm": ["8"],
+            "wall_width_mm": ["2"],
+            "base_cell_size_mm": ["5"],
+            "surface_start_layer": ["3"],
+            "surface_start_layer_semantics": ["first_nonzero_curvature_physical"],
+            "samples_x": ["21"],
+            "samples_y": ["11"],
+        }
+    )
+    fiber_run = run_conformal_lattice_pipeline(
+        config,
+        physical_layer_height_mm=0.5,
+        fiber_layer_height_mm=0.1,
+        plan_for_continuous_fiber=True,
+        extrusion=ExtrusionVolumeModel(1.0, 1.0),
+    )
+    assert fiber_run.path_graph is not None
+    fiber_plan = fiber_run.layer_embedding.report["physical_stack_plan"]
+    assert fiber_plan["resin_layer_count"] == 12
+    assert fiber_plan["fiber_layer_count"] == 10
+    assert fiber_plan["planned_final_height_mm"] == pytest.approx(7.0)
+    assert fiber_plan["height_error_mm"] == pytest.approx(0.0)
+    assert fiber_run.layer_embedding.report["surface_progress_basis"] == "physical_stack_z_mm"
+
+    source_job = fiber_run.path_graph.to_external_base_source_job()
+    source_job.meta["physical_stack_plan"] = dict(fiber_plan)
+    first, last = derive_symmetric_curvature_fiber_interfaces(fiber_run.layer_embedding)
+    result = apply_continuous_course_fiber_strategy(
+        source_job=source_job,
+        graph=fiber_run.path_graph,
+        course_paths_by_layer=fiber_run.continuous_course_paths_by_layer,
+        settings=ContinuousCourseFiberSettings(
+            True,
+            first,
+            last,
+            resin_z_preplanned_for_fiber=True,
+            planned_resin_layer_indices=tuple(fiber_plan["fiber_layer_indices"]),
+        ),
+        fiber_layer_height_mm=0.1,
+        fiber_e_per_mm=1.0,
+    )
+    assert result.nominal_final_height_mm == pytest.approx(7.0)
+    assert result.report["automatic_resin_z_raise"] is False
+    # The job stores bead centre-lines; its last 0.5 mm resin bead is centred
+    # at 6.75 mm and therefore has a 7.0 mm physical top extent.
+    assert max(float(path[:, 2].max()) for group in source_job.material_paths for path in group.paths) == pytest.approx(6.75)
+
+    resin_only_run = run_conformal_lattice_pipeline(
+        config,
+        physical_layer_height_mm=0.5,
+        fiber_layer_height_mm=0.1,
+        plan_for_continuous_fiber=False,
+        extrusion=ExtrusionVolumeModel(1.0, 1.0),
+    )
+    assert resin_only_run.path_graph is not None
+    resin_plan = resin_only_run.layer_embedding.report["physical_stack_plan"]
+    assert resin_plan["fiber_layer_count"] == 0
+    assert resin_plan["planned_final_height_mm"] == pytest.approx(7.0)
+    resin_source_job = resin_only_run.path_graph.to_external_base_source_job()
+    assert max(float(path[:, 2].max()) for group in resin_source_job.material_paths for path in group.paths) == pytest.approx(6.75)
+
+
+def test_main_ui_height_guided_conformal_export_keeps_7mm_physical_extent(tmp_path: Path):
+    config = conformal_lattice_config_payload(
+        {
+            "part_length_mm": ["40"],
+            "part_width_mm": ["20"],
+            "part_height_mm": ["7"],
+            "specimen_variant": ["tensile"],
+            "grip_end_length_mm": ["8"],
+            "wall_width_mm": ["2"],
+            "base_cell_size_mm": ["5"],
+            "surface_start_layer": ["3"],
+            "surface_start_layer_semantics": ["first_nonzero_curvature_physical"],
+            "samples_x": ["21"],
+            "samples_y": ["11"],
+        }
+    )
+    handler = object.__new__(_SlicerUiHandler)
+    handler.server_output_dir = tmp_path
+    result = handler._handle_conformal_slice(
+        "",
+        request_data=(
+            {
+                "core_resin_layer_height": ["0.5"],
+                "core_fiber_layer_height": ["0.1"],
+                "conformal_fiber_enabled": ["true"],
+            },
+            {"conformal_spec": ("height_7mm.json", json.dumps(config).encode("utf-8"))},
+        ),
+    )
+
+    assert result["layers"] == 12
+    assert result["nominal_final_height_mm"] == pytest.approx(7.0)
+    assert result["height_plan"]["fiber_layer_count"] == 10
+    assert result["height_plan"]["planned_final_height_mm"] == pytest.approx(7.0)
+    assert result["fiber_reinforcement"]["automatic_resin_z_raise"] is False
+    job_dir = tmp_path / result["download_url"].split("/")[-2]
+    with np.load(job_dir / "conformal_lattice_core.npz", allow_pickle=False) as core:
+        resin_print = (
+            (core["event_flag"] == 0)
+            & (core["tool_id"] == 2)
+            & (core["move_type"] == 1)
+        )
+        assert float(np.max(core["z"][resin_print])) == pytest.approx(6.75, abs=2e-3)
 
 
 def test_bending_continuous_courses_and_fiber_use_the_full_rectangle_without_grips():

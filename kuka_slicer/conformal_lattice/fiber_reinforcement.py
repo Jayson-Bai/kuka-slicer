@@ -52,6 +52,8 @@ class ContinuousCourseFiberSettings:
     first_after_resin_layer_physical: int
     last_after_resin_layer_physical: int
     layer_interface_source: str = "design_json_symmetric_nonzero_curvature"
+    resin_z_preplanned_for_fiber: bool = False
+    planned_resin_layer_indices: tuple[int, ...] = ()
 
 
 def derive_symmetric_curvature_fiber_interfaces(
@@ -72,6 +74,22 @@ def derive_symmetric_curvature_fiber_interfaces(
     alpha = np.asarray(layer_embedding.report.get("alpha_by_layer"), dtype=np.float64)
     if alpha.ndim != 1 or len(alpha) != len(layer_embedding.node_positions_xyz):
         raise ValueError("conformal layer embedding is missing a valid alpha_by_layer schedule")
+    first, last, _selected = symmetric_curvature_fiber_schedule(alpha)
+    return first, last
+
+
+def symmetric_curvature_fiber_schedule(
+    alpha_by_layer: np.ndarray | tuple[float, ...] | list[float],
+) -> tuple[int, int, tuple[int, ...]]:
+    """Return the design-owned fiber window and zero-based resin interfaces.
+
+    This small, geometry-free form lets the physical stack planner determine
+    resin/fiber layer counts before it embeds any lattice paths.
+    """
+
+    alpha = np.asarray(alpha_by_layer, dtype=np.float64)
+    if alpha.ndim != 1 or len(alpha) < 1 or not np.all(np.isfinite(alpha)):
+        raise ValueError("conformal layer embedding is missing a valid alpha_by_layer schedule")
     active = np.flatnonzero(np.abs(alpha) > 1e-12)
     if active.size == 0:
         raise ValueError("continuous fiber requires a design JSON with at least one non-zero-curvature layer")
@@ -90,7 +108,13 @@ def derive_symmetric_curvature_fiber_interfaces(
         )
     if last_after_resin_layer_physical > len(alpha):
         raise ValueError("the symmetric curvature schedule leaves no top resin layer after the final fiber interface")
-    return first_after_resin_layer_physical, last_after_resin_layer_physical
+    final_resin_layer = len(alpha) - 1
+    selected = tuple(
+        physical_layer - 1
+        for physical_layer in range(first_after_resin_layer_physical, last_after_resin_layer_physical + 1)
+        if physical_layer - 1 < final_resin_layer
+    )
+    return first_after_resin_layer_physical, last_after_resin_layer_physical, selected
 
 
 def reserve_fiber_layer_interfaces(
@@ -368,7 +392,7 @@ def apply_continuous_course_fiber_strategy(
         course_paths_by_layer=course_paths_by_layer,
     )
     if not settings.enabled:
-        height = _source_job_max_z(source_job)
+        height = _height_guided_final_height(source_job)
         return FiberReinforcementResult(
             enabled=False,
             reserved=False,
@@ -412,6 +436,8 @@ def apply_continuous_course_fiber_strategy(
     )
     if not selected_layers:
         return _empty_continuous_course_result(source_job, "requested_interfaces_not_available_before_top_resin_cap", settings)
+    if settings.resin_z_preplanned_for_fiber and settings.planned_resin_layer_indices != selected_layers:
+        raise ValueError("height-guided fiber stack plan does not match the design-owned curvature interfaces")
     fiber_groups: list[MaterialPaths] = []
     total_length_mm = 0.0
     work_bounds = _continuous_work_bounds(graph)
@@ -420,7 +446,11 @@ def apply_continuous_course_fiber_strategy(
     for layer_index in selected_layers:
         layer_courses = _courses_for_layer(course_paths_by_layer, layer_index)
         prior_fibers = sum(previous < layer_index for previous in selected_layers)
-        z_offset = (prior_fibers + 1) * float(fiber_layer_height_mm)
+        z_offset = (
+            float(fiber_layer_height_mm)
+            if settings.resin_z_preplanned_for_fiber
+            else (prior_fibers + 1) * float(fiber_layer_height_mm)
+        )
         paths, profiles, length_mm = _render_continuous_courses(layer_courses, float(fiber_e_per_mm), z_offset)
         course_records = [
             (path, profile, "conformal_continuous_course_fragment")
@@ -437,11 +467,12 @@ def apply_continuous_course_fiber_strategy(
         fiber_groups.append(MaterialPaths(layer_index, "F", paths, profiles))
         total_length_mm += length_mm
 
-    _raise_resin_and_travel_z_after_fiber_interfaces(
-        source_job,
-        selected_layers=selected_layers,
-        fiber_layer_height_mm=float(fiber_layer_height_mm),
-    )
+    if not settings.resin_z_preplanned_for_fiber:
+        _raise_resin_and_travel_z_after_fiber_interfaces(
+            source_job,
+            selected_layers=selected_layers,
+            fiber_layer_height_mm=float(fiber_layer_height_mm),
+        )
     resin_roles_root = source_job.meta.get("path_roles", {}).get("R", {})
     for layer_index, paths in fiber_route_specs:
         resin_group = next(
@@ -500,7 +531,8 @@ def apply_continuous_course_fiber_strategy(
         "course_semantics": "every rectangle-clipped continuous-course fragment is an independent resin/F path with normal Core travel/cut boundaries",
         "planar_skeleton_then_surface_embedding": True,
     }
-    nominal_resin_height = _source_job_max_z(source_job) - len(selected_layers) * float(fiber_layer_height_mm)
+    final_height = _height_guided_final_height(source_job)
+    nominal_resin_height = final_height - len(selected_layers) * float(fiber_layer_height_mm)
     report = {
         "enabled": True,
         "reserved": False,
@@ -515,9 +547,10 @@ def apply_continuous_course_fiber_strategy(
         "total_resin_honeycomb_path_count": resin_paths_per_layer * len(resin_layer_indices),
         "total_fiber_length_mm": total_length_mm,
         "fiber_layer_height_mm": float(fiber_layer_height_mm),
-        "automatic_resin_z_raise": True,
+        "automatic_resin_z_raise": not settings.resin_z_preplanned_for_fiber,
+        "resin_z_preplanned_for_fiber": bool(settings.resin_z_preplanned_for_fiber),
         "nominal_resin_stack_height_mm": nominal_resin_height,
-        "nominal_final_height_mm": _source_job_max_z(source_job),
+        "nominal_final_height_mm": final_height,
         "core_material_paths": "F",
         "course_semantics": "every rectangle-clipped continuous-course fragment is an independent resin/F path with normal Core travel/cut boundaries",
         "resin_path_strategy": "preview_continuous_courses_then_conformal_embedding",
@@ -529,7 +562,7 @@ def apply_continuous_course_fiber_strategy(
         resin_layer_indices=selected_layers,
         paths_per_layer=resin_paths_per_layer,
         fiber_layer_height_mm=float(fiber_layer_height_mm),
-        nominal_final_height_mm=float(report["nominal_final_height_mm"]),
+        nominal_final_height_mm=final_height,
         total_path_count=int(report["total_fiber_path_count"]),
         report=report,
     )
@@ -1385,6 +1418,17 @@ def _raise_resin_and_travel_z_after_fiber_interfaces(
         group.paths = [np.asarray(path, dtype=np.float64).copy() for path in group.paths]
         for path in group.paths:
             path[:, 2] += offset
+
+
+def _height_guided_final_height(source_job: ExternalSourceJob) -> float:
+    """Return the physical part extent when the UI supplied a stack plan."""
+
+    plan = source_job.meta.get("physical_stack_plan")
+    if isinstance(plan, Mapping):
+        planned_height = plan.get("planned_final_height_mm")
+        if isinstance(planned_height, (int, float)) and np.isfinite(float(planned_height)):
+            return float(planned_height)
+    return _source_job_max_z(source_job)
 
 
 def _source_job_max_z(source_job: ExternalSourceJob) -> float:

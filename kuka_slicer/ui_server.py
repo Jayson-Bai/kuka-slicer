@@ -2227,6 +2227,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         core_params = _parse_core_process_params(params, process_params_module)
         resin = core_params.resin
         layer_height = float(resin.layer_height_mm)
+        conformal_fiber_enabled = _bool_param(params, "conformal_fiber_enabled", True)
         e_per_mm = float(resin.e_per_mm())
         if e_per_mm <= 0.0:
             raise ValueError("当前 Core 树脂 E/mm 必须为正数")
@@ -2259,6 +2260,8 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             # keeping it out of this request lets the prepared one-stroke
             # conformal paths proceed directly to Core.
             validate_fill_ratio=False,
+            fiber_layer_height_mm=float(core_params.fiber.layer_height_mm),
+            plan_for_continuous_fiber=bool(conformal_fiber_enabled and not is_planar),
         )
         if run.path_graph is None:
             raise RuntimeError("共形蜂窝路径桥接未生成一笔画路径")
@@ -2307,15 +2310,26 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                 run.layer_embedding
             )
             fiber_interface_source = "design_json_symmetric_nonzero_curvature"
+        stack_plan = run.layer_embedding.report.get("physical_stack_plan")
+        if not isinstance(stack_plan, dict):
+            stack_plan = {}
+        # The SourceJob stores bead centre-lines. Preserve the height-guided
+        # physical stack contract alongside it so the final UI report does not
+        # mistake the last centre-line Z for the printed part extent.
+        conformal_source_job.meta["physical_stack_plan"] = dict(stack_plan)
+        planned_fiber_layers = tuple(int(value) for value in stack_plan.get("fiber_layer_indices", []))
+        resin_z_preplanned_for_fiber = bool(stack_plan.get("resin_z_preplanned_for_fiber", False))
         fiber_reinforcement = apply_continuous_course_fiber_strategy(
             source_job=conformal_source_job,
             graph=run.path_graph,
             course_paths_by_layer=run.continuous_course_paths_by_layer,
             settings=ContinuousCourseFiberSettings(
-                enabled=_bool_param(params, "conformal_fiber_enabled", True),
+                enabled=conformal_fiber_enabled,
                 first_after_resin_layer_physical=first_fiber_interface,
                 last_after_resin_layer_physical=last_fiber_interface,
                 layer_interface_source=fiber_interface_source,
+                resin_z_preplanned_for_fiber=resin_z_preplanned_for_fiber,
+                planned_resin_layer_indices=planned_fiber_layers,
             ),
             fiber_layer_height_mm=float(core_params.fiber.layer_height_mm),
             fiber_e_per_mm=float(core_params.fiber.e_per_mm()),
@@ -2405,6 +2419,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             "infill_pattern_execution": {"applied": True, "mode": "continuous_course_network_v1"},
             "conformal_lattice": run.report,
             "fiber_reinforcement": fiber_reinforcement.report,
+            "height_plan": stack_plan,
             "brim": brim_report,
             "nominal_final_height_mm": fiber_reinforcement.nominal_final_height_mm,
             "core_export_seconds": float(core_stats.get("total_s", 0.0)),
@@ -6547,9 +6562,15 @@ def _index_html() -> str:
         statusEl.className = 'status ok';
         const fiberReport = result.fiber_reinforcement;
         const fiberInterfaceText = fiberReport?.enabled
-          ? `；已生成与树脂连续路径同拓扑的 F 路径，共 ${{fiberReport.total_fiber_path_count}} 条，并已按纤维层高抬高后续树脂层`
+          ? `；已生成与树脂连续路径同拓扑的 F 路径，共 ${{fiberReport.total_fiber_path_count}} 条，并已纳入最终高度层程`
           : '；本次未启用连续纤维策略';
-        statusEl.textContent = '完成：' + (result.design_label || selectedLatticeDesignLabel) + '连续路径已生成，并已写出 Core NPZ。' + fiberInterfaceText;
+        const heightPlan = result.height_plan || {{}};
+        const plannedHeight = Number(heightPlan.planned_final_height_mm);
+        const targetHeight = Number(heightPlan.target_final_height_mm);
+        const heightText = Number.isFinite(plannedHeight) && Number.isFinite(targetHeight)
+          ? `；目标最终高度 ${{targetHeight.toFixed(3)}} mm，本次层程 ${{plannedHeight.toFixed(3)}} mm`
+          : '';
+        statusEl.textContent = '完成：' + (result.design_label || selectedLatticeDesignLabel) + '连续路径已生成，并已写出 Core NPZ。' + fiberInterfaceText + heightText;
         const workflowTiming = result.workflow_timing || {{}};
         const totalSeconds = Number(workflowTiming.total_s);
         const coreSeconds = Number(workflowTiming.core_export_s ?? result.core_export_seconds);
