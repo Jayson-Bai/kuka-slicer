@@ -227,10 +227,7 @@ def test_macos_designer_browser_activation_uses_its_containing_app(monkeypatch, 
     ]
 
 
-def test_macos_browser_session_uses_an_isolated_profile_without_background_mode(monkeypatch, tmp_path: Path) -> None:
-    chrome = tmp_path / "Google Chrome.app" / "Contents" / "MacOS" / "Google Chrome"
-    chrome.parent.mkdir(parents=True)
-    chrome.touch()
+def test_macos_browser_session_uses_system_open_without_an_isolated_profile(monkeypatch, tmp_path: Path) -> None:
     process = _Process()
     commands: list[list[str]] = []
 
@@ -239,19 +236,12 @@ def test_macos_browser_session_uses_an_isolated_profile_without_background_mode(
         return process
 
     monkeypatch.setattr(app_session.sys, "platform", "darwin")
-    monkeypatch.setattr(app_session, "_find_browser", lambda: chrome)
-    monkeypatch.setattr(app_session, "_activate_macos_browser_window", lambda _path: None)
     monkeypatch.setattr(app_session.subprocess, "Popen", fake_popen)
 
     _browser, profile = app_session._launch_browser_app("http://127.0.0.1:45678", "surface-preview")
 
-    assert commands[0][:2] == [
-        str(chrome),
-        "--app=http://127.0.0.1:45678",
-    ]
-    assert "--disable-background-mode" in commands[0]
-    assert "--app=http://127.0.0.1:45678" in commands[0]
-    profile.rmdir()
+    assert commands == [["/usr/bin/open", "http://127.0.0.1:45678"]]
+    assert profile is None
 
 
 def test_macos_session_waits_for_the_profile_process_to_close(monkeypatch, tmp_path: Path) -> None:

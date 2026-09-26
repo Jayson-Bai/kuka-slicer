@@ -7,6 +7,8 @@ import math
 import os
 import secrets
 import subprocess
+import threading
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -721,6 +723,33 @@ def run_surface_preview_server(host: str, port: int) -> None:
     server = ThreadingHTTPServer((host, port), SurfacePreviewHandler)
     server.preview_domains = {}
     server.designer_state_path = _designer_state_path()
+    server.browser_session_required = os.environ.get("KUKA_SLICER_BROWSER_SESSION") == "1"
+    server.browser_session_started_at = time.monotonic()
+    server.browser_session_last_heartbeat = None
+    server.browser_session_close_requested = False
+    server.browser_session_lock = threading.Lock()
+
+    def stop_unattended_browser_session() -> None:
+        while True:
+            time.sleep(1.0)
+            now = time.monotonic()
+            with server.browser_session_lock:
+                last_heartbeat = server.browser_session_last_heartbeat
+            expired = (
+                now - server.browser_session_started_at >= 60.0
+                if last_heartbeat is None
+                else now - last_heartbeat >= 30.0
+            )
+            if expired:
+                server.shutdown()
+                return
+
+    if server.browser_session_required:
+        threading.Thread(
+            target=stop_unattended_browser_session,
+            daemon=True,
+            name="surface-preview-browser-session-watchdog",
+        ).start()
     print(f"KUKA surface preview running at http://{host}:{port}")
     try:
         server.serve_forever()
@@ -798,6 +827,25 @@ class SurfacePreviewHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        if parsed.path == "/browser-session-heartbeat":
+            if self.server.browser_session_required:
+                with self.server.browser_session_lock:
+                    self.server.browser_session_last_heartbeat = time.monotonic()
+            self._send_json({"ok": True})
+            return
+        if parsed.path == "/browser-session-close":
+            if self.server.browser_session_required:
+                with self.server.browser_session_lock:
+                    already_closing = self.server.browser_session_close_requested
+                    self.server.browser_session_close_requested = True
+                if not already_closing:
+                    threading.Thread(
+                        target=self.server.shutdown,
+                        daemon=True,
+                        name="surface-preview-browser-session-close",
+                    ).start()
+            self._send_json({"ok": True})
+            return
         if parsed.path == "/api/designer-state":
             try:
                 raw_length = self.headers.get("Content-Length")
@@ -2783,6 +2831,17 @@ def surface_preview_html() -> str:
       refresh();
     });
     window.addEventListener('resize', render);
+    if (new URLSearchParams(window.location.search).get('browser_session') === '1') {
+      const sendBrowserSessionHeartbeat = () => {
+        fetch('/browser-session-heartbeat', { method: 'POST', keepalive: true }).catch(() => {});
+      };
+      sendBrowserSessionHeartbeat();
+      const browserSessionHeartbeatTimer = window.setInterval(sendBrowserSessionHeartbeat, 5000);
+      window.addEventListener('pagehide', () => {
+        window.clearInterval(browserSessionHeartbeatTimer);
+        navigator.sendBeacon('/browser-session-close', '');
+      }, { once: true });
+    }
     async function initialiseDesigner() {
       restoreDesignerState();
       await restorePersistentDesignerState();

@@ -158,7 +158,10 @@ def run_app_session(tool: str) -> int:
 
     command, extra_args = _tool_spec(tool)
     port = _find_available_port()
-    browser_heartbeat_session = sys.platform == "darwin" and tool == "ui"
+    # Chrome's isolated --app profiles intermittently crash with Error 15 on
+    # this Mac. All macOS local tools therefore use the ordinary system
+    # browser, while their page heartbeat still owns the short-lived server.
+    browser_heartbeat_session = sys.platform == "darwin"
     previous_browser_session = os.environ.get("KUKA_SLICER_BROWSER_SESSION")
     if browser_heartbeat_session:
         os.environ["KUKA_SLICER_BROWSER_SESSION"] = "1"
@@ -373,7 +376,20 @@ def _wait_for_port(port: int, server: _ManagedProcess, timeout_s: float = 60.0) 
     raise TimeoutError(f"local server did not start on port {port}")
 
 
-def _launch_browser_app(url: str, tool: str) -> tuple[subprocess.Popen[bytes], Path]:
+def _launch_browser_app(url: str, tool: str) -> tuple[subprocess.Popen[bytes], Path | None]:
+    if sys.platform == "darwin":
+        # Do not launch Chrome directly with a temporary --user-data-dir here.
+        # That renderer path is unstable on this host; macOS `open` uses the
+        # user's healthy normal browser profile instead. The caller waits for
+        # the server's page heartbeat rather than this short-lived opener.
+        return (
+            subprocess.Popen(
+                ["/usr/bin/open", url],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            ),
+            None,
+        )
     browser_path = _find_browser()
     profile_dir = Path(tempfile.mkdtemp(prefix=f"kuka-slicer-{tool}-"))
     try:
