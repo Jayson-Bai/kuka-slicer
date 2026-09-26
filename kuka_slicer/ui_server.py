@@ -1434,6 +1434,7 @@ def run_ui_server(host: str, port: int, output_dir: Path) -> None:
         browser_session_required = os.environ.get("KUKA_SLICER_BROWSER_SESSION") == "1"
         browser_session_started_at = time.monotonic()
         browser_session_last_heartbeat: float | None = None
+        browser_session_close_requested = False
         browser_session_lock = threading.Lock()
 
     server = ThreadingHTTPServer((host, port), SlicerUiHandler)
@@ -1567,6 +1568,24 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             if type(self).browser_session_required:
                 with type(self).browser_session_lock:
                     type(self).browser_session_last_heartbeat = time.monotonic()
+            self._send_json({"ok": True})
+            return
+        if parsed.path == "/browser-session-close":
+            if type(self).browser_session_required:
+                with type(self).browser_session_lock:
+                    already_closing = type(self).browser_session_close_requested
+                    type(self).browser_session_close_requested = True
+                if not already_closing:
+                    # ``serve_forever`` owns the server loop on a different
+                    # thread.  Scheduling shutdown after this response lets
+                    # the browser finish its page-close beacon, then releases
+                    # the port immediately instead of waiting for heartbeat
+                    # expiry after the dedicated app window has closed.
+                    threading.Thread(
+                        target=self.server.shutdown,
+                        daemon=True,
+                        name="browser-session-close",
+                    ).start()
             self._send_json({"ok": True})
             return
         if parsed.path == "/launch-tool":
@@ -9630,7 +9649,11 @@ def _index_html() -> str:
         fetch('/browser-session-heartbeat', {{ method: 'POST', keepalive: true }}).catch(() => {{}});
       }};
       sendBrowserSessionHeartbeat();
-      window.setInterval(sendBrowserSessionHeartbeat, 5000);
+      const browserSessionHeartbeatTimer = window.setInterval(sendBrowserSessionHeartbeat, 5000);
+      window.addEventListener('pagehide', () => {{
+        window.clearInterval(browserSessionHeartbeatTimer);
+        navigator.sendBeacon('/browser-session-close', '');
+      }}, {{ once: true }});
     }}
     drawPreview();
   </script>

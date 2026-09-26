@@ -936,6 +936,8 @@ def test_ui_uses_pre_core_source_preview_and_exposes_core_export_progress():
     assert "exportElapsedEl.textContent = '总用时 '" in html
     assert 'Core：仓库源码 · 三次样条优化已启用' in html
     assert "slice-status?job_id=" in html
+    assert "browser-session-close" in html
+    assert "window.addEventListener('pagehide'" in html
     assert 'id="coreDt" type="number" min="0.0001" step="0.0001" value="0.004"' in html
     assert 'id="coreMaxTcpOrientationSpeed"' in html
     assert "core_max_tcp_orientation_speed" in html
