@@ -457,6 +457,58 @@ def test_main_ui_height_guided_conformal_export_keeps_7mm_physical_extent(tmp_pa
         assert float(np.max(core["z"][resin_print])) == pytest.approx(6.75, abs=2e-3)
 
 
+def test_main_ui_double_sine_without_fiber_uses_fiber_aware_16_layer_mapping(tmp_path: Path):
+    config = conformal_lattice_config_payload(
+        {
+            "part_length_mm": ["40"],
+            "part_width_mm": ["20"],
+            "part_height_mm": ["7"],
+            "specimen_variant": ["tensile"],
+            "grip_end_length_mm": ["8"],
+            "wall_width_mm": ["2"],
+            "base_cell_size_mm": ["5"],
+            "surface_start_layer": ["3"],
+            "surface_start_layer_semantics": ["first_nonzero_curvature_physical"],
+            "samples_x": ["21"],
+            "samples_y": ["11"],
+        }
+    )
+    reference_height = config["fiber_aware_resin_only_height_plan"]["fiber_enabled_reference_height_mm"]
+    assert reference_height == pytest.approx(7.95)
+    run = run_conformal_lattice_pipeline(
+        config,
+        physical_layer_height_mm=0.5,
+        resin_only_reference_height_mm=float(reference_height),
+        extrusion=ExtrusionVolumeModel(1.0, 1.0),
+    )
+    assert len(run.layer_embedding.node_positions_xyz) == 16
+    assert run.layer_embedding.report["physical_stack_plan"]["planned_final_height_mm"] == pytest.approx(8.0)
+    # The authored JSON still defines where curvature starts: physical layers
+    # one and two remain flat, and the third is the first curved layer.
+    alpha = run.layer_embedding.report["alpha_by_layer"]
+    assert alpha[1] == pytest.approx(0.0)
+    assert alpha[2] > 0.0
+
+    handler = object.__new__(_SlicerUiHandler)
+    handler.server_output_dir = tmp_path
+    result = handler._handle_conformal_slice(
+        "",
+        request_data=(
+            {
+                "core_resin_layer_height": ["0.5"],
+                "core_fiber_layer_height": ["0.1"],
+                "conformal_fiber_enabled": ["false"],
+            },
+            {"conformal_spec": ("double_sine_height_7mm.json", json.dumps(config).encode("utf-8"))},
+        ),
+    )
+
+    assert result["layers"] == 16
+    assert result["nominal_final_height_mm"] == pytest.approx(8.0)
+    assert result["height_plan"]["target_final_height_mm"] == pytest.approx(7.95)
+    assert result["height_plan"]["planned_final_height_mm"] == pytest.approx(8.0)
+
+
 def test_main_ui_fiber_disabled_uses_designer_fiber_aware_resin_only_height_plan(tmp_path: Path):
     config = planar_lattice_config_payload(
         {

@@ -122,42 +122,20 @@ def fiber_aware_resin_only_height_plan(
     if not math.isfinite(fiber_height) or fiber_height <= 0.0:
         raise ValueError("fiber_layer_height_mm must be positive and finite")
 
-    if spec.source_provider == "planar":
+    if spec.source_provider in {"planar", "double_sine"}:
         resin_count = int(math.ceil(final_height / resin_height))
         schedule = plan_flat_resin_interlayers(range(resin_count))
-        # Flat fiber remains a post-path operation in the main UI.  The last
-        # resin centre-line is consequently the same height users see in the
-        # final NPZ after all selected interfaces have raised later layers.
+        # The no-fiber substitute must use one stable contract for both the
+        # planar and double-sine routes: retain the authored nominal resin
+        # layer count, then account for every normal flat interlayer that
+        # would raise later resin paths.  Curvature still comes entirely from
+        # the JSON's surface_start_layer when those resin layers are embedded.
         fiber_reference_height = (
             (resin_count - 0.5) * resin_height
             + len(schedule.after_resin_layer_indices) * fiber_height
         )
         fiber_layer_count = len(schedule.after_resin_layer_indices)
         source = schedule.source
-    elif spec.source_provider == "double_sine":
-        # The double-sine route already owns a height-guided fiber schedule.
-        # Reuse it here so the saved no-fiber reference agrees with the path
-        # pipeline instead of duplicating its curvature-interface policy.
-        try:
-            _count, _centres, stack = _physical_layer_schedule(
-                spec,
-                requested_count=None,
-                physical_layer_height_mm=resin_height,
-                fiber_layer_height_mm=fiber_height,
-                plan_for_continuous_fiber=True,
-            )
-        except ValueError:
-            # A very short coupon can be valid as a resin-only design while
-            # being too short for the authored symmetric fiber window.  Its
-            # JSON must still export; the nominal height is the only valid
-            # no-fiber reference in that case.
-            fiber_reference_height = final_height
-            fiber_layer_count = 0
-            source = "symmetric_curvature_schedule_unavailable_fallback_v1"
-        else:
-            fiber_reference_height = float(stack["planned_final_height_mm"])
-            fiber_layer_count = int(stack["fiber_layer_count"])
-            source = "symmetric_curvature_height_guided_v1"
     else:
         raise ValueError("fiber-aware resin-only planning requires planar or double-sine source")
 
