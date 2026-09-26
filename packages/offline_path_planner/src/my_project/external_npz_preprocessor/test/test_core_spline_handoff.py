@@ -5,7 +5,7 @@ from external_npz_preprocessor.converter import source_job_to_parsed_commands
 from external_npz_preprocessor.process_params import ProcessParams
 from external_npz_preprocessor.source_npz import LayerPaths, MaterialPath, SourceJob
 from path_processing_core import npz_exporter
-from path_processing_core.types import GlobalCurveCommand, MoveCommand, Position
+from path_processing_core.types import GlobalCurveCommand, MoveCommand
 
 
 def test_external_source_print_path_is_fitted_by_core_with_density(tmp_path, monkeypatch):
@@ -109,67 +109,6 @@ def test_generic_external_source_path_does_not_split_at_short_input_segments(tmp
     assert len(captured) == 1
     assert captured[0].cmd == "SPLINE"
     assert len(captured[0].original_moves) == 3
-
-
-def test_source_stroke_retries_lower_density_without_splitting(tmp_path, monkeypatch):
-    job = SourceJob(
-        meta={},
-        layers=[
-            LayerPaths(
-                index=0,
-                resin_paths=[
-                    MaterialPath(
-                        "R",
-                        0,
-                        np.asarray(
-                            [
-                                [0.0, 0.0, 0.5, 0.0, 0.0, 0.0],
-                                [5.0, 0.0, 0.5, 0.0, 0.0, 0.0],
-                                [5.0, 5.0, 0.5, 0.0, 0.0, 0.0],
-                                [10.0, 5.0, 0.5, 0.0, 0.0, 0.0],
-                            ],
-                            dtype=np.float32,
-                        ),
-                    )
-                ],
-            )
-        ],
-    )
-    commands = source_job_to_parsed_commands(job, ProcessParams(primeline_enabled=False))
-    captured: list[GlobalCurveCommand] = []
-    fit_densities: list[int] = []
-    original_fit = npz_exporter.GlobalSplinePlanner.fit_global_curve
-    original_sample = npz_exporter.sample_global_curve_iter
-
-    def unstable_at_high_density(self, moves, **kwargs):
-        fit_densities.append(kwargs["density"])
-        curve = original_fit(self, moves, **kwargs)
-        if curve is not None and kwargs["density"] > 3:
-            point = curve.control_points[0]
-            curve.control_points[0] = Position(
-                x=point.x + 1_000_000.0,
-                y=point.y,
-                z=point.z,
-                a=point.a,
-                b=point.b,
-                c=point.c,
-            )
-        return curve
-
-    def record_sample(curve, **kwargs):
-        if curve.type in {"PRINT", "PRINT_FIT"}:
-            captured.append(curve)
-        return original_sample(curve, **kwargs)
-
-    monkeypatch.setattr(npz_exporter.GlobalSplinePlanner, "fit_global_curve", unstable_at_high_density)
-    monkeypatch.setattr(npz_exporter, "sample_global_curve_iter", record_sample)
-    npz_exporter.export_npz(commands, str(tmp_path / "adaptive-density.npz"), density=5)
-
-    assert fit_densities == [5, 4, 3]
-    assert len(captured) == 1
-    assert captured[0].cmd == "SPLINE"
-    assert len(captured[0].original_moves) == 3
-    assert captured[0].raw.endswith("adaptive_fit_density=3")
 
 
 def test_declared_continuous_source_path_is_one_fitted_core_timing_curve(tmp_path, monkeypatch):

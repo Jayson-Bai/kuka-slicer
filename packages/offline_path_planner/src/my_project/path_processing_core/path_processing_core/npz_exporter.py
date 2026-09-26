@@ -1384,40 +1384,6 @@ def export_npz(
             ctrl_len += math.sqrt((b.x - a.x) ** 2 + (b.y - a.y) ** 2 + (b.z - a.z) ** 2)
         return ctrl_len > orig_len * 4.0
 
-    def _fit_source_stroke(moves: List[MoveCommand]) -> GlobalCurveCommand | None:
-        """Fit one authored stroke without converting its interior into stops.
-
-        Long, already-dense routes such as a one-stroke Brim spiral can make a
-        high global densification level numerically oscillatory.  Retry with
-        progressively less *input* densification while retaining the same
-        whole-path B-spline, corner retreat and 4 ms sampler.  This is a
-        geometric-stability adaptation, never a source-path partition.
-        """
-
-        requested_density = max(0, int(density))
-        for candidate_density in range(requested_density, -1, -1):
-            t0 = time.perf_counter()
-            gc = planner.fit_global_curve(
-                moves,
-                corner_angle_deg=corner_angle_deg,
-                corner_retreat_ratio=corner_retreat_ratio,
-                density=candidate_density,
-                degree=degree,
-                max_fit_points=max_fit_points_per_segment,
-                preserve_source_e=preserve_source_e_profile,
-            )
-            timings["fit_s"] += time.perf_counter() - t0
-            _accumulate_fit_profile(planner.last_fit_profile)
-            if gc is None or _curve_is_pathological(gc, moves):
-                continue
-            if candidate_density != requested_density:
-                gc.raw = (
-                    f"{gc.raw or 'GLOBAL_BSPLINE_LIB'}"
-                    f" | adaptive_fit_density={candidate_density}"
-                )
-            return gc
-        return None
-
     def flush_moves():
         nonlocal buffer, current_type, current_layer, current_subtype, current_source_path_id, current_occ
         if not buffer:
@@ -1477,7 +1443,18 @@ def export_npz(
             # sampler.  A one/two-point path has no B-spline solution; its
             # exact polyline is the only safe single-stroke fallback and still
             # receives one timing law.
-            gc = _fit_source_stroke(work_buffer)
+            t0 = time.perf_counter()
+            gc = planner.fit_global_curve(
+                work_buffer,
+                corner_angle_deg=corner_angle_deg,
+                corner_retreat_ratio=corner_retreat_ratio,
+                density=density,
+                degree=degree,
+                max_fit_points=max_fit_points_per_segment,
+                preserve_source_e=preserve_source_e_profile,
+            )
+            timings["fit_s"] += time.perf_counter() - t0
+            _accumulate_fit_profile(planner.last_fit_profile)
             gc_list = [_make_polyline_gc(work_buffer, " | source_continuous_linear_fallback")] if (
                 gc is None or _curve_is_pathological(gc, work_buffer)) else [gc]
         elif work_buffer and _is_wall_outline_subtype(work_buffer[0].subtype):
