@@ -37,7 +37,7 @@ from kuka_slicer.conformal_lattice.fiber_reinforcement import (
 import kuka_slicer.ui_server as ui_server
 from kuka_slicer.conformal_lattice.path_bridge import ExtrusionVolumeModel
 from kuka_slicer.conformal_lattice.pipeline import run_conformal_lattice_pipeline
-from kuka_slicer.surface_preview.server import conformal_lattice_config_payload
+from kuka_slicer.surface_preview.server import conformal_lattice_config_payload, planar_lattice_config_payload
 
 
 def test_conformal_design_json_generates_core_output_without_source_npz_round_trip(tmp_path: Path):
@@ -455,6 +455,87 @@ def test_main_ui_height_guided_conformal_export_keeps_7mm_physical_extent(tmp_pa
             & (core["move_type"] == 1)
         )
         assert float(np.max(core["z"][resin_print])) == pytest.approx(6.75, abs=2e-3)
+
+
+def test_main_ui_fiber_disabled_uses_designer_fiber_aware_resin_only_height_plan(tmp_path: Path):
+    config = planar_lattice_config_payload(
+        {
+            "part_length_mm": ["40"],
+            "part_width_mm": ["20"],
+            "part_height_mm": ["7"],
+            "specimen_variant": ["bending"],
+            "wall_width_mm": ["2"],
+            "base_cell_size_mm": ["5"],
+        }
+    )
+    handler = object.__new__(_SlicerUiHandler)
+    handler.server_output_dir = tmp_path
+    result = handler._handle_conformal_slice(
+        "",
+        request_data=(
+            {
+                "core_resin_layer_height": ["0.5"],
+                "core_fiber_layer_height": ["0.1"],
+                "conformal_fiber_enabled": ["false"],
+            },
+            {"conformal_spec": ("planar_height_7mm.json", json.dumps(config).encode("utf-8"))},
+        ),
+    )
+
+    assert result["layers"] == 16
+    assert result["nominal_final_height_mm"] == pytest.approx(8.0)
+    assert result["fiber_reinforcement"]["enabled"] is False
+    assert result["height_plan"] == {
+        "target_final_height_mm": pytest.approx(7.95),
+        "planned_final_height_mm": pytest.approx(8.0),
+        "height_error_mm": pytest.approx(0.05),
+        "design_final_height_mm": pytest.approx(7.0),
+        "resin_layer_count": 16,
+        "resin_layer_height_mm": pytest.approx(0.5),
+        "fiber_enabled": False,
+        "fiber_layer_count": 0,
+        "fiber_layer_indices": [],
+        "resin_z_preplanned_for_fiber": False,
+        "resin_only_plan_source": "design_json_fiber_aware_resin_only_v1",
+    }
+    job_dir = tmp_path / result["download_url"].split("/")[-2]
+    with np.load(job_dir / "planar_honeycomb_core.npz", allow_pickle=False) as core:
+        resin_print = (
+            (core["event_flag"] == 0)
+            & (core["tool_id"] == 2)
+            & (core["move_type"] == 1)
+        )
+        assert float(np.max(core["z"][resin_print])) == pytest.approx(7.75, abs=2e-3)
+
+
+def test_main_ui_planar_fiber_enabled_keeps_legacy_post_path_height_behavior(tmp_path: Path):
+    config = planar_lattice_config_payload(
+        {
+            "part_length_mm": ["40"],
+            "part_width_mm": ["20"],
+            "part_height_mm": ["7"],
+            "specimen_variant": ["bending"],
+            "wall_width_mm": ["2"],
+            "base_cell_size_mm": ["5"],
+        }
+    )
+    handler = object.__new__(_SlicerUiHandler)
+    handler.server_output_dir = tmp_path
+    result = handler._handle_conformal_slice(
+        "",
+        request_data=(
+            {
+                "core_resin_layer_height": ["0.5"],
+                "core_fiber_layer_height": ["0.1"],
+                "conformal_fiber_enabled": ["true"],
+            },
+            {"conformal_spec": ("planar_height_7mm.json", json.dumps(config).encode("utf-8"))},
+        ),
+    )
+
+    assert result["layers"] == 14
+    assert result["nominal_final_height_mm"] == pytest.approx(7.95)
+    assert result["fiber_reinforcement"]["automatic_resin_z_raise"] is True
 
 
 def test_bending_continuous_courses_and_fiber_use_the_full_rectangle_without_grips():

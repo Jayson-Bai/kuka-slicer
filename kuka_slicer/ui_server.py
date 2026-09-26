@@ -140,6 +140,26 @@ def _conformal_spec_ui_summary(payload: bytes, filename: str) -> dict[str, objec
     }
 
 
+def _fiber_aware_resin_only_reference_height(spec) -> float | None:
+    """Read the optional designer-owned no-fiber height reference safely."""
+
+    raw_plan = spec.raw_config.get("fiber_aware_resin_only_height_plan")
+    if raw_plan is None:
+        return None
+    if not isinstance(raw_plan, dict):
+        raise ValueError("设计 JSON 的纤维等效无纤维高度计划必须是对象")
+    if raw_plan.get("format") != "fiber_aware_resin_only_height_plan_v1":
+        raise ValueError("设计 JSON 的纤维等效无纤维高度计划格式不受支持")
+    value = raw_plan.get("fiber_enabled_reference_height_mm")
+    try:
+        reference_height = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("设计 JSON 的纤维等效高度必须是正数") from exc
+    if not math.isfinite(reference_height) or reference_height <= 0.0:
+        raise ValueError("设计 JSON 的纤维等效高度必须是正数")
+    return reference_height
+
+
 class FiberTemplatePaths(list[list[list[float]]]):
     """Fiber geometry together with the declared XY coordinate semantics."""
 
@@ -2262,6 +2282,9 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         resin = core_params.resin
         layer_height = float(resin.layer_height_mm)
         conformal_fiber_enabled = _bool_param(params, "conformal_fiber_enabled", True)
+        resin_only_reference_height = (
+            None if conformal_fiber_enabled else _fiber_aware_resin_only_reference_height(spec)
+        )
         e_per_mm = float(resin.e_per_mm())
         if e_per_mm <= 0.0:
             raise ValueError("当前 Core 树脂 E/mm 必须为正数")
@@ -2296,6 +2319,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             validate_fill_ratio=False,
             fiber_layer_height_mm=float(core_params.fiber.layer_height_mm),
             plan_for_continuous_fiber=bool(conformal_fiber_enabled and not is_planar),
+            resin_only_reference_height_mm=resin_only_reference_height,
         )
         if run.path_graph is None:
             raise RuntimeError("共形蜂窝路径桥接未生成一笔画路径")
@@ -2350,7 +2374,15 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         # The SourceJob stores bead centre-lines. Preserve the height-guided
         # physical stack contract alongside it so the final UI report does not
         # mistake the last centre-line Z for the printed part extent.
-        conformal_source_job.meta["physical_stack_plan"] = dict(stack_plan)
+        # Flat fiber is intentionally still the legacy post-path Z-lift.  It
+        # must not consume the resin-only reference plan, otherwise its final
+        # report would be forced back to the nominal design height.  The plan
+        # is attached for fiber-disabled flat runs and for the preplanned
+        # double-sine fiber route only.
+        if not (is_planar and conformal_fiber_enabled):
+            conformal_source_job.meta["physical_stack_plan"] = dict(stack_plan)
+        else:
+            stack_plan = {}
         planned_fiber_layers = tuple(int(value) for value in stack_plan.get("fiber_layer_indices", []))
         resin_z_preplanned_for_fiber = bool(stack_plan.get("resin_z_preplanned_for_fiber", False))
         fiber_reinforcement = apply_continuous_course_fiber_strategy(

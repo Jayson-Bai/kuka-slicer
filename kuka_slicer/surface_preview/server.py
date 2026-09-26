@@ -31,6 +31,7 @@ MAX_CONFORMAL_SAMPLES = 512
 MAX_STL_BYTES = 64 * 1024 * 1024
 MAX_DESIGNER_STATE_BYTES = 32 * 1024
 CONFORMAL_MAPPING_REFERENCE_LAYER_HEIGHT_MM = 0.5
+CONFORMAL_MAPPING_REFERENCE_FIBER_LAYER_HEIGHT_MM = 0.1
 SURFACE_PREVIEW_API_VERSION = "surface_preview_v2"
 
 
@@ -696,7 +697,21 @@ def _rectangular_lattice_config_payload(
         # A pure geometry range: the executable zigzag process settings are
         # intentionally supplied later by the resin path planner/Core preset.
         config["part"]["symmetric_grip_end_length_mm"] = grip_end_length_mm  # type: ignore[index]
-    load_conformal_lattice_spec(config)
+    spec = load_conformal_lattice_spec(config)
+    # This does not enable fiber in the designer.  It records the Z that the
+    # existing main-UI fiber workflow would reach, so a later resin-only run
+    # can choose the nearest whole resin-layer stack instead of silently
+    # returning to the smaller nominal design height.
+    # Import lazily: the surface-domain model is also an input of the lattice
+    # pipeline, so importing the full pipeline while this web module loads
+    # would create a package-initialisation cycle.
+    from ..conformal_lattice.pipeline import fiber_aware_resin_only_height_plan
+
+    config["fiber_aware_resin_only_height_plan"] = fiber_aware_resin_only_height_plan(
+        spec,
+        resin_layer_height_mm=layer_height_mm,
+        fiber_layer_height_mm=CONFORMAL_MAPPING_REFERENCE_FIBER_LAYER_HEIGHT_MM,
+    )
     return config
 
 
@@ -936,6 +951,7 @@ def surface_preview_html() -> str:
         <div class="field"><label for="part_length_mm">零件长度 X（mm）</label><input id="part_length_mm" type="number" min="0.001" step="1" value="150"></div>
         <div class="field"><label for="part_width_mm">零件宽度 Y（mm）</label><input id="part_width_mm" type="number" min="0.001" step="1" value="50"></div>
         <div class="field"><label for="part_height_mm">最终物理高度 Z（mm）</label><input id="part_height_mm" type="number" min="0.001" step="0.1" value="10"></div>
+        <p class="hint" id="fiberAwareHeightHint">导出的 JSON 会同时记录纤维等效的无纤维层程。主界面关闭纤维时，会按当前树脂层高取最接近的完整层数；开启纤维时保持原有层程策略。</p>
         <div class="field"><label for="specimen_variant">试件版本</label><select id="specimen_variant"><option value="tensile" selected>拉伸版：两端夹持区</option><option value="bending">弯曲版：全长蜂窝工作段</option></select></div>
         <div class="field" id="gripEndLengthField"><label for="grip_end_length_mm">每端夹持区 X（mm）</label><input id="grip_end_length_mm" type="number" min="0.001" step="0.5" value="25" aria-describedby="gripLengthHint"></div>
         <p class="hint" id="gripLengthHint">两端采用相同长度；蜂窝工作段为 X 总长 − 2 × 每端夹持区。曲面仍按完整零件 X/Y 范围计算，不会因夹持区而改变波长、相位或曲率。</p>
@@ -1218,6 +1234,10 @@ def surface_preview_html() -> str:
       const samplesY = nonNegativeInteger('samples_y');
       const partHeight = positiveNumber('part_height_mm');
       const progressionSummary = document.getElementById('layerProgressionSummary');
+      const fiberAwareHeightHint = document.getElementById('fiberAwareHeightHint');
+      if (partHeight !== null) {
+        fiberAwareHeightHint.textContent = `导出 JSON 会记录纤维等效的无纤维层程（设计器参考：树脂 ${mappingReferenceLayerHeightMm.toFixed(3)} mm、纤维 0.100 mm）。主界面关闭纤维时按当前树脂层高取最近完整层数；开启纤维时保持原有层程策略。`;
+      }
       if (firstCurvedLayer === null || firstCurvedLayer < 2) {
         progressionSummary.className = 'designSummary error';
         progressionSummary.textContent = '首个非零曲率层必须是大于等于 2 的物理层号。';

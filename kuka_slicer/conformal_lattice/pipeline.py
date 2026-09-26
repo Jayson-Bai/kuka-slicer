@@ -13,6 +13,7 @@ from .contracts import ConformalLatticeSpec, load_conformal_lattice_spec
 from .continuous_course import ContinuousCoursePlan, build_continuous_course_plan, embed_continuous_course_plan
 from .fill_ratio_validation import FillRatioValidation, validate_realized_fill_ratio
 from .fiber_reinforcement import symmetric_curvature_fiber_schedule
+from ..fiber_interlayers import plan_flat_resin_interlayers
 from .layer_embedding import LayerEmbedding, _symmetric_alphas, embed_lattice_layers
 from .lattice_generator import (
     ConformalLatticeGeometry,
@@ -100,6 +101,80 @@ class ConformalLatticeRun:
         }
 
 
+def fiber_aware_resin_only_height_plan(
+    spec: ConformalLatticeSpec,
+    *,
+    resin_layer_height_mm: float,
+    fiber_layer_height_mm: float,
+) -> dict[str, object]:
+    """Describe the no-fiber resin stack that matches a fiber-enabled design.
+
+    The designer owns this small, portable reference plan.  The main UI may
+    use a different resin preset later, so it consumes the recorded reference
+    height and rounds it again with its active resin-layer height.
+    """
+
+    final_height = float(spec.part["final_height_mm"])
+    resin_height = float(resin_layer_height_mm)
+    fiber_height = float(fiber_layer_height_mm)
+    if not math.isfinite(resin_height) or resin_height <= 0.0:
+        raise ValueError("resin_layer_height_mm must be positive and finite")
+    if not math.isfinite(fiber_height) or fiber_height <= 0.0:
+        raise ValueError("fiber_layer_height_mm must be positive and finite")
+
+    if spec.source_provider == "planar":
+        resin_count = int(math.ceil(final_height / resin_height))
+        schedule = plan_flat_resin_interlayers(range(resin_count))
+        # Flat fiber remains a post-path operation in the main UI.  The last
+        # resin centre-line is consequently the same height users see in the
+        # final NPZ after all selected interfaces have raised later layers.
+        fiber_reference_height = (
+            (resin_count - 0.5) * resin_height
+            + len(schedule.after_resin_layer_indices) * fiber_height
+        )
+        fiber_layer_count = len(schedule.after_resin_layer_indices)
+        source = schedule.source
+    elif spec.source_provider == "double_sine":
+        # The double-sine route already owns a height-guided fiber schedule.
+        # Reuse it here so the saved no-fiber reference agrees with the path
+        # pipeline instead of duplicating its curvature-interface policy.
+        try:
+            _count, _centres, stack = _physical_layer_schedule(
+                spec,
+                requested_count=None,
+                physical_layer_height_mm=resin_height,
+                fiber_layer_height_mm=fiber_height,
+                plan_for_continuous_fiber=True,
+            )
+        except ValueError:
+            # A very short coupon can be valid as a resin-only design while
+            # being too short for the authored symmetric fiber window.  Its
+            # JSON must still export; the nominal height is the only valid
+            # no-fiber reference in that case.
+            fiber_reference_height = final_height
+            fiber_layer_count = 0
+            source = "symmetric_curvature_schedule_unavailable_fallback_v1"
+        else:
+            fiber_reference_height = float(stack["planned_final_height_mm"])
+            fiber_layer_count = int(stack["fiber_layer_count"])
+            source = "symmetric_curvature_height_guided_v1"
+    else:
+        raise ValueError("fiber-aware resin-only planning requires planar or double-sine source")
+
+    resin_only_count = max(1, int(math.floor(fiber_reference_height / resin_height + 0.5)))
+    return {
+        "format": "fiber_aware_resin_only_height_plan_v1",
+        "reference_resin_layer_height_mm": resin_height,
+        "reference_fiber_layer_height_mm": fiber_height,
+        "fiber_enabled_reference_height_mm": fiber_reference_height,
+        "reference_fiber_layer_count": fiber_layer_count,
+        "reference_fiber_schedule_source": source,
+        "resin_only_nearest_full_height_mm": resin_only_count * resin_height,
+        "resin_only_reference_layer_count": resin_only_count,
+        "rounding": "nearest_complete_resin_layer_stack",
+    }
+
+
 def _build_generated_surface_domain(
     spec: ConformalLatticeSpec,
     *,
@@ -121,6 +196,7 @@ def run_conformal_lattice_pipeline(
     physical_layer_height_mm: float | None = None,
     fiber_layer_height_mm: float | None = None,
     plan_for_continuous_fiber: bool = False,
+    resin_only_reference_height_mm: float | None = None,
     extrusion: ExtrusionVolumeModel | None = None,
     validate_fill_ratio: bool = False,
     fill_samples_per_triangle_side: int = 6,
@@ -145,6 +221,7 @@ def run_conformal_lattice_pipeline(
             physical_layer_height_mm=physical_layer_height_mm,
             fiber_layer_height_mm=fiber_layer_height_mm,
             plan_for_continuous_fiber=plan_for_continuous_fiber,
+            resin_only_reference_height_mm=resin_only_reference_height_mm,
         )
     elif spec.source_provider == "planar":
         raise ValueError("planar lattice workflow requires a rectangular part")
@@ -580,13 +657,16 @@ def _layer_embedding_for_spec(
             raise ValueError("planar lattice pipeline requires layer_embedding.mode=planar_stack")
         if base_z_by_layer is None:
             raise ValueError("planar lattice pipeline requires physical layer Z positions")
-        return embed_lattice_layers(
+        result = embed_lattice_layers(
             domain,
             orientation,
             geometry,
             mode="planar_stack",
             layer_offsets_mm=base_z_by_layer,
         )
+        if physical_stack_plan is not None:
+            result.report["physical_stack_plan"] = dict(physical_stack_plan)
+        return result
     if embedding.get("mode") != "symmetric_shape_morphing" or embedding.get("transition") != "smoothstep":
         raise ValueError("first-version UI pipeline supports only symmetric_shape_morphing with smoothstep")
     surface = spec.source_surface["double_sine"]
@@ -682,6 +762,7 @@ def _physical_layer_schedule(
     physical_layer_height_mm: float | None = None,
     fiber_layer_height_mm: float | None = None,
     plan_for_continuous_fiber: bool = False,
+    resin_only_reference_height_mm: float | None = None,
 ) -> tuple[int, np.ndarray, dict[str, object]]:
     """Return monotonic layer-centre Z values whose printed extent is the requested part height."""
 
@@ -733,6 +814,35 @@ def _physical_layer_schedule(
             "fiber_layer_indices": list(selected_layers),
             "fiber_layer_count": len(selected_layers),
             "resin_z_preplanned_for_fiber": True,
+        }
+
+    if resin_only_reference_height_mm is not None:
+        if plan_for_continuous_fiber:
+            raise ValueError("resin_only_reference_height_mm cannot be combined with continuous-fiber stack planning")
+        reference_height = float(resin_only_reference_height_mm)
+        if not math.isfinite(reference_height) or reference_height <= 0.0:
+            raise ValueError("resin_only_reference_height_mm must be positive and finite")
+        # This is deliberately a full-resin-layer plan.  A design JSON records
+        # the real Z reached by its fiber-enabled counterpart; when fiber is
+        # disabled the nearest complete resin stack is the only honest way to
+        # preserve that reference without adding a thin, unrelated top layer.
+        count = max(1, int(math.floor(reference_height / nominal_height + 0.5)))
+        planned_height = count * nominal_height
+        if requested_count is not None and requested_count != count:
+            raise ValueError("logical_layer_count must match the fiber-aware resin-only stack plan")
+        centres = (np.arange(count, dtype=np.float64) + 0.5) * nominal_height
+        return count, centres, {
+            "target_final_height_mm": reference_height,
+            "planned_final_height_mm": planned_height,
+            "height_error_mm": planned_height - reference_height,
+            "design_final_height_mm": final_height,
+            "resin_layer_count": count,
+            "resin_layer_height_mm": nominal_height,
+            "fiber_enabled": False,
+            "fiber_layer_count": 0,
+            "fiber_layer_indices": [],
+            "resin_z_preplanned_for_fiber": False,
+            "resin_only_plan_source": "design_json_fiber_aware_resin_only_v1",
         }
 
     count = int(math.ceil(final_height / nominal_height))
