@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import secrets
 import shutil
 import socket
 import subprocess
@@ -163,8 +164,12 @@ def run_app_session(tool: str) -> int:
     # browser, while their page heartbeat still owns the short-lived server.
     browser_heartbeat_session = sys.platform == "darwin"
     previous_browser_session = os.environ.get("KUKA_SLICER_BROWSER_SESSION")
+    previous_browser_session_token = os.environ.get("KUKA_SLICER_BROWSER_SESSION_TOKEN")
+    browser_session_token: str | None = None
     if browser_heartbeat_session:
+        browser_session_token = secrets.token_urlsafe(12)
         os.environ["KUKA_SLICER_BROWSER_SESSION"] = "1"
+        os.environ["KUKA_SLICER_BROWSER_SESSION_TOKEN"] = browser_session_token
     server = _launch_server_process(
         [sys.executable, "-m", "kuka_slicer", command, "--host", "127.0.0.1", "--port", str(port), *extra_args]
     )
@@ -173,7 +178,11 @@ def run_app_session(tool: str) -> int:
         _wait_for_port(port, server)
         browser_url = f"http://127.0.0.1:{port}"
         if browser_heartbeat_session:
-            browser_url += "?browser_session=1"
+            # A session-specific URL prevents macOS Chrome from selecting an
+            # old, dead tab that happens to have the same local address.
+            # Reusing that tab was indistinguishable from a button click that
+            # did nothing, while the server backing the old tab had exited.
+            browser_url += f"?browser_session=1&session={browser_session_token}"
         browser, profile_dir = _launch_browser_app(browser_url, tool)
         if browser_heartbeat_session:
             # Chrome's macOS process tree is not a dependable window-lifetime
@@ -190,6 +199,10 @@ def run_app_session(tool: str) -> int:
                 os.environ.pop("KUKA_SLICER_BROWSER_SESSION", None)
             else:
                 os.environ["KUKA_SLICER_BROWSER_SESSION"] = previous_browser_session
+            if previous_browser_session_token is None:
+                os.environ.pop("KUKA_SLICER_BROWSER_SESSION_TOKEN", None)
+            else:
+                os.environ["KUKA_SLICER_BROWSER_SESSION_TOKEN"] = previous_browser_session_token
         if profile_dir is not None:
             shutil.rmtree(profile_dir, ignore_errors=True)
 

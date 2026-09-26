@@ -80,17 +80,26 @@ def test_macos_ui_session_waits_for_heartbeat_owned_server(monkeypatch, tmp_path
     browser = _Process()
     profile = tmp_path / "isolated-browser-profile"
     profile.mkdir()
+    opened_urls: list[str] = []
     monkeypatch.setattr(app_session.subprocess, "Popen", lambda *args, **kwargs: server)
     monkeypatch.setattr(app_session.sys, "platform", "darwin")
     monkeypatch.setattr(app_session, "_wait_for_port", lambda *args, **kwargs: None)
-    monkeypatch.setattr(app_session, "_launch_browser_app", lambda *args, **kwargs: (browser, profile))
+    def launch_browser(url: str, *_args, **_kwargs):
+        opened_urls.append(url)
+        return browser, profile
+
+    monkeypatch.setattr(app_session, "_launch_browser_app", launch_browser)
     monkeypatch.delenv("KUKA_SLICER_BROWSER_SESSION", raising=False)
+    monkeypatch.delenv("KUKA_SLICER_BROWSER_SESSION_TOKEN", raising=False)
 
     assert app_session.run_app_session("ui") == 0
 
     assert server.waited
     assert not browser.waited
+    assert opened_urls[0].startswith("http://127.0.0.1:")
+    assert "?browser_session=1&session=" in opened_urls[0]
     assert "KUKA_SLICER_BROWSER_SESSION" not in app_session.os.environ
+    assert "KUKA_SLICER_BROWSER_SESSION_TOKEN" not in app_session.os.environ
 
 
 def test_server_process_requests_windows_job_breakaway(monkeypatch) -> None:

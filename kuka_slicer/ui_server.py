@@ -1432,35 +1432,14 @@ def run_ui_server(host: str, port: int, output_dir: Path) -> None:
             "message": "正在启动 Core 预热",
         }
         browser_session_required = os.environ.get("KUKA_SLICER_BROWSER_SESSION") == "1"
+        browser_session_token = os.environ.get("KUKA_SLICER_BROWSER_SESSION_TOKEN")
         browser_session_started_at = time.monotonic()
         browser_session_last_heartbeat: float | None = None
+        browser_session_lease_active = False
         browser_session_close_requested = False
         browser_session_lock = threading.Lock()
 
     server = ThreadingHTTPServer((host, port), SlicerUiHandler)
-
-    def stop_unattended_browser_session() -> None:
-        """Stop an app-launched UI after its browser page disappears."""
-
-        while True:
-            time.sleep(1.0)
-            now = time.monotonic()
-            with SlicerUiHandler.browser_session_lock:
-                last_heartbeat = SlicerUiHandler.browser_session_last_heartbeat
-            if last_heartbeat is None:
-                expired = now - SlicerUiHandler.browser_session_started_at >= 60.0
-            else:
-                expired = now - last_heartbeat >= 30.0
-            if expired:
-                server.shutdown()
-                return
-
-    if SlicerUiHandler.browser_session_required:
-        threading.Thread(
-            target=stop_unattended_browser_session,
-            daemon=True,
-            name="browser-session-watchdog",
-        ).start()
 
     def warm_core_workers() -> None:
         try:
@@ -1545,6 +1524,9 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/browser-session-lease":
+            self._serve_browser_session_lease(parse_qs(parsed.query))
+            return
         if parsed.path == "/":
             self._send_html(_index_html())
             return
@@ -1571,7 +1553,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": True})
             return
         if parsed.path == "/browser-session-close":
-            if type(self).browser_session_required:
+            if type(self).browser_session_required and self._matches_browser_session(parse_qs(parsed.query)):
                 with type(self).browser_session_lock:
                     already_closing = type(self).browser_session_close_requested
                     type(self).browser_session_close_requested = True
@@ -1690,6 +1672,40 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                 "message": "已接收任务，等待处理",
             }
         )
+
+    def _matches_browser_session(self, params: dict[str, list[str]]) -> bool:
+        """Reject close signals from an older tab sharing this local port."""
+
+        expected = type(self).browser_session_token
+        return not expected or params.get("session", [""])[0] == expected
+
+    def _serve_browser_session_lease(self, params: dict[str, list[str]]) -> None:
+        """Keep one browser-owned session alive without timer throttling."""
+
+        if not type(self).browser_session_required or not self._matches_browser_session(params):
+            self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+            return
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache, no-store")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        try:
+            while not type(self).browser_session_close_requested:
+                with type(self).browser_session_lock:
+                    type(self).browser_session_lease_active = True
+                    type(self).browser_session_last_heartbeat = time.monotonic()
+                self.wfile.write(b": session-lease\n\n")
+                self.wfile.flush()
+                time.sleep(2.0)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            with type(self).browser_session_lock:
+                type(self).browser_session_close_requested = True
+            threading.Thread(
+                target=self.server.shutdown,
+                daemon=True,
+                name="browser-session-lease-close",
+            ).start()
 
     def _choose_surface_npz_preview(self) -> None:
         """Choose and load a legacy mapped or conformal-path NPZ."""
@@ -9645,15 +9661,27 @@ def _index_html() -> str:
     showDirectionInput.addEventListener('change', drawPreview);
     window.addEventListener('resize', drawPreview);
     if (new URLSearchParams(window.location.search).get('browser_session') === '1') {{
-      const sendBrowserSessionHeartbeat = () => {{
-        fetch('/browser-session-heartbeat', {{ method: 'POST', keepalive: true }}).catch(() => {{}});
-      }};
-      sendBrowserSessionHeartbeat();
-      const browserSessionHeartbeatTimer = window.setInterval(sendBrowserSessionHeartbeat, 5000);
+      // Closing or navigating away from this page is distinct from merely
+      // backgrounding it while the designer opens in front of it.
       window.addEventListener('pagehide', () => {{
-        window.clearInterval(browserSessionHeartbeatTimer);
-        navigator.sendBeacon('/browser-session-close', '');
+        const session = new URLSearchParams(window.location.search).get('session') || '';
+        navigator.sendBeacon('/browser-session-close?session=' + encodeURIComponent(session));
       }}, {{ once: true }});
+      // This response intentionally stays open. Unlike setInterval-based
+      // heartbeats it remains alive while Chrome backgrounds this tab after
+      // the designer opens; closing the page breaks the stream server-side.
+      (async () => {{
+        try {{
+          const session = new URLSearchParams(window.location.search).get('session') || '';
+          const response = await fetch('/browser-session-lease?session=' + encodeURIComponent(session), {{ cache: 'no-store' }});
+          const reader = response.body?.getReader();
+          if (!reader) return;
+          while (true) {{
+            const next = await reader.read();
+            if (next.done) return;
+          }}
+        }} catch (_error) {{}}
+      }})();
     }}
     drawPreview();
   </script>
