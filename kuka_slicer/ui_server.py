@@ -14,7 +14,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import re
 import shutil
-import subprocess
 import sys
 import threading
 import time
@@ -1413,8 +1412,6 @@ def run_ui_server(host: str, port: int, output_dir: Path) -> None:
         server_output_dir = output_dir.resolve()
         slice_jobs: dict[str, dict[str, object]] = {}
         slice_jobs_lock = threading.Lock()
-        tool_launchers: dict[str, subprocess.Popen[bytes]] = {}
-        tool_launchers_lock = threading.Lock()
         surface_preview_picker_lock = threading.Lock()
         surface_preview_picker_state_path = _surface_preview_picker_state_path(server_output_dir)
         surface_preview_last_directory = _load_surface_preview_last_directory(
@@ -1506,8 +1503,6 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
     server_output_dir: Path
     slice_jobs: dict[str, dict[str, object]] = {}
     slice_jobs_lock = threading.Lock()
-    tool_launchers: dict[str, subprocess.Popen[bytes]] = {}
-    tool_launchers_lock = threading.Lock()
     surface_preview_picker_lock = threading.Lock()
     surface_preview_last_directory: Path | None = None
     surface_preview_picker_state_path: Path | None = None
@@ -1569,9 +1564,6 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                         name="browser-session-close",
                     ).start()
             self._send_json({"ok": True})
-            return
-        if parsed.path == "/launch-tool":
-            self._launch_tool(parse_qs(parsed.query))
             return
         if parsed.path == "/ui-settings":
             try:
@@ -1770,35 +1762,6 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                 ),
             }
         )
-
-    def _launch_tool(self, params: dict[str, list[str]]) -> None:
-        tool = params.get("tool", [""])[0]
-        if tool not in {"surface-preview", "surface-map"}:
-            self._send_json({"ok": False, "error": "unknown local tool"}, HTTPStatus.BAD_REQUEST)
-            return
-        with self.tool_launchers_lock:
-            existing = self.tool_launchers.get(tool)
-            if existing is not None and existing.poll() is None:
-                self._send_json({"ok": True, "already_running": True})
-                return
-            from .app_session import spawn_app_session
-
-            process = spawn_app_session(tool)
-            self.tool_launchers[tool] = process
-        watcher = threading.Thread(
-            target=self._clear_finished_tool,
-            args=(tool, process),
-            daemon=True,
-            name=f"slicer-tool-{tool}",
-        )
-        watcher.start()
-        self._send_json({"ok": True, "already_running": False})
-
-    def _clear_finished_tool(self, tool: str, process: subprocess.Popen[bytes]) -> None:
-        process.wait()
-        with self.tool_launchers_lock:
-            if self.tool_launchers.get(tool) is process:
-                self.tool_launchers.pop(tool, None)
 
     def log_message(self, format: str, *args: object) -> None:
         print(f"{self.address_string()} - {format % args}")
@@ -5625,7 +5588,6 @@ def _index_html() -> str:
         <div class="surfaceToolGroups">
           <div class="surfaceToolGroup" aria-label="蜂窝结构 JSON 流程">
             <span class="surfaceToolGroupLabel">蜂窝结构</span>
-            <button id="surfacePreviewButton" class="surfaceToolButton" type="button">打开设计器</button>
             <button id="conformalSpecButton" class="surfaceToolButton" type="button">导入设计 JSON</button>
             <button id="coreProcessSettingsTopButton" class="surfaceToolButton" type="button">Core 导出参数</button>
             <button id="conformalSliceButton" class="surfaceToolButton primary" type="button" disabled>生成并导入 Core</button>
@@ -6404,9 +6366,6 @@ def _index_html() -> str:
   <script>
     const form = document.getElementById('sliceForm');
     const button = document.getElementById('sliceButton');
-    const surfaceToolButtons = {{
-      'surface-preview': document.getElementById('surfacePreviewButton')
-    }};
     const surfaceNpzPreviewButton = document.getElementById('surfaceNpzPreviewButton');
     const coreNpzPreviewButton = document.getElementById('coreNpzPreviewButton');
     const conformalSpecButton = document.getElementById('conformalSpecButton');
@@ -6440,28 +6399,6 @@ def _index_html() -> str:
     }}
     restoreConformalFiberSettings();
     conformalFiberEnabled.addEventListener('change', saveConformalFiberSettings);
-    async function launchSurfaceTool(tool) {{
-      const toolButton = surfaceToolButtons[tool];
-      const originalLabel = toolButton.textContent;
-      toolButton.disabled = true;
-      toolButton.textContent = '正在启动…';
-      try {{
-        const response = await fetch('/launch-tool?tool=' + encodeURIComponent(tool), {{ method: 'POST' }});
-        const result = await response.json();
-        if (!response.ok || !result.ok) throw new Error(result.error || '启动失败');
-        statusEl.className = 'status ok';
-        statusEl.textContent = result.already_running
-          ? '该曲面工具窗口已打开。'
-          : '曲面工具已在独立窗口打开；关闭该窗口后服务会自动停止。';
-      }} catch (error) {{
-        statusEl.className = 'status error';
-        statusEl.textContent = '无法启动曲面工具：' + error.message;
-      }} finally {{
-        toolButton.disabled = false;
-        toolButton.textContent = originalLabel;
-      }}
-    }}
-    surfaceToolButtons['surface-preview'].addEventListener('click', () => launchSurfaceTool('surface-preview'));
     function applyMappedSurfacePreview(preview, fileName, collisionCheckAvailable = false) {{
       const isConformalLattice = preview?.preview_source === 'conformal_lattice_external_source_npz';
       previewData = preview;

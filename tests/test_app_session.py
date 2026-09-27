@@ -307,11 +307,10 @@ def test_macos_profile_process_lookup_matches_the_browser_and_profile(monkeypatc
     assert app_session._macos_browser_profile_pids(profile, chrome) == (123,)
 
 
-def test_main_ui_exposes_surface_tool_launchers() -> None:
+def test_main_ui_leaves_the_designer_to_its_independent_desktop_launcher() -> None:
     html = _index_html()
 
-    assert 'id="surfacePreviewButton"' in html
+    assert 'id="surfacePreviewButton"' not in html
     assert 'id="surfaceMapperButton"' not in html
-    assert "surfaceToolButtons['surface-preview'].addEventListener" in html
-    assert "surfaceToolButtons['surface-map'].addEventListener" not in html
-    assert "/launch-tool?tool=" in html
+    assert "surfaceToolButtons" not in html
+    assert "/launch-tool?tool=" not in html
