@@ -298,9 +298,11 @@ def test_sine_surface_axes_are_independent(x_enabled, y_enabled, x_mm, y_mm):
         assert dy == pytest.approx(0.0)
 
 
-def test_sine_surface_rejects_disabling_both_axes():
-    with pytest.raises(ValueError, match="at least one axis"):
-        DoubleSineSurface(x_enabled=False, y_enabled=False)
+def test_sine_surface_with_both_axes_disabled_is_a_flat_preview_field():
+    surface = DoubleSineSurface(z_reference_mm=1.25, x_enabled=False, y_enabled=False)
+
+    assert surface.height(4.0, 9.0) == pytest.approx(1.25)
+    assert surface.gradient(4.0, 9.0) == pytest.approx((0.0, 0.0))
 
 
 def test_double_sine_surface_reports_analytical_maximum_slope():
@@ -341,6 +343,62 @@ def test_surface_payload_contains_surface_grid_and_diagnostics():
     assert len(payload["grid"]["z"]) == 9
     assert len(payload["grid"]["z"][0]) == 9
     assert payload["statistics"]["z_range_mm"] > 0.0
+
+
+@pytest.mark.parametrize(
+    ("x_enabled", "y_enabled", "expected_provider"),
+    [
+        (True, True, "double_sine"),
+        (True, False, "double_sine"),
+        (False, True, "double_sine"),
+        (False, False, "planar"),
+    ],
+)
+def test_designer_exports_all_curvature_axis_combinations_without_synthetic_planar_parameters(
+    x_enabled, y_enabled, expected_provider
+):
+    params = {
+        "part_length_mm": ["150"],
+        "part_width_mm": ["60"],
+        "part_height_mm": ["8"],
+        "specimen_variant": ["bending"],
+        "curvature_x_enabled": [str(x_enabled).lower()],
+        "curvature_y_enabled": [str(y_enabled).lower()],
+        "surface_start_layer": ["2"],
+        "surface_start_layer_semantics": ["first_nonzero_curvature_physical"],
+        "transition_step_count": ["6"],
+        "transition_step_policy": ["manual"],
+    }
+
+    config = conformal_lattice_config_payload(params)
+
+    assert config["source_surface"]["provider"] == expected_provider
+    if expected_provider == "planar":
+        assert "double_sine" not in config["source_surface"]
+        assert config["layer_embedding"] == {"mode": "planar_stack"}
+    else:
+        surface = config["source_surface"]["double_sine"]
+        assert surface["curvature_x_enabled"] is x_enabled
+        assert surface["curvature_y_enabled"] is y_enabled
+        assert config["layer_embedding"]["transition_step_policy"] == "manual"
+        assert config["layer_embedding"]["transition_step_count"] == 6
+
+
+def test_surface_payload_previews_both_axes_disabled_as_a_flat_plane():
+    payload = surface_payload(
+        {
+            "curvature_x_enabled": ["false"],
+            "curvature_y_enabled": ["false"],
+            "z_reference_mm": ["0"],
+            "width_mm": ["30"],
+            "height_mm": ["20"],
+            "samples": ["9"],
+        }
+    )
+
+    assert payload["statistics"]["z_range_mm"] == pytest.approx(0.0)
+    assert payload["surface"]["curvature_x_enabled"] is False
+    assert payload["surface"]["curvature_y_enabled"] is False
 
 
 def test_conformal_rectangle_preview_uses_the_exported_lower_left_origin():
@@ -518,6 +576,30 @@ def test_designer_first_nonzero_physical_layer_semantics_map_to_the_legacy_progr
     assert config["layer_embedding"]["first_nonzero_curvature_layer_physical"] == 3
 
 
+def test_designer_manual_transition_steps_match_the_solid_stack_preview_and_export():
+    params = {
+        "part_length_mm": ["150"],
+        "part_width_mm": ["60"],
+        "part_height_mm": ["8"],
+        "surface_start_layer": ["2"],
+        "surface_start_layer_semantics": ["first_nonzero_curvature_physical"],
+        "transition_step_policy": ["manual"],
+        "transition_step_count": ["6"],
+        "samples": ["9"],
+    }
+
+    preview = surface_payload(
+        {**params, "width_mm": ["150"], "height_mm": ["60"]},
+        rectangle_origin_lower_left=True,
+    )
+    config = conformal_lattice_config_payload(params)
+
+    assert preview["solid_stack"]["transition_step_count"] == 6
+    assert preview["solid_stack"]["peak_layer_indices"] == [6, 7, 8, 9]
+    assert config["layer_embedding"]["transition_step_policy"] == "manual"
+    assert config["layer_embedding"]["transition_step_count"] == 6
+
+
 def test_surface_payload_converts_designer_pi_multiples_to_internal_radians():
     payload = surface_payload(
         {
@@ -567,6 +649,8 @@ def test_surface_preview_html_has_an_independent_surface_api_and_controls():
     assert 'id="wave_count_y"' in html
     assert 'id="applyTensilePreset"' in html
     assert 'id="amplitude_mm"' in html
+    assert 'id="curvature_x_enabled" type="checkbox" checked' in html
+    assert 'id="curvature_y_enabled" type="checkbox" checked' in html
     assert 'id="wavelength_x_mm"' in html
     assert 'id="phase_x_pi"' in html
     assert 'id="phase_y_pi"' in html
@@ -616,6 +700,10 @@ def test_surface_preview_html_has_an_independent_surface_api_and_controls():
     assert 'function drawSurfaceGuideMesh' in html
     assert 'function physicalPreviewLayer' in html
     assert 'function physicalLayerZ' in html
+    assert 'id="transition_step_count"' in html
+    assert 'id="transition_step_policy" type="hidden" value="auto_to_midplane"' in html
+    assert 'id="restoreAutomaticTransition"' in html
+    assert 'function syncTransitionStepInput' in html
     assert 'const baseZ = 0;' in html
     assert 'Z=0 基准面' in html
     assert 'α=1 完整曲率层（物理 Z）' in html

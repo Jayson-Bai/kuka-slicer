@@ -95,8 +95,8 @@ def test_double_sine_domain_is_deterministic_and_has_one_boundary_loop():
 @pytest.mark.parametrize(
     ("x_enabled", "y_enabled", "point", "expected_height"),
     [
-        (True, False, (5.0, 7.0), 2.0),
-        (False, True, (3.0, 7.5), 2.0),
+        (True, False, (5.0, 7.5), 2.0),
+        (False, True, (5.0, 7.5), 2.0),
     ],
 )
 def test_generated_surface_contract_supports_one_active_sine_axis(
@@ -106,6 +106,7 @@ def test_generated_surface_contract_supports_one_active_sine_axis(
     surface = raw["source_surface"]["double_sine"]
     surface["curvature_x_enabled"] = x_enabled
     surface["curvature_y_enabled"] = y_enabled
+    surface["samples"] = [5, 5]
     raw["source_surface"]["sha256"] = double_sine_source_sha256(raw["source_surface"])
 
     spec = load_conformal_lattice_spec(raw)

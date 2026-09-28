@@ -12,6 +12,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
+import numpy as np
+
 from ..conformal_lattice.contracts import (
     CONFORMAL_LATTICE_SPEC_V1,
     double_sine_source_sha256,
@@ -20,7 +22,6 @@ from ..conformal_lattice.contracts import (
 )
 from .model import DoubleSineSurface
 from .stl_domain import STLProjectionDomain, stl_projection_domain_from_bytes
-from ..surface_mapper.progression import LayerProgression
 
 
 DEFAULT_PREVIEW_WIDTH_MM = 120.0
@@ -189,6 +190,8 @@ def _surface_from_query(
     mode = params.get("surface_parameter_mode", ["manual_wavelength_phase"])[0]
     amplitude_mm = _query_float(params, "amplitude_mm", 0.8)
     z_reference_mm = _query_float(params, "z_reference_mm", 0.0)
+    curvature_x_enabled = _query_bool(params, "curvature_x_enabled", True)
+    curvature_y_enabled = _query_bool(params, "curvature_y_enabled", True)
     if mode == "tensile_centered_wave_count":
         wave_count_x = _query_positive_half_integer(params, "wave_count_x", 1.5)
         wave_count_y = _query_positive_half_integer(params, "wave_count_y", 1.5)
@@ -204,6 +207,8 @@ def _surface_from_query(
                 phase_x_rad=phase_x_rad,
                 phase_y_rad=phase_y_rad,
                 z_reference_mm=z_reference_mm,
+                x_enabled=curvature_x_enabled,
+                y_enabled=curvature_y_enabled,
             ),
             {
                 "mode": mode,
@@ -230,6 +235,8 @@ def _surface_from_query(
                 legacy_radians_name="phase_y_rad",
             ),
             z_reference_mm=z_reference_mm,
+            x_enabled=curvature_x_enabled,
+            y_enabled=curvature_y_enabled,
         ),
         {"mode": mode, "phase_policy": "manual"},
     )
@@ -295,17 +302,10 @@ def _inspection_point(
     y_mm = _query_float(params, "check_y_mm", (y_min_mm + y_max_mm) / 2.0)
     if not x_min_mm <= x_mm <= x_max_mm or not y_min_mm <= y_mm <= y_max_mm:
         raise ValueError("check point must lie inside the preview XY bounds")
-    phase_x = (2.0 * math.pi * x_mm) / surface.wavelength_x_mm + surface.phase_x_rad
-    phase_y = (2.0 * math.pi * y_mm) / surface.wavelength_y_mm + surface.phase_y_rad
-    kx = 2.0 * math.pi / surface.wavelength_x_mm
-    ky = 2.0 * math.pi / surface.wavelength_y_mm
-    sin_x, cos_x = math.sin(phase_x), math.cos(phase_x)
-    sin_y, cos_y = math.sin(phase_y), math.cos(phase_y)
-    fx = surface.amplitude_mm * kx * cos_x * sin_y
-    fy = surface.amplitude_mm * ky * sin_x * cos_y
-    fxx = -surface.amplitude_mm * kx * kx * sin_x * sin_y
-    fyy = -surface.amplitude_mm * ky * ky * sin_x * sin_y
-    fxy = surface.amplitude_mm * kx * ky * cos_x * cos_y
+    fx_value, fy_value = surface.gradient(x_mm, y_mm)
+    fxx_value, fyy_value, fxy_value = surface.second_derivatives(x_mm, y_mm)
+    fx, fy = float(fx_value), float(fy_value)
+    fxx, fyy, fxy = float(fxx_value), float(fyy_value), float(fxy_value)
     denominator = 2.0 * (1.0 + fx * fx + fy * fy) ** 1.5
     mean_curvature = (
         (1.0 + fy * fy) * fxx - 2.0 * fx * fy * fxy + (1.0 + fx * fx) * fyy
@@ -331,11 +331,34 @@ def _conformal_solid_stack_payload(
     if "part_height_mm" not in params and "surface_start_layer" not in params:
         return None
     final_height_mm = _query_float(params, "part_height_mm", 10.0, positive=True)
+    # Import lazily: mesh_domain imports surface_preview.model while the
+    # conformal package is initialising.
+    from ..conformal_lattice.layer_embedding import (
+        _maximum_symmetric_transition_steps,
+        _symmetric_alphas,
+    )
+
     layer_count = int(math.ceil(final_height_mm / CONFORMAL_MAPPING_REFERENCE_LAYER_HEIGHT_MM))
     start_layer, first_curved_layer = _resolve_surface_progression_start(
         params, logical_layer_count=layer_count
     )
-    progression = LayerProgression(start_layer, layer_count - 1)
+    transition_policy = params.get("transition_step_policy", ["auto_to_midplane"])[0]
+    if transition_policy not in {"auto_to_midplane", "manual"}:
+        raise ValueError("transition_step_policy must be auto_to_midplane or manual")
+    maximum_transition_steps = _maximum_symmetric_transition_steps(
+        layer_count, surface_start_layer=start_layer
+    )
+    requested_transition_steps = (
+        _query_nonnegative_int(params, "transition_step_count", maximum_transition_steps, minimum=1)
+        if transition_policy == "manual"
+        else None
+    )
+    alphas = _symmetric_alphas(
+        layer_count,
+        surface_start_layer=start_layer,
+        transition_step_count=requested_transition_steps,
+    )
+    resolved_transition_steps = maximum_transition_steps if requested_transition_steps is None else requested_transition_steps
     layer_thicknesses = [CONFORMAL_MAPPING_REFERENCE_LAYER_HEIGHT_MM] * layer_count
     layer_thicknesses[-1] = final_height_mm - CONFORMAL_MAPPING_REFERENCE_LAYER_HEIGHT_MM * (layer_count - 1)
     base_z_by_layer: list[float] = []
@@ -350,7 +373,7 @@ def _conformal_solid_stack_payload(
     ]
     layers = []
     for index, base_z_mm in enumerate(base_z_by_layer):
-        alpha = progression.alpha(index)
+        alpha = float(alphas[index])
         layers.append(
             {
                 "index": index,
@@ -370,12 +393,15 @@ def _conformal_solid_stack_payload(
         "surface_start_layer": start_layer,
         "first_nonzero_curvature_layer_physical": first_curved_layer,
         "surface_start_layer_semantics": "first_nonzero_curvature_physical",
-        "surface_return_layer": progression.surface_return_layer,
-        "peak_layer_indices": list(progression.peak_layers),
+        "surface_return_layer": layer_count - 1 - start_layer,
+        "transition_step_policy": transition_policy,
+        "transition_step_count": resolved_transition_steps,
+        "maximum_transition_step_count": maximum_transition_steps,
+        "peak_layer_indices": np.flatnonzero(np.isclose(alphas, 1.0)).tolist(),
         # The lower of the one/two complete-curvature layers is the stable
         # three-dimensional representative.  It is a physical layer centre,
         # not the Z=0 surface-definition reference plane.
-        "representative_peak_layer_index": progression.peak_layers[0],
+        "representative_peak_layer_index": int(np.flatnonzero(np.isclose(alphas, 1.0))[0]),
         "layers": layers,
     }
 
@@ -456,6 +482,8 @@ def surface_payload(
         },
         "surface": {
             "type": "double_sine_product",
+            "curvature_x_enabled": surface.x_enabled,
+            "curvature_y_enabled": surface.y_enabled,
             "amplitude_mm": surface.amplitude_mm,
             "wavelength_x_mm": surface.wavelength_x_mm,
             "wavelength_y_mm": surface.wavelength_y_mm,
@@ -518,6 +546,10 @@ def graded_surface_config_payload(
 def conformal_lattice_config_payload(params: dict[str, list[str]]) -> dict[str, object]:
     """Build the STL-free rectangular conformal-design contract."""
 
+    if not _query_bool(params, "curvature_x_enabled", True) and not _query_bool(
+        params, "curvature_y_enabled", True
+    ):
+        return _rectangular_lattice_config_payload(params, source_provider="planar")
     return _rectangular_lattice_config_payload(params, source_provider="double_sine")
 
 
@@ -599,6 +631,8 @@ def _rectangular_lattice_config_payload(
     )
     random_seed = _query_nonnegative_int(params, "random_seed", 0)
     if source_provider == "double_sine":
+        from ..conformal_lattice.layer_embedding import _maximum_symmetric_transition_steps
+
         surface_params = {**params, "width_mm": [str(length_mm)], "height_mm": [str(width_mm)]}
         surface = surface_payload(
             surface_params,
@@ -633,6 +667,27 @@ def _rectangular_lattice_config_payload(
             "surface_start_layer_semantics": "legacy_zero_alpha_zero_based",
             "first_nonzero_curvature_layer_physical": first_curved_layer,
         }
+        maximum_transition_steps = _maximum_symmetric_transition_steps(
+            logical_layer_count, surface_start_layer=surface_start_layer
+        )
+        transition_policy = params.get("transition_step_policy", ["auto_to_midplane"])[0]
+        if transition_policy not in {"auto_to_midplane", "manual"}:
+            raise ValueError("transition_step_policy must be auto_to_midplane or manual")
+        layer_embedding["transition_step_policy"] = transition_policy
+        if transition_policy == "manual":
+            transition_step_count = _query_nonnegative_int(
+                params,
+                "transition_step_count",
+                maximum_transition_steps,
+                minimum=1,
+            )
+            if transition_step_count > maximum_transition_steps:
+                raise ValueError(
+                    f"transition_step_count must not exceed {maximum_transition_steps} for the design reference stack"
+                )
+            layer_embedding["transition_step_count"] = transition_step_count
+        elif maximum_transition_steps >= 1:
+            layer_embedding["transition_step_count"] = maximum_transition_steps
     else:
         source_surface = {
             "provider": "planar",
@@ -959,6 +1014,9 @@ def surface_preview_html() -> str:
         <p class="modelMeta" id="modelMeta">外边界固定为矩形；新共形流程不读取 STL，也不继承 STL 中的蜂窝孔壁。</p>
         <div class="divider"></div>
         <h2>曲面参数</h2>
+        <div class="field"><label for="curvature_x_enabled">启用 X 向曲率</label><input id="curvature_x_enabled" type="checkbox" checked></div>
+        <div class="field"><label for="curvature_y_enabled">启用 Y 向曲率</label><input id="curvature_y_enabled" type="checkbox" checked></div>
+        <p class="hint" id="curvatureAxesHint">X、Y 同时启用为双正弦曲面；只启用一个方向为单正弦曲面；全部关闭时预览和“连续路径 JSON”导出均自动使用现有平面蜂窝合同。</p>
         <div class="field"><label for="surface_parameter_mode">曲面参数策略</label><select id="surface_parameter_mode"><option value="tensile_centered_wave_count" selected>拉伸：试样中心对称波数</option><option value="manual_wavelength_phase">手动：波长与相位</option></select></div>
         <div class="field"><label for="amplitude_mm">幅值 A（mm）</label><input id="amplitude_mm" type="number" step="0.01" value="1.5"></div>
         <div id="tensileWaveFields">
@@ -1006,8 +1064,12 @@ def surface_preview_html() -> str:
         <p class="hint">长度是平面预览中每条完整连续路径的累加，不包含层数和曲面映射造成的弧长变化；后续接入路径内核时会重新以实际三维长度计算挤出量。</p>
         <div class="divider"></div>
         <h2>对称层间渐变</h2>
-        <div class="field"><label for="surface_start_layer">首个非零曲率层（物理层）</label><input id="surface_start_layer" type="number" min="2" step="1" value="3"></div>
-        <p class="hint">以自下而上、从 1 开始计数。填 3 表示第 1–2 层为平面，第 3 层首次出现非零曲率；连续纤维可在第 2 层树脂完成后铺设。导出仍保留旧映射器所需的零基边界层索引。</p>
+        <div class="field"><label for="surface_start_layer">首个非零曲率层（物理层）</label><input id="surface_start_layer" type="number" min="2" step="1" value="2"></div>
+        <div class="field"><label for="transition_step_count">达到完整曲率的层间步数</label><input id="transition_step_count" type="number" min="1" step="1" value="9" aria-describedby="transitionStepHint"></div>
+        <input id="transition_step_policy" type="hidden" value="auto_to_midplane">
+        <button type="button" class="secondary" id="restoreAutomaticTransition">恢复自动过渡步数</button>
+        <p class="hint" id="transitionStepHint">步数是从 α=0 边界层到首次 α=1 层经历的层间间隔数。默认根据设计器参考层数自动计算；手动修改后保留该值，并在最终实际层栈上重新核验。</p>
+        <p class="hint">层号自下而上从 1 开始。填 2 表示第 1 层为平面、第 2 层首次出现非零曲率；导出仍保留旧映射器所需的零基边界层索引。</p>
         <div class="designSummary" id="layerProgressionSummary" aria-live="polite"></div>
         <details class="advanced">
           <summary>高级参数（共形计算）</summary>
@@ -1033,16 +1095,16 @@ def surface_preview_html() -> str:
         <div class="field"><label for="surfaceZScale">三维视觉 Z 放大</label><select id="surfaceZScale"><option value="1">真实比例 ×1</option><option value="3">形态观察 ×3</option><option value="5" selected>形态观察 ×5</option><option value="10">形态观察 ×10</option></select></div>
         <div class="field"><label for="sectionZScale">XZ 剖面视觉 Z 放大</label><select id="sectionZScale"><option value="1">真实比例 ×1</option><option value="3" selected>辅助观察 ×3</option><option value="5">辅助观察 ×5</option></select></div>
         <p class="hint">视觉 Z 放大只影响画布，不改变参数、检验值、导出的 JSON 或实际零件尺寸。XZ 剖面采用统一 X/Z 比例后再按所选倍率放大 Z，避免隐藏的纵向拉伸。</p>
-        <canvas id="canvas" aria-label="双正弦曲面预览"></canvas>
+        <canvas id="canvas" aria-label="蜂窝承载曲面预览"></canvas>
         <p class="navigationHint">左键拖拽旋转；中键拖拽平移；右键上下拖拽缩放；滚轮缩放；双击恢复视角。</p>
         <div class="status" id="status">正在生成曲面…</div>
       </section>
     </section>
   </main>
   <script>
-    const surfaceIds = ['surface_parameter_mode', 'amplitude_mm', 'wave_count_x', 'wave_count_y', 'wavelength_x_mm', 'wavelength_y_mm', 'phase_x_pi', 'phase_y_pi', 'z_reference_mm', 'inspection_enabled', 'check_x_mm', 'check_y_mm', 'samples'];
+    const surfaceIds = ['curvature_x_enabled', 'curvature_y_enabled', 'surface_parameter_mode', 'amplitude_mm', 'wave_count_x', 'wave_count_y', 'wavelength_x_mm', 'wavelength_y_mm', 'phase_x_pi', 'phase_y_pi', 'z_reference_mm', 'inspection_enabled', 'check_x_mm', 'check_y_mm', 'samples'];
     const mappingReferenceLayerHeightMm = 0.5;
-    const conformalDesignIds = ['part_length_mm', 'part_width_mm', 'part_height_mm', 'specimen_variant', 'grip_end_length_mm', 'wall_width_mm', 'base_cell_size_mm', 'orientation_angle_deg', 'align_load_line', 'honeycomb_align_x', 'honeycomb_align_x_mm', 'honeycomb_align_y', 'honeycomb_align_y_mm', 'surface_start_layer', 'samples_x', 'samples_y', 'boundary_mode', 'random_seed'];
+    const conformalDesignIds = ['part_length_mm', 'part_width_mm', 'part_height_mm', 'specimen_variant', 'grip_end_length_mm', 'wall_width_mm', 'base_cell_size_mm', 'orientation_angle_deg', 'surface_start_layer', 'transition_step_count', 'transition_step_policy', 'samples_x', 'samples_y', 'boundary_mode', 'random_seed'];
     const canvas = document.getElementById('canvas');
     const statusEl = document.getElementById('status');
     const statsEl = document.getElementById('stats');
@@ -1159,10 +1221,22 @@ def surface_preview_html() -> str:
 
     function syncSurfaceParameterControls() {
       const tensileMode = document.getElementById('surface_parameter_mode').value === 'tensile_centered_wave_count';
+      const xEnabled = document.getElementById('curvature_x_enabled').checked;
+      const yEnabled = document.getElementById('curvature_y_enabled').checked;
       document.getElementById('tensileWaveFields').hidden = !tensileMode;
       document.getElementById('manualSurfaceFields').hidden = tensileMode;
-      ['wave_count_x', 'wave_count_y'].forEach((id) => { document.getElementById(id).disabled = !tensileMode; });
-      ['wavelength_x_mm', 'wavelength_y_mm', 'phase_x_pi', 'phase_y_pi'].forEach((id) => { document.getElementById(id).disabled = tensileMode; });
+      document.getElementById('wave_count_x').disabled = !tensileMode || !xEnabled;
+      document.getElementById('wave_count_y').disabled = !tensileMode || !yEnabled;
+      ['wavelength_x_mm', 'phase_x_pi'].forEach((id) => { document.getElementById(id).disabled = tensileMode || !xEnabled; });
+      ['wavelength_y_mm', 'phase_y_pi'].forEach((id) => { document.getElementById(id).disabled = tensileMode || !yEnabled; });
+      document.getElementById('amplitude_mm').disabled = !xEnabled && !yEnabled;
+      document.getElementById('curvatureAxesHint').textContent = xEnabled && yEnabled
+        ? '当前为 XY 双正弦乘积曲面。两个方向参数分别控制对应正弦因子。'
+        : xEnabled
+          ? '当前为 X 向单正弦曲面；Y 向波长和相位保留但不参与几何。'
+          : yEnabled
+            ? '当前为 Y 向单正弦曲面；X 向波长和相位保留但不参与几何。'
+            : '当前为平面蜂窝。预览保持平面，“连续路径 JSON”也走现有平面合同，不携带曲面或渐变参数。';
       updateTensileWaveHint();
     }
 
@@ -1181,13 +1255,43 @@ def surface_preview_html() -> str:
       const width = positiveNumber('part_width_mm');
       const nx = positiveNumber('wave_count_x');
       const ny = positiveNumber('wave_count_y');
+      const xEnabled = document.getElementById('curvature_x_enabled').checked;
+      const yEnabled = document.getElementById('curvature_y_enabled').checked;
       const isHalfInteger = (waves) => Math.abs((waves - 0.5) - Math.round(waves - 0.5)) < 1e-9;
-      if (length === null || width === null || nx === null || ny === null || !isHalfInteger(nx) || !isHalfInteger(ny)) {
+      if (length === null || width === null || (xEnabled && (nx === null || !isHalfInteger(nx))) || (yEnabled && (ny === null || !isHalfInteger(ny)))) {
         hint.textContent = '请输入正的试样尺寸，以及 0.5、1.5、2.5… 等半整数 X/Y 波数，以自动换算波长和相位。';
         return;
       }
+      if (!xEnabled && !yEnabled) {
+        hint.textContent = 'X、Y 曲率均关闭；波数参数已保留，但不会参与平面预览或平面 JSON。';
+        return;
+      }
       const phasePi = (waves) => ((0.5 - waves) % 2 + 2) % 2;
-      hint.textContent = `当前换算：λx=${(length / nx).toFixed(3)} mm，λy=${(width / ny).toFixed(3)} mm，φx=${phasePi(nx).toFixed(3)}π，φy=${phasePi(ny).toFixed(3)}π。中心为正峰，边界 H=0；改变矩形尺寸时保持 nx、ny 不变即可保持同类构型。`;
+      const descriptions = [];
+      if (xEnabled) descriptions.push(`λx=${(length / nx).toFixed(3)} mm，φx=${phasePi(nx).toFixed(3)}π`);
+      if (yEnabled) descriptions.push(`λy=${(width / ny).toFixed(3)} mm，φy=${phasePi(ny).toFixed(3)}π`);
+      hint.textContent = `当前启用方向换算：${descriptions.join('；')}。启用方向的中心为正峰、对应两端边界 H=0；关闭方向不参与几何。`;
+    }
+
+    function maximumTransitionStepCount() {
+      const firstCurvedLayer = nonNegativeInteger('surface_start_layer');
+      const partHeight = positiveNumber('part_height_mm');
+      if (firstCurvedLayer === null || firstCurvedLayer < 2 || partHeight === null) return null;
+      const layerCount = Math.ceil(partHeight / mappingReferenceLayerHeightMm);
+      const legacyStartLayer = firstCurvedLayer - 2;
+      const maximum = Math.floor((layerCount - 2 * legacyStartLayer - 1) / 2);
+      return maximum >= 1 ? maximum : null;
+    }
+
+    function syncTransitionStepInput({ restoreAutomatic = false } = {}) {
+      const policy = document.getElementById('transition_step_policy');
+      const input = document.getElementById('transition_step_count');
+      if (restoreAutomatic) policy.value = 'auto_to_midplane';
+      const maximum = maximumTransitionStepCount();
+      if (policy.value === 'auto_to_midplane' && maximum !== null) input.value = maximum;
+      document.getElementById('transitionStepHint').textContent = policy.value === 'manual'
+        ? `当前为手动值；零件高度或起始层改变时不会覆盖。最终切片将按真实层栈重新核验${maximum === null ? '' : `（设计器参考上限 ${maximum}）`}。`
+        : `当前为自动值${maximum === null ? '' : ` ${maximum}`}；按设计器 0.5 mm 参考层高填入，最终切片会根据真实层栈重新计算。`;
     }
 
     function clampInspectionPointToPartBounds() {
@@ -1231,6 +1335,7 @@ def surface_preview_html() -> str:
       }
 
       const firstCurvedLayer = nonNegativeInteger('surface_start_layer');
+      const transitionSteps = nonNegativeInteger('transition_step_count');
       const samplesX = nonNegativeInteger('samples_x');
       const samplesY = nonNegativeInteger('samples_y');
       const partHeight = positiveNumber('part_height_mm');
@@ -1245,22 +1350,29 @@ def surface_preview_html() -> str:
       } else if (partHeight === null) {
         progressionSummary.className = 'designSummary error';
         progressionSummary.textContent = '最终物理高度必须是正数。';
+      } else if (transitionSteps === null || transitionSteps < 1) {
+        progressionSummary.className = 'designSummary error';
+        progressionSummary.textContent = '达到完整曲率的层间步数必须是不小于 1 的整数。';
       } else if (samplesX === null || samplesX < 2 || samplesY === null || samplesY < 2) {
         progressionSummary.className = 'designSummary error';
         progressionSummary.textContent = '曲面采样 X 和 Y 都必须是不小于 2 的整数。';
       } else {
         const layerCount = Math.ceil(partHeight / mappingReferenceLayerHeightMm);
-        const maxLegacyStart = Math.floor((layerCount - 1) / 2);
-        const maxFirstCurvedLayer = maxLegacyStart + 2;
-        if (firstCurvedLayer > maxFirstCurvedLayer) {
+        const maximumTransitionSteps = maximumTransitionStepCount();
+        if (maximumTransitionSteps === null) {
           progressionSummary.className = 'designSummary error';
-          progressionSummary.textContent = `当前高度与参考层高共得到 ${layerCount} 个物理层；首个非零曲率层不能大于 ${maxFirstCurvedLayer}。`;
+          progressionSummary.textContent = `当前高度与参考层高共得到 ${layerCount} 个物理层；起始层没有留下至少一个对称过渡步。`;
+        } else if (transitionSteps > maximumTransitionSteps) {
+          progressionSummary.className = 'designSummary error';
+          progressionSummary.textContent = `当前参考层栈最多允许 ${maximumTransitionSteps} 个过渡步；手动值 ${transitionSteps} 不可行。请减小步数或恢复自动。`;
         } else {
           const legacyStartLayer = firstCurvedLayer - 2;
           const returnLayerPhysical = layerCount - legacyStartLayer;
-          const peakLayers = layerCount % 2 === 1 ? `${Math.floor(layerCount / 2) + 1}` : `${layerCount / 2}、${layerCount / 2 + 1}`;
+          const firstPeakLayer = firstCurvedLayer - 1 + transitionSteps;
+          const lastPeakLayer = returnLayerPhysical - transitionSteps;
+          const peakLayers = firstPeakLayer === lastPeakLayer ? `第 ${firstPeakLayer} 层` : `第 ${firstPeakLayer}–${lastPeakLayer} 层`;
           progressionSummary.className = 'designSummary';
-          progressionSummary.textContent = `映射参考层数：${layerCount}；首个非零曲率层：第 ${firstCurvedLayer} 层；对称回落至平面：第 ${returnLayerPhysical} 层；完整曲率层：第 ${peakLayers} 层；共形采样：${samplesX} × ${samplesY}。实际切片层高在主界面 Core 工艺参数中设置。`;
+          progressionSummary.textContent = `映射参考层数：${layerCount}；首个非零曲率层：第 ${firstCurvedLayer} 层；过渡步数：${transitionSteps}（${document.getElementById('transition_step_policy').value === 'manual' ? '手动' : '自动'}）；对称回落至平面：第 ${returnLayerPhysical} 层；完整曲率保持：${peakLayers}；共形采样：${samplesX} × ${samplesY}。实际切片会按 Core 真实层栈重新核验。`;
         }
       }
     }
@@ -1326,8 +1438,14 @@ def surface_preview_html() -> str:
       const surface = payload.surface;
       const xPhase = (2 * Math.PI * x) / surface.wavelength_x_mm + surface.phase_x_rad;
       const yPhase = (2 * Math.PI * y) / surface.wavelength_y_mm + surface.phase_y_rad;
-      const dx = surface.amplitude_mm * (2 * Math.PI / surface.wavelength_x_mm) * Math.cos(xPhase) * Math.sin(yPhase);
-      const dy = surface.amplitude_mm * (2 * Math.PI / surface.wavelength_y_mm) * Math.sin(xPhase) * Math.cos(yPhase);
+      const xFactor = surface.curvature_x_enabled ? Math.sin(xPhase) : 1;
+      const yFactor = surface.curvature_y_enabled ? Math.sin(yPhase) : 1;
+      const dx = surface.curvature_x_enabled
+        ? surface.amplitude_mm * (2 * Math.PI / surface.wavelength_x_mm) * Math.cos(xPhase) * yFactor
+        : 0;
+      const dy = surface.curvature_y_enabled
+        ? surface.amplitude_mm * (2 * Math.PI / surface.wavelength_y_mm) * xFactor * Math.cos(yPhase)
+        : 0;
       const normalLength = Math.hypot(dx, dy, 1);
       const normal = [-dx / normalLength, -dy / normalLength, 1 / normalLength];
       const light = [-0.38, -0.46, 0.8];
@@ -2185,9 +2303,14 @@ def surface_preview_html() -> str:
 
     function heightAt(x, y) {
       const surface = payload.surface;
-      return surface.z_reference_mm + surface.amplitude_mm
-        * Math.sin((2 * Math.PI * x) / surface.wavelength_x_mm + surface.phase_x_rad)
-        * Math.sin((2 * Math.PI * y) / surface.wavelength_y_mm + surface.phase_y_rad);
+      if (!surface.curvature_x_enabled && !surface.curvature_y_enabled) return surface.z_reference_mm;
+      const xFactor = surface.curvature_x_enabled
+        ? Math.sin((2 * Math.PI * x) / surface.wavelength_x_mm + surface.phase_x_rad)
+        : 1;
+      const yFactor = surface.curvature_y_enabled
+        ? Math.sin((2 * Math.PI * y) / surface.wavelength_y_mm + surface.phase_y_rad)
+        : 1;
+      return surface.z_reference_mm + surface.amplitude_mm * xFactor * yFactor;
     }
 
     function physicalPreviewLayer() {
@@ -2593,8 +2716,10 @@ def surface_preview_html() -> str:
     ['part_length_mm', 'part_width_mm', 'part_height_mm', 'surface_start_layer'].forEach((id) => document.getElementById(id).addEventListener('input', () => {
       syncInspectionPointControls();
       updateTensileWaveHint();
+      syncTransitionStepInput();
       saveDesignerState();
       invalidateLatticePreview();
+      updateConformalDesignSummary();
       scheduleRefresh();
     }));
     conformalDesignIds.forEach((id) => document.getElementById(id).addEventListener('input', () => {
@@ -2632,6 +2757,24 @@ def surface_preview_html() -> str:
     document.getElementById('surface_parameter_mode').addEventListener('change', () => {
       syncSurfaceParameterControls();
       saveDesignerState();
+      scheduleRefresh();
+    });
+    ['curvature_x_enabled', 'curvature_y_enabled'].forEach((id) => document.getElementById(id).addEventListener('change', () => {
+      syncSurfaceParameterControls();
+      saveDesignerState();
+      scheduleRefresh();
+    }));
+    document.getElementById('transition_step_count').addEventListener('input', () => {
+      document.getElementById('transition_step_policy').value = 'manual';
+      syncTransitionStepInput();
+      saveDesignerState();
+      updateConformalDesignSummary();
+      scheduleRefresh();
+    });
+    document.getElementById('restoreAutomaticTransition').addEventListener('click', () => {
+      syncTransitionStepInput({ restoreAutomatic: true });
+      saveDesignerState();
+      updateConformalDesignSummary();
       scheduleRefresh();
     });
     document.getElementById('specimen_variant').addEventListener('change', () => {
@@ -2757,7 +2900,7 @@ def surface_preview_html() -> str:
       render();
     });
     document.getElementById('reset').addEventListener('click', () => {
-      const defaults = { part_length_mm: 150, part_width_mm: 50, part_height_mm: 10, specimen_variant: 'tensile', grip_end_length_mm: 25, surface_parameter_mode: 'tensile_centered_wave_count', amplitude_mm: 1.5, wave_count_x: 1.5, wave_count_y: 1.5, wavelength_x_mm: 100, wavelength_y_mm: 33.333, phase_x_pi: 1, phase_y_pi: 1, z_reference_mm: 0, inspection_enabled: false, check_x_mm: 75, check_y_mm: 25, wall_width_mm: 2, base_cell_size_mm: 10, orientation_angle_deg: 0, honeycomb_align_x: false, honeycomb_align_x_mm: 75, honeycomb_align_y: false, honeycomb_align_y_mm: 25, surface_start_layer: 3, samples_x: 49, samples_y: 49, boundary_mode: 'clip', random_seed: 0, samples: 49, surfaceZScale: 5, sectionZScale: 3, previewMode: 'surface' };
+      const defaults = { part_length_mm: 150, part_width_mm: 50, part_height_mm: 10, specimen_variant: 'tensile', grip_end_length_mm: 25, curvature_x_enabled: true, curvature_y_enabled: true, surface_parameter_mode: 'tensile_centered_wave_count', amplitude_mm: 1.5, wave_count_x: 1.5, wave_count_y: 1.5, wavelength_x_mm: 100, wavelength_y_mm: 33.333, phase_x_pi: 1, phase_y_pi: 1, z_reference_mm: 0, inspection_enabled: false, check_x_mm: 75, check_y_mm: 25, wall_width_mm: 2, base_cell_size_mm: 10, orientation_angle_deg: 0, honeycomb_align_x: false, honeycomb_align_x_mm: 75, honeycomb_align_y: false, honeycomb_align_y_mm: 25, surface_start_layer: 2, transition_step_count: 9, transition_step_policy: 'auto_to_midplane', samples_x: 49, samples_y: 49, boundary_mode: 'clip', random_seed: 0, samples: 49, surfaceZScale: 5, sectionZScale: 3, previewMode: 'surface' };
       Object.entries(defaults).forEach(([id, value]) => {
         const element = document.getElementById(id);
         if (element.type === 'checkbox') element.checked = value;
@@ -2765,6 +2908,7 @@ def surface_preview_html() -> str:
       });
       document.getElementById('align_load_line').checked = false;
       syncSurfaceParameterControls();
+      syncTransitionStepInput({ restoreAutomatic: true });
       syncSpecimenVariantControls();
       syncInspectionPointControls();
       syncLoadLineAlignmentControls();
@@ -2777,7 +2921,13 @@ def surface_preview_html() -> str:
     async function initialiseDesigner() {
       restoreDesignerState();
       await restorePersistentDesignerState();
+      // These legacy controls mutate manufacturing phase/orientation. The
+      // current designer exposes bending lines as a visual diagnostic only.
+      document.getElementById('align_load_line').checked = false;
+      document.getElementById('honeycomb_align_x').checked = false;
+      document.getElementById('honeycomb_align_y').checked = false;
       syncSurfaceParameterControls();
+      syncTransitionStepInput();
       syncSpecimenVariantControls();
       syncInspectionPointControls();
       syncLoadLineAlignmentControls();

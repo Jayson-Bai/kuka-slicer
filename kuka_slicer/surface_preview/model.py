@@ -40,8 +40,6 @@ class DoubleSineSurface:
         object.__setattr__(self, "z_reference_mm", _finite(self.z_reference_mm, "z_reference_mm"))
         if not isinstance(self.x_enabled, bool) or not isinstance(self.y_enabled, bool):
             raise ValueError("x_enabled and y_enabled must be booleans")
-        if not self.x_enabled and not self.y_enabled:
-            raise ValueError("a sine surface must enable at least one axis")
         for name in ("wavelength_x_mm", "wavelength_y_mm"):
             value = _finite(getattr(self, name), name)
             if value <= 0.0:
@@ -53,6 +51,8 @@ class DoubleSineSurface:
 
         x = np.asarray(x_mm, dtype=float)
         y = np.asarray(y_mm, dtype=float)
+        if not self.x_enabled and not self.y_enabled:
+            return np.full(np.broadcast(x, y).shape, self.z_reference_mm, dtype=float)
         x_factor = (
             np.sin((2.0 * np.pi * x) / self.wavelength_x_mm + self.phase_x_rad)
             if self.x_enabled
@@ -85,6 +85,26 @@ class DoubleSineSurface:
             else np.zeros_like(y)
         )
         return dx, dy
+
+    def second_derivatives(self, x_mm, y_mm) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return analytical ``(d²H/dx², d²H/dy², d²H/dxdy)`` values."""
+
+        x = np.asarray(x_mm, dtype=float)
+        y = np.asarray(y_mm, dtype=float)
+        x_phase = (2.0 * np.pi * x) / self.wavelength_x_mm + self.phase_x_rad
+        y_phase = (2.0 * np.pi * y) / self.wavelength_y_mm + self.phase_y_rad
+        x_sine = np.sin(x_phase) if self.x_enabled else np.ones_like(x)
+        y_sine = np.sin(y_phase) if self.y_enabled else np.ones_like(y)
+        kx = 2.0 * np.pi / self.wavelength_x_mm
+        ky = 2.0 * np.pi / self.wavelength_y_mm
+        dxx = -self.amplitude_mm * kx * kx * x_sine * y_sine if self.x_enabled else np.zeros_like(x)
+        dyy = -self.amplitude_mm * ky * ky * x_sine * y_sine if self.y_enabled else np.zeros_like(y)
+        dxy = (
+            self.amplitude_mm * kx * ky * np.cos(x_phase) * np.cos(y_phase)
+            if self.x_enabled and self.y_enabled
+            else np.zeros_like(x)
+        )
+        return dxx, dyy, dxy
 
 
     def sample_grid(
