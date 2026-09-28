@@ -659,6 +659,12 @@ def test_surface_payload_rejects_invalid_input(params, error):
 def test_surface_preview_html_has_an_independent_surface_api_and_controls():
     html = surface_preview_html()
 
+    assert html.index('<section class="panel preview">') < html.index('<form class="controls" id="surfaceForm">')
+    assert 'class="controlGrid"' in html
+    assert html.count('class="panel controlGroup"') == 6
+    assert 'grid-template-columns: repeat(3, minmax(0, 1fr))' in html
+    assert '@media (max-width: 1180px)' in html
+    assert '@media (max-width: 760px)' in html
     assert 'fetch(`/api/surface?' in html
     assert 'id="surface_parameter_mode"' in html
     assert 'id="specimen_variant"' in html

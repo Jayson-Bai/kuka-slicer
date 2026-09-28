@@ -954,14 +954,16 @@ def surface_preview_html() -> str:
     :root { color-scheme: light; font-family: "Segoe UI", "Microsoft YaHei", sans-serif; color: #152033; background: #f4f7fb; }
     * { box-sizing: border-box; }
     body { margin: 0; min-width: 320px; }
-    main { max-width: 1260px; margin: 0 auto; padding: 24px; }
+    main { max-width: 1600px; margin: 0 auto; padding: 20px clamp(14px, 2vw, 28px) 28px; }
     header { margin-bottom: 18px; }
     h1 { margin: 0; font-size: clamp(22px, 3vw, 32px); letter-spacing: -.02em; }
     header p { color: #526074; margin: 8px 0 0; line-height: 1.55; }
-    .workspace { display: grid; grid-template-columns: minmax(260px, 340px) minmax(0, 1fr); gap: 18px; align-items: start; }
+    .workspace { display: flex; flex-direction: column; gap: 18px; }
     .panel { background: #fff; border: 1px solid #dbe3ef; border-radius: 14px; box-shadow: 0 10px 30px rgba(32, 52, 82, .07); }
-    .controls { padding: 18px; }
-    .controls h2, .preview h2 { margin: 0 0 14px; font-size: 16px; }
+    .controls { margin: 0; }
+    .controlGrid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; align-items: start; }
+    .controlGroup { min-width: 0; padding: 18px; }
+    .controlGroup h2, .preview h2 { margin: 0 0 14px; font-size: 16px; }
     .field { display: grid; grid-template-columns: 1fr 112px; align-items: center; gap: 10px; margin: 10px 0; }
     label { font-size: 13px; color: #38475d; }
     input { width: 100%; border: 1px solid #bdcadb; border-radius: 7px; padding: 8px; color: #142238; font: inherit; }
@@ -985,14 +987,19 @@ def surface_preview_html() -> str:
     .advancedBody { padding-top: 4px; }
     .preview { overflow: hidden; }
     .previewHead { padding: 18px 18px 0; display: flex; justify-content: space-between; gap: 12px; align-items: start; }
+    .previewToolbar { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px 16px; padding: 4px 18px 14px; }
+    .previewToolbar .field { grid-template-columns: minmax(110px, 1fr) minmax(150px, 210px); margin: 0; }
+    .previewToolbar .hint { grid-column: 1 / -1; margin: 0; }
     .stats { display: flex; flex-wrap: wrap; gap: 7px; justify-content: end; }
     .stat { border: 1px solid #dae4f1; border-radius: 999px; padding: 4px 8px; color: #40516a; font-size: 12px; white-space: nowrap; }
-    canvas { display: block; width: 100%; height: min(65vh, 620px); min-height: 400px; background: linear-gradient(180deg, #fbfdff 0%, #eef4fa 100%); touch-action: none; cursor: grab; }
+    canvas { display: block; width: 100%; height: clamp(430px, 56vh, 680px); background: linear-gradient(180deg, #fbfdff 0%, #eef4fa 100%); touch-action: none; cursor: grab; }
     canvas.isDragging { cursor: grabbing; }
     .navigationHint { margin: 0; padding: 10px 18px 14px; color: #66758b; font-size: 12px; line-height: 1.5; border-top: 1px solid #edf1f6; }
     .status { min-height: 18px; padding: 0 18px 16px; color: #68778c; font-size: 12px; }
     .status.error { color: #b42318; }
-    @media (max-width: 820px) { main { padding: 14px; } .workspace { grid-template-columns: 1fr; } canvas { min-height: 330px; } }
+    @media (max-width: 1180px) { .controlGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .previewToolbar { grid-template-columns: 1fr 1fr; } }
+    @media (max-width: 760px) { main { padding: 14px; } .controlGrid, .previewToolbar { grid-template-columns: 1fr; } .previewToolbar .hint { grid-column: auto; } canvas { height: 420px; } }
+    @media (max-width: 480px) { .field, .previewToolbar .field { grid-template-columns: 1fr; } input[type="checkbox"] { justify-self: start; } canvas { height: 340px; } }
   </style>
 </head>
 <body>
@@ -1002,7 +1009,21 @@ def surface_preview_html() -> str:
       <p>在矩形实体上定义双正弦共形曲面与六边形格栅；可独立选择拉伸或弯曲试件版本，导出 JSON 后回到主切片器生成路径与送入 Core。</p>
     </header>
     <section class="workspace">
-      <form class="panel controls" id="surfaceForm">
+      <section class="panel preview">
+        <div class="previewHead"><h2 id="previewTitle">α=1 完整曲率层（物理 Z）</h2><div class="stats" id="stats"></div></div>
+        <div class="previewToolbar">
+          <div class="field"><label for="previewMode">预览模式</label><select id="previewMode"><option value="surface" selected>α=1 完整曲率层（物理 Z）</option><option value="solid_xz">实体层叠 / XZ 剖面</option></select></div>
+          <div class="field"><label for="surfaceZScale">三维视觉 Z 放大</label><select id="surfaceZScale"><option value="1">真实比例 ×1</option><option value="3">形态观察 ×3</option><option value="5" selected>形态观察 ×5</option><option value="10">形态观察 ×10</option></select></div>
+          <div class="field"><label for="sectionZScale">XZ 剖面视觉 Z 放大</label><select id="sectionZScale"><option value="1">真实比例 ×1</option><option value="3" selected>辅助观察 ×3</option><option value="5">辅助观察 ×5</option></select></div>
+          <p class="hint">视觉 Z 放大只影响画布，不改变参数、检验值、导出的 JSON 或实际零件尺寸。XZ 剖面采用统一 X/Z 比例后再按所选倍率放大 Z，避免隐藏的纵向拉伸。</p>
+        </div>
+        <canvas id="canvas" aria-label="蜂窝承载曲面预览"></canvas>
+        <p class="navigationHint">左键拖拽旋转；中键拖拽平移；右键上下拖拽缩放；滚轮缩放；双击恢复视角。</p>
+        <div class="status" id="status">正在生成曲面…</div>
+      </section>
+      <form class="controls" id="surfaceForm">
+        <div class="controlGrid">
+        <section class="panel controlGroup">
         <h2>矩形实体</h2>
         <div class="field"><label for="part_length_mm">零件长度 X（mm）</label><input id="part_length_mm" type="number" min="0.001" step="1" value="150"></div>
         <div class="field"><label for="part_width_mm">零件宽度 Y（mm）</label><input id="part_width_mm" type="number" min="0.001" step="1" value="50"></div>
@@ -1012,7 +1033,8 @@ def surface_preview_html() -> str:
         <div class="field" id="gripEndLengthField"><label for="grip_end_length_mm">每端夹持区 X（mm）</label><input id="grip_end_length_mm" type="number" min="0.001" step="0.5" value="25" aria-describedby="gripLengthHint"></div>
         <p class="hint" id="gripLengthHint">两端采用相同长度；蜂窝工作段为 X 总长 − 2 × 每端夹持区。曲面仍按完整零件 X/Y 范围计算，不会因夹持区而改变波长、相位或曲率。</p>
         <p class="modelMeta" id="modelMeta">外边界固定为矩形；新共形流程不读取 STL，也不继承 STL 中的蜂窝孔壁。</p>
-        <div class="divider"></div>
+        </section>
+        <section class="panel controlGroup">
         <h2>曲面参数</h2>
         <div class="field"><label for="curvature_x_enabled">启用 X 向曲率</label><input id="curvature_x_enabled" type="checkbox" checked></div>
         <div class="field"><label for="curvature_y_enabled">启用 Y 向曲率</label><input id="curvature_y_enabled" type="checkbox" checked></div>
@@ -1033,21 +1055,8 @@ def surface_preview_html() -> str:
           <p class="hint" id="phasePiHint">输入 π 的倍数：1 表示 π，0.5 表示 π/2，1.5 表示 3π/2；导出的设计 JSON 仍以 rad 保存。</p>
         </div>
         <div class="field"><label for="z_reference_mm">Z 基准（mm）</label><input id="z_reference_mm" type="number" step="0.01" value="0"></div>
-        <div class="divider"></div>
-        <h2>弯曲专用检验（可选）</h2>
-        <div id="bendingFixtureFields" hidden>
-          <div class="field"><label for="bending_span_preview_mm">支撑跨度（仅预览，mm）</label><input id="bending_span_preview_mm" type="number" min="0.001" step="1" value="100" aria-describedby="bendingFixtureHint"></div>
-          <button type="button" class="secondary" id="restoreBendingSpanPreview">恢复 100 mm 预览跨度</button>
-          <p class="hint" id="bendingFixtureHint">只在画布绘制跨中加载线和两条对称支撑线；不会改变蜂窝相位、曲面相位、路径、零件尺寸或任何导出 JSON 字段。</p>
-          <div class="designSummary" id="bendingFixtureSummary" aria-live="polite"></div>
-        </div>
-        <div class="field"><label for="inspection_enabled">显示弯曲检验点</label><input id="inspection_enabled" type="checkbox"></div>
-        <div id="inspectionPointFields" hidden>
-          <div class="field"><label for="check_x_mm">检验点 X（mm）</label><input id="check_x_mm" type="number" min="0" step="0.1" value="75" aria-describedby="checkPointHint"></div>
-          <div class="field"><label for="check_y_mm">检验点 Y（mm）</label><input id="check_y_mm" type="number" min="0" step="0.1" value="50" aria-describedby="checkPointHint"></div>
-          <p class="hint" id="checkPointHint">仅在第三章三点弯曲时启用。启用后可查看任意点的 H、坡度和平均曲率；尺寸变化时，超出矩形范围的坐标会自动收回到范围内。</p>
-        </div>
-        <div class="divider"></div>
+        </section>
+        <section class="panel controlGroup">
         <h2>连续路径蜂窝（预览）</h2>
         <div class="field"><label for="base_cell_size_mm">目标六边形边长（mm）</label><input id="base_cell_size_mm" type="number" min="0.001" step="0.01" value="10"></div>
         <p class="hint">以目标边长为唯一蜂窝几何参数。一个完整黄色孔洞中心固定在蜂窝工作区中心；300 × 300 mm 母板只用于向外铺展，再按当前工作区逐边裁剪。裁剪窗已扣除外矩形轮廓和夹持分界树脂带的半宽，因此边界允许出现截断六边形，但不会穿入树脂轮廓。</p>
@@ -1068,7 +1077,23 @@ def surface_preview_html() -> str:
         <div class="designSummary" id="latticeDesignSummary" aria-live="polite"></div>
         <div class="designSummary" id="latticeLengthSummary" aria-live="polite">连续路径总长将在曲面预览更新后显示。</div>
         <p class="hint">长度是平面预览中每条完整连续路径的累加，不包含层数和曲面映射造成的弧长变化；后续接入路径内核时会重新以实际三维长度计算挤出量。</p>
-        <div class="divider"></div>
+        </section>
+        <section class="panel controlGroup">
+        <h2>弯曲专用检验（可选）</h2>
+        <div id="bendingFixtureFields" hidden>
+          <div class="field"><label for="bending_span_preview_mm">支撑跨度（仅预览，mm）</label><input id="bending_span_preview_mm" type="number" min="0.001" step="1" value="100" aria-describedby="bendingFixtureHint"></div>
+          <button type="button" class="secondary" id="restoreBendingSpanPreview">恢复 100 mm 预览跨度</button>
+          <p class="hint" id="bendingFixtureHint">只在画布绘制跨中加载线和两条对称支撑线；不会改变蜂窝相位、曲面相位、路径、零件尺寸或任何导出 JSON 字段。</p>
+          <div class="designSummary" id="bendingFixtureSummary" aria-live="polite"></div>
+        </div>
+        <div class="field"><label for="inspection_enabled">显示弯曲检验点</label><input id="inspection_enabled" type="checkbox"></div>
+        <div id="inspectionPointFields" hidden>
+          <div class="field"><label for="check_x_mm">检验点 X（mm）</label><input id="check_x_mm" type="number" min="0" step="0.1" value="75" aria-describedby="checkPointHint"></div>
+          <div class="field"><label for="check_y_mm">检验点 Y（mm）</label><input id="check_y_mm" type="number" min="0" step="0.1" value="50" aria-describedby="checkPointHint"></div>
+          <p class="hint" id="checkPointHint">仅在第三章三点弯曲时启用。启用后可查看任意点的 H、坡度和平均曲率；尺寸变化时，超出矩形范围的坐标会自动收回到范围内。</p>
+        </div>
+        </section>
+        <section class="panel controlGroup">
         <h2>对称层间渐变</h2>
         <div class="field"><label for="surface_start_layer">首个非零曲率层（物理层）</label><input id="surface_start_layer" type="number" min="2" step="1" value="2"></div>
         <div class="field"><label for="transition_step_count">达到完整曲率的层间步数</label><input id="transition_step_count" type="number" min="1" step="1" value="9" aria-describedby="transitionStepHint"></div>
@@ -1088,23 +1113,16 @@ def surface_preview_html() -> str:
             <p class="hint">曲面采样 X/Y 参与共形计算；预览网格密度只影响本页显示。格栅相位由导出流程在实际曲面相位域自动避让，避免蜂窝墙与矩形外边界重合；参数化固定使用 LSCM、最远边界锚点和无切缝。</p>
           </div>
         </details>
-        <div class="divider"></div>
+        </section>
+        <section class="panel controlGroup">
         <h2>下一步</h2>
         <button type="button" id="exportConformalConfig">导出连续路径 JSON</button>
         <button type="button" class="secondary" id="exportPlanarConfig">导出平面蜂窝结构 JSON</button>
         <button type="button" class="secondary" id="reset">恢复示例参数</button>
         <p class="hint">曲面 JSON 包含双正弦参数；平面 JSON 只保留当前零件尺寸、分区和蜂窝路径/形状样式。两者都可直接导入主切片器，并复用同一套树脂、可选纤维及 Core 工艺参数。</p>
+        </section>
+        </div>
       </form>
-      <section class="panel preview">
-        <div class="previewHead"><h2 id="previewTitle">α=1 完整曲率层（物理 Z）</h2><div class="stats" id="stats"></div></div>
-        <div class="field"><label for="previewMode">预览模式</label><select id="previewMode"><option value="surface" selected>α=1 完整曲率层（物理 Z）</option><option value="solid_xz">实体层叠 / XZ 剖面</option></select></div>
-        <div class="field"><label for="surfaceZScale">三维视觉 Z 放大</label><select id="surfaceZScale"><option value="1">真实比例 ×1</option><option value="3">形态观察 ×3</option><option value="5" selected>形态观察 ×5</option><option value="10">形态观察 ×10</option></select></div>
-        <div class="field"><label for="sectionZScale">XZ 剖面视觉 Z 放大</label><select id="sectionZScale"><option value="1">真实比例 ×1</option><option value="3" selected>辅助观察 ×3</option><option value="5">辅助观察 ×5</option></select></div>
-        <p class="hint">视觉 Z 放大只影响画布，不改变参数、检验值、导出的 JSON 或实际零件尺寸。XZ 剖面采用统一 X/Z 比例后再按所选倍率放大 Z，避免隐藏的纵向拉伸。</p>
-        <canvas id="canvas" aria-label="蜂窝承载曲面预览"></canvas>
-        <p class="navigationHint">左键拖拽旋转；中键拖拽平移；右键上下拖拽缩放；滚轮缩放；双击恢复视角。</p>
-        <div class="status" id="status">正在生成曲面…</div>
-      </section>
     </section>
   </main>
   <script>
