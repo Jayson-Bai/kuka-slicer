@@ -401,6 +401,25 @@ def test_surface_payload_previews_both_axes_disabled_as_a_flat_plane():
     assert payload["surface"]["curvature_y_enabled"] is False
 
 
+def test_bending_span_preview_parameter_never_changes_the_exported_design_contract():
+    params = {
+        "part_length_mm": ["150"],
+        "part_width_mm": ["60"],
+        "part_height_mm": ["8"],
+        "specimen_variant": ["bending"],
+        "surface_start_layer": ["2"],
+        "surface_start_layer_semantics": ["first_nonzero_curvature_physical"],
+    }
+
+    without_overlay = conformal_lattice_config_payload(params)
+    with_overlay = conformal_lattice_config_payload(
+        {**params, "bending_span_preview_mm": ["100"]}
+    )
+
+    assert with_overlay == without_overlay
+    assert "bending_span_preview_mm" not in json.dumps(with_overlay)
+
+
 def test_conformal_rectangle_preview_uses_the_exported_lower_left_origin():
     payload = surface_payload(
         {
@@ -700,6 +719,10 @@ def test_surface_preview_html_has_an_independent_surface_api_and_controls():
     assert 'function drawSurfaceGuideMesh' in html
     assert 'function physicalPreviewLayer' in html
     assert 'function physicalLayerZ' in html
+    assert 'id="bending_span_preview_mm"' in html
+    assert 'id="restoreBendingSpanPreview"' in html
+    assert 'function drawBendingFixtureOverlay' in html
+    assert '不会改变蜂窝相位、曲面相位、路径、零件尺寸或任何导出 JSON 字段' in html
     assert 'id="transition_step_count"' in html
     assert 'id="transition_step_policy" type="hidden" value="auto_to_midplane"' in html
     assert 'id="restoreAutomaticTransition"' in html

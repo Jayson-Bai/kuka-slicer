@@ -1035,6 +1035,12 @@ def surface_preview_html() -> str:
         <div class="field"><label for="z_reference_mm">Z 基准（mm）</label><input id="z_reference_mm" type="number" step="0.01" value="0"></div>
         <div class="divider"></div>
         <h2>弯曲专用检验（可选）</h2>
+        <div id="bendingFixtureFields" hidden>
+          <div class="field"><label for="bending_span_preview_mm">支撑跨度（仅预览，mm）</label><input id="bending_span_preview_mm" type="number" min="0.001" step="1" value="100" aria-describedby="bendingFixtureHint"></div>
+          <button type="button" class="secondary" id="restoreBendingSpanPreview">恢复 100 mm 预览跨度</button>
+          <p class="hint" id="bendingFixtureHint">只在画布绘制跨中加载线和两条对称支撑线；不会改变蜂窝相位、曲面相位、路径、零件尺寸或任何导出 JSON 字段。</p>
+          <div class="designSummary" id="bendingFixtureSummary" aria-live="polite"></div>
+        </div>
         <div class="field"><label for="inspection_enabled">显示弯曲检验点</label><input id="inspection_enabled" type="checkbox"></div>
         <div id="inspectionPointFields" hidden>
           <div class="field"><label for="check_x_mm">检验点 X（mm）</label><input id="check_x_mm" type="number" min="0" step="0.1" value="75" aria-describedby="checkPointHint"></div>
@@ -1244,9 +1250,39 @@ def surface_preview_html() -> str:
       const bending = document.getElementById('specimen_variant').value === 'bending';
       document.getElementById('gripEndLengthField').hidden = bending;
       document.getElementById('grip_end_length_mm').disabled = bending;
+      document.getElementById('bendingFixtureFields').hidden = !bending;
       document.getElementById('gripLengthHint').textContent = bending
         ? '弯曲版不导出夹持区：蜂窝骨架、树脂连续路径和纤维连续路径的有效 X 域为整个矩形。仍保留每层一条闭合外轮廓及其半线宽净空。'
         : '两端采用相同长度；蜂窝工作段为 X 总长 − 2 × 每端夹持区。曲面仍按完整零件 X/Y 范围计算，不会因夹持区而改变波长、相位或曲率。';
+      updateBendingFixtureSummary();
+    }
+
+    function bendingFixturePreview() {
+      if (document.getElementById('specimen_variant').value !== 'bending') return null;
+      const length = positiveNumber('part_length_mm');
+      const height = positiveNumber('part_height_mm');
+      const span = positiveNumber('bending_span_preview_mm');
+      if (length === null || height === null || span === null || span >= length) return null;
+      return {
+        span,
+        loadX: length / 2,
+        leftSupportX: (length - span) / 2,
+        rightSupportX: (length + span) / 2,
+        spanToHeight: span / height,
+      };
+    }
+
+    function updateBendingFixtureSummary() {
+      const summary = document.getElementById('bendingFixtureSummary');
+      const fixture = bendingFixturePreview();
+      if (document.getElementById('specimen_variant').value !== 'bending') return;
+      if (!fixture) {
+        summary.className = 'designSummary error';
+        summary.textContent = '仅预览跨度必须为正数并小于零件长度；该错误只影响标线显示，不阻止几何参数编辑。';
+        return;
+      }
+      summary.className = 'designSummary';
+      summary.textContent = `仅预览：加载线 x=${fixture.loadX.toFixed(2)} mm；支撑线 x=${fixture.leftSupportX.toFixed(2)}、${fixture.rightSupportX.toFixed(2)} mm；跨度/高度=${fixture.spanToHeight.toFixed(2)}。这些数值不参与导出或路径计算。`;
     }
 
     function updateTensileWaveHint() {
@@ -2377,6 +2413,55 @@ def surface_preview_html() -> str:
       ctx.fillText(`检验点 (${point.x_mm.toFixed(1)}, ${point.y_mm.toFixed(1)})`, projected.x + 7, projected.y - 7);
     }
 
+    function drawBendingFixtureOverlay(ctx, layer, zMid, yaw, pitch, scale, cx, cy) {
+      const fixture = bendingFixturePreview();
+      if (!fixture) return;
+      const width = positiveNumber('part_width_mm');
+      if (width === null) return;
+      const drawLine = (xMm, { colour, dash, label }) => {
+        ctx.save();
+        ctx.beginPath();
+        const samples = 80;
+        for (let index = 0; index <= samples; index += 1) {
+          const yMm = width * index / samples;
+          const point = project(
+            xMm,
+            yMm,
+            physicalLayerZ(heightAt(xMm, yMm), layer) - zMid,
+            yaw,
+            pitch,
+            scale,
+            cx,
+            cy,
+          );
+          if (index === 0) ctx.moveTo(point.x, point.y);
+          else ctx.lineTo(point.x, point.y);
+        }
+        ctx.strokeStyle = colour;
+        ctx.lineWidth = 2.2;
+        ctx.setLineDash(dash);
+        ctx.stroke();
+        const labelPoint = project(
+          xMm,
+          width,
+          physicalLayerZ(heightAt(xMm, width), layer) - zMid,
+          yaw,
+          pitch,
+          scale,
+          cx,
+          cy,
+        );
+        ctx.setLineDash([]);
+        ctx.fillStyle = colour;
+        ctx.font = '600 11px Segoe UI, Microsoft YaHei, sans-serif';
+        ctx.fillText(label, labelPoint.x + 5, labelPoint.y - 4);
+        ctx.restore();
+      };
+      drawLine(fixture.leftSupportX, { colour: '#6d28d9', dash: [6, 4], label: '支撑' });
+      drawLine(fixture.rightSupportX, { colour: '#6d28d9', dash: [6, 4], label: '支撑' });
+      drawLine(fixture.loadX, { colour: '#0369a1', dash: [], label: '跨中加载' });
+    }
+
     function drawSurfaceReferenceFrame(ctx, zMid, yaw, pitch, scale, cx, cy) {
       const bounds = payload.coordinate_system.xy_bounds_mm;
       const baseZ = 0;
@@ -2647,6 +2732,7 @@ def surface_preview_html() -> str:
       drawProjectionBoundaries(ctx, projection, layer, zMid, yaw, pitch, scale, cx, cy);
       drawSurfaceGuideMesh(ctx, x, y, z, layer, zMid, yaw, pitch, scale, cx, cy);
       drawLatticePreview(ctx, layer, zMid, yaw, pitch, scale, cx, cy);
+      drawBendingFixtureOverlay(ctx, layer, zMid, yaw, pitch, scale, cx, cy);
       drawInspectionMarker(ctx, layer, zMid, yaw, pitch, scale, cx, cy);
       ctx.fillStyle = 'rgba(21,32,51,.68)';
       ctx.font = '12px Segoe UI, Microsoft YaHei, sans-serif';
@@ -2694,7 +2780,14 @@ def surface_preview_html() -> str:
         showStats(result);
         updateLatticeLengthSummary();
         render();
-        statusEl.textContent = '已更新：当前预览对应固定矩形外边界的双正弦承载曲面。';
+        const curvatureLabel = result.surface.curvature_x_enabled && result.surface.curvature_y_enabled
+          ? 'XY 双方向'
+          : result.surface.curvature_x_enabled
+            ? 'X 单方向'
+            : result.surface.curvature_y_enabled ? 'Y 单方向' : '';
+        statusEl.textContent = curvatureLabel
+          ? `已更新：当前预览对应固定矩形外边界的 ${curvatureLabel}曲率承载面。`
+          : '已更新：当前预览为平面蜂窝；曲率参数保留但不参与几何。';
       } catch (error) {
         if (sequence !== queued) return;
         statusEl.className = 'status error';
@@ -2720,6 +2813,7 @@ def surface_preview_html() -> str:
       saveDesignerState();
       invalidateLatticePreview();
       updateConformalDesignSummary();
+      updateBendingFixtureSummary();
       scheduleRefresh();
     }));
     conformalDesignIds.forEach((id) => document.getElementById(id).addEventListener('input', () => {
@@ -2783,6 +2877,15 @@ def surface_preview_html() -> str:
       invalidateLatticePreview();
       updateConformalDesignSummary();
       updateLatticeLengthSummary();
+      if (payload) render();
+    });
+    document.getElementById('bending_span_preview_mm').addEventListener('input', () => {
+      updateBendingFixtureSummary();
+      if (payload) render();
+    });
+    document.getElementById('restoreBendingSpanPreview').addEventListener('click', () => {
+      document.getElementById('bending_span_preview_mm').value = 100;
+      updateBendingFixtureSummary();
       if (payload) render();
     });
     document.getElementById('inspection_enabled').addEventListener('change', () => {
@@ -2907,6 +3010,7 @@ def surface_preview_html() -> str:
         else element.value = value;
       });
       document.getElementById('align_load_line').checked = false;
+      document.getElementById('bending_span_preview_mm').value = 100;
       syncSurfaceParameterControls();
       syncTransitionStepInput({ restoreAutomatic: true });
       syncSpecimenVariantControls();
@@ -2915,6 +3019,7 @@ def surface_preview_html() -> str:
       invalidateLatticePreview();
       saveDesignerState();
       updateConformalDesignSummary();
+      updateBendingFixtureSummary();
       refresh();
     });
     window.addEventListener('resize', render);
@@ -2932,6 +3037,7 @@ def surface_preview_html() -> str:
       syncInspectionPointControls();
       syncLoadLineAlignmentControls();
       updateConformalDesignSummary();
+      updateBendingFixtureSummary();
       refresh();
     }
     initialiseDesigner();
