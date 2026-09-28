@@ -285,6 +285,8 @@ def _cross_section_payload(
 def _default_section_y(target: SurfaceTarget) -> float:
     """Choose a valid Y cut where the double-sine profile is most visible."""
 
+    if not target.surface.y_enabled:
+        return target.height_mm * 0.5
     candidates = np.linspace(0.0, target.height_mm, 1001)
     factor = np.abs(
         np.sin((2.0 * np.pi * candidates) / target.surface.wavelength_y_mm + target.surface.phase_y_rad)

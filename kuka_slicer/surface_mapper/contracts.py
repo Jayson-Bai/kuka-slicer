@@ -90,6 +90,12 @@ def load_surface_target(data: bytes | str | Mapping[str, object]) -> SurfaceTarg
     surface_data = _mapping(raw.get("surface"), "surface")
     if surface_data.get("type") != "double_sine_product":
         raise ValueError("only double_sine_product surface configs are currently supported")
+    curvature_x_enabled = surface_data.get("curvature_x_enabled", True)
+    curvature_y_enabled = surface_data.get("curvature_y_enabled", True)
+    if not isinstance(curvature_x_enabled, bool) or not isinstance(curvature_y_enabled, bool):
+        raise ValueError("surface curvature axis flags must be booleans")
+    if not curvature_x_enabled and not curvature_y_enabled:
+        raise ValueError("a graded sine surface must enable at least one curvature axis")
     coordinate_system = _mapping(raw.get("coordinate_system"), "coordinate_system")
     if coordinate_system.get("plane") != "XY" or coordinate_system.get("origin") != "stl_xy_min":
         raise ValueError("surface config must use the stl_xy_min XY coordinate system")
@@ -110,6 +116,8 @@ def load_surface_target(data: bytes | str | Mapping[str, object]) -> SurfaceTarg
             phase_x_rad=_finite(surface_data.get("phase_x_rad"), "surface.phase_x_rad"),
             phase_y_rad=_finite(surface_data.get("phase_y_rad"), "surface.phase_y_rad"),
             z_reference_mm=_finite(surface_data.get("z_reference_mm"), "surface.z_reference_mm"),
+            x_enabled=curvature_x_enabled,
+            y_enabled=curvature_y_enabled,
         ),
         width_mm=width_mm,
         height_mm=height_mm,

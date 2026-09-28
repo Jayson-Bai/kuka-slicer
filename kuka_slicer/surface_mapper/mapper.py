@@ -140,12 +140,8 @@ def _with_kuka_orientation_columns(array: np.ndarray) -> np.ndarray:
 def _surface_gradient(
     target: SurfaceTarget, x: np.ndarray, y: np.ndarray, alpha: float
 ) -> tuple[np.ndarray, np.ndarray]:
-    surface = target.surface
-    x_phase = (2.0 * np.pi / surface.wavelength_x_mm) * x + surface.phase_x_rad
-    y_phase = (2.0 * np.pi / surface.wavelength_y_mm) * y + surface.phase_y_rad
-    dz_dx = alpha * surface.amplitude_mm * (2.0 * np.pi / surface.wavelength_x_mm) * np.cos(x_phase) * np.sin(y_phase)
-    dz_dy = alpha * surface.amplitude_mm * (2.0 * np.pi / surface.wavelength_y_mm) * np.sin(x_phase) * np.cos(y_phase)
-    return dz_dx, dz_dy
+    dz_dx, dz_dy = target.surface.gradient(x, y)
+    return alpha * dz_dx, alpha * dz_dy
 
 
 def _validate_domain(source: SourceNPZ, target: SurfaceTarget) -> None:

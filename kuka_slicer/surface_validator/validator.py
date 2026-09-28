@@ -378,7 +378,12 @@ def _check_sampling_density(
                 max_segment_xy = max(max_segment_xy, float(np.max(xy_length[nonzero])))
             max_dz = max(max_dz, float(np.max(dz)))
             segment_count += len(delta)
-    shortest_wavelength = min(target.surface.wavelength_x_mm, target.surface.wavelength_y_mm)
+    active_wavelengths = []
+    if target.surface.x_enabled:
+        active_wavelengths.append(target.surface.wavelength_x_mm)
+    if target.surface.y_enabled:
+        active_wavelengths.append(target.surface.wavelength_y_mm)
+    shortest_wavelength = min(active_wavelengths)
     permitted_segment = shortest_wavelength * limits.max_segment_fraction_of_wavelength
     warnings: list[str] = []
     if max_slope > limits.max_slope:

@@ -26,7 +26,14 @@ from kuka_slicer.surface_mapper.server import (
 from kuka_slicer.surface_mapper.orientation import kuka_abc_for_surface
 
 
-def _target(*, amplitude_mm: float = 1.0, phase_x_rad: float = 0.0, sha256: str = "same-model"):
+def _target(
+    *,
+    amplitude_mm: float = 1.0,
+    phase_x_rad: float = 0.0,
+    sha256: str = "same-model",
+    curvature_x_enabled: bool = True,
+    curvature_y_enabled: bool = True,
+):
     return load_surface_target(
         {
             "format": "graded_surface_v1",
@@ -41,6 +48,8 @@ def _target(*, amplitude_mm: float = 1.0, phase_x_rad: float = 0.0, sha256: str 
                 "phase_x_rad": phase_x_rad,
                 "phase_y_rad": 0.0,
                 "z_reference_mm": 0.0,
+                "curvature_x_enabled": curvature_x_enabled,
+                "curvature_y_enabled": curvature_y_enabled,
             },
         }
     )
@@ -84,6 +93,24 @@ def test_mapper_adds_relative_kuka_surface_normal_orientation(tmp_path):
     assert mapped.arrays["layer_0000_R"][0, 0, 3:] == pytest.approx([0.0, 0.0, 0.0])
     assert np.linalg.norm(mapped.arrays["layer_0001_R"][0, 0, 3:]) > 1e-3
     assert mapped.meta["surface_mapping"]["orientation"]["kuka_abc_order"] == "A=Z,B=Y,C=X"
+
+
+def test_mapper_keeps_the_disabled_sine_axis_flat_in_xyz_and_tool_orientation(tmp_path):
+    source = _source(tmp_path)
+    first = source.arrays["layer_0001_R"][0, 0]
+    second = source.arrays["layer_0001_R"][0, 1]
+    first[:2] = [2.5, 2.5]
+    second[:2] = [2.5, 7.5]
+
+    mapped = map_source_job(
+        source,
+        _target(curvature_y_enabled=False),
+        SurfaceMappingPlan(LayerProgression(0, 3)),
+    ).source.arrays["layer_0001_R"][0]
+
+    assert mapped[0, 2] == pytest.approx(mapped[1, 2])
+    assert mapped[0, 3:] == pytest.approx(mapped[1, 3:])
+    assert np.linalg.norm(mapped[0, 3:]) > 1e-3
 
 
 def test_mapper_rejects_negative_z_instead_of_silently_raising_the_path(tmp_path):
