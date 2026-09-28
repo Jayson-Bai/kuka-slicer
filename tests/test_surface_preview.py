@@ -659,15 +659,19 @@ def test_surface_payload_rejects_invalid_input(params, error):
 def test_surface_preview_html_has_an_independent_surface_api_and_controls():
     html = surface_preview_html()
 
-    assert html.index('<section class="panel preview">') < html.index('<form class="controls" id="surfaceForm">')
+    assert html.index('<form class="controls" id="surfaceForm">') < html.index('<section class="panel preview">')
     assert 'class="controlGrid"' in html
-    assert html.count('class="panel controlGroup"') == 6
-    assert 'grid-template-columns: repeat(3, minmax(0, 1fr))' in html
+    assert html.count('class="panel controlGroup"') == 4
+    assert 'grid-template-columns: repeat(4, minmax(0, 1fr))' in html
+    assert 'class="panel actionBar"' in html
+    assert html.index('id="base_cell_size_mm"') < html.index('<h2>曲面参数</h2>')
+    assert '<h2>连续路径蜂窝（预览）</h2>' not in html
     assert '@media (max-width: 1180px)' in html
     assert '@media (max-width: 760px)' in html
     assert html.count('class="helpTip"') == 6
     assert html.count('role="tooltip"') == 6
     assert html.count('aria-label="查看') == 6
+    assert 'class="navigationHint"' not in html
     assert '.helpTipWrap:hover .tipBubble, .helpTipWrap:focus-within .tipBubble' in html
     assert 'class="parameterGrid"' in html
     assert '<p class="hint" id="curvatureAxesHint">' not in html
@@ -704,6 +708,9 @@ def test_surface_preview_html_has_an_independent_surface_api_and_controls():
     assert 'const centeredX = x - (bounds[0] + bounds[2]) * 0.5;' in html
     assert 'const uniformScale = Math.min(' in html
     assert '连续路径蜂窝：' in html
+    assert 'ctx.fillText(`连续路径蜂窝：' not in html
+    assert 'ctx.fillText(`XZ 剖面：' not in html
+    assert 'const originLabel =' not in html
     assert 'function drawLatticePreview' in html
     assert 'function continuousCoursePreview' in html
     assert 'id="exportConformalConfig">导出连续路径 JSON</button>' in html
@@ -724,7 +731,7 @@ def test_surface_preview_html_has_an_independent_surface_api_and_controls():
     assert 'function appendProjectedClippedPore' in html
     assert '红线为 2 mm 连续纤维的中心线预览' in html
     assert '夹持分界树脂带内侧截断' in html
-    assert '红色为孔间通道中心线，裁断后每段独立制造' in html
+    assert '边界允许出现截断六边形，但路径不会穿入外轮廓' in html
     assert 'function offsetContinuousCourse' in html
     assert '导出连续路径 JSON' in html
     assert 'function drawFiberDoubleWallPreview' not in html

@@ -962,7 +962,7 @@ def surface_preview_html() -> str:
     .workspace { display: flex; flex-direction: column; gap: 18px; }
     .panel { background: #fff; border: 1px solid #dbe3ef; border-radius: 14px; box-shadow: 0 10px 30px rgba(32, 52, 82, .07); }
     .controls { margin: 0; }
-    .controlGrid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; align-items: stretch; }
+    .controlGrid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; align-items: stretch; }
     .controlGroup { position: relative; min-width: 0; height: 100%; padding: 16px; display: flex; flex-direction: column; }
     .groupHeading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
     .controlGroup h2 { margin: 0; font-size: 16px; }
@@ -997,26 +997,30 @@ def surface_preview_html() -> str:
     .tipBubble strong { display: block; margin-bottom: 5px; color: #23364f; font-size: 12px; }
     .tipText { display: block; }
     .tipText + .tipText, .tipText + .designSummary, .designSummary + .designSummary { margin-top: 8px; }
+    .tipText + strong { display: block; margin-top: 10px; }
     .tipBubble .designSummary { margin-bottom: 0; box-shadow: none; }
-    .exportActions { display: grid; gap: 8px; margin-top: auto; }
-    .exportActions button { margin: 0; }
+    .subsectionLabel { margin: 13px 0 8px; padding-top: 11px; border-top: 1px solid #e6ecf4; color: #526074; font-size: 12px; font-weight: 600; }
+    .actionBar { display: flex; align-items: center; gap: 14px; margin-top: 14px; padding: 12px 14px; }
+    .actionHeading { display: flex; align-items: center; gap: 10px; min-width: max-content; }
+    .actionHeading h2 { margin: 0; font-size: 15px; }
+    .exportActions { display: flex; justify-content: flex-end; gap: 8px; margin-left: auto; }
+    .exportActions button { width: auto; min-width: 190px; margin: 0; }
     details.advanced { margin-top: 12px; color: #40516a; font-size: 13px; }
     details.advanced summary { cursor: pointer; color: #2e405a; font-weight: 600; }
     .advancedBody { padding-top: 4px; }
-    .preview { overflow: hidden; }
-    .previewHead { padding: 18px 18px 0; display: flex; justify-content: space-between; gap: 12px; align-items: start; }
+    .preview { position: relative; overflow: visible; }
+    .previewHead { padding: 16px 18px 4px; display: flex; justify-content: space-between; gap: 12px; align-items: center; }
     .previewToolbar { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px 16px; padding: 4px 18px 14px; }
     .previewToolbar .field { grid-template-columns: minmax(110px, 1fr) minmax(150px, 210px); margin: 0; }
-    .previewToolbar .hint { grid-column: 1 / -1; margin: 0; }
     .stats { display: flex; flex-wrap: wrap; gap: 7px; justify-content: end; }
+    .tipBubble .stats { justify-content: start; }
     .stat { border: 1px solid #dae4f1; border-radius: 999px; padding: 4px 8px; color: #40516a; font-size: 12px; white-space: nowrap; }
     canvas { display: block; width: 100%; height: clamp(430px, 56vh, 680px); background: linear-gradient(180deg, #fbfdff 0%, #eef4fa 100%); touch-action: none; cursor: grab; }
     canvas.isDragging { cursor: grabbing; }
-    .navigationHint { margin: 0; padding: 10px 18px 14px; color: #66758b; font-size: 12px; line-height: 1.5; border-top: 1px solid #edf1f6; }
-    .status { min-height: 18px; padding: 0 18px 16px; color: #68778c; font-size: 12px; }
-    .status.error { color: #b42318; }
-    @media (max-width: 1180px) { .controlGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .previewToolbar { grid-template-columns: 1fr 1fr; } }
-    @media (max-width: 760px) { main { padding: 14px; } .controlGrid, .previewToolbar { grid-template-columns: 1fr; } .previewToolbar .hint { grid-column: auto; } canvas { height: 420px; } }
+    .status { display: none; margin: 0; padding: 10px 18px 12px; color: #68778c; font-size: 12px; border-top: 1px solid #edf1f6; }
+    .status.error { display: block; color: #b42318; }
+    @media (max-width: 1180px) { .controlGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .previewToolbar { grid-template-columns: 1fr 1fr; } .actionBar { align-items: stretch; flex-direction: column; } .actionHeading { justify-content: space-between; width: 100%; } .exportActions { width: 100%; margin-left: 0; } .exportActions button { flex: 1; min-width: 0; } }
+    @media (max-width: 760px) { main { padding: 14px; } .controlGrid, .previewToolbar { grid-template-columns: 1fr; } .exportActions { flex-direction: column; } .exportActions button { width: 100%; } canvas { height: 420px; } }
     @media (max-width: 480px) { .field, .previewToolbar .field, .parameterGrid { grid-template-columns: 1fr; } input[type="checkbox"] { justify-self: start; } canvas { height: 340px; } }
   </style>
 </head>
@@ -1027,18 +1031,6 @@ def surface_preview_html() -> str:
       <p>在矩形实体上定义双正弦共形曲面与六边形格栅；可独立选择拉伸或弯曲试件版本，导出 JSON 后回到主切片器生成路径与送入 Core。</p>
     </header>
     <section class="workspace">
-      <section class="panel preview">
-        <div class="previewHead"><h2 id="previewTitle">α=1 完整曲率层（物理 Z）</h2><div class="stats" id="stats"></div></div>
-        <div class="previewToolbar">
-          <div class="field"><label for="previewMode">预览模式</label><select id="previewMode"><option value="surface" selected>α=1 完整曲率层（物理 Z）</option><option value="solid_xz">实体层叠 / XZ 剖面</option></select></div>
-          <div class="field"><label for="surfaceZScale">三维视觉 Z 放大</label><select id="surfaceZScale"><option value="1">真实比例 ×1</option><option value="3">形态观察 ×3</option><option value="5" selected>形态观察 ×5</option><option value="10">形态观察 ×10</option></select></div>
-          <div class="field"><label for="sectionZScale">XZ 剖面视觉 Z 放大</label><select id="sectionZScale"><option value="1">真实比例 ×1</option><option value="3" selected>辅助观察 ×3</option><option value="5">辅助观察 ×5</option></select></div>
-          <p class="hint">视觉 Z 放大只影响画布，不改变参数、检验值、导出的 JSON 或实际零件尺寸。XZ 剖面采用统一 X/Z 比例后再按所选倍率放大 Z，避免隐藏的纵向拉伸。</p>
-        </div>
-        <canvas id="canvas" aria-label="蜂窝承载曲面预览"></canvas>
-        <p class="navigationHint">左键拖拽旋转；中键拖拽平移；右键上下拖拽缩放；滚轮缩放；双击恢复视角。</p>
-        <div class="status" id="status">正在生成曲面…</div>
-      </section>
       <form class="controls" id="surfaceForm">
         <div class="controlGrid">
         <section class="panel controlGroup">
@@ -1051,6 +1043,11 @@ def surface_preview_html() -> str:
                 <span class="tipText" id="fiberAwareHeightHint">导出的 JSON 会同时记录纤维等效的无纤维层程。主界面关闭纤维时，会按当前树脂层高取最接近的完整层数；开启纤维时保持原有层程策略。</span>
                 <span class="tipText" id="gripLengthHint">两端采用相同长度；蜂窝工作段为 X 总长 − 2 × 每端夹持区。曲面仍按完整零件 X/Y 范围计算，不会因夹持区而改变波长、相位或曲率。</span>
                 <span class="tipText" id="modelMeta">外边界固定为矩形；新共形流程不读取 STL，也不继承 STL 中的蜂窝孔壁。</span>
+                <strong>蜂窝与连续路径</strong>
+                <span class="tipText">连续路径蜂窝：以目标边长为唯一蜂窝几何参数。一个完整黄色孔洞中心固定在蜂窝工作区中心；300 × 300 mm 母板只用于向外铺展，再按当前工作区逐边裁剪。</span>
+                <span class="tipText">红线为 2 mm 连续纤维的中心线预览；黄色为孔洞参考，绿色点为起点、深红点为终点。边界允许出现截断六边形，但路径不会穿入外轮廓。</span>
+                <div class="designSummary" id="latticeDesignSummary" aria-live="polite"></div>
+                <div class="designSummary" id="latticeLengthSummary" aria-live="polite">连续路径总长将在曲面预览更新后显示。</div>
               </div>
             </div>
           </div>
@@ -1060,6 +1057,23 @@ def surface_preview_html() -> str:
             <div class="field"><label for="part_height_mm">最终物理高度 Z（mm）</label><input id="part_height_mm" type="number" min="0.001" step="0.1" value="10" aria-describedby="fiberAwareHeightHint"></div>
             <div class="field"><label for="specimen_variant">试件版本</label><select id="specimen_variant" aria-describedby="gripLengthHint"><option value="tensile" selected>拉伸版：两端夹持区</option><option value="bending">弯曲版：全长蜂窝工作段</option></select></div>
             <div class="field" id="gripEndLengthField"><label for="grip_end_length_mm">每端夹持区 X（mm）</label><input id="grip_end_length_mm" type="number" min="0.001" step="0.5" value="25" aria-describedby="gripLengthHint"></div>
+          </div>
+          <div class="subsectionLabel">蜂窝几何</div>
+          <div class="parameterGrid">
+            <div class="field"><label for="base_cell_size_mm">目标六边形边长（mm）</label><input id="base_cell_size_mm" type="number" min="0.001" step="0.01" value="10"></div>
+          </div>
+          <!-- Kept only so the still-supported legacy JSON form remains readable while
+               the new continuous-course topology is preview-only. -->
+          <div hidden aria-hidden="true">
+            <input id="wall_width_mm" value="2">
+            <input id="orientation_angle_deg" value="0">
+            <input id="align_load_line" type="checkbox">
+            <input id="honeycomb_align_x" type="checkbox">
+            <input id="honeycomb_align_x_mm" value="75">
+            <input id="honeycomb_align_y" type="checkbox">
+            <input id="honeycomb_align_y_mm" value="25">
+            <button type="button" id="centreHoneycombAlignment"></button>
+            <span id="loadLineAlignmentHint"></span><span id="honeycombAlignmentHint"></span>
           </div>
         </section>
         <section class="panel controlGroup">
@@ -1095,38 +1109,6 @@ def surface_preview_html() -> str:
             <div class="field"><label for="z_reference_mm">Z 基准（mm）</label><input id="z_reference_mm" type="number" step="0.01" value="0"></div>
           </div>
           <button type="button" class="secondary" id="applyTensilePreset">应用拉伸中间参数组</button>
-        </section>
-        <section class="panel controlGroup">
-          <div class="groupHeading">
-            <h2>连续路径蜂窝（预览）</h2>
-            <div class="helpTipWrap">
-              <button type="button" class="helpTip" aria-label="查看连续路径蜂窝说明与摘要" aria-describedby="latticeGroupHelp"><span aria-hidden="true">i</span></button>
-              <div class="tipBubble" id="latticeGroupHelp" role="tooltip">
-                <strong>蜂窝与连续路径</strong>
-                <span class="tipText">以目标边长为唯一蜂窝几何参数。一个完整黄色孔洞中心固定在蜂窝工作区中心；300 × 300 mm 母板只用于向外铺展，再按当前工作区逐边裁剪。裁剪窗已扣除外矩形轮廓和夹持分界树脂带的半宽，因此边界允许出现截断六边形，但不会穿入树脂轮廓。</span>
-                <span class="tipText">红线为 2 mm 连续纤维的中心线预览：先沿黄色孔洞之间可容纳纤维的 X 向材料通道绕行，再在左右夹持区保持当前 Y 高度直线延伸到零件边界。绿色点为起点、深红点为终点；纤维只在试样端部切断。</span>
-                <div class="designSummary" id="latticeDesignSummary" aria-live="polite"></div>
-                <div class="designSummary" id="latticeLengthSummary" aria-live="polite">连续路径总长将在曲面预览更新后显示。</div>
-                <span class="tipText">长度是平面预览中每条完整连续路径的累加，不包含层数和曲面映射造成的弧长变化；后续接入路径内核时会重新以实际三维长度计算挤出量。</span>
-              </div>
-            </div>
-          </div>
-          <div class="parameterGrid">
-            <div class="field"><label for="base_cell_size_mm">目标六边形边长（mm）</label><input id="base_cell_size_mm" type="number" min="0.001" step="0.01" value="10"></div>
-          </div>
-        <!-- Kept only so the still-supported legacy JSON form remains readable while
-             the new continuous-course topology is preview-only. -->
-        <div hidden aria-hidden="true">
-          <input id="wall_width_mm" value="2">
-          <input id="orientation_angle_deg" value="0">
-          <input id="align_load_line" type="checkbox">
-          <input id="honeycomb_align_x" type="checkbox">
-          <input id="honeycomb_align_x_mm" value="75">
-          <input id="honeycomb_align_y" type="checkbox">
-          <input id="honeycomb_align_y_mm" value="25">
-          <button type="button" id="centreHoneycombAlignment"></button>
-          <span id="loadLineAlignmentHint"></span><span id="honeycombAlignmentHint"></span>
-        </div>
         </section>
         <section class="panel controlGroup">
           <div class="groupHeading">
@@ -1182,9 +1164,10 @@ def surface_preview_html() -> str:
           </div>
         </details>
         </section>
-        <section class="panel controlGroup">
-          <div class="groupHeading">
-            <h2>下一步</h2>
+        </div>
+        <section class="panel actionBar">
+          <div class="actionHeading">
+            <h2>导出与重置</h2>
             <div class="helpTipWrap">
               <button type="button" class="helpTip" aria-label="查看导出说明" aria-describedby="exportGroupHelp"><span aria-hidden="true">i</span></button>
               <div class="tipBubble" id="exportGroupHelp" role="tooltip">
@@ -1193,14 +1176,35 @@ def surface_preview_html() -> str:
               </div>
             </div>
           </div>
-        <div class="exportActions">
-          <button type="button" id="exportConformalConfig">导出连续路径 JSON</button>
-          <button type="button" class="secondary" id="exportPlanarConfig">导出平面蜂窝结构 JSON</button>
-          <button type="button" class="secondary" id="reset">恢复示例参数</button>
-        </div>
+          <div class="exportActions">
+            <button type="button" id="exportConformalConfig">导出连续路径 JSON</button>
+            <button type="button" class="secondary" id="exportPlanarConfig">导出平面蜂窝结构 JSON</button>
+            <button type="button" class="secondary" id="reset">恢复示例参数</button>
+          </div>
         </section>
-        </div>
       </form>
+      <section class="panel preview">
+        <div class="previewHead">
+          <h2 id="previewTitle">α=1 完整曲率层（物理 Z）</h2>
+          <div class="helpTipWrap">
+            <button type="button" class="helpTip" aria-label="查看预览统计与操作说明" aria-describedby="previewGroupHelp"><span aria-hidden="true">i</span></button>
+            <div class="tipBubble" id="previewGroupHelp" role="tooltip">
+              <strong>预览统计</strong>
+              <div class="stats" id="stats"></div>
+              <span class="tipText">视觉 Z 放大只影响画布，不改变参数、检验值、导出的 JSON 或实际零件尺寸。XZ 剖面采用统一 X/Z 比例后再按所选倍率放大 Z。</span>
+              <span class="tipText">X/Y 单位为 mm，矩形原点为矩形左下角 (0, 0)，Z=0 为零件底面。</span>
+              <span class="tipText">左键拖拽旋转；中键拖拽平移；右键上下拖拽缩放；滚轮缩放；双击恢复视角。</span>
+            </div>
+          </div>
+        </div>
+        <div class="previewToolbar">
+          <div class="field"><label for="previewMode">预览模式</label><select id="previewMode"><option value="surface" selected>α=1 完整曲率层（物理 Z）</option><option value="solid_xz">实体层叠 / XZ 剖面</option></select></div>
+          <div class="field"><label for="surfaceZScale">三维视觉 Z 放大</label><select id="surfaceZScale"><option value="1">真实比例 ×1</option><option value="3">形态观察 ×3</option><option value="5" selected>形态观察 ×5</option><option value="10">形态观察 ×10</option></select></div>
+          <div class="field"><label for="sectionZScale">XZ 剖面视觉 Z 放大</label><select id="sectionZScale"><option value="1">真实比例 ×1</option><option value="3" selected>辅助观察 ×3</option><option value="5">辅助观察 ×5</option></select></div>
+        </div>
+        <canvas id="canvas" aria-label="蜂窝承载曲面预览"></canvas>
+        <div class="status" id="status" aria-live="polite">正在生成曲面…</div>
+      </section>
     </section>
   </main>
   <script>
@@ -2683,9 +2687,6 @@ def surface_preview_html() -> str:
         });
       });
       ctx.restore();
-      ctx.fillStyle = 'rgba(132, 25, 37, .88)';
-      ctx.font = '12px Segoe UI, Microsoft YaHei, sans-serif';
-      ctx.fillText(`连续路径蜂窝：中心孔锚定 (${coursePreview.latticeAnchorMm[0].toFixed(2)}, ${coursePreview.latticeAnchorMm[1].toFixed(2)})；黄色由 300 × 300 mm 母板逐边裁切；红色为孔间通道中心线，裁断后每段独立制造；目标边长 ${coursePreview.edgeLength.toFixed(2)} mm；α=${layer.alpha.toFixed(2)}，物理层 ${layer.index + 1}`, 14, 20);
     }
 
     function renderSolidStack(ctx, width, height) {
@@ -2752,11 +2753,6 @@ def surface_preview_html() -> str:
           ctx.fill();
         }
       });
-      ctx.fillStyle = 'rgba(21,32,51,.78)';
-      ctx.font = '12px Segoe UI, Microsoft YaHei, sans-serif';
-      ctx.fillText(`XZ 剖面：Y = ${stack.section_y_mm.toFixed(2)} mm；完整曲率层 = L${stack.representative_peak_layer_index + 1}；参考层高 ${stack.reference_layer_height_mm.toFixed(2)} mm；视觉 Z ×${visualZScale}；α 为旧版对称 smoothstep`, margin.left, 17);
-      ctx.fillText(`X：${xMin.toFixed(1)} ～ ${xMax.toFixed(1)} mm`, offsetX, height - 16);
-      ctx.fillText(`物理 Z：${zMin.toFixed(2)} ～ ${zMax.toFixed(2)} mm`, width - 178, height - 16);
     }
 
     function render() {
@@ -2830,12 +2826,6 @@ def surface_preview_html() -> str:
       drawLatticePreview(ctx, layer, zMid, yaw, pitch, scale, cx, cy);
       drawBendingFixtureOverlay(ctx, layer, zMid, yaw, pitch, scale, cx, cy);
       drawInspectionMarker(ctx, layer, zMid, yaw, pitch, scale, cx, cy);
-      ctx.fillStyle = 'rgba(21,32,51,.68)';
-      ctx.font = '12px Segoe UI, Microsoft YaHei, sans-serif';
-      const originLabel = payload.domain.mode === 'rectangle'
-        ? '矩形左下角 (0, 0)'
-        : 'STL 投影左下基准 (0, 0)';
-      ctx.fillText(`X / Y：mm，原点：${originLabel}；Z=0 为零件底面；展示 L${layer.index + 1}（α=${layer.alpha.toFixed(2)}，中心 Z=${layer.base_z_mm.toFixed(2)} mm）；视觉 Z ×${surfaceZScale.value}`, 14, height - 16);
     }
 
     function showStats(data) {
