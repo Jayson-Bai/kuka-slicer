@@ -20,7 +20,7 @@ from kuka_slicer.conformal_lattice.fiber_reinforcement import (
 from kuka_slicer.surface_preview.server import conformal_lattice_config_payload
 
 
-def _spec(*, surface_start_layer: int = 0):
+def _spec(*, surface_start_layer: int = 0, transition_step_count: int | None = None):
     source = {
         "provider": "double_sine",
         "source_file": "generated://pipeline-test-double-sine",
@@ -44,6 +44,18 @@ def _spec(*, surface_start_layer: int = 0):
         },
     }
     source["sha256"] = double_sine_source_sha256(source)
+    layer_embedding = {
+        "mode": "symmetric_shape_morphing",
+        "transition": "smoothstep",
+        "surface_start_layer": surface_start_layer,
+    }
+    if transition_step_count is not None:
+        layer_embedding.update(
+            {
+                "transition_step_policy": "manual",
+                "transition_step_count": transition_step_count,
+            }
+        )
     return load_conformal_lattice_spec(
         {
             "format": "conformal_lattice_spec_v1",
@@ -63,11 +75,7 @@ def _spec(*, surface_start_layer: int = 0):
             },
             "fill_field": {"mode": "fixed_cell_size", "drivers": []},
             "orientation_field": {"mode": "global_axis", "angle_deg": 0.0, "constraints": []},
-            "layer_embedding": {
-                "mode": "symmetric_shape_morphing",
-                "transition": "smoothstep",
-                "surface_start_layer": surface_start_layer,
-            },
+            "layer_embedding": layer_embedding,
             "quality_limits": {},
             "random_seed": 0,
         }
@@ -332,6 +340,17 @@ def test_pipeline_keeps_path_export_disabled_without_process_e_conversion(tmp_pa
 def test_pipeline_rejects_invalid_logical_layer_progression(logical_layer_count, surface_start_layer, error):
     with pytest.raises(ValueError, match=error):
         run_conformal_lattice_pipeline(_spec(surface_start_layer=surface_start_layer), logical_layer_count=logical_layer_count)
+
+
+def test_pipeline_applies_manual_transition_steps_to_the_final_layer_stack():
+    run = run_conformal_lattice_pipeline(
+        _spec(transition_step_count=6),
+        logical_layer_count=16,
+    )
+
+    assert run.layer_embedding.report["transition_step_count"] == 6
+    assert run.layer_embedding.report["maximum_transition_step_count"] == 7
+    assert run.layer_embedding.report["peak_layer_indices"] == [6, 7, 8, 9]
 
 
 def test_rectangular_physical_part_derives_monotonic_layer_centres_and_requires_the_matching_count():

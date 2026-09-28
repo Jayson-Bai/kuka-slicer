@@ -182,6 +182,20 @@ def load_conformal_lattice_spec(data: bytes | str | Mapping[str, object]) -> Con
         start_layer = layer_embedding.get("surface_start_layer")
         if not isinstance(start_layer, int) or isinstance(start_layer, bool) or start_layer < 0:
             raise ValueError("symmetric_shape_morphing requires a non-negative integer surface_start_layer")
+        transition_policy = layer_embedding.get("transition_step_policy", "auto_to_midplane")
+        if transition_policy not in {"auto_to_midplane", "manual"}:
+            raise ValueError(
+                "symmetric_shape_morphing transition_step_policy must be auto_to_midplane or manual"
+            )
+        transition_steps = layer_embedding.get("transition_step_count")
+        if transition_steps is not None and (
+            not isinstance(transition_steps, int)
+            or isinstance(transition_steps, bool)
+            or transition_steps < 1
+        ):
+            raise ValueError("symmetric_shape_morphing transition_step_count must be an integer >= 1")
+        if transition_policy == "manual" and transition_steps is None:
+            raise ValueError("manual transition_step_policy requires transition_step_count")
     if provider == "planar" and embedding_mode != "planar_stack":
         raise ValueError("planar source_surface requires layer_embedding.mode=planar_stack")
     if provider != "planar" and embedding_mode == "planar_stack":

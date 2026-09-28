@@ -47,6 +47,7 @@ def embed_lattice_layers(
     layer_offsets_mm: np.ndarray | tuple[float, ...] | None = None,
     symmetric_layer_count: int | None = None,
     surface_start_layer: int = 0,
+    transition_step_count: int | None = None,
     flat_reference_nodes_xyz: np.ndarray | None = None,
     base_z_by_layer_mm: np.ndarray | tuple[float, ...] | None = None,
     symmetric_progress_z_mm: np.ndarray | tuple[float, ...] | None = None,
@@ -80,11 +81,16 @@ def embed_lattice_layers(
         if flat.shape != geometry.lattice_nodes_xyz.shape or not np.all(np.isfinite(flat)):
             raise ValueError("flat_reference_nodes_xyz must be finite and match lattice nodes")
         alphas = (
-            _symmetric_alphas(symmetric_layer_count, surface_start_layer=surface_start_layer)
+            _symmetric_alphas(
+                symmetric_layer_count,
+                surface_start_layer=surface_start_layer,
+                transition_step_count=transition_step_count,
+            )
             if symmetric_progress_z_mm is None
             else _symmetric_alphas_at_physical_z(
                 symmetric_layer_count,
                 surface_start_layer=surface_start_layer,
+                transition_step_count=transition_step_count,
                 positions_mm=symmetric_progress_z_mm,
             )
         )
@@ -94,6 +100,9 @@ def embed_lattice_layers(
         offsets = alphas
         final_layer = symmetric_layer_count - 1
         return_layer = final_layer - surface_start_layer
+        maximum_steps = _maximum_symmetric_transition_steps(
+            symmetric_layer_count, surface_start_layer=surface_start_layer
+        )
         report = {
             "mode": mode,
             "strict_conformal_claim": "not_claimed_for_intermediate_layers; this is a legacy-compatible morphology transition",
@@ -101,6 +110,8 @@ def embed_lattice_layers(
             "node_count_per_layer": int(len(geometry.lattice_nodes_xyz)),
             "surface_start_layer": surface_start_layer,
             "surface_return_layer": return_layer,
+            "transition_step_count": maximum_steps if transition_step_count is None else transition_step_count,
+            "maximum_transition_step_count": maximum_steps,
             "peak_layer_indices": np.flatnonzero(np.isclose(alphas, 1.0)).tolist(),
             "alpha_range": {"min": float(np.min(alphas)), "max": float(np.max(alphas))},
             "alpha_by_layer": alphas.tolist(),
@@ -177,32 +188,71 @@ def _base_z_by_layer(values: np.ndarray | tuple[float, ...] | None, layer_count:
     return base_z
 
 
-def _symmetric_alphas(layer_count: int, *, surface_start_layer: int = 0) -> np.ndarray:
-    """Return the exact old ``LayerProgression`` alpha semantics without importing it.
-
-    The independent conformal package deliberately does not take a runtime
-    dependency on ``surface_mapper``.  The accompanying regression tests compare
-    this implementation against ``LayerProgression`` for odd/even stacks and the
-    one/two-layer active-region exceptions.
-    """
-
+def _maximum_symmetric_transition_steps(layer_count: int, *, surface_start_layer: int) -> int:
     if not isinstance(layer_count, int) or isinstance(layer_count, bool) or layer_count < 1:
         raise ValueError("symmetric_layer_count must be an integer >= 1")
     if not isinstance(surface_start_layer, int) or isinstance(surface_start_layer, bool) or surface_start_layer < 0:
         raise ValueError("surface_start_layer must be a non-negative integer")
+    active_count = layer_count - 2 * surface_start_layer
+    maximum_steps = (active_count - 1) // 2
+    if maximum_steps < 1:
+        if active_count in {1, 2}:
+            return 0
+        raise ValueError("surface_start_layer must leave at least one symmetric transition step")
+    return maximum_steps
+
+
+def _resolved_transition_steps(
+    layer_count: int, *, surface_start_layer: int, transition_step_count: int | None
+) -> tuple[int, int]:
+    maximum_steps = _maximum_symmetric_transition_steps(
+        layer_count, surface_start_layer=surface_start_layer
+    )
+    if transition_step_count is None:
+        return maximum_steps, maximum_steps
+    if (
+        not isinstance(transition_step_count, int)
+        or isinstance(transition_step_count, bool)
+        or transition_step_count < 1
+    ):
+        raise ValueError("transition_step_count must be an integer >= 1")
+    if transition_step_count > maximum_steps:
+        raise ValueError(
+            f"transition_step_count must not exceed {maximum_steps} for the final physical layer stack"
+        )
+    return transition_step_count, maximum_steps
+
+
+def _symmetric_alphas(
+    layer_count: int,
+    *,
+    surface_start_layer: int = 0,
+    transition_step_count: int | None = None,
+) -> np.ndarray:
+    """Return the exact old ``LayerProgression`` alpha semantics without importing it.
+
+    The independent conformal package deliberately does not take a runtime
+    dependency on ``surface_mapper``.  The accompanying regression tests compare
+    this implementation against ``LayerProgression`` for odd/even stacks. The
+    historical one/two-layer active-region exception remains available only
+    for automatic legacy schedules; an explicit transition still needs at
+    least one layer interval.
+    """
+
+    transition_steps, _maximum_steps = _resolved_transition_steps(
+        layer_count,
+        surface_start_layer=surface_start_layer,
+        transition_step_count=transition_step_count,
+    )
     final_layer = layer_count - 1
-    if surface_start_layer > final_layer // 2:
-        raise ValueError("surface_start_layer must leave a symmetric curved region around the middle layer")
     return_layer = final_layer - surface_start_layer
-    active_count = return_layer - surface_start_layer + 1
     alphas = np.zeros(layer_count, dtype=np.float64)
-    if active_count <= 2:
+    if transition_steps == 0:
         alphas[surface_start_layer : return_layer + 1] = 1.0
         return alphas
     indices = np.arange(surface_start_layer, return_layer + 1, dtype=np.float64)
     edge_distance = np.minimum(indices - surface_start_layer, return_layer - indices)
-    half_transition_steps = (active_count - 1) // 2
-    raw = edge_distance / half_transition_steps
+    raw = np.clip(edge_distance / transition_steps, 0.0, 1.0)
     alphas[surface_start_layer : return_layer + 1] = raw * raw * (3.0 - 2.0 * raw)
     return alphas
 
@@ -211,6 +261,7 @@ def _symmetric_alphas_at_physical_z(
     layer_count: int,
     *,
     surface_start_layer: int,
+    transition_step_count: int | None,
     positions_mm: np.ndarray | tuple[float, ...],
 ) -> np.ndarray:
     """Map the symmetric morph onto actual resin-centre Z positions.
@@ -223,7 +274,21 @@ def _symmetric_alphas_at_physical_z(
 
     positions = _base_z_by_layer(positions_mm, layer_count)
     # Retain the existing validation and the exact start/return semantics.
-    ordinal = _symmetric_alphas(layer_count, surface_start_layer=surface_start_layer)
+    transition_steps, _maximum_steps = _resolved_transition_steps(
+        layer_count,
+        surface_start_layer=surface_start_layer,
+        transition_step_count=transition_step_count,
+    )
+    if transition_steps == 0:
+        return _symmetric_alphas(
+            layer_count,
+            surface_start_layer=surface_start_layer,
+        )
+    ordinal = _symmetric_alphas(
+        layer_count,
+        surface_start_layer=surface_start_layer,
+        transition_step_count=transition_steps,
+    )
     active = np.flatnonzero(np.isclose(ordinal, 1.0) | (ordinal > 0.0))
     if active.size == 0:
         return ordinal
@@ -233,12 +298,8 @@ def _symmetric_alphas_at_physical_z(
     final_layer = layer_count - 1
     start = surface_start_layer
     end = final_layer - surface_start_layer
-    active_count = end - start + 1
-    if active_count <= 2:
-        return ordinal
-    half_transition_steps = (active_count - 1) // 2
-    left_peak = start + half_transition_steps
-    right_peak = end - half_transition_steps
+    left_peak = start + transition_steps
+    right_peak = end - transition_steps
     alphas = np.zeros(layer_count, dtype=np.float64)
 
     left_span = positions[left_peak] - positions[start]

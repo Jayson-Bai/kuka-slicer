@@ -647,6 +647,11 @@ def _layer_embedding_for_spec(
         return result
     if embedding.get("mode") != "symmetric_shape_morphing" or embedding.get("transition") != "smoothstep":
         raise ValueError("first-version UI pipeline supports only symmetric_shape_morphing with smoothstep")
+    transition_steps = (
+        int(embedding["transition_step_count"])
+        if embedding.get("transition_step_policy", "auto_to_midplane") == "manual"
+        else None
+    )
     surface = spec.source_surface["double_sine"]
     if not isinstance(surface, Mapping):
         raise ValueError("double-sine source metadata is malformed")
@@ -659,6 +664,7 @@ def _layer_embedding_for_spec(
         mode="symmetric_shape_morphing",
         symmetric_layer_count=logical_layer_count,
         surface_start_layer=int(embedding["surface_start_layer"]),
+        transition_step_count=transition_steps,
         flat_reference_nodes_xyz=flat,
         base_z_by_layer_mm=base_z_by_layer,
         symmetric_progress_z_mm=base_z_by_layer,
@@ -755,11 +761,20 @@ def _physical_layer_schedule(
         if not math.isfinite(fiber_height) or fiber_height <= 0.0:
             raise ValueError("fiber_layer_height_mm must be positive and finite when planning continuous fiber")
         surface_start = int(spec.layer_embedding["surface_start_layer"])
+        transition_steps = (
+            int(spec.layer_embedding["transition_step_count"])
+            if spec.layer_embedding.get("transition_step_policy", "auto_to_midplane") == "manual"
+            else None
+        )
         candidate_limit = max(1, int(math.ceil(final_height / nominal_height)))
         candidates: list[tuple[float, float, int, tuple[int, ...]]] = []
         for candidate_count in range(1, candidate_limit + 1):
             try:
-                alpha = _symmetric_alphas(candidate_count, surface_start_layer=surface_start)
+                alpha = _symmetric_alphas(
+                    candidate_count,
+                    surface_start_layer=surface_start,
+                    transition_step_count=transition_steps,
+                )
                 _first, _last, selected = symmetric_curvature_fiber_schedule(alpha)
             except ValueError:
                 continue

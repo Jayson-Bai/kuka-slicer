@@ -84,6 +84,51 @@ def test_symmetric_compatibility_mode_respects_the_requested_start_and_return_la
     assert stack.report["peak_layer_indices"] == [4, 5]
 
 
+def test_manual_transition_steps_reach_full_curvature_early_and_hold_a_symmetric_plateau():
+    alphas = _symmetric_alphas(
+        16,
+        surface_start_layer=0,
+        transition_step_count=6,
+    )
+
+    assert alphas[0] == pytest.approx(0.0)
+    assert alphas[1] == pytest.approx(3 * (1 / 6) ** 2 - 2 * (1 / 6) ** 3)
+    assert alphas[6:10] == pytest.approx(np.ones(4))
+    assert alphas.tolist() == pytest.approx(alphas[::-1].tolist())
+
+
+@pytest.mark.parametrize("transition_step_count", [0, -1, True, 8])
+def test_manual_transition_steps_are_validated_against_the_final_stack(transition_step_count):
+    with pytest.raises(ValueError, match="transition_step_count"):
+        _symmetric_alphas(
+            16,
+            surface_start_layer=0,
+            transition_step_count=transition_step_count,
+        )
+
+
+def test_embedding_reports_the_resolved_transition_step_count():
+    domain, parameterization, fields, orientation, phase = _inputs()
+    geometry = generate_conformal_lattice_geometry(
+        domain, parameterization, fields, orientation, phase, boundary_mode="inset"
+    )
+    flat = geometry.lattice_nodes_xyz + np.asarray([0.0, 0.0, 5.0])
+
+    stack = embed_lattice_layers(
+        domain,
+        orientation,
+        geometry,
+        mode="symmetric_shape_morphing",
+        symmetric_layer_count=16,
+        transition_step_count=6,
+        flat_reference_nodes_xyz=flat,
+    )
+
+    assert stack.report["transition_step_count"] == 6
+    assert stack.report["maximum_transition_step_count"] == 7
+    assert stack.report["peak_layer_indices"] == [6, 7, 8, 9]
+
+
 @pytest.mark.parametrize(
     ("layer_count", "surface_start_layer"),
     [(3, 2), (4, -1), (0, 0)],
