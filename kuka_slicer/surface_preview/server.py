@@ -7,8 +7,6 @@ import math
 import os
 import secrets
 import subprocess
-import threading
-import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -723,13 +721,6 @@ def run_surface_preview_server(host: str, port: int) -> None:
     server = ThreadingHTTPServer((host, port), SurfacePreviewHandler)
     server.preview_domains = {}
     server.designer_state_path = _designer_state_path()
-    server.browser_session_required = os.environ.get("KUKA_SLICER_BROWSER_SESSION") == "1"
-    server.browser_session_token = os.environ.get("KUKA_SLICER_BROWSER_SESSION_TOKEN")
-    server.browser_session_started_at = time.monotonic()
-    server.browser_session_last_heartbeat = None
-    server.browser_session_lease_active = False
-    server.browser_session_close_requested = False
-    server.browser_session_lock = threading.Lock()
 
     print(f"KUKA surface preview running at http://{host}:{port}")
     try:
@@ -745,9 +736,6 @@ class SurfacePreviewHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
-        if parsed.path == "/browser-session-lease":
-            self._serve_browser_session_lease(parse_qs(parsed.query))
-            return
         if parsed.path == "/":
             self._send_html(surface_preview_html())
             return
@@ -811,25 +799,6 @@ class SurfacePreviewHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
-        if parsed.path == "/browser-session-heartbeat":
-            if self.server.browser_session_required:
-                with self.server.browser_session_lock:
-                    self.server.browser_session_last_heartbeat = time.monotonic()
-            self._send_json({"ok": True})
-            return
-        if parsed.path == "/browser-session-close":
-            if self.server.browser_session_required and self._matches_browser_session(parse_qs(parsed.query)):
-                with self.server.browser_session_lock:
-                    already_closing = self.server.browser_session_close_requested
-                    self.server.browser_session_close_requested = True
-                if not already_closing:
-                    threading.Thread(
-                        target=self.server.shutdown,
-                        daemon=True,
-                        name="surface-preview-browser-session-close",
-                    ).start()
-            self._send_json({"ok": True})
-            return
         if parsed.path == "/api/designer-state":
             try:
                 raw_length = self.headers.get("Content-Length")
@@ -875,38 +844,6 @@ class SurfacePreviewHandler(BaseHTTPRequestHandler):
         domain_id = secrets.token_urlsafe(18)
         self.server.preview_domains[domain_id] = domain
         self._send_json({"ok": True, "domain_id": domain_id, "projection": domain.preview_payload()})
-
-    def _matches_browser_session(self, params: dict[str, list[str]]) -> bool:
-        expected = self.server.browser_session_token
-        return not expected or params.get("session", [""])[0] == expected
-
-    def _serve_browser_session_lease(self, params: dict[str, list[str]]) -> None:
-        """Hold a browser session through background-tab timer throttling."""
-
-        if not self.server.browser_session_required or not self._matches_browser_session(params):
-            self.send_error(HTTPStatus.NOT_FOUND, "Not found")
-            return
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache, no-store")
-        self.send_header("Connection", "keep-alive")
-        self.end_headers()
-        try:
-            while not self.server.browser_session_close_requested:
-                with self.server.browser_session_lock:
-                    self.server.browser_session_lease_active = True
-                    self.server.browser_session_last_heartbeat = time.monotonic()
-                self.wfile.write(b": session-lease\n\n")
-                self.wfile.flush()
-                time.sleep(2.0)
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            with self.server.browser_session_lock:
-                self.server.browser_session_close_requested = True
-            threading.Thread(
-                target=self.server.shutdown,
-                daemon=True,
-                name="surface-preview-browser-session-lease-close",
-            ).start()
 
     def _domain_from_params(
         self, params: dict[str, list[str]], *, required: bool = False
@@ -2743,45 +2680,35 @@ def surface_preview_html() -> str:
     });
     surfaceZScale.addEventListener('change', () => { saveDesignerState(); render(); });
     sectionZScale.addEventListener('change', () => { saveDesignerState(); render(); });
-    exportConformalConfigButton.addEventListener('click', async () => {
-      try {
-        const response = await fetch(`/api/export-conformal-lattice-config?${conformalParameters().toString()}`);
-        if (!response.ok) {
-          const result = await response.json();
-          throw new Error(result.error || '无法导出共形格栅配置');
-        }
-        const blob = await response.blob();
-        const link = document.createElement('a');
-        link.href = URL.createObjectURL(blob);
-        link.download = 'conformal_lattice_spec_v1.json';
-        link.click();
-        URL.revokeObjectURL(link.href);
-        statusEl.className = 'status';
-        statusEl.textContent = '已导出连续路径设计 JSON；回到主切片器导入该文件以生成正式路径。';
-      } catch (error) {
-        statusEl.className = 'status error';
-        statusEl.textContent = error.message;
-      }
+
+    function downloadAttachment(url, fileName) {
+      // Keep this synchronous with the user's click. Browsers may reject a
+      // download started after await fetch() because that user gesture has
+      // already expired. The server sets Content-Disposition: attachment.
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = fileName;
+      link.style.display = 'none';
+      document.body.appendChild(link);
+      link.click();
+      setTimeout(() => link.remove(), 0);
+    }
+
+    exportConformalConfigButton.addEventListener('click', () => {
+      downloadAttachment(
+        `/api/export-conformal-lattice-config?${conformalParameters().toString()}`,
+        'conformal_lattice_spec_v1.json',
+      );
+      statusEl.className = 'status';
+      statusEl.textContent = '正在下载连续路径设计 JSON…';
     });
-    exportPlanarConfigButton.addEventListener('click', async () => {
-      try {
-        const response = await fetch(`/api/export-planar-lattice-config?${conformalParameters().toString()}`);
-        if (!response.ok) {
-          const result = await response.json();
-          throw new Error(result.error || '无法导出平面蜂窝结构配置');
-        }
-        const blob = await response.blob();
-        const link = document.createElement('a');
-        link.href = URL.createObjectURL(blob);
-        link.download = 'planar_honeycomb_spec_v1.json';
-        link.click();
-        URL.revokeObjectURL(link.href);
-        statusEl.className = 'status';
-        statusEl.textContent = '已导出平面蜂窝结构 JSON；文件不包含双正弦曲面参数，可在主切片器中按平面路径生成 Core NPZ。';
-      } catch (error) {
-        statusEl.className = 'status error';
-        statusEl.textContent = error.message;
-      }
+    exportPlanarConfigButton.addEventListener('click', () => {
+      downloadAttachment(
+        `/api/export-planar-lattice-config?${conformalParameters().toString()}`,
+        'planar_honeycomb_spec_v1.json',
+      );
+      statusEl.className = 'status';
+      statusEl.textContent = '正在下载平面蜂窝结构 JSON…';
     });
     canvas.addEventListener('contextmenu', (event) => event.preventDefault());
     canvas.addEventListener('pointerdown', (event) => {
@@ -2847,24 +2774,6 @@ def surface_preview_html() -> str:
       refresh();
     });
     window.addEventListener('resize', render);
-    if (new URLSearchParams(window.location.search).get('browser_session') === '1') {
-      window.addEventListener('pagehide', () => {
-        const session = new URLSearchParams(window.location.search).get('session') || '';
-        navigator.sendBeacon('/browser-session-close?session=' + encodeURIComponent(session));
-      }, { once: true });
-      (async () => {
-        try {
-          const session = new URLSearchParams(window.location.search).get('session') || '';
-          const response = await fetch('/browser-session-lease?session=' + encodeURIComponent(session), { cache: 'no-store' });
-          const reader = response.body?.getReader();
-          if (!reader) return;
-          while (true) {
-            const next = await reader.read();
-            if (next.done) return;
-          }
-        } catch (_error) {}
-      })();
-    }
     async function initialiseDesigner() {
       restoreDesignerState();
       await restorePersistentDesignerState();

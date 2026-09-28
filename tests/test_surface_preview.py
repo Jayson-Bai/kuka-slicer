@@ -560,6 +560,14 @@ def test_surface_preview_html_has_an_independent_surface_api_and_controls():
     assert 'function continuousCoursePreview' in html
     assert 'id="exportConformalConfig">导出连续路径 JSON</button>' in html
     assert 'id="exportConformalConfig" disabled' not in html
+    assert 'function downloadAttachment(url, fileName)' in html
+    assert 'document.body.appendChild(link);' in html
+    assert 'setTimeout(() => link.remove(), 0);' in html
+    assert 'because that user gesture has' in html
+    assert '`/api/export-conformal-lattice-config?${conformalParameters().toString()}`' in html
+    assert '`/api/export-planar-lattice-config?${conformalParameters().toString()}`' in html
+    assert 'await fetch(`/api/export-conformal-lattice-config?' not in html
+    assert 'await fetch(`/api/export-planar-lattice-config?' not in html
     assert '连续路径目前仅在本页生成和验证' not in html
     assert 'id="latticeLengthSummary"' in html
     assert 'function updateLatticeLengthSummary' in html

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-import secrets
 import shutil
 import socket
 import subprocess
@@ -21,10 +20,6 @@ _TOOLS: dict[str, tuple[str, tuple[str, ...]]] = {
 }
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _BREAKAWAY_FALLBACK_WINERRORS = {5, 87}
-_MACOS_BROWSER_PATHS = (
-    Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
-    Path("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
-)
 
 
 class _ManagedProcess(Protocol):
@@ -159,50 +154,17 @@ def run_app_session(tool: str) -> int:
 
     command, extra_args = _tool_spec(tool)
     port = _find_available_port()
-    # Chrome's isolated --app profiles intermittently crash with Error 15 on
-    # this Mac. All macOS local tools therefore use the ordinary system
-    # browser, while their page heartbeat still owns the short-lived server.
-    browser_heartbeat_session = sys.platform == "darwin"
-    previous_browser_session = os.environ.get("KUKA_SLICER_BROWSER_SESSION")
-    previous_browser_session_token = os.environ.get("KUKA_SLICER_BROWSER_SESSION_TOKEN")
-    browser_session_token: str | None = None
-    if browser_heartbeat_session:
-        browser_session_token = secrets.token_urlsafe(12)
-        os.environ["KUKA_SLICER_BROWSER_SESSION"] = "1"
-        os.environ["KUKA_SLICER_BROWSER_SESSION_TOKEN"] = browser_session_token
     server = _launch_server_process(
         [sys.executable, "-m", "kuka_slicer", command, "--host", "127.0.0.1", "--port", str(port), *extra_args]
     )
     profile_dir: Path | None = None
     try:
         _wait_for_port(port, server)
-        browser_url = f"http://127.0.0.1:{port}"
-        if browser_heartbeat_session:
-            # A session-specific URL prevents macOS Chrome from selecting an
-            # old, dead tab that happens to have the same local address.
-            # Reusing that tab was indistinguishable from a button click that
-            # did nothing, while the server backing the old tab had exited.
-            browser_url += f"?browser_session=1&session={browser_session_token}"
-        browser, profile_dir = _launch_browser_app(browser_url, tool)
-        if browser_heartbeat_session:
-            # Chrome's macOS process tree is not a dependable window-lifetime
-            # signal. The UI server instead stops itself after its page stops
-            # sending the browser-session heartbeat.
-            server.wait()
-        else:
-            _wait_for_browser_session(browser, profile_dir)
+        browser, profile_dir = _launch_browser_app(f"http://127.0.0.1:{port}", tool)
+        browser.wait()
         return 0
     finally:
         _stop_process(server)
-        if browser_heartbeat_session:
-            if previous_browser_session is None:
-                os.environ.pop("KUKA_SLICER_BROWSER_SESSION", None)
-            else:
-                os.environ["KUKA_SLICER_BROWSER_SESSION"] = previous_browser_session
-            if previous_browser_session_token is None:
-                os.environ.pop("KUKA_SLICER_BROWSER_SESSION_TOKEN", None)
-            else:
-                os.environ["KUKA_SLICER_BROWSER_SESSION_TOKEN"] = previous_browser_session_token
         if profile_dir is not None:
             shutil.rmtree(profile_dir, ignore_errors=True)
 
@@ -389,20 +351,7 @@ def _wait_for_port(port: int, server: _ManagedProcess, timeout_s: float = 60.0) 
     raise TimeoutError(f"local server did not start on port {port}")
 
 
-def _launch_browser_app(url: str, tool: str) -> tuple[subprocess.Popen[bytes], Path | None]:
-    if sys.platform == "darwin":
-        # Do not launch Chrome directly with a temporary --user-data-dir here.
-        # That renderer path is unstable on this host; macOS `open` uses the
-        # user's healthy normal browser profile instead. The caller waits for
-        # the server's page heartbeat rather than this short-lived opener.
-        return (
-            subprocess.Popen(
-                ["/usr/bin/open", url],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            ),
-            None,
-        )
+def _launch_browser_app(url: str, tool: str) -> tuple[subprocess.Popen[bytes], Path]:
     browser_path = _find_browser()
     profile_dir = Path(tempfile.mkdtemp(prefix=f"kuka-slicer-{tool}-"))
     try:
@@ -416,176 +365,29 @@ def _launch_browser_app(url: str, tool: str) -> tuple[subprocess.Popen[bytes], P
             "--disable-background-mode",
             f"--user-data-dir={profile_dir}",
         ]
-        if sys.platform == "darwin":
-            # Launch Chrome's executable directly. Finder's ``open`` command
-            # returns while a Chrome app window is still alive, which leaves
-            # the UI server without a reliable owner process.
-            command = [str(browser_path), *browser_args]
-        else:
-            command = [str(browser_path), *browser_args]
         browser = subprocess.Popen(
-            command,
+            [str(browser_path), *browser_args],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        _activate_macos_browser_window(browser_path)
     except Exception:
         shutil.rmtree(profile_dir, ignore_errors=True)
         raise
     return browser, profile_dir
 
 
-def _wait_for_browser_session(browser: _ManagedProcess, profile_dir: Path) -> None:
-    """Wait for the dedicated browser app instance to exit."""
-
-    if sys.platform == "darwin":
-        _wait_for_macos_browser_profile(profile_dir, _find_browser())
-        return
-    browser.wait()
-
-
-def _wait_for_macos_browser_profile(profile_dir: Path, browser_path: Path) -> None:
-    """Wait for the main browser process carrying this session's profile.
-
-    Chrome on macOS forks its application process, so the PID returned by
-    ``Popen`` can exit while the visible app window is still open. The unique
-    user-data directory is a stable ownership marker for the real app. Once
-    that main process has appeared and subsequently disappears, the UI window
-    is definitively closed and its local server may be stopped.
-    """
-
-    # A cold Chrome start can take noticeably longer on macOS while the
-    # system restores its app process.  Do not let the short startup probe
-    # turn that normal delay into an orphaned browser window.
-    deadline = time.monotonic() + 60.0
-    profile_stable_since: float | None = None
-    observed_stable_profile = False
-    missing_since: float | None = None
-    while True:
-        now = time.monotonic()
-        if _macos_browser_profile_pids(profile_dir, browser_path):
-            if profile_stable_since is None:
-                profile_stable_since = now
-            # ``open -n`` can briefly create one Chrome process for the
-            # isolated profile, then replace it with the real app process.
-            # Treating that first transient process as the window owner can
-            # make the supervisor stop the server just before the visible
-            # app window appears.  A profile must remain present briefly
-            # before its disappearance means that the user closed the UI.
-            if now - profile_stable_since >= 2.0:
-                observed_stable_profile = True
-            missing_since = None
-        else:
-            if not observed_stable_profile:
-                # A startup-only Chrome process disappeared.  Keep the
-                # server alive while the app finishes replacing it, and make
-                # the eventual real process establish its own stable window.
-                profile_stable_since = None
-            else:
-            # ``pgrep`` can momentarily miss a process during a macOS app
-            # activation or child-process change. Do not tear down a working
-            # slicer server on one transient observation.
-                if missing_since is None:
-                    missing_since = now
-                # Chrome can take several seconds to replace or re-parent its
-                # initial app process even after the window was visible.  Its
-                # process list is therefore only a delayed close signal on
-                # macOS: keep the local server through a generous hand-off
-                # window, then still clean it up after an actual close.
-                elif now - missing_since >= 30.0:
-                    return
-            if now >= deadline:
-                raise RuntimeError("macOS browser session did not create its isolated window process")
-        # The launcher may have exited already; keep waiting until the unique
-        # profile process appears or the bounded startup deadline is reached.
-        time.sleep(0.1)
-
-
-def _macos_browser_profile_pids(profile_dir: Path, browser_path: Path) -> tuple[int, ...]:
-    """Return live main-browser PIDs using a particular temporary profile."""
-
-    profile_argument = f"--user-data-dir={profile_dir}"
-    try:
-        completed = subprocess.run(
-            # BSD ``pgrep -f`` can intermittently miss a newly re-parented
-            # Chrome app process.  Read the complete command lines directly
-            # and match the executable plus the unique profile argument.
-            [
-                "/bin/ps",
-                "-ax",
-                "-ww",
-                "-o",
-                "pid=",
-                "-o",
-                "command=",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=2.0,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return ()
-    if completed.returncode != 0:
-        return ()
-    pids: list[int] = []
-    for line in completed.stdout.splitlines():
-        pid_text, separator, command = line.strip().partition(" ")
-        if not separator or not pid_text.isdigit():
-            continue
-        if command.startswith(str(browser_path)) and profile_argument in command:
-            pids.append(int(pid_text))
-    return tuple(pids)
-
-
-def _activate_macos_browser_window(browser_path: Path) -> None:
-    """Bring a newly-created macOS browser app window to the foreground.
-
-    Directly launching Chrome's executable is necessary to own the temporary
-    profile and accurately stop the matching design-server session. Unlike
-    ``open -a``, though, it may leave the app window behind the main slicer or
-    on a different Space.  Activating its containing ``.app`` makes a designer
-    launch visible without changing how Windows sessions behave.
-    """
-
-    if sys.platform != "darwin":
-        return
-    try:
-        app_bundle = browser_path.parents[2]
-        app_name = app_bundle.stem
-    except IndexError:
-        return
-    if not app_name:
-        return
-    try:
-        subprocess.run(
-            ["/usr/bin/osascript", "-e", f'tell application "{app_name}" to activate'],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=5.0,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        # The window may already be frontmost, and activation must never turn
-        # a working local designer session into a failed launch.
-        pass
-
-
 def _find_browser() -> Path:
     configured = os.environ.get("KUKA_SLICER_BROWSER")
     candidates = [Path(configured)] if configured else []
-    if sys.platform == "darwin":
-        candidates.extend(_MACOS_BROWSER_PATHS)
-    else:
-        candidates.extend(
-            Path(root) / relative
-            for root in (os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles"))
-            if root
-            for relative in (
-                Path("Google/Chrome/Application/chrome.exe"),
-                Path("Microsoft/Edge/Application/msedge.exe"),
-            )
+    candidates.extend(
+        Path(root) / relative
+        for root in (os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles"))
+        if root
+        for relative in (
+            Path("Google/Chrome/Application/chrome.exe"),
+            Path("Microsoft/Edge/Application/msedge.exe"),
         )
+    )
     for candidate in candidates:
         if candidate.is_file():
             return candidate

@@ -42,6 +42,12 @@ build/
 
 .playwright-cli/*
 
+# Host-local macOS development and Finder launchers.  These files may exist in
+# a Mac checkout, but Windows is the production baseline for origin/main.
+.DS_Store
+docs/macos_development_setup.md
+scripts/*_macos.command
+
 # Local agent-analysis artifacts; regenerate them as needed.
 graphify-out/
 RTK.md

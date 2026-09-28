@@ -37,7 +37,6 @@ def test_app_session_stops_server_when_browser_window_exits(monkeypatch, tmp_pat
     profile = tmp_path / "isolated-browser-profile"
     profile.mkdir()
     monkeypatch.setattr(app_session.subprocess, "Popen", lambda *args, **kwargs: server)
-    monkeypatch.setattr(app_session.sys, "platform", "linux")
     monkeypatch.setattr(app_session, "_wait_for_port", lambda *args, **kwargs: None)
     monkeypatch.setattr(app_session, "_launch_browser_app", lambda *args, **kwargs: (browser, profile))
 
@@ -65,7 +64,6 @@ def test_app_session_uses_a_fresh_port_for_each_server(monkeypatch, tmp_path: Pa
         return server
 
     monkeypatch.setattr(app_session.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(app_session.sys, "platform", "linux")
     monkeypatch.setattr(app_session, "_find_available_port", lambda: 43210)
     monkeypatch.setattr(app_session, "_wait_for_port", lambda *args, **kwargs: None)
     monkeypatch.setattr(app_session, "_launch_browser_app", lambda *args, **kwargs: (browser, profile))
@@ -73,33 +71,6 @@ def test_app_session_uses_a_fresh_port_for_each_server(monkeypatch, tmp_path: Pa
     assert app_session.run_app_session("ui") == 0
 
     assert "43210" in launched[0]
-
-
-def test_macos_ui_session_waits_for_heartbeat_owned_server(monkeypatch, tmp_path: Path) -> None:
-    server = _Process()
-    browser = _Process()
-    profile = tmp_path / "isolated-browser-profile"
-    profile.mkdir()
-    opened_urls: list[str] = []
-    monkeypatch.setattr(app_session.subprocess, "Popen", lambda *args, **kwargs: server)
-    monkeypatch.setattr(app_session.sys, "platform", "darwin")
-    monkeypatch.setattr(app_session, "_wait_for_port", lambda *args, **kwargs: None)
-    def launch_browser(url: str, *_args, **_kwargs):
-        opened_urls.append(url)
-        return browser, profile
-
-    monkeypatch.setattr(app_session, "_launch_browser_app", launch_browser)
-    monkeypatch.delenv("KUKA_SLICER_BROWSER_SESSION", raising=False)
-    monkeypatch.delenv("KUKA_SLICER_BROWSER_SESSION_TOKEN", raising=False)
-
-    assert app_session.run_app_session("ui") == 0
-
-    assert server.waited
-    assert not browser.waited
-    assert opened_urls[0].startswith("http://127.0.0.1:")
-    assert "?browser_session=1&session=" in opened_urls[0]
-    assert "KUKA_SLICER_BROWSER_SESSION" not in app_session.os.environ
-    assert "KUKA_SLICER_BROWSER_SESSION_TOKEN" not in app_session.os.environ
 
 
 def test_server_process_requests_windows_job_breakaway(monkeypatch) -> None:
@@ -195,122 +166,11 @@ def test_app_session_prefers_google_chrome_over_edge(monkeypatch, tmp_path: Path
     assert app_session._find_browser() == chrome
 
 
-def test_app_session_finds_macos_chrome_for_designer_window(monkeypatch, tmp_path: Path) -> None:
-    chrome = tmp_path / "Google Chrome.app" / "Contents" / "MacOS" / "Google Chrome"
-    edge = tmp_path / "Microsoft Edge.app" / "Contents" / "MacOS" / "Microsoft Edge"
-    chrome.parent.mkdir(parents=True)
-    edge.parent.mkdir(parents=True)
-    chrome.touch()
-    edge.touch()
-    monkeypatch.delenv("KUKA_SLICER_BROWSER", raising=False)
-    monkeypatch.setattr(app_session.sys, "platform", "darwin")
-    monkeypatch.setattr(app_session, "_MACOS_BROWSER_PATHS", (chrome, edge))
-
-    assert app_session._find_browser() == chrome
-
-
-def test_macos_designer_browser_activation_uses_its_containing_app(monkeypatch, tmp_path: Path) -> None:
-    chrome = tmp_path / "Google Chrome.app" / "Contents" / "MacOS" / "Google Chrome"
-    chrome.parent.mkdir(parents=True)
-    chrome.touch()
-    calls: list[tuple[list[str], dict[str, object]]] = []
-
-    def fake_run(command, **kwargs):
-        calls.append((command, kwargs))
-
-    monkeypatch.setattr(app_session.sys, "platform", "darwin")
-    monkeypatch.setattr(app_session.subprocess, "run", fake_run)
-
-    app_session._activate_macos_browser_window(chrome)
-
-    assert calls == [
-        (
-            ["/usr/bin/osascript", "-e", 'tell application "Google Chrome" to activate'],
-            {
-                "check": False,
-                "stdout": app_session.subprocess.DEVNULL,
-                "stderr": app_session.subprocess.DEVNULL,
-                "timeout": 5.0,
-            },
-        )
-    ]
-
-
-def test_macos_browser_session_uses_system_open_without_an_isolated_profile(monkeypatch, tmp_path: Path) -> None:
-    process = _Process()
-    commands: list[list[str]] = []
-
-    def fake_popen(command, **_kwargs):
-        commands.append(command)
-        return process
-
-    monkeypatch.setattr(app_session.sys, "platform", "darwin")
-    monkeypatch.setattr(app_session.subprocess, "Popen", fake_popen)
-
-    _browser, profile = app_session._launch_browser_app("http://127.0.0.1:45678", "surface-preview")
-
-    assert commands == [["/usr/bin/open", "http://127.0.0.1:45678"]]
-    assert profile is None
-
-
-def test_macos_session_waits_for_the_profile_process_to_close(monkeypatch, tmp_path: Path) -> None:
-    profile = tmp_path / "isolated-browser-profile"
-    profile.mkdir()
-    observed = iter([(), (1234,), (1234,), (1234,), (), ()])
-    monotonic_values = iter([0.0, 0.0, 0.5, 2.1, 2.5, 3.6, 33.7])
-    monkeypatch.setattr(
-        app_session,
-        "_macos_browser_profile_pids",
-        lambda _profile, _browser: next(observed),
-    )
-    monkeypatch.setattr(app_session.time, "monotonic", lambda: next(monotonic_values))
-    monkeypatch.setattr(app_session.time, "sleep", lambda _seconds: None)
-
-    app_session._wait_for_macos_browser_profile(profile, tmp_path / "Google Chrome")
-
-
-def test_macos_session_ignores_a_transient_startup_profile_process(monkeypatch, tmp_path: Path) -> None:
-    profile = tmp_path / "isolated-browser-profile"
-    profile.mkdir()
-    # The first process is the short-lived ``open -n`` startup process.  The
-    # later profile process owns the actual visible app window.
-    observed = iter([(), (1111,), (), (2222,), (2222,), (2222,), (), ()])
-    monotonic_values = iter([0.0, 0.0, 0.3, 0.6, 1.0, 2.8, 3.0, 4.1, 34.2])
-    monkeypatch.setattr(
-        app_session,
-        "_macos_browser_profile_pids",
-        lambda _profile, _browser: next(observed),
-    )
-    monkeypatch.setattr(app_session.time, "monotonic", lambda: next(monotonic_values))
-    monkeypatch.setattr(app_session.time, "sleep", lambda _seconds: None)
-
-    app_session._wait_for_macos_browser_profile(profile, tmp_path / "Google Chrome")
-
-
-def test_macos_profile_process_lookup_matches_the_browser_and_profile(monkeypatch, tmp_path: Path) -> None:
-    chrome = tmp_path / "Google Chrome.app" / "Contents" / "MacOS" / "Google Chrome"
-    profile = tmp_path / "isolated-browser-profile"
-    output = "\n".join(
-        [
-            f"  123 {chrome} --app=http://127.0.0.1:43210 --user-data-dir={profile}",
-            f"  456 {chrome} --app=http://127.0.0.1:43211 --user-data-dir={tmp_path / 'other'}",
-            "  789 /Applications/Other.app/Contents/MacOS/Other --user-data-dir=ignored",
-        ]
-    )
-
-    class _Completed:
-        returncode = 0
-        stdout = output
-
-    monkeypatch.setattr(app_session.subprocess, "run", lambda *_args, **_kwargs: _Completed())
-
-    assert app_session._macos_browser_profile_pids(profile, chrome) == (123,)
-
-
-def test_main_ui_leaves_the_designer_to_its_independent_desktop_launcher() -> None:
+def test_main_ui_exposes_surface_tool_launchers() -> None:
     html = _index_html()
 
-    assert 'id="surfacePreviewButton"' not in html
+    assert 'id="surfacePreviewButton"' in html
     assert 'id="surfaceMapperButton"' not in html
-    assert "surfaceToolButtons" not in html
-    assert "/launch-tool?tool=" not in html
+    assert "surfaceToolButtons['surface-preview'].addEventListener" in html
+    assert "surfaceToolButtons['surface-map'].addEventListener" not in html
+    assert "/launch-tool?tool=" in html
