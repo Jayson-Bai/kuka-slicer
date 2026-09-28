@@ -342,6 +342,17 @@ def _vector(value: object, name: str, *, length: int) -> tuple[float, ...]:
 
 def _validate_double_sine_source(source: Mapping[str, object]) -> None:
     surface = _object(source, "double_sine")
+    if surface.get("type", "double_sine_product") != "double_sine_product":
+        raise ValueError("source_surface.double_sine.type must be double_sine_product")
+    enabled_axes = []
+    for axis in ("x", "y"):
+        key = f"curvature_{axis}_enabled"
+        value = surface.get(key, True)
+        if not isinstance(value, bool):
+            raise ValueError(f"source_surface.double_sine.{key} must be a boolean")
+        enabled_axes.append(value)
+    if not any(enabled_axes):
+        raise ValueError("double_sine source must enable curvature on at least one axis")
     for key in ("amplitude_mm", "wavelength_x_mm", "wavelength_y_mm", "phase_x_rad", "phase_y_rad", "z_reference_mm"):
         _finite(surface.get(key), f"source_surface.double_sine.{key}")
     _positive(surface.get("wavelength_x_mm"), "source_surface.double_sine.wavelength_x_mm")

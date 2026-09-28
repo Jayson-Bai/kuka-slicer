@@ -58,5 +58,7 @@ def height_field_from_spec(spec: ConformalLatticeSpec) -> HeightField:
             phase_x_rad=float(values["phase_x_rad"]),
             phase_y_rad=float(values["phase_y_rad"]),
             z_reference_mm=float(values["z_reference_mm"]),
+            x_enabled=bool(values.get("curvature_x_enabled", True)),
+            y_enabled=bool(values.get("curvature_y_enabled", True)),
         )
     raise ValueError(f"source provider {spec.source_provider!r} is not a generated height field")

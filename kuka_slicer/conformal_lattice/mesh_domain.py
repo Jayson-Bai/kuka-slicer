@@ -206,6 +206,8 @@ def build_double_sine_surface_domain(
         phase_x_rad=float(values["phase_x_rad"]),
         phase_y_rad=float(values["phase_y_rad"]),
         z_reference_mm=float(values["z_reference_mm"]),
+        x_enabled=bool(values.get("curvature_x_enabled", True)),
+        y_enabled=bool(values.get("curvature_y_enabled", True)),
     )
     global_bounds = tuple(float(value) for value in values["xy_bounds_mm"])
     x_min, y_min, x_max, y_max = global_bounds

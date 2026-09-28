@@ -17,7 +17,12 @@ def _finite(value: float, name: str) -> float:
 
 @dataclass(frozen=True, slots=True)
 class DoubleSineSurface:
-    """The initial ``graded_surface_v1`` double-sine height field in millimetres."""
+    """A separable one/two-axis sine height field in millimetres.
+
+    The historical name remains part of the public Python API. Disabling an
+    axis replaces only that axis' sine factor with one; it does not set the
+    shared amplitude to zero.
+    """
 
     amplitude_mm: float = 0.8
     wavelength_x_mm: float = 40.0
@@ -25,12 +30,18 @@ class DoubleSineSurface:
     phase_x_rad: float = 0.0
     phase_y_rad: float = 0.0
     z_reference_mm: float = 0.0
+    x_enabled: bool = True
+    y_enabled: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "amplitude_mm", _finite(self.amplitude_mm, "amplitude_mm"))
         object.__setattr__(self, "phase_x_rad", _finite(self.phase_x_rad, "phase_x_rad"))
         object.__setattr__(self, "phase_y_rad", _finite(self.phase_y_rad, "phase_y_rad"))
         object.__setattr__(self, "z_reference_mm", _finite(self.z_reference_mm, "z_reference_mm"))
+        if not isinstance(self.x_enabled, bool) or not isinstance(self.y_enabled, bool):
+            raise ValueError("x_enabled and y_enabled must be booleans")
+        if not self.x_enabled and not self.y_enabled:
+            raise ValueError("a sine surface must enable at least one axis")
         for name in ("wavelength_x_mm", "wavelength_y_mm"):
             value = _finite(getattr(self, name), name)
             if value <= 0.0:
@@ -42,9 +53,17 @@ class DoubleSineSurface:
 
         x = np.asarray(x_mm, dtype=float)
         y = np.asarray(y_mm, dtype=float)
-        return self.z_reference_mm + self.amplitude_mm * np.sin(
-            (2.0 * np.pi * x) / self.wavelength_x_mm + self.phase_x_rad
-        ) * np.sin((2.0 * np.pi * y) / self.wavelength_y_mm + self.phase_y_rad)
+        x_factor = (
+            np.sin((2.0 * np.pi * x) / self.wavelength_x_mm + self.phase_x_rad)
+            if self.x_enabled
+            else np.ones_like(x)
+        )
+        y_factor = (
+            np.sin((2.0 * np.pi * y) / self.wavelength_y_mm + self.phase_y_rad)
+            if self.y_enabled
+            else np.ones_like(y)
+        )
+        return self.z_reference_mm + self.amplitude_mm * x_factor * y_factor
 
     def gradient(self, x_mm, y_mm) -> tuple[np.ndarray, np.ndarray]:
         """Return the analytical ``(dH/dx, dH/dy)`` gradient."""
@@ -53,19 +72,20 @@ class DoubleSineSurface:
         y = np.asarray(y_mm, dtype=float)
         x_phase = (2.0 * np.pi * x) / self.wavelength_x_mm + self.phase_x_rad
         y_phase = (2.0 * np.pi * y) / self.wavelength_y_mm + self.phase_y_rad
+        x_sine = np.sin(x_phase) if self.x_enabled else np.ones_like(x)
+        y_sine = np.sin(y_phase) if self.y_enabled else np.ones_like(y)
         dx = (
-            self.amplitude_mm
-            * (2.0 * np.pi / self.wavelength_x_mm)
-            * np.cos(x_phase)
-            * np.sin(y_phase)
+            self.amplitude_mm * (2.0 * np.pi / self.wavelength_x_mm) * np.cos(x_phase) * y_sine
+            if self.x_enabled
+            else np.zeros_like(x)
         )
         dy = (
-            self.amplitude_mm
-            * (2.0 * np.pi / self.wavelength_y_mm)
-            * np.sin(x_phase)
-            * np.cos(y_phase)
+            self.amplitude_mm * (2.0 * np.pi / self.wavelength_y_mm) * x_sine * np.cos(y_phase)
+            if self.y_enabled
+            else np.zeros_like(y)
         )
         return dx, dy
+
 
     def sample_grid(
         self,

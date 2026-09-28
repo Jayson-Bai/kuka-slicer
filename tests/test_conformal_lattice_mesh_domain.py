@@ -14,6 +14,7 @@ from kuka_slicer.conformal_lattice import (
     prepare_surface_mesh_domain,
 )
 from kuka_slicer.conformal_lattice.contracts import double_sine_source_sha256
+from kuka_slicer.conformal_lattice.surface_field import height_field_from_spec
 
 
 def _spec(*, provider: str, source_file: str, sha256: str, source_extra: dict[str, object] | None = None):
@@ -89,6 +90,44 @@ def test_double_sine_domain_is_deterministic_and_has_one_boundary_loop():
     assert len(first.boundary_loops) == 1
     assert first.report["provider"] == "double_sine"
     assert first.report["input_sha256"] == spec.source_sha256
+
+
+@pytest.mark.parametrize(
+    ("x_enabled", "y_enabled", "point", "expected_height"),
+    [
+        (True, False, (5.0, 7.0), 2.0),
+        (False, True, (3.0, 7.5), 2.0),
+    ],
+)
+def test_generated_surface_contract_supports_one_active_sine_axis(
+    x_enabled, y_enabled, point, expected_height
+):
+    raw = _double_sine_spec()
+    surface = raw["source_surface"]["double_sine"]
+    surface["curvature_x_enabled"] = x_enabled
+    surface["curvature_y_enabled"] = y_enabled
+    raw["source_surface"]["sha256"] = double_sine_source_sha256(raw["source_surface"])
+
+    spec = load_conformal_lattice_spec(raw)
+    domain = build_double_sine_surface_domain(spec)
+    field = height_field_from_spec(spec)
+
+    assert field.height(*point) == pytest.approx(expected_height)
+    matching = np.isclose(domain.vertices[:, 0], point[0]) & np.isclose(domain.vertices[:, 1], point[1])
+    assert domain.vertices[matching, 2].item() == pytest.approx(expected_height)
+
+
+def test_generated_surface_contract_keeps_legacy_double_axis_default_and_rejects_no_axes():
+    legacy = load_conformal_lattice_spec(_double_sine_spec())
+    assert height_field_from_spec(legacy).height(5.0, 7.5) == pytest.approx(2.0)
+
+    raw = _double_sine_spec()
+    surface = raw["source_surface"]["double_sine"]
+    surface["curvature_x_enabled"] = False
+    surface["curvature_y_enabled"] = False
+    raw["source_surface"]["sha256"] = double_sine_source_sha256(raw["source_surface"])
+    with pytest.raises(ValueError, match="at least one axis"):
+        load_conformal_lattice_spec(raw)
 
 
 def test_mesh_preparation_merges_vertices_removes_degenerate_faces_and_records_provenance():

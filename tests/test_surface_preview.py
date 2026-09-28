@@ -272,6 +272,37 @@ def test_double_sine_surface_matches_the_documented_height_field():
     assert surface.height(0.0, 10.0) == pytest.approx(1.5)
 
 
+@pytest.mark.parametrize(
+    ("x_enabled", "y_enabled", "x_mm", "y_mm"),
+    [
+        (True, True, 5.0, 10.0),
+        (True, False, 5.0, 7.0),
+        (False, True, 3.0, 10.0),
+    ],
+)
+def test_sine_surface_axes_are_independent(x_enabled, y_enabled, x_mm, y_mm):
+    surface = DoubleSineSurface(
+        amplitude_mm=2.0,
+        wavelength_x_mm=20.0,
+        wavelength_y_mm=40.0,
+        x_enabled=x_enabled,
+        y_enabled=y_enabled,
+    )
+
+    dx, dy = surface.gradient(x_mm, y_mm)
+
+    assert surface.height(x_mm, y_mm) == pytest.approx(2.0)
+    if not x_enabled:
+        assert dx == pytest.approx(0.0)
+    if not y_enabled:
+        assert dy == pytest.approx(0.0)
+
+
+def test_sine_surface_rejects_disabling_both_axes():
+    with pytest.raises(ValueError, match="at least one axis"):
+        DoubleSineSurface(x_enabled=False, y_enabled=False)
+
+
 def test_double_sine_surface_reports_analytical_maximum_slope():
     surface = DoubleSineSurface(amplitude_mm=1.0, wavelength_x_mm=20.0, wavelength_y_mm=40.0)
     grid = surface.sample_grid(width_mm=20.0, height_mm=40.0, samples=41)
