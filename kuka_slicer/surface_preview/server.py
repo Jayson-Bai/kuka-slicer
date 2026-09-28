@@ -953,6 +953,7 @@ def surface_preview_html() -> str:
   <style>
     :root { color-scheme: light; font-family: "Segoe UI", "Microsoft YaHei", sans-serif; color: #152033; background: #f4f7fb; }
     * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
     body { margin: 0; min-width: 320px; }
     main { max-width: 1600px; margin: 0 auto; padding: 20px clamp(14px, 2vw, 28px) 28px; }
     header { margin-bottom: 18px; }
@@ -961,27 +962,44 @@ def surface_preview_html() -> str:
     .workspace { display: flex; flex-direction: column; gap: 18px; }
     .panel { background: #fff; border: 1px solid #dbe3ef; border-radius: 14px; box-shadow: 0 10px 30px rgba(32, 52, 82, .07); }
     .controls { margin: 0; }
-    .controlGrid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; align-items: start; }
-    .controlGroup { min-width: 0; padding: 18px; }
-    .controlGroup h2, .preview h2 { margin: 0 0 14px; font-size: 16px; }
-    .field { display: grid; grid-template-columns: 1fr 112px; align-items: center; gap: 10px; margin: 10px 0; }
+    .controlGrid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; align-items: stretch; }
+    .controlGroup { position: relative; min-width: 0; height: 100%; padding: 16px; display: flex; flex-direction: column; }
+    .groupHeading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+    .controlGroup h2 { margin: 0; font-size: 16px; }
+    .preview h2 { margin: 0 0 14px; font-size: 16px; }
+    .parameterGrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 12px; align-items: end; }
+    .parameterGrid + button, .parameterGrid + .parameterGrid, .controlGroup > button { margin-top: 12px; }
+    .field { display: grid; grid-template-columns: 1fr 112px; align-items: center; gap: 10px; margin: 8px 0; }
+    .parameterGrid .field { grid-template-columns: 1fr; align-content: end; gap: 6px; margin: 0; }
     label { font-size: 13px; color: #38475d; }
-    input { width: 100%; border: 1px solid #bdcadb; border-radius: 7px; padding: 8px; color: #142238; font: inherit; }
+    input { width: 100%; border: 1px solid #bdcadb; border-radius: 7px; padding: 7px 8px; color: #142238; font: inherit; font-variant-numeric: tabular-nums; }
     input[type="checkbox"] { width: 18px; height: 18px; justify-self: start; padding: 0; }
     input:disabled { background: #f0f4f8; color: #7b8798; cursor: not-allowed; }
     input:focus { outline: 3px solid rgba(36, 122, 207, .18); border-color: #247acf; }
     .divider { height: 1px; background: #e6ecf4; margin: 17px 0; }
-    button { width: 100%; border: 0; border-radius: 8px; padding: 10px 12px; background: #126fd1; color: white; font: 600 14px inherit; cursor: pointer; }
+    button { width: 100%; border: 0; border-radius: 8px; padding: 9px 12px; background: #126fd1; color: white; font: 600 14px inherit; cursor: pointer; }
     button:hover { background: #075eaf; }
     button:disabled { background: #9ba9ba; cursor: not-allowed; }
     button.secondary { background: #eaf2fb; color: #0b5da9; margin-top: 8px; }
     button.secondary:hover { background: #dcebf9; }
-    select { width: 100%; border: 1px solid #bdcadb; border-radius: 7px; padding: 8px; color: #142238; font: inherit; background: #fff; }
+    select { width: 100%; border: 1px solid #bdcadb; border-radius: 7px; padding: 7px 8px; color: #142238; font: inherit; background: #fff; }
     .fileInput { margin: 8px 0 0; font-size: 12px; }
     .modelMeta { min-height: 18px; margin: 9px 0 0; color: #526074; font-size: 12px; line-height: 1.5; word-break: break-word; }
     .hint { margin: 12px 0 0; color: #66758b; font-size: 12px; line-height: 1.55; }
     .designSummary { margin: 10px 0 0; padding: 9px 10px; border: 1px solid #d9e5f4; border-radius: 8px; background: #f5f9fd; color: #40516a; font-size: 12px; line-height: 1.55; }
     .designSummary.error { border-color: #f0c5c2; background: #fff7f6; color: #a52a21; }
+    .helpTipWrap { position: relative; flex: 0 0 auto; }
+    button.helpTip { width: 28px; height: 28px; padding: 0; border: 1px solid #c9d7e8; border-radius: 50%; background: #f3f7fc; color: #35618f; font-size: 13px; line-height: 1; }
+    button.helpTip:hover, button.helpTip:focus-visible { background: #e5effa; color: #0b5da9; }
+    button.helpTip:focus-visible { outline: 3px solid rgba(36, 122, 207, .2); outline-offset: 2px; }
+    .tipBubble { position: absolute; top: calc(100% + 8px); right: 0; z-index: 20; visibility: hidden; width: min(390px, calc(100vw - 44px)); max-height: min(62vh, 520px); overflow: auto; padding: 12px 13px; border: 1px solid #cbd9e9; border-radius: 10px; background: #fff; box-shadow: 0 14px 32px rgba(32, 52, 82, .16); color: #40516a; font-size: 12px; line-height: 1.6; text-align: left; }
+    .helpTipWrap:hover .tipBubble, .helpTipWrap:focus-within .tipBubble { visibility: visible; }
+    .tipBubble strong { display: block; margin-bottom: 5px; color: #23364f; font-size: 12px; }
+    .tipText { display: block; }
+    .tipText + .tipText, .tipText + .designSummary, .designSummary + .designSummary { margin-top: 8px; }
+    .tipBubble .designSummary { margin-bottom: 0; box-shadow: none; }
+    .exportActions { display: grid; gap: 8px; margin-top: auto; }
+    .exportActions button { margin: 0; }
     details.advanced { margin-top: 12px; color: #40516a; font-size: 13px; }
     details.advanced summary { cursor: pointer; color: #2e405a; font-weight: 600; }
     .advancedBody { padding-top: 4px; }
@@ -999,7 +1017,7 @@ def surface_preview_html() -> str:
     .status.error { color: #b42318; }
     @media (max-width: 1180px) { .controlGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .previewToolbar { grid-template-columns: 1fr 1fr; } }
     @media (max-width: 760px) { main { padding: 14px; } .controlGrid, .previewToolbar { grid-template-columns: 1fr; } .previewToolbar .hint { grid-column: auto; } canvas { height: 420px; } }
-    @media (max-width: 480px) { .field, .previewToolbar .field { grid-template-columns: 1fr; } input[type="checkbox"] { justify-self: start; } canvas { height: 340px; } }
+    @media (max-width: 480px) { .field, .previewToolbar .field, .parameterGrid { grid-template-columns: 1fr; } input[type="checkbox"] { justify-self: start; } canvas { height: 340px; } }
   </style>
 </head>
 <body>
@@ -1024,43 +1042,78 @@ def surface_preview_html() -> str:
       <form class="controls" id="surfaceForm">
         <div class="controlGrid">
         <section class="panel controlGroup">
-        <h2>矩形实体</h2>
-        <div class="field"><label for="part_length_mm">零件长度 X（mm）</label><input id="part_length_mm" type="number" min="0.001" step="1" value="150"></div>
-        <div class="field"><label for="part_width_mm">零件宽度 Y（mm）</label><input id="part_width_mm" type="number" min="0.001" step="1" value="50"></div>
-        <div class="field"><label for="part_height_mm">最终物理高度 Z（mm）</label><input id="part_height_mm" type="number" min="0.001" step="0.1" value="10"></div>
-        <p class="hint" id="fiberAwareHeightHint">导出的 JSON 会同时记录纤维等效的无纤维层程。主界面关闭纤维时，会按当前树脂层高取最接近的完整层数；开启纤维时保持原有层程策略。</p>
-        <div class="field"><label for="specimen_variant">试件版本</label><select id="specimen_variant"><option value="tensile" selected>拉伸版：两端夹持区</option><option value="bending">弯曲版：全长蜂窝工作段</option></select></div>
-        <div class="field" id="gripEndLengthField"><label for="grip_end_length_mm">每端夹持区 X（mm）</label><input id="grip_end_length_mm" type="number" min="0.001" step="0.5" value="25" aria-describedby="gripLengthHint"></div>
-        <p class="hint" id="gripLengthHint">两端采用相同长度；蜂窝工作段为 X 总长 − 2 × 每端夹持区。曲面仍按完整零件 X/Y 范围计算，不会因夹持区而改变波长、相位或曲率。</p>
-        <p class="modelMeta" id="modelMeta">外边界固定为矩形；新共形流程不读取 STL，也不继承 STL 中的蜂窝孔壁。</p>
+          <div class="groupHeading">
+            <h2>矩形实体</h2>
+            <div class="helpTipWrap">
+              <button type="button" class="helpTip" aria-label="查看矩形实体说明" aria-describedby="partGroupHelp"><span aria-hidden="true">i</span></button>
+              <div class="tipBubble" id="partGroupHelp" role="tooltip">
+                <strong>零件与试件版本</strong>
+                <span class="tipText" id="fiberAwareHeightHint">导出的 JSON 会同时记录纤维等效的无纤维层程。主界面关闭纤维时，会按当前树脂层高取最接近的完整层数；开启纤维时保持原有层程策略。</span>
+                <span class="tipText" id="gripLengthHint">两端采用相同长度；蜂窝工作段为 X 总长 − 2 × 每端夹持区。曲面仍按完整零件 X/Y 范围计算，不会因夹持区而改变波长、相位或曲率。</span>
+                <span class="tipText" id="modelMeta">外边界固定为矩形；新共形流程不读取 STL，也不继承 STL 中的蜂窝孔壁。</span>
+              </div>
+            </div>
+          </div>
+          <div class="parameterGrid">
+            <div class="field"><label for="part_length_mm">零件长度 X（mm）</label><input id="part_length_mm" type="number" min="0.001" step="1" value="150"></div>
+            <div class="field"><label for="part_width_mm">零件宽度 Y（mm）</label><input id="part_width_mm" type="number" min="0.001" step="1" value="50"></div>
+            <div class="field"><label for="part_height_mm">最终物理高度 Z（mm）</label><input id="part_height_mm" type="number" min="0.001" step="0.1" value="10" aria-describedby="fiberAwareHeightHint"></div>
+            <div class="field"><label for="specimen_variant">试件版本</label><select id="specimen_variant" aria-describedby="gripLengthHint"><option value="tensile" selected>拉伸版：两端夹持区</option><option value="bending">弯曲版：全长蜂窝工作段</option></select></div>
+            <div class="field" id="gripEndLengthField"><label for="grip_end_length_mm">每端夹持区 X（mm）</label><input id="grip_end_length_mm" type="number" min="0.001" step="0.5" value="25" aria-describedby="gripLengthHint"></div>
+          </div>
         </section>
         <section class="panel controlGroup">
-        <h2>曲面参数</h2>
-        <div class="field"><label for="curvature_x_enabled">启用 X 向曲率</label><input id="curvature_x_enabled" type="checkbox" checked></div>
-        <div class="field"><label for="curvature_y_enabled">启用 Y 向曲率</label><input id="curvature_y_enabled" type="checkbox" checked></div>
-        <p class="hint" id="curvatureAxesHint">X、Y 同时启用为双正弦曲面；只启用一个方向为单正弦曲面；全部关闭时预览和“连续路径 JSON”导出均自动使用现有平面蜂窝合同。</p>
-        <div class="field"><label for="surface_parameter_mode">曲面参数策略</label><select id="surface_parameter_mode"><option value="tensile_centered_wave_count" selected>拉伸：试样中心对称波数</option><option value="manual_wavelength_phase">手动：波长与相位</option></select></div>
-        <div class="field"><label for="amplitude_mm">幅值 A（mm）</label><input id="amplitude_mm" type="number" step="0.01" value="1.5"></div>
-        <div id="tensileWaveFields">
-          <div class="field"><label for="wave_count_x">X 向波数 nx</label><input id="wave_count_x" type="number" min="0.5" step="1" value="1.5"></div>
-          <div class="field"><label for="wave_count_y">Y 向波数 ny</label><input id="wave_count_y" type="number" min="0.5" step="1" value="1.5"></div>
+          <div class="groupHeading">
+            <h2>曲面参数</h2>
+            <div class="helpTipWrap">
+              <button type="button" class="helpTip" aria-label="查看曲面参数说明" aria-describedby="surfaceGroupHelp"><span aria-hidden="true">i</span></button>
+              <div class="tipBubble" id="surfaceGroupHelp" role="tooltip">
+                <strong>曲面定义</strong>
+                <span class="tipText" id="curvatureAxesHint">X、Y 同时启用为双正弦曲面；只启用一个方向为单正弦曲面；全部关闭时预览和“连续路径 JSON”导出均自动使用现有平面蜂窝合同。</span>
+                <span class="tipText" id="tensileWaveHint">仅允许 0.5、1.5、2.5… 等半整数波数。波数按完整试样 X/Y 尺寸归一化：自动计算 λx、λy 与相位，使试样中心为正峰，四周边界回到 H=0；改变矩形尺寸不会改变无量纲曲面构型。</span>
+                <span class="tipText" id="phasePiHint">输入 π 的倍数：1 表示 π，0.5 表示 π/2，1.5 表示 3π/2；导出的设计 JSON 仍以 rad 保存。</span>
+              </div>
+            </div>
+          </div>
+          <div class="parameterGrid">
+            <div class="field"><label for="curvature_x_enabled">启用 X 向曲率</label><input id="curvature_x_enabled" type="checkbox" checked></div>
+            <div class="field"><label for="curvature_y_enabled">启用 Y 向曲率</label><input id="curvature_y_enabled" type="checkbox" checked></div>
+            <div class="field"><label for="surface_parameter_mode">曲面参数策略</label><select id="surface_parameter_mode"><option value="tensile_centered_wave_count" selected>拉伸：试样中心对称波数</option><option value="manual_wavelength_phase">手动：波长与相位</option></select></div>
+            <div class="field"><label for="amplitude_mm">幅值 A（mm）</label><input id="amplitude_mm" type="number" step="0.01" value="1.5"></div>
+          </div>
+          <div class="parameterGrid" id="tensileWaveFields">
+            <div class="field"><label for="wave_count_x">X 向波数 nx</label><input id="wave_count_x" type="number" min="0.5" step="1" value="1.5"></div>
+            <div class="field"><label for="wave_count_y">Y 向波数 ny</label><input id="wave_count_y" type="number" min="0.5" step="1" value="1.5"></div>
+          </div>
+          <div class="parameterGrid" id="manualSurfaceFields" hidden>
+            <div class="field"><label for="wavelength_x_mm">X 波长 λx（mm）</label><input id="wavelength_x_mm" type="number" min="0.001" step="0.1" value="100"></div>
+            <div class="field"><label for="wavelength_y_mm">Y 波长 λy（mm）</label><input id="wavelength_y_mm" type="number" min="0.001" step="0.1" value="66.667"></div>
+            <div class="field"><label for="phase_x_pi">X 相位 φx（π）</label><input id="phase_x_pi" type="number" step="0.25" value="1" aria-describedby="phasePiHint"></div>
+            <div class="field"><label for="phase_y_pi">Y 相位 φy（π）</label><input id="phase_y_pi" type="number" step="0.25" value="1" aria-describedby="phasePiHint"></div>
+          </div>
+          <div class="parameterGrid">
+            <div class="field"><label for="z_reference_mm">Z 基准（mm）</label><input id="z_reference_mm" type="number" step="0.01" value="0"></div>
+          </div>
           <button type="button" class="secondary" id="applyTensilePreset">应用拉伸中间参数组</button>
-          <p class="hint" id="tensileWaveHint">仅允许 0.5、1.5、2.5… 等半整数波数。波数按完整试样 X/Y 尺寸归一化：自动计算 λx、λy 与相位，使试样中心为正峰，四周边界回到 H=0；改变矩形尺寸不会改变无量纲曲面构型。</p>
-        </div>
-        <div id="manualSurfaceFields" hidden>
-          <div class="field"><label for="wavelength_x_mm">X 波长 λx（mm）</label><input id="wavelength_x_mm" type="number" min="0.001" step="0.1" value="100"></div>
-          <div class="field"><label for="wavelength_y_mm">Y 波长 λy（mm）</label><input id="wavelength_y_mm" type="number" min="0.001" step="0.1" value="66.667"></div>
-          <div class="field"><label for="phase_x_pi">X 相位 φx（π）</label><input id="phase_x_pi" type="number" step="0.25" value="1" aria-describedby="phasePiHint"></div>
-          <div class="field"><label for="phase_y_pi">Y 相位 φy（π）</label><input id="phase_y_pi" type="number" step="0.25" value="1" aria-describedby="phasePiHint"></div>
-          <p class="hint" id="phasePiHint">输入 π 的倍数：1 表示 π，0.5 表示 π/2，1.5 表示 3π/2；导出的设计 JSON 仍以 rad 保存。</p>
-        </div>
-        <div class="field"><label for="z_reference_mm">Z 基准（mm）</label><input id="z_reference_mm" type="number" step="0.01" value="0"></div>
         </section>
         <section class="panel controlGroup">
-        <h2>连续路径蜂窝（预览）</h2>
-        <div class="field"><label for="base_cell_size_mm">目标六边形边长（mm）</label><input id="base_cell_size_mm" type="number" min="0.001" step="0.01" value="10"></div>
-        <p class="hint">以目标边长为唯一蜂窝几何参数。一个完整黄色孔洞中心固定在蜂窝工作区中心；300 × 300 mm 母板只用于向外铺展，再按当前工作区逐边裁剪。裁剪窗已扣除外矩形轮廓和夹持分界树脂带的半宽，因此边界允许出现截断六边形，但不会穿入树脂轮廓。</p>
-        <p class="hint">红线为 2 mm 连续纤维的中心线预览：先沿黄色孔洞之间可容纳纤维的 X 向材料通道绕行，再在左右夹持区保持当前 Y 高度直线延伸到零件边界。绿色点为起点、深红点为终点；纤维只在试样端部切断。</p>
+          <div class="groupHeading">
+            <h2>连续路径蜂窝（预览）</h2>
+            <div class="helpTipWrap">
+              <button type="button" class="helpTip" aria-label="查看连续路径蜂窝说明与摘要" aria-describedby="latticeGroupHelp"><span aria-hidden="true">i</span></button>
+              <div class="tipBubble" id="latticeGroupHelp" role="tooltip">
+                <strong>蜂窝与连续路径</strong>
+                <span class="tipText">以目标边长为唯一蜂窝几何参数。一个完整黄色孔洞中心固定在蜂窝工作区中心；300 × 300 mm 母板只用于向外铺展，再按当前工作区逐边裁剪。裁剪窗已扣除外矩形轮廓和夹持分界树脂带的半宽，因此边界允许出现截断六边形，但不会穿入树脂轮廓。</span>
+                <span class="tipText">红线为 2 mm 连续纤维的中心线预览：先沿黄色孔洞之间可容纳纤维的 X 向材料通道绕行，再在左右夹持区保持当前 Y 高度直线延伸到零件边界。绿色点为起点、深红点为终点；纤维只在试样端部切断。</span>
+                <div class="designSummary" id="latticeDesignSummary" aria-live="polite"></div>
+                <div class="designSummary" id="latticeLengthSummary" aria-live="polite">连续路径总长将在曲面预览更新后显示。</div>
+                <span class="tipText">长度是平面预览中每条完整连续路径的累加，不包含层数和曲面映射造成的弧长变化；后续接入路径内核时会重新以实际三维长度计算挤出量。</span>
+              </div>
+            </div>
+          </div>
+          <div class="parameterGrid">
+            <div class="field"><label for="base_cell_size_mm">目标六边形边长（mm）</label><input id="base_cell_size_mm" type="number" min="0.001" step="0.01" value="10"></div>
+          </div>
         <!-- Kept only so the still-supported legacy JSON form remains readable while
              the new continuous-course topology is preview-only. -->
         <div hidden aria-hidden="true">
@@ -1074,52 +1127,77 @@ def surface_preview_html() -> str:
           <button type="button" id="centreHoneycombAlignment"></button>
           <span id="loadLineAlignmentHint"></span><span id="honeycombAlignmentHint"></span>
         </div>
-        <div class="designSummary" id="latticeDesignSummary" aria-live="polite"></div>
-        <div class="designSummary" id="latticeLengthSummary" aria-live="polite">连续路径总长将在曲面预览更新后显示。</div>
-        <p class="hint">长度是平面预览中每条完整连续路径的累加，不包含层数和曲面映射造成的弧长变化；后续接入路径内核时会重新以实际三维长度计算挤出量。</p>
         </section>
         <section class="panel controlGroup">
-        <h2>弯曲专用检验（可选）</h2>
+          <div class="groupHeading">
+            <h2>弯曲专用检验（可选）</h2>
+            <div class="helpTipWrap">
+              <button type="button" class="helpTip" aria-label="查看弯曲检验说明与摘要" aria-describedby="bendingGroupHelp"><span aria-hidden="true">i</span></button>
+              <div class="tipBubble" id="bendingGroupHelp" role="tooltip">
+                <strong>三点弯曲预览</strong>
+                <span class="tipText" id="bendingFixtureHint">只在画布绘制跨中加载线和两条对称支撑线；不会改变蜂窝相位、曲面相位、路径、零件尺寸或任何导出 JSON 字段。</span>
+                <span class="tipText" id="checkPointHint">仅在第三章三点弯曲时启用。启用后可查看任意点的 H、坡度和平均曲率；尺寸变化时，超出矩形范围的坐标会自动收回到范围内。</span>
+                <div class="designSummary" id="bendingFixtureSummary" aria-live="polite"></div>
+              </div>
+            </div>
+          </div>
         <div id="bendingFixtureFields" hidden>
-          <div class="field"><label for="bending_span_preview_mm">支撑跨度（仅预览，mm）</label><input id="bending_span_preview_mm" type="number" min="0.001" step="1" value="100" aria-describedby="bendingFixtureHint"></div>
+          <div class="parameterGrid"><div class="field"><label for="bending_span_preview_mm">支撑跨度（仅预览，mm）</label><input id="bending_span_preview_mm" type="number" min="0.001" step="1" value="100" aria-describedby="bendingFixtureHint"></div></div>
           <button type="button" class="secondary" id="restoreBendingSpanPreview">恢复 100 mm 预览跨度</button>
-          <p class="hint" id="bendingFixtureHint">只在画布绘制跨中加载线和两条对称支撑线；不会改变蜂窝相位、曲面相位、路径、零件尺寸或任何导出 JSON 字段。</p>
-          <div class="designSummary" id="bendingFixtureSummary" aria-live="polite"></div>
         </div>
-        <div class="field"><label for="inspection_enabled">显示弯曲检验点</label><input id="inspection_enabled" type="checkbox"></div>
-        <div id="inspectionPointFields" hidden>
+        <div class="parameterGrid"><div class="field"><label for="inspection_enabled">显示弯曲检验点</label><input id="inspection_enabled" type="checkbox"></div></div>
+        <div class="parameterGrid" id="inspectionPointFields" hidden>
           <div class="field"><label for="check_x_mm">检验点 X（mm）</label><input id="check_x_mm" type="number" min="0" step="0.1" value="75" aria-describedby="checkPointHint"></div>
           <div class="field"><label for="check_y_mm">检验点 Y（mm）</label><input id="check_y_mm" type="number" min="0" step="0.1" value="50" aria-describedby="checkPointHint"></div>
-          <p class="hint" id="checkPointHint">仅在第三章三点弯曲时启用。启用后可查看任意点的 H、坡度和平均曲率；尺寸变化时，超出矩形范围的坐标会自动收回到范围内。</p>
         </div>
         </section>
         <section class="panel controlGroup">
-        <h2>对称层间渐变</h2>
-        <div class="field"><label for="surface_start_layer">首个非零曲率层（物理层）</label><input id="surface_start_layer" type="number" min="2" step="1" value="2"></div>
-        <div class="field"><label for="transition_step_count">达到完整曲率的层间步数</label><input id="transition_step_count" type="number" min="1" step="1" value="9" aria-describedby="transitionStepHint"></div>
+          <div class="groupHeading">
+            <h2>对称层间渐变</h2>
+            <div class="helpTipWrap">
+              <button type="button" class="helpTip" aria-label="查看层间渐变说明与摘要" aria-describedby="transitionGroupHelp"><span aria-hidden="true">i</span></button>
+              <div class="tipBubble" id="transitionGroupHelp" role="tooltip">
+                <strong>层间过渡规则</strong>
+                <span class="tipText" id="transitionStepHint">步数是从 α=0 边界层到首次 α=1 层经历的层间间隔数。默认根据设计器参考层数自动计算；手动修改后保留该值，并在最终实际层栈上重新核验。</span>
+                <span class="tipText">层号自下而上从 1 开始。填 2 表示第 1 层为平面、第 2 层首次出现非零曲率；导出仍保留旧映射器所需的零基边界层索引。</span>
+                <span class="tipText">曲面采样 X/Y 参与共形计算；预览网格密度只影响本页显示。格栅相位由导出流程在实际曲面相位域自动避让，避免蜂窝墙与矩形外边界重合；参数化固定使用 LSCM、最远边界锚点和无切缝。</span>
+                <div class="designSummary" id="layerProgressionSummary" aria-live="polite"></div>
+              </div>
+            </div>
+          </div>
+        <div class="parameterGrid">
+          <div class="field"><label for="surface_start_layer">首个非零曲率层（物理层）</label><input id="surface_start_layer" type="number" min="2" step="1" value="2"></div>
+          <div class="field"><label for="transition_step_count">达到完整曲率的层间步数</label><input id="transition_step_count" type="number" min="1" step="1" value="9" aria-describedby="transitionStepHint"></div>
+        </div>
         <input id="transition_step_policy" type="hidden" value="auto_to_midplane">
         <button type="button" class="secondary" id="restoreAutomaticTransition">恢复自动过渡步数</button>
-        <p class="hint" id="transitionStepHint">步数是从 α=0 边界层到首次 α=1 层经历的层间间隔数。默认根据设计器参考层数自动计算；手动修改后保留该值，并在最终实际层栈上重新核验。</p>
-        <p class="hint">层号自下而上从 1 开始。填 2 表示第 1 层为平面、第 2 层首次出现非零曲率；导出仍保留旧映射器所需的零基边界层索引。</p>
-        <div class="designSummary" id="layerProgressionSummary" aria-live="polite"></div>
         <details class="advanced">
           <summary>高级参数（共形计算）</summary>
-          <div class="advancedBody">
+          <div class="advancedBody parameterGrid">
             <div class="field"><label for="samples_x">曲面采样 X</label><input id="samples_x" type="number" min="2" max="512" step="1" value="49"></div>
             <div class="field"><label for="samples_y">曲面采样 Y</label><input id="samples_y" type="number" min="2" max="512" step="1" value="49"></div>
             <div class="field"><label for="boundary_mode">边界策略</label><select id="boundary_mode"><option value="clip" selected>裁剪至矩形</option><option value="inset">向内缩进</option></select></div>
             <div class="field"><label for="random_seed">随机种子</label><input id="random_seed" type="number" min="0" step="1" value="0"></div>
             <div class="field"><label for="samples">预览网格密度</label><input id="samples" type="number" min="8" max="120" step="1" value="49"></div>
-            <p class="hint">曲面采样 X/Y 参与共形计算；预览网格密度只影响本页显示。格栅相位由导出流程在实际曲面相位域自动避让，避免蜂窝墙与矩形外边界重合；参数化固定使用 LSCM、最远边界锚点和无切缝。</p>
           </div>
         </details>
         </section>
         <section class="panel controlGroup">
-        <h2>下一步</h2>
-        <button type="button" id="exportConformalConfig">导出连续路径 JSON</button>
-        <button type="button" class="secondary" id="exportPlanarConfig">导出平面蜂窝结构 JSON</button>
-        <button type="button" class="secondary" id="reset">恢复示例参数</button>
-        <p class="hint">曲面 JSON 包含双正弦参数；平面 JSON 只保留当前零件尺寸、分区和蜂窝路径/形状样式。两者都可直接导入主切片器，并复用同一套树脂、可选纤维及 Core 工艺参数。</p>
+          <div class="groupHeading">
+            <h2>下一步</h2>
+            <div class="helpTipWrap">
+              <button type="button" class="helpTip" aria-label="查看导出说明" aria-describedby="exportGroupHelp"><span aria-hidden="true">i</span></button>
+              <div class="tipBubble" id="exportGroupHelp" role="tooltip">
+                <strong>导出用途</strong>
+                <span class="tipText">曲面 JSON 包含双正弦参数；平面 JSON 只保留当前零件尺寸、分区和蜂窝路径/形状样式。两者都可直接导入主切片器，并复用同一套树脂、可选纤维及 Core 工艺参数。</span>
+              </div>
+            </div>
+          </div>
+        <div class="exportActions">
+          <button type="button" id="exportConformalConfig">导出连续路径 JSON</button>
+          <button type="button" class="secondary" id="exportPlanarConfig">导出平面蜂窝结构 JSON</button>
+          <button type="button" class="secondary" id="reset">恢复示例参数</button>
+        </div>
         </section>
         </div>
       </form>
