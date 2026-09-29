@@ -662,7 +662,15 @@ def test_surface_preview_html_has_an_independent_surface_api_and_controls():
     assert html.index('<form class="controls" id="surfaceForm">') < html.index('<section class="panel preview">')
     assert 'class="controlGrid"' in html
     assert html.count('class="panel controlGroup"') == 4
-    assert 'grid-template-columns: repeat(4, minmax(0, 1fr))' in html
+    assert 'grid-template-columns: minmax(260px, .95fr) minmax(360px, 1.3fr) minmax(250px, .9fr) minmax(290px, 1fr)' in html
+    assert '.controlGroup { position: relative; min-width: 0; height: 100%; padding: 12px 13px;' in html
+    assert '.parameterGrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px 10px;' in html
+    assert '.partParameterGrid { grid-template-columns: repeat(3, minmax(0, 1fr)); }' in html
+    assert '.surfaceParameterGrid { grid-template-columns: repeat(4, minmax(0, 1fr)); }' in html
+    assert '.bendingParameterGrid { grid-template-columns: repeat(3, minmax(0, 1fr)); flex: 1; align-content: center; }' in html
+    assert '.transitionParameterGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }' in html
+    assert '.transitionParameterGrid details.advanced[open] { grid-column: 1 / -1; }' in html
+    assert 'input { width: 100%; min-height: 34px;' in html
     assert 'class="panel actionBar"' in html
     assert html.index('id="base_cell_size_mm"') < html.index('<h2>曲面参数</h2>')
     assert '<h2>连续路径蜂窝（预览）</h2>' not in html
@@ -673,14 +681,22 @@ def test_surface_preview_html_has_an_independent_surface_api_and_controls():
     assert html.count('aria-label="查看') == 6
     assert 'class="navigationHint"' not in html
     assert '.helpTipWrap:hover .tipBubble, .helpTipWrap:focus-within .tipBubble' in html
-    assert 'class="parameterGrid"' in html
+    assert 'class="parameterGrid partParameterGrid"' in html
+    assert 'class="field baseCellField"' in html
+    assert 'class="parameterGrid surfaceParameterGrid"' in html
+    assert 'class="parameterGrid bendingParameterGrid"' in html
+    assert '<h2>弯曲检验</h2>' in html
+    assert 'class="parameterGrid transitionParameterGrid"' in html
+    assert 'class="subsectionLabel"' not in html
     assert '<p class="hint" id="curvatureAxesHint">' not in html
     assert '<p class="hint" id="tensileWaveHint">' not in html
     assert '<p class="hint" id="transitionStepHint">' not in html
     assert 'fetch(`/api/surface?' in html
     assert 'id="surface_parameter_mode"' in html
     assert 'id="specimen_variant"' in html
-    assert 'value="bending">弯曲版：全长蜂窝工作段' in html
+    assert 'value="tensile" selected>拉伸版' in html
+    assert 'value="bending">弯曲版' in html
+    assert '弯曲版：全长蜂窝工作段' not in html
     assert 'value="tensile_centered_wave_count" selected' in html
     assert 'id="wave_count_x"' in html
     assert 'id="wave_count_y"' in html
@@ -701,6 +717,9 @@ def test_surface_preview_html_has_an_independent_surface_api_and_controls():
     assert 'id="inspection_enabled" type="checkbox"' in html
     assert 'function syncInspectionPointControls()' in html
     assert 'id="previewMode"' in html
+    assert 'class="previewChrome"' in html
+    assert '.previewChrome { display: grid; grid-template-columns: minmax(210px, .7fr) minmax(0, 3fr);' in html
+    assert 'height: clamp(340px, 46vh, 560px)' in html
     assert '实体层叠 / XZ 剖面' in html
     assert 'id="surfaceZScale"' in html
     assert 'id="sectionZScale"' in html
@@ -784,7 +803,7 @@ def test_surface_preview_html_has_an_independent_surface_api_and_controls():
     assert 'id="phase_origin_x_mm"' not in html
     assert '自动避让' in html
     assert 'id="surface_start_layer"' in html
-    assert '首个非零曲率层（物理层）' in html
+    assert '起始曲率层' in html
     assert '连续纤维层接口（路径待定义）' not in html
     assert 'id="fiber_first_after_resin_layer"' not in html
     assert 'id="fiber_last_after_resin_layer"' not in html

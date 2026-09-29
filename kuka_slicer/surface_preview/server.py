@@ -955,41 +955,57 @@ def surface_preview_html() -> str:
     * { box-sizing: border-box; }
     [hidden] { display: none !important; }
     body { margin: 0; min-width: 320px; }
-    main { max-width: 1600px; margin: 0 auto; padding: 20px clamp(14px, 2vw, 28px) 28px; }
-    header { margin-bottom: 18px; }
-    h1 { margin: 0; font-size: clamp(22px, 3vw, 32px); letter-spacing: -.02em; }
-    header p { color: #526074; margin: 8px 0 0; line-height: 1.55; }
-    .workspace { display: flex; flex-direction: column; gap: 18px; }
-    .panel { background: #fff; border: 1px solid #dbe3ef; border-radius: 14px; box-shadow: 0 10px 30px rgba(32, 52, 82, .07); }
+    main { max-width: 1600px; margin: 0 auto; padding: 14px clamp(12px, 1.5vw, 22px) 20px; }
+    header { margin-bottom: 12px; }
+    h1 { margin: 0; font-size: clamp(23px, 2.4vw, 30px); line-height: 1.18; letter-spacing: -.02em; }
+    header p { color: #526074; margin: 5px 0 0; font-size: 14px; line-height: 1.4; }
+    .workspace { display: flex; flex-direction: column; gap: 10px; }
+    .panel { background: #fff; border: 1px solid #dbe3ef; border-radius: 12px; box-shadow: 0 6px 20px rgba(32, 52, 82, .06); }
     .controls { margin: 0; }
-    .controlGrid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; align-items: stretch; }
-    .controlGroup { position: relative; min-width: 0; height: 100%; padding: 16px; display: flex; flex-direction: column; }
-    .groupHeading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
-    .controlGroup h2 { margin: 0; font-size: 16px; }
-    .preview h2 { margin: 0 0 14px; font-size: 16px; }
-    .parameterGrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 12px; align-items: end; }
-    .parameterGrid + button, .parameterGrid + .parameterGrid, .controlGroup > button { margin-top: 12px; }
-    .field { display: grid; grid-template-columns: 1fr 112px; align-items: center; gap: 10px; margin: 8px 0; }
-    .parameterGrid .field { grid-template-columns: 1fr; align-content: end; gap: 6px; margin: 0; }
-    label { font-size: 13px; color: #38475d; }
-    input { width: 100%; border: 1px solid #bdcadb; border-radius: 7px; padding: 7px 8px; color: #142238; font: inherit; font-variant-numeric: tabular-nums; }
-    input[type="checkbox"] { width: 18px; height: 18px; justify-self: start; padding: 0; }
+    .controlGrid { display: grid; grid-template-columns: minmax(260px, .95fr) minmax(360px, 1.3fr) minmax(250px, .9fr) minmax(290px, 1fr); gap: 10px; align-items: stretch; }
+    .controlGroup { position: relative; min-width: 0; height: 100%; padding: 12px 13px; display: flex; flex-direction: column; }
+    .groupHeading { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 24px; margin-bottom: 8px; }
+    .groupHeadingActions { display: flex; align-items: center; gap: 6px; }
+    .controlGroup h2, .preview h2 { margin: 0; font-size: 15px; line-height: 1.25; }
+    .parameterGrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px 10px; align-items: end; }
+    .partParameterGrid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .surfaceParameterGrid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .bendingParameterGrid { grid-template-columns: repeat(3, minmax(0, 1fr)); flex: 1; align-content: center; }
+    .transitionParameterGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .partParameterGrid .variantField { grid-column: span 1; }
+    .partParameterGrid .baseCellField { grid-column: span 2; }
+    .partParameterGrid:has(#gripEndLengthField:not([hidden])) .baseCellField { grid-column: span 1; }
+    #tensileWaveFields, #manualSurfaceFields, #bendingFixtureFields, #inspectionPointFields { display: contents; }
+    .surfaceParameterGrid .surfaceModeField { grid-column: span 2; }
+    .bendingParameterGrid .inspectionToggle { grid-column: span 1; min-height: 34px; grid-template-columns: auto 17px; align-content: center; justify-content: center; gap: 8px; padding: 5px 8px; border: 1px solid #d9e5f4; border-radius: 8px; background: #f5f9fd; }
+    .bendingParameterGrid .inspectionToggle label { white-space: nowrap; }
+    .bendingParameterGrid .inspectionToggle input { justify-self: center; }
+    .bendingParameterGrid #inspectionPointFields > .field { grid-column: span 1; }
+    .compactAction { align-self: end; margin: 0; }
+    .parameterGrid + button, .parameterGrid + .parameterGrid, .controlGroup > button { margin-top: 8px; }
+    .field { display: grid; grid-template-columns: 1fr 104px; align-items: center; gap: 8px; margin: 5px 0; }
+    .parameterGrid .field { grid-template-columns: 1fr; align-content: end; gap: 4px; margin: 0; }
+    label { font-size: 12.5px; line-height: 1.25; color: #38475d; }
+    input { width: 100%; min-height: 34px; border: 1px solid #bdcadb; border-radius: 7px; padding: 5px 7px; color: #142238; font: inherit; font-variant-numeric: tabular-nums; }
+    input[type="checkbox"] { width: 17px; height: 17px; min-height: 0; justify-self: start; padding: 0; }
     input:disabled { background: #f0f4f8; color: #7b8798; cursor: not-allowed; }
     input:focus { outline: 3px solid rgba(36, 122, 207, .18); border-color: #247acf; }
-    .divider { height: 1px; background: #e6ecf4; margin: 17px 0; }
-    button { width: 100%; border: 0; border-radius: 8px; padding: 9px 12px; background: #126fd1; color: white; font: 600 14px inherit; cursor: pointer; }
+    .divider { height: 1px; background: #e6ecf4; margin: 12px 0; }
+    button { width: 100%; min-height: 34px; border: 0; border-radius: 8px; padding: 7px 10px; background: #126fd1; color: white; font: 600 13px inherit; cursor: pointer; }
     button:hover { background: #075eaf; }
     button:disabled { background: #9ba9ba; cursor: not-allowed; }
-    button.secondary { background: #eaf2fb; color: #0b5da9; margin-top: 8px; }
+    button.secondary { background: #eaf2fb; color: #0b5da9; margin-top: 6px; }
     button.secondary:hover { background: #dcebf9; }
-    select { width: 100%; border: 1px solid #bdcadb; border-radius: 7px; padding: 7px 8px; color: #142238; font: inherit; background: #fff; }
-    .fileInput { margin: 8px 0 0; font-size: 12px; }
-    .modelMeta { min-height: 18px; margin: 9px 0 0; color: #526074; font-size: 12px; line-height: 1.5; word-break: break-word; }
-    .hint { margin: 12px 0 0; color: #66758b; font-size: 12px; line-height: 1.55; }
-    .designSummary { margin: 10px 0 0; padding: 9px 10px; border: 1px solid #d9e5f4; border-radius: 8px; background: #f5f9fd; color: #40516a; font-size: 12px; line-height: 1.55; }
+    button.headingAction { width: auto; min-height: 24px; padding: 3px 8px; border: 1px solid #d2e1f2; border-radius: 7px; background: #eaf2fb; color: #0b5da9; font-size: 12px; white-space: nowrap; }
+    button.headingAction:hover { background: #dcebf9; }
+    select { width: 100%; min-height: 34px; border: 1px solid #bdcadb; border-radius: 7px; padding: 5px 7px; color: #142238; font: inherit; background: #fff; }
+    .fileInput { margin: 6px 0 0; font-size: 12px; }
+    .modelMeta { min-height: 17px; margin: 6px 0 0; color: #526074; font-size: 12px; line-height: 1.4; word-break: break-word; }
+    .hint { margin: 8px 0 0; color: #66758b; font-size: 12px; line-height: 1.45; }
+    .designSummary { margin: 7px 0 0; padding: 7px 8px; border: 1px solid #d9e5f4; border-radius: 8px; background: #f5f9fd; color: #40516a; font-size: 12px; line-height: 1.45; }
     .designSummary.error { border-color: #f0c5c2; background: #fff7f6; color: #a52a21; }
     .helpTipWrap { position: relative; flex: 0 0 auto; }
-    button.helpTip { width: 28px; height: 28px; padding: 0; border: 1px solid #c9d7e8; border-radius: 50%; background: #f3f7fc; color: #35618f; font-size: 13px; line-height: 1; }
+    button.helpTip { width: 24px; height: 24px; min-height: 24px; padding: 0; border: 1px solid #c9d7e8; border-radius: 50%; background: #f3f7fc; color: #35618f; font-size: 12px; line-height: 1; }
     button.helpTip:hover, button.helpTip:focus-visible { background: #e5effa; color: #0b5da9; }
     button.helpTip:focus-visible { outline: 3px solid rgba(36, 122, 207, .2); outline-offset: 2px; }
     .tipBubble { position: absolute; top: calc(100% + 8px); right: 0; z-index: 20; visibility: hidden; width: min(390px, calc(100vw - 44px)); max-height: min(62vh, 520px); overflow: auto; padding: 12px 13px; border: 1px solid #cbd9e9; border-radius: 10px; background: #fff; box-shadow: 0 14px 32px rgba(32, 52, 82, .16); color: #40516a; font-size: 12px; line-height: 1.6; text-align: left; }
@@ -999,29 +1015,32 @@ def surface_preview_html() -> str:
     .tipText + .tipText, .tipText + .designSummary, .designSummary + .designSummary { margin-top: 8px; }
     .tipText + strong { display: block; margin-top: 10px; }
     .tipBubble .designSummary { margin-bottom: 0; box-shadow: none; }
-    .subsectionLabel { margin: 13px 0 8px; padding-top: 11px; border-top: 1px solid #e6ecf4; color: #526074; font-size: 12px; font-weight: 600; }
-    .actionBar { display: flex; align-items: center; gap: 14px; margin-top: 14px; padding: 12px 14px; }
-    .actionHeading { display: flex; align-items: center; gap: 10px; min-width: max-content; }
-    .actionHeading h2 { margin: 0; font-size: 15px; }
-    .exportActions { display: flex; justify-content: flex-end; gap: 8px; margin-left: auto; }
-    .exportActions button { width: auto; min-width: 190px; margin: 0; }
-    details.advanced { margin-top: 12px; color: #40516a; font-size: 13px; }
+    .subsectionLabel { margin: 9px 0 6px; padding-top: 8px; border-top: 1px solid #e6ecf4; color: #526074; font-size: 12px; font-weight: 600; }
+    .actionBar { display: flex; align-items: center; gap: 10px; margin-top: 10px; padding: 8px 10px; }
+    .actionHeading { display: flex; align-items: center; gap: 8px; min-width: max-content; }
+    .actionHeading h2 { margin: 0; font-size: 14px; }
+    .exportActions { display: flex; justify-content: flex-end; gap: 7px; margin-left: auto; }
+    .exportActions button { width: auto; min-width: 176px; margin: 0; }
+    details.advanced { margin-top: 8px; color: #40516a; font-size: 12.5px; }
+    .transitionParameterGrid details.advanced { grid-column: span 1; align-self: center; margin-top: 0; padding-top: 1px; }
+    .transitionParameterGrid details.advanced[open] { grid-column: 1 / -1; }
     details.advanced summary { cursor: pointer; color: #2e405a; font-weight: 600; }
     .advancedBody { padding-top: 4px; }
     .preview { position: relative; overflow: visible; }
-    .previewHead { padding: 16px 18px 4px; display: flex; justify-content: space-between; gap: 12px; align-items: center; }
-    .previewToolbar { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px 16px; padding: 4px 18px 14px; }
-    .previewToolbar .field { grid-template-columns: minmax(110px, 1fr) minmax(150px, 210px); margin: 0; }
+    .previewChrome { display: grid; grid-template-columns: minmax(210px, .7fr) minmax(0, 3fr); gap: 14px; align-items: center; padding: 9px 12px; }
+    .previewHead { min-width: 0; display: flex; justify-content: space-between; gap: 8px; align-items: center; }
+    .previewToolbar { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+    .previewToolbar .field { grid-template-columns: minmax(96px, 1fr) minmax(128px, 1.35fr); gap: 7px; margin: 0; }
     .stats { display: flex; flex-wrap: wrap; gap: 7px; justify-content: end; }
     .tipBubble .stats { justify-content: start; }
     .stat { border: 1px solid #dae4f1; border-radius: 999px; padding: 4px 8px; color: #40516a; font-size: 12px; white-space: nowrap; }
-    canvas { display: block; width: 100%; height: clamp(430px, 56vh, 680px); background: linear-gradient(180deg, #fbfdff 0%, #eef4fa 100%); touch-action: none; cursor: grab; }
+    canvas { display: block; width: 100%; height: clamp(340px, 46vh, 560px); border-top: 1px solid #edf1f6; background: linear-gradient(180deg, #fbfdff 0%, #eef4fa 100%); touch-action: none; cursor: grab; }
     canvas.isDragging { cursor: grabbing; }
-    .status { display: none; margin: 0; padding: 10px 18px 12px; color: #68778c; font-size: 12px; border-top: 1px solid #edf1f6; }
+    .status { display: none; margin: 0; padding: 8px 12px 9px; color: #68778c; font-size: 12px; border-top: 1px solid #edf1f6; }
     .status.error { display: block; color: #b42318; }
-    @media (max-width: 1180px) { .controlGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .previewToolbar { grid-template-columns: 1fr 1fr; } .actionBar { align-items: stretch; flex-direction: column; } .actionHeading { justify-content: space-between; width: 100%; } .exportActions { width: 100%; margin-left: 0; } .exportActions button { flex: 1; min-width: 0; } }
-    @media (max-width: 760px) { main { padding: 14px; } .controlGrid, .previewToolbar { grid-template-columns: 1fr; } .exportActions { flex-direction: column; } .exportActions button { width: 100%; } canvas { height: 420px; } }
-    @media (max-width: 480px) { .field, .previewToolbar .field, .parameterGrid { grid-template-columns: 1fr; } input[type="checkbox"] { justify-self: start; } canvas { height: 340px; } }
+    @media (max-width: 1180px) { .controlGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .partParameterGrid, .surfaceParameterGrid { grid-template-columns: repeat(3, minmax(0, 1fr)); } .bendingParameterGrid, .transitionParameterGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .surfaceParameterGrid .surfaceModeField { grid-column: span 2; } .bendingParameterGrid .inspectionToggle { grid-column: span 2; } .previewChrome { grid-template-columns: 1fr; gap: 8px; } .actionBar { align-items: stretch; flex-direction: column; } .actionHeading { justify-content: space-between; width: 100%; } .exportActions { width: 100%; margin-left: 0; } .exportActions button { flex: 1; min-width: 0; } }
+    @media (max-width: 760px) { main { padding: 12px; } header { margin-bottom: 10px; } .controlGrid, .previewToolbar { grid-template-columns: 1fr; } .exportActions { flex-direction: column; } .exportActions button { width: 100%; } .previewToolbar .field { grid-template-columns: minmax(110px, 1fr) minmax(150px, 1.4fr); } canvas { height: 360px; } }
+    @media (max-width: 480px) { .field, .previewToolbar .field, .parameterGrid { grid-template-columns: 1fr; } .partParameterGrid .variantField, .surfaceParameterGrid .surfaceModeField, .bendingParameterGrid .inspectionToggle, .transitionParameterGrid details.advanced { grid-column: 1 / -1 !important; } input[type="checkbox"] { justify-self: start; } canvas { height: 340px; } }
   </style>
 </head>
 <body>
@@ -1051,16 +1070,13 @@ def surface_preview_html() -> str:
               </div>
             </div>
           </div>
-          <div class="parameterGrid">
-            <div class="field"><label for="part_length_mm">零件长度 X（mm）</label><input id="part_length_mm" type="number" min="0.001" step="1" value="150"></div>
-            <div class="field"><label for="part_width_mm">零件宽度 Y（mm）</label><input id="part_width_mm" type="number" min="0.001" step="1" value="50"></div>
-            <div class="field"><label for="part_height_mm">最终物理高度 Z（mm）</label><input id="part_height_mm" type="number" min="0.001" step="0.1" value="10" aria-describedby="fiberAwareHeightHint"></div>
-            <div class="field"><label for="specimen_variant">试件版本</label><select id="specimen_variant" aria-describedby="gripLengthHint"><option value="tensile" selected>拉伸版：两端夹持区</option><option value="bending">弯曲版：全长蜂窝工作段</option></select></div>
-            <div class="field" id="gripEndLengthField"><label for="grip_end_length_mm">每端夹持区 X（mm）</label><input id="grip_end_length_mm" type="number" min="0.001" step="0.5" value="25" aria-describedby="gripLengthHint"></div>
-          </div>
-          <div class="subsectionLabel">蜂窝几何</div>
-          <div class="parameterGrid">
-            <div class="field"><label for="base_cell_size_mm">目标六边形边长（mm）</label><input id="base_cell_size_mm" type="number" min="0.001" step="0.01" value="10"></div>
+          <div class="parameterGrid partParameterGrid">
+            <div class="field"><label for="part_length_mm">长度 X（mm）</label><input id="part_length_mm" type="number" min="0.001" step="1" value="150"></div>
+            <div class="field"><label for="part_width_mm">宽度 Y（mm）</label><input id="part_width_mm" type="number" min="0.001" step="1" value="50"></div>
+            <div class="field"><label for="part_height_mm">高度 Z（mm）</label><input id="part_height_mm" type="number" min="0.001" step="0.1" value="10" aria-describedby="fiberAwareHeightHint"></div>
+            <div class="field variantField"><label for="specimen_variant">试件版本</label><select id="specimen_variant" aria-describedby="gripLengthHint"><option value="tensile" selected>拉伸版</option><option value="bending">弯曲版</option></select></div>
+            <div class="field" id="gripEndLengthField"><label for="grip_end_length_mm">夹持区 X（mm）</label><input id="grip_end_length_mm" type="number" min="0.001" step="0.5" value="25" aria-describedby="gripLengthHint"></div>
+            <div class="field baseCellField"><label for="base_cell_size_mm">六边形边长（mm）</label><input id="base_cell_size_mm" type="number" min="0.001" step="0.01" value="10"></div>
           </div>
           <!-- Kept only so the still-supported legacy JSON form remains readable while
                the new continuous-course topology is preview-only. -->
@@ -1079,40 +1095,40 @@ def surface_preview_html() -> str:
         <section class="panel controlGroup">
           <div class="groupHeading">
             <h2>曲面参数</h2>
-            <div class="helpTipWrap">
-              <button type="button" class="helpTip" aria-label="查看曲面参数说明" aria-describedby="surfaceGroupHelp"><span aria-hidden="true">i</span></button>
-              <div class="tipBubble" id="surfaceGroupHelp" role="tooltip">
-                <strong>曲面定义</strong>
-                <span class="tipText" id="curvatureAxesHint">X、Y 同时启用为双正弦曲面；只启用一个方向为单正弦曲面；全部关闭时预览和“连续路径 JSON”导出均自动使用现有平面蜂窝合同。</span>
-                <span class="tipText" id="tensileWaveHint">仅允许 0.5、1.5、2.5… 等半整数波数。波数按完整试样 X/Y 尺寸归一化：自动计算 λx、λy 与相位，使试样中心为正峰，四周边界回到 H=0；改变矩形尺寸不会改变无量纲曲面构型。</span>
-                <span class="tipText" id="phasePiHint">输入 π 的倍数：1 表示 π，0.5 表示 π/2，1.5 表示 3π/2；导出的设计 JSON 仍以 rad 保存。</span>
+            <div class="groupHeadingActions">
+              <button type="button" class="headingAction" id="applyTensilePreset">应用预设</button>
+              <div class="helpTipWrap">
+                <button type="button" class="helpTip" aria-label="查看曲面参数说明" aria-describedby="surfaceGroupHelp"><span aria-hidden="true">i</span></button>
+                <div class="tipBubble" id="surfaceGroupHelp" role="tooltip">
+                  <strong>曲面定义</strong>
+                  <span class="tipText" id="curvatureAxesHint">X、Y 同时启用为双正弦曲面；只启用一个方向为单正弦曲面；全部关闭时预览和“连续路径 JSON”导出均自动使用现有平面蜂窝合同。</span>
+                  <span class="tipText" id="tensileWaveHint">仅允许 0.5、1.5、2.5… 等半整数波数。波数按完整试样 X/Y 尺寸归一化：自动计算 λx、λy 与相位，使试样中心为正峰，四周边界回到 H=0；改变矩形尺寸不会改变无量纲曲面构型。</span>
+                  <span class="tipText" id="phasePiHint">输入 π 的倍数：1 表示 π，0.5 表示 π/2，1.5 表示 3π/2；导出的设计 JSON 仍以 rad 保存。</span>
+                </div>
               </div>
             </div>
           </div>
-          <div class="parameterGrid">
-            <div class="field"><label for="curvature_x_enabled">启用 X 向曲率</label><input id="curvature_x_enabled" type="checkbox" checked></div>
-            <div class="field"><label for="curvature_y_enabled">启用 Y 向曲率</label><input id="curvature_y_enabled" type="checkbox" checked></div>
-            <div class="field"><label for="surface_parameter_mode">曲面参数策略</label><select id="surface_parameter_mode"><option value="tensile_centered_wave_count" selected>拉伸：试样中心对称波数</option><option value="manual_wavelength_phase">手动：波长与相位</option></select></div>
-            <div class="field"><label for="amplitude_mm">幅值 A（mm）</label><input id="amplitude_mm" type="number" step="0.01" value="1.5"></div>
-          </div>
-          <div class="parameterGrid" id="tensileWaveFields">
+          <div class="parameterGrid surfaceParameterGrid">
+            <div class="field"><label for="curvature_x_enabled">X 向曲率</label><input id="curvature_x_enabled" type="checkbox" checked></div>
+            <div class="field"><label for="curvature_y_enabled">Y 向曲率</label><input id="curvature_y_enabled" type="checkbox" checked></div>
+            <div class="field surfaceModeField"><label for="surface_parameter_mode">参数策略</label><select id="surface_parameter_mode"><option value="tensile_centered_wave_count" selected>中心对称波数</option><option value="manual_wavelength_phase">手动波长/相位</option></select></div>
+            <div class="field"><label for="amplitude_mm">幅值 A</label><input id="amplitude_mm" type="number" step="0.01" value="1.5"></div>
+            <div class="field"><label for="z_reference_mm">Z 基准</label><input id="z_reference_mm" type="number" step="0.01" value="0"></div>
+          <div id="tensileWaveFields">
             <div class="field"><label for="wave_count_x">X 向波数 nx</label><input id="wave_count_x" type="number" min="0.5" step="1" value="1.5"></div>
             <div class="field"><label for="wave_count_y">Y 向波数 ny</label><input id="wave_count_y" type="number" min="0.5" step="1" value="1.5"></div>
           </div>
-          <div class="parameterGrid" id="manualSurfaceFields" hidden>
+          <div id="manualSurfaceFields" hidden>
             <div class="field"><label for="wavelength_x_mm">X 波长 λx（mm）</label><input id="wavelength_x_mm" type="number" min="0.001" step="0.1" value="100"></div>
             <div class="field"><label for="wavelength_y_mm">Y 波长 λy（mm）</label><input id="wavelength_y_mm" type="number" min="0.001" step="0.1" value="66.667"></div>
             <div class="field"><label for="phase_x_pi">X 相位 φx（π）</label><input id="phase_x_pi" type="number" step="0.25" value="1" aria-describedby="phasePiHint"></div>
             <div class="field"><label for="phase_y_pi">Y 相位 φy（π）</label><input id="phase_y_pi" type="number" step="0.25" value="1" aria-describedby="phasePiHint"></div>
           </div>
-          <div class="parameterGrid">
-            <div class="field"><label for="z_reference_mm">Z 基准（mm）</label><input id="z_reference_mm" type="number" step="0.01" value="0"></div>
           </div>
-          <button type="button" class="secondary" id="applyTensilePreset">应用拉伸中间参数组</button>
         </section>
         <section class="panel controlGroup">
           <div class="groupHeading">
-            <h2>弯曲专用检验（可选）</h2>
+            <h2>弯曲检验</h2>
             <div class="helpTipWrap">
               <button type="button" class="helpTip" aria-label="查看弯曲检验说明与摘要" aria-describedby="bendingGroupHelp"><span aria-hidden="true">i</span></button>
               <div class="tipBubble" id="bendingGroupHelp" role="tooltip">
@@ -1123,14 +1139,16 @@ def surface_preview_html() -> str:
               </div>
             </div>
           </div>
-        <div id="bendingFixtureFields" hidden>
-          <div class="parameterGrid"><div class="field"><label for="bending_span_preview_mm">支撑跨度（仅预览，mm）</label><input id="bending_span_preview_mm" type="number" min="0.001" step="1" value="100" aria-describedby="bendingFixtureHint"></div></div>
-          <button type="button" class="secondary" id="restoreBendingSpanPreview">恢复 100 mm 预览跨度</button>
-        </div>
-        <div class="parameterGrid"><div class="field"><label for="inspection_enabled">显示弯曲检验点</label><input id="inspection_enabled" type="checkbox"></div></div>
-        <div class="parameterGrid" id="inspectionPointFields" hidden>
-          <div class="field"><label for="check_x_mm">检验点 X（mm）</label><input id="check_x_mm" type="number" min="0" step="0.1" value="75" aria-describedby="checkPointHint"></div>
-          <div class="field"><label for="check_y_mm">检验点 Y（mm）</label><input id="check_y_mm" type="number" min="0" step="0.1" value="50" aria-describedby="checkPointHint"></div>
+        <div class="parameterGrid bendingParameterGrid">
+          <div id="bendingFixtureFields" hidden>
+            <div class="field bendingSpanField"><label for="bending_span_preview_mm">跨度（mm）</label><input id="bending_span_preview_mm" type="number" min="0.001" step="1" value="100" aria-describedby="bendingFixtureHint"></div>
+            <button type="button" class="secondary compactAction" id="restoreBendingSpanPreview">恢复 100 mm</button>
+          </div>
+          <div class="field inspectionToggle"><label for="inspection_enabled">显示检验点</label><input id="inspection_enabled" type="checkbox"></div>
+          <div id="inspectionPointFields" hidden>
+            <div class="field"><label for="check_x_mm">检验点 X（mm）</label><input id="check_x_mm" type="number" min="0" step="0.1" value="75" aria-describedby="checkPointHint"></div>
+            <div class="field"><label for="check_y_mm">检验点 Y（mm）</label><input id="check_y_mm" type="number" min="0" step="0.1" value="50" aria-describedby="checkPointHint"></div>
+          </div>
         </div>
         </section>
         <section class="panel controlGroup">
@@ -1147,22 +1165,22 @@ def surface_preview_html() -> str:
               </div>
             </div>
           </div>
-        <div class="parameterGrid">
-          <div class="field"><label for="surface_start_layer">首个非零曲率层（物理层）</label><input id="surface_start_layer" type="number" min="2" step="1" value="2"></div>
-          <div class="field"><label for="transition_step_count">达到完整曲率的层间步数</label><input id="transition_step_count" type="number" min="1" step="1" value="9" aria-describedby="transitionStepHint"></div>
+        <div class="parameterGrid transitionParameterGrid">
+          <div class="field"><label for="surface_start_layer">起始曲率层</label><input id="surface_start_layer" type="number" min="2" step="1" value="2"></div>
+          <div class="field"><label for="transition_step_count">完整曲率步数</label><input id="transition_step_count" type="number" min="1" step="1" value="9" aria-describedby="transitionStepHint"></div>
+          <input id="transition_step_policy" type="hidden" value="auto_to_midplane">
+          <button type="button" class="secondary compactAction" id="restoreAutomaticTransition">恢复自动步数</button>
+          <details class="advanced">
+            <summary>高级参数</summary>
+            <div class="advancedBody parameterGrid">
+              <div class="field"><label for="samples_x">曲面采样 X</label><input id="samples_x" type="number" min="2" max="512" step="1" value="49"></div>
+              <div class="field"><label for="samples_y">曲面采样 Y</label><input id="samples_y" type="number" min="2" max="512" step="1" value="49"></div>
+              <div class="field"><label for="boundary_mode">边界策略</label><select id="boundary_mode"><option value="clip" selected>裁剪至矩形</option><option value="inset">向内缩进</option></select></div>
+              <div class="field"><label for="random_seed">随机种子</label><input id="random_seed" type="number" min="0" step="1" value="0"></div>
+              <div class="field"><label for="samples">预览网格密度</label><input id="samples" type="number" min="8" max="120" step="1" value="49"></div>
+            </div>
+          </details>
         </div>
-        <input id="transition_step_policy" type="hidden" value="auto_to_midplane">
-        <button type="button" class="secondary" id="restoreAutomaticTransition">恢复自动过渡步数</button>
-        <details class="advanced">
-          <summary>高级参数（共形计算）</summary>
-          <div class="advancedBody parameterGrid">
-            <div class="field"><label for="samples_x">曲面采样 X</label><input id="samples_x" type="number" min="2" max="512" step="1" value="49"></div>
-            <div class="field"><label for="samples_y">曲面采样 Y</label><input id="samples_y" type="number" min="2" max="512" step="1" value="49"></div>
-            <div class="field"><label for="boundary_mode">边界策略</label><select id="boundary_mode"><option value="clip" selected>裁剪至矩形</option><option value="inset">向内缩进</option></select></div>
-            <div class="field"><label for="random_seed">随机种子</label><input id="random_seed" type="number" min="0" step="1" value="0"></div>
-            <div class="field"><label for="samples">预览网格密度</label><input id="samples" type="number" min="8" max="120" step="1" value="49"></div>
-          </div>
-        </details>
         </section>
         </div>
         <section class="panel actionBar">
@@ -1184,23 +1202,25 @@ def surface_preview_html() -> str:
         </section>
       </form>
       <section class="panel preview">
-        <div class="previewHead">
-          <h2 id="previewTitle">α=1 完整曲率层（物理 Z）</h2>
-          <div class="helpTipWrap">
-            <button type="button" class="helpTip" aria-label="查看预览统计与操作说明" aria-describedby="previewGroupHelp"><span aria-hidden="true">i</span></button>
-            <div class="tipBubble" id="previewGroupHelp" role="tooltip">
-              <strong>预览统计</strong>
-              <div class="stats" id="stats"></div>
-              <span class="tipText">视觉 Z 放大只影响画布，不改变参数、检验值、导出的 JSON 或实际零件尺寸。XZ 剖面采用统一 X/Z 比例后再按所选倍率放大 Z。</span>
-              <span class="tipText">X/Y 单位为 mm，矩形原点为矩形左下角 (0, 0)，Z=0 为零件底面。</span>
-              <span class="tipText">左键拖拽旋转；中键拖拽平移；右键上下拖拽缩放；滚轮缩放；双击恢复视角。</span>
+        <div class="previewChrome">
+          <div class="previewHead">
+            <h2 id="previewTitle">α=1 完整曲率层（物理 Z）</h2>
+            <div class="helpTipWrap">
+              <button type="button" class="helpTip" aria-label="查看预览统计与操作说明" aria-describedby="previewGroupHelp"><span aria-hidden="true">i</span></button>
+              <div class="tipBubble" id="previewGroupHelp" role="tooltip">
+                <strong>预览统计</strong>
+                <div class="stats" id="stats"></div>
+                <span class="tipText">视觉 Z 放大只影响画布，不改变参数、检验值、导出的 JSON 或实际零件尺寸。XZ 剖面采用统一 X/Z 比例后再按所选倍率放大 Z。</span>
+                <span class="tipText">X/Y 单位为 mm，矩形原点为矩形左下角 (0, 0)，Z=0 为零件底面。</span>
+                <span class="tipText">左键拖拽旋转；中键拖拽平移；右键上下拖拽缩放；滚轮缩放；双击恢复视角。</span>
+              </div>
             </div>
           </div>
-        </div>
-        <div class="previewToolbar">
-          <div class="field"><label for="previewMode">预览模式</label><select id="previewMode"><option value="surface" selected>α=1 完整曲率层（物理 Z）</option><option value="solid_xz">实体层叠 / XZ 剖面</option></select></div>
-          <div class="field"><label for="surfaceZScale">三维视觉 Z 放大</label><select id="surfaceZScale"><option value="1">真实比例 ×1</option><option value="3">形态观察 ×3</option><option value="5" selected>形态观察 ×5</option><option value="10">形态观察 ×10</option></select></div>
-          <div class="field"><label for="sectionZScale">XZ 剖面视觉 Z 放大</label><select id="sectionZScale"><option value="1">真实比例 ×1</option><option value="3" selected>辅助观察 ×3</option><option value="5">辅助观察 ×5</option></select></div>
+          <div class="previewToolbar">
+            <div class="field"><label for="previewMode">预览模式</label><select id="previewMode"><option value="surface" selected>α=1 完整曲率层（物理 Z）</option><option value="solid_xz">实体层叠 / XZ 剖面</option></select></div>
+            <div class="field"><label for="surfaceZScale">三维视觉 Z 放大</label><select id="surfaceZScale"><option value="1">真实比例 ×1</option><option value="3">形态观察 ×3</option><option value="5" selected>形态观察 ×5</option><option value="10">形态观察 ×10</option></select></div>
+            <div class="field"><label for="sectionZScale">XZ 剖面视觉 Z 放大</label><select id="sectionZScale"><option value="1">真实比例 ×1</option><option value="3" selected>辅助观察 ×3</option><option value="5">辅助观察 ×5</option></select></div>
+          </div>
         </div>
         <canvas id="canvas" aria-label="蜂窝承载曲面预览"></canvas>
         <div class="status" id="status" aria-live="polite">正在生成曲面…</div>
