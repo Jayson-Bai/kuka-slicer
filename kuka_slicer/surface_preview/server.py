@@ -338,7 +338,9 @@ def _conformal_solid_stack_payload(
         _symmetric_alphas,
     )
 
-    layer_count = int(math.ceil(final_height_mm / CONFORMAL_MAPPING_REFERENCE_LAYER_HEIGHT_MM))
+    from ..conformal_lattice.height_planning import nearest_resin_layer_count
+
+    layer_count = nearest_resin_layer_count(final_height_mm, CONFORMAL_MAPPING_REFERENCE_LAYER_HEIGHT_MM)
     start_layer, first_curved_layer = _resolve_surface_progression_start(
         params, logical_layer_count=layer_count
     )
@@ -360,7 +362,6 @@ def _conformal_solid_stack_payload(
     )
     resolved_transition_steps = maximum_transition_steps if requested_transition_steps is None else requested_transition_steps
     layer_thicknesses = [CONFORMAL_MAPPING_REFERENCE_LAYER_HEIGHT_MM] * layer_count
-    layer_thicknesses[-1] = final_height_mm - CONFORMAL_MAPPING_REFERENCE_LAYER_HEIGHT_MM * (layer_count - 1)
     base_z_by_layer: list[float] = []
     accumulated = 0.0
     for thickness in layer_thicknesses:
@@ -388,7 +389,8 @@ def _conformal_solid_stack_payload(
     return {
         "format": "conformal_solid_stack_preview_v1",
         "reference_layer_height_mm": CONFORMAL_MAPPING_REFERENCE_LAYER_HEIGHT_MM,
-        "final_height_mm": final_height_mm,
+        "final_height_mm": layer_count * CONFORMAL_MAPPING_REFERENCE_LAYER_HEIGHT_MM,
+        "target_final_height_mm": final_height_mm,
         "section_y_mm": y_mm,
         "surface_start_layer": start_layer,
         "first_nonzero_curvature_layer_physical": first_curved_layer,
@@ -639,7 +641,9 @@ def _rectangular_lattice_config_payload(
             include_projection_geometry=False,
             rectangle_origin_lower_left=True,
         )["surface"]
-        logical_layer_count = math.ceil(final_height_mm / layer_height_mm)
+        from ..conformal_lattice.height_planning import nearest_resin_layer_count
+
+        logical_layer_count = nearest_resin_layer_count(final_height_mm, layer_height_mm)
         surface_start_layer, first_curved_layer = _resolve_surface_progression_start(
             params, logical_layer_count=logical_layer_count
         )
@@ -748,21 +752,29 @@ def _rectangular_lattice_config_payload(
     }
     if specimen_variant is not None:
         config["part"]["specimen_variant"] = specimen_variant  # type: ignore[index]
+    course_phase = params.get("continuous_course_phase", ["centered"])[0]
+    # Old callers retain the old topology. A tensile export ignores the
+    # hidden bending-only selection, without changing the user's saved choice.
+    if specimen_variant == "bending":
+        config["lattice"]["continuous_course_phase"] = course_phase  # type: ignore[index]
+        if "bending_span_mm" in params:
+            config["part"]["bending_fixture"] = {  # type: ignore[index]
+                "mode": "symmetric_three_point_y_lines",
+                "span_mm": _query_float(params, "bending_span_mm", 96.92820323027551, positive=True),
+            }
     if grip_end_length_mm is not None and grip_end_length_mm > 0.0:
         # A pure geometry range: the executable zigzag process settings are
         # intentionally supplied later by the resin path planner/Core preset.
         config["part"]["symmetric_grip_end_length_mm"] = grip_end_length_mm  # type: ignore[index]
     spec = load_conformal_lattice_spec(config)
-    # This does not enable fiber in the designer.  It records the Z that the
-    # existing main-UI fiber workflow would reach, so a later resin-only run
-    # can choose the nearest whole resin-layer stack instead of silently
-    # returning to the smaller nominal design height.
+    # Informational estimates for both material options, sharing the same
+    # requested top extent. Runtime always recomputes with its active presets.
     # Import lazily: the surface-domain model is also an input of the lattice
     # pipeline, so importing the full pipeline while this web module loads
     # would create a package-initialisation cycle.
-    from ..conformal_lattice.pipeline import fiber_aware_resin_only_height_plan
+    from ..conformal_lattice.pipeline import target_height_reference_plan
 
-    config["fiber_aware_resin_only_height_plan"] = fiber_aware_resin_only_height_plan(
+    config["target_height_reference_plan"] = target_height_reference_plan(
         spec,
         resin_layer_height_mm=layer_height_mm,
         fiber_layer_height_mm=CONFORMAL_MAPPING_REFERENCE_FIBER_LAYER_HEIGHT_MM,
@@ -1059,11 +1071,11 @@ def surface_preview_html() -> str:
               <button type="button" class="helpTip" aria-label="查看矩形实体说明" aria-describedby="partGroupHelp"><span aria-hidden="true">i</span></button>
               <div class="tipBubble" id="partGroupHelp" role="tooltip">
                 <strong>零件与试件版本</strong>
-                <span class="tipText" id="fiberAwareHeightHint">导出的 JSON 会同时记录纤维等效的无纤维层程。主界面关闭纤维时，会按当前树脂层高取最接近的完整层数；开启纤维时保持原有层程策略。</span>
+                <span class="tipText" id="fiberAwareHeightHint">高度是最终期望厚度。无纤维按树脂层高取最近完整层数；有纤维把界面抬高计入总厚度，再选最近完整层栈。等距时取较薄值；最终按主界面的实际层高重新计算。</span>
                 <span class="tipText" id="gripLengthHint">两端采用相同长度；蜂窝工作段为 X 总长 − 2 × 每端夹持区。曲面仍按完整零件 X/Y 范围计算，不会因夹持区而改变波长、相位或曲率。</span>
                 <span class="tipText" id="modelMeta">外边界固定为矩形；新共形流程不读取 STL，也不继承 STL 中的蜂窝孔壁。</span>
                 <strong>蜂窝与连续路径</strong>
-                <span class="tipText">连续路径蜂窝：以目标边长为唯一蜂窝几何参数。一个完整黄色孔洞中心固定在蜂窝工作区中心；300 × 300 mm 母板只用于向外铺展，再按当前工作区逐边裁剪。</span>
+                <span class="tipText">连续路径蜂窝：边长控制孔洞尺寸，蜂窝相位控制孔洞相对加载线的位置。弯曲基准将母板沿 X 平移 −Px/4，使跨中加载线穿过斜边中点；Px=3a+4/√3 mm。300 × 300 mm 母板先移相，再按工作区裁剪。</span>
                 <span class="tipText">红线为 2 mm 连续纤维的中心线预览；黄色为孔洞参考，绿色点为起点、深红点为终点。边界允许出现截断六边形，但路径不会穿入外轮廓。</span>
                 <div class="designSummary" id="latticeDesignSummary" aria-live="polite"></div>
                 <div class="designSummary" id="latticeLengthSummary" aria-live="polite">连续路径总长将在曲面预览更新后显示。</div>
@@ -1072,9 +1084,9 @@ def surface_preview_html() -> str:
           </div>
           <div class="parameterGrid partParameterGrid">
             <div class="field"><label for="part_length_mm">长度 X（mm）</label><input id="part_length_mm" type="number" min="0.001" step="1" value="150"></div>
-            <div class="field"><label for="part_width_mm">宽度 Y（mm）</label><input id="part_width_mm" type="number" min="0.001" step="1" value="50"></div>
-            <div class="field"><label for="part_height_mm">高度 Z（mm）</label><input id="part_height_mm" type="number" min="0.001" step="0.1" value="10" aria-describedby="fiberAwareHeightHint"></div>
-            <div class="field variantField"><label for="specimen_variant">试件版本</label><select id="specimen_variant" aria-describedby="gripLengthHint"><option value="tensile" selected>拉伸版</option><option value="bending">弯曲版</option></select></div>
+            <div class="field"><label for="part_width_mm">宽度 Y（mm）</label><input id="part_width_mm" type="number" min="0.001" step="1" value="60"></div>
+            <div class="field"><label for="part_height_mm">目标厚度（mm）</label><input id="part_height_mm" type="number" min="0.001" step="0.1" value="8" aria-describedby="fiberAwareHeightHint"></div>
+            <div class="field variantField"><label for="specimen_variant">试件版本</label><select id="specimen_variant" aria-describedby="gripLengthHint"><option value="tensile">拉伸版</option><option value="bending" selected>弯曲版</option></select></div>
             <div class="field" id="gripEndLengthField"><label for="grip_end_length_mm">夹持区 X（mm）</label><input id="grip_end_length_mm" type="number" min="0.001" step="0.5" value="25" aria-describedby="gripLengthHint"></div>
             <div class="field baseCellField"><label for="base_cell_size_mm">六边形边长（mm）</label><input id="base_cell_size_mm" type="number" min="0.001" step="0.01" value="10"></div>
           </div>
@@ -1115,8 +1127,8 @@ def surface_preview_html() -> str:
             <div class="field"><label for="amplitude_mm">幅值 A</label><input id="amplitude_mm" type="number" step="0.01" value="1.5"></div>
             <div class="field"><label for="z_reference_mm">Z 基准</label><input id="z_reference_mm" type="number" step="0.01" value="0"></div>
           <div id="tensileWaveFields">
-            <div class="field"><label for="wave_count_x">X 向波数 nx</label><input id="wave_count_x" type="number" min="0.5" step="1" value="1.5"></div>
-            <div class="field"><label for="wave_count_y">Y 向波数 ny</label><input id="wave_count_y" type="number" min="0.5" step="1" value="1.5"></div>
+            <div class="field"><label for="wave_count_x">X 向波数 nx</label><input id="wave_count_x" type="number" min="0.5" step="1" value="2.5"></div>
+            <div class="field"><label for="wave_count_y">Y 向波数 ny</label><input id="wave_count_y" type="number" min="0.5" step="1" value="0.5"></div>
           </div>
           <div id="manualSurfaceFields" hidden>
             <div class="field"><label for="wavelength_x_mm">X 波长 λx（mm）</label><input id="wavelength_x_mm" type="number" min="0.001" step="0.1" value="100"></div>
@@ -1133,21 +1145,22 @@ def surface_preview_html() -> str:
               <button type="button" class="helpTip" aria-label="查看弯曲检验说明与摘要" aria-describedby="bendingGroupHelp"><span aria-hidden="true">i</span></button>
               <div class="tipBubble" id="bendingGroupHelp" role="tooltip">
                 <strong>三点弯曲预览</strong>
-                <span class="tipText" id="bendingFixtureHint">只在画布绘制跨中加载线和两条对称支撑线；不会改变蜂窝相位、曲面相位、路径、零件尺寸或任何导出 JSON 字段。</span>
-                <span class="tipText" id="checkPointHint">仅在第三章三点弯曲时启用。启用后可查看任意点的 H、坡度和平均曲率；尺寸变化时，超出矩形范围的坐标会自动收回到范围内。</span>
+                <span class="tipText" id="bendingFixtureHint">蜂窝相位会改变预览及实际连续路径，曲面相位不变。跨度仅记录夹具布置并绘制三条 Y 向标线，不改变打印路径。基准跨度为 3Px，使左右支承处蜂窝接触分布一致；这是结构对比方案，不是标准材料弯曲试样认证。</span>
+                <span class="tipText" id="checkPointHint">启用后可查看任意点的 H、坡度和平均曲率；尺寸变化时，超出矩形范围的坐标会自动收回到范围内。</span>
                 <div class="designSummary" id="bendingFixtureSummary" aria-live="polite"></div>
               </div>
             </div>
           </div>
         <div class="parameterGrid bendingParameterGrid">
           <div id="bendingFixtureFields" hidden>
-            <div class="field bendingSpanField"><label for="bending_span_preview_mm">跨度（mm）</label><input id="bending_span_preview_mm" type="number" min="0.001" step="1" value="100" aria-describedby="bendingFixtureHint"></div>
-            <button type="button" class="secondary compactAction" id="restoreBendingSpanPreview">恢复 100 mm</button>
+            <div class="field"><label for="continuous_course_phase">蜂窝相位</label><select id="continuous_course_phase" aria-describedby="bendingFixtureHint"><option value="bending_zigzag_midline" selected>斜边中点加载</option><option value="centered">原居中相位</option></select></div>
+            <div class="field bendingSpanField"><label for="bending_span_preview_mm">跨度（mm）</label><input id="bending_span_preview_mm" type="number" min="0.001" step="any" value="96.92820323027551" aria-describedby="bendingFixtureHint bendingFixtureSummary"></div>
+            <button type="button" class="secondary compactAction" id="restoreBendingSpanPreview">匹配当前蜂窝 3Px</button>
           </div>
           <div class="field inspectionToggle"><label for="inspection_enabled">显示检验点</label><input id="inspection_enabled" type="checkbox"></div>
           <div id="inspectionPointFields" hidden>
             <div class="field"><label for="check_x_mm">检验点 X（mm）</label><input id="check_x_mm" type="number" min="0" step="0.1" value="75" aria-describedby="checkPointHint"></div>
-            <div class="field"><label for="check_y_mm">检验点 Y（mm）</label><input id="check_y_mm" type="number" min="0" step="0.1" value="50" aria-describedby="checkPointHint"></div>
+            <div class="field"><label for="check_y_mm">检验点 Y（mm）</label><input id="check_y_mm" type="number" min="0" step="0.1" value="30" aria-describedby="checkPointHint"></div>
           </div>
         </div>
         </section>
@@ -1166,7 +1179,7 @@ def surface_preview_html() -> str:
             </div>
           </div>
         <div class="parameterGrid transitionParameterGrid">
-          <div class="field"><label for="surface_start_layer">起始曲率层</label><input id="surface_start_layer" type="number" min="2" step="1" value="2"></div>
+          <div class="field"><label for="surface_start_layer">起始曲率层</label><input id="surface_start_layer" type="number" min="2" step="1" value="3"></div>
           <div class="field"><label for="transition_step_count">完整曲率步数</label><input id="transition_step_count" type="number" min="1" step="1" value="9" aria-describedby="transitionStepHint"></div>
           <input id="transition_step_policy" type="hidden" value="auto_to_midplane">
           <button type="button" class="secondary compactAction" id="restoreAutomaticTransition">恢复自动步数</button>
@@ -1245,6 +1258,8 @@ def surface_preview_html() -> str:
     const persistedInputIds = [...new Set([
       ...surfaceIds,
       ...conformalDesignIds,
+      'continuous_course_phase',
+      'bending_span_preview_mm',
       'surfaceZScale',
       'sectionZScale',
       'previewMode',
@@ -1293,6 +1308,9 @@ def surface_preview_html() -> str:
 
     function applyDesignerState(state) {
       if (!state || typeof state !== 'object') return false;
+      // Loading an old saved design must not silently move its honeycomb.
+      document.getElementById('continuous_course_phase').value = state.continuous_course_phase ?? 'centered';
+      document.getElementById('bending_span_preview_mm').value = state.bending_span_preview_mm ?? '100';
       const needsTensileMigration = !Object.prototype.hasOwnProperty.call(state, 'surface_parameter_mode');
       persistedInputIds.forEach((id) => {
         const element = document.getElementById(id);
@@ -1398,11 +1416,15 @@ def surface_preview_html() -> str:
       if (document.getElementById('specimen_variant').value !== 'bending') return;
       if (!fixture) {
         summary.className = 'designSummary error';
-        summary.textContent = '仅预览跨度必须为正数并小于零件长度；该错误只影响标线显示，不阻止几何参数编辑。';
+        summary.textContent = '跨度必须为正数并小于零件长度；请修正后导出弯曲设计。';
+        document.getElementById('bending_span_preview_mm').setAttribute('aria-invalid', 'true');
         return;
       }
       summary.className = 'designSummary';
-      summary.textContent = `仅预览：加载线 x=${fixture.loadX.toFixed(2)} mm；支撑线 x=${fixture.leftSupportX.toFixed(2)}、${fixture.rightSupportX.toFixed(2)} mm；跨度/高度=${fixture.spanToHeight.toFixed(2)}。这些数值不参与导出或路径计算。`;
+      document.getElementById('bending_span_preview_mm').setAttribute('aria-invalid', 'false');
+      const pitch = 3 * positiveNumber('base_cell_size_mm') + 4 / Math.sqrt(3);
+      const matched = Math.abs(fixture.span / pitch - Math.round(fixture.span / pitch)) < 1e-3;
+      summary.textContent = `加载 x=${fixture.loadX.toFixed(2)} mm；支承 x=${fixture.leftSupportX.toFixed(2)}、${fixture.rightSupportX.toFixed(2)} mm；跨度/输入高度=${fixture.spanToHeight.toFixed(2)}（实测厚度另核）。${matched ? '跨度为整周期，左右支承相位匹配。' : '跨度不是整周期，左右支承接触分布需复核。'}夹具布置随 JSON 保存，不参与路径计算。`;
     }
 
     function updateTensileWaveHint() {
@@ -1433,7 +1455,7 @@ def surface_preview_html() -> str:
       const firstCurvedLayer = nonNegativeInteger('surface_start_layer');
       const partHeight = positiveNumber('part_height_mm');
       if (firstCurvedLayer === null || firstCurvedLayer < 2 || partHeight === null) return null;
-      const layerCount = Math.ceil(partHeight / mappingReferenceLayerHeightMm);
+      const layerCount = Math.max(1, Math.ceil(partHeight / mappingReferenceLayerHeightMm - 0.5 - 1e-12));
       const legacyStartLayer = firstCurvedLayer - 2;
       const maximum = Math.floor((layerCount - 2 * legacyStartLayer - 1) / 2);
       return maximum >= 1 ? maximum : null;
@@ -1498,7 +1520,7 @@ def surface_preview_html() -> str:
       const progressionSummary = document.getElementById('layerProgressionSummary');
       const fiberAwareHeightHint = document.getElementById('fiberAwareHeightHint');
       if (partHeight !== null) {
-        fiberAwareHeightHint.textContent = `导出 JSON 会记录纤维等效的无纤维层程（设计器参考：树脂 ${mappingReferenceLayerHeightMm.toFixed(3)} mm、纤维 0.100 mm）。主界面关闭纤维时按当前树脂层高取最近完整层数；开启纤维时保持原有层程策略。`;
+        fiberAwareHeightHint.textContent = `输入值是最终期望厚度。无纤维取最近完整树脂层数；有纤维按“树脂层数×层高＋纤维界面数×层高”选最近层栈，等距取较薄值。参考树脂 ${mappingReferenceLayerHeightMm.toFixed(3)} mm、纤维 0.100 mm；主切片器按实际工艺重新计算并报告误差。此处层叠预览为无纤维参考。`;
       }
       if (firstCurvedLayer === null || firstCurvedLayer < 2) {
         progressionSummary.className = 'designSummary error';
@@ -1513,7 +1535,7 @@ def surface_preview_html() -> str:
         progressionSummary.className = 'designSummary error';
         progressionSummary.textContent = '曲面采样 X 和 Y 都必须是不小于 2 的整数。';
       } else {
-        const layerCount = Math.ceil(partHeight / mappingReferenceLayerHeightMm);
+        const layerCount = Math.max(1, Math.ceil(partHeight / mappingReferenceLayerHeightMm - 0.5 - 1e-12));
         const maximumTransitionSteps = maximumTransitionStepCount();
         if (maximumTransitionSteps === null) {
           progressionSummary.className = 'designSummary error';
@@ -1553,6 +1575,10 @@ def surface_preview_html() -> str:
         const element = document.getElementById(id);
         query.set(id, element.type === 'checkbox' ? String(element.checked) : element.value);
       });
+      if (document.getElementById('specimen_variant').value === 'bending') {
+        query.set('continuous_course_phase', document.getElementById('continuous_course_phase').value);
+        query.set('bending_span_mm', document.getElementById('bending_span_preview_mm').value);
+      }
       return query;
     }
 
@@ -1767,7 +1793,9 @@ def surface_preview_html() -> str:
         bounds[2] - contourInnerInsetMm,
         bounds[3] - contourInnerInsetMm,
       ];
-      const key = JSON.stringify({ edgeLength, bounds, resinContourWidthMm });
+      const phaseMode = document.getElementById('specimen_variant').value === 'bending'
+        ? document.getElementById('continuous_course_phase').value : 'centered';
+      const key = JSON.stringify({ edgeLength, bounds, resinContourWidthMm, phaseMode });
       if (continuousCoursePreviewCache?.key === key) return continuousCoursePreviewCache.value;
       if (poreClipBounds[0] >= poreClipBounds[2] || poreClipBounds[1] >= poreClipBounds[3]) {
         return { courses: [], pores: [], poreClipBounds, resinContourWidthMm, edgeLength, fiberTowWidthMm, totalLengthMm: 0, activeXBounds };
@@ -1779,12 +1807,12 @@ def surface_preview_html() -> str:
       // facing inclined sides are exactly 2 mm apart, so they carry one tow.
       const singleWallMm = fiberTowWidthMm;
       const doubleWallMm = fiberTowWidthMm * 2.0;
-      const xMid = (bounds[0] + bounds[2]) * 0.5;
+      const phaseShiftX = phaseMode === 'bending_zigzag_midline'
+        ? -(3 * edgeLength + 2 * fiberTowWidthMm / Math.sqrt(3)) / 4 : 0;
+      const xMid = (bounds[0] + bounds[2]) * 0.5 + phaseShiftX;
       const yMid = (bounds[1] + bounds[3]) * 0.5;
-      // The 300 mm parent is only an oversized source for clipping.  Its
-      // phase is translated for every cell size so that one *complete* pore
-      // centre always coincides with the tensile working-region centre.  This
-      // keeps cell size separate from pore/curvature/load-axis registration.
+      // The oversized parent is phase-registered before clipping. The legacy
+      // phase is unchanged; bending can explicitly shift it by -Px/4.
       const parentHalfSpanMm = 150.0;
       const parentBounds = [
         xMid - parentHalfSpanMm,
@@ -2439,7 +2467,7 @@ def surface_preview_html() -> str:
         summary.textContent = '当前尺寸与目标边长不能容纳完整的连续路径单元。请减小目标边长或增大工作段。';
       } else {
         const fragmentCount = courses.courses.reduce((count, course) => count + course.fragments.length, 0);
-        summary.textContent = `当前平面连续路径：中心孔锚定在 (${courses.latticeAnchorMm[0].toFixed(2)}, ${courses.latticeAnchorMm[1].toFixed(2)}) mm；黄色孔洞由该锚点的 300 × 300 mm 母板裁切，并在外矩形轮廓和夹持分界树脂带内侧截断（树脂轮廓宽 ${courses.resinContourWidthMm.toFixed(2)} mm）。${courses.courses.length} 条基础长路径裁为 ${fragmentCount} 条独立制造路径；每个截断首尾均按独立树脂/纤维路径处理。预计纤维总长 ${courses.totalLengthMm.toFixed(2)} mm。`;
+        summary.textContent = `当前平面连续路径：母板相位锚点 (${courses.latticeAnchorMm[0].toFixed(2)}, ${courses.latticeAnchorMm[1].toFixed(2)}) mm；黄色孔洞由该锚点的 300 × 300 mm 母板裁切，并在外矩形轮廓和夹持分界树脂带内侧截断（树脂轮廓宽 ${courses.resinContourWidthMm.toFixed(2)} mm）。${courses.courses.length} 条基础长路径裁为 ${fragmentCount} 条独立制造路径；每个截断首尾均按独立树脂/纤维路径处理。预计纤维总长 ${courses.totalLengthMm.toFixed(2)} mm。`;
       }
     }
 
@@ -2986,11 +3014,15 @@ def surface_preview_html() -> str:
       if (payload) render();
     });
     document.getElementById('bending_span_preview_mm').addEventListener('input', () => {
+      saveDesignerState();
       updateBendingFixtureSummary();
       if (payload) render();
     });
     document.getElementById('restoreBendingSpanPreview').addEventListener('click', () => {
-      document.getElementById('bending_span_preview_mm').value = 100;
+      const edge = positiveNumber('base_cell_size_mm');
+      if (edge === null) return;
+      document.getElementById('bending_span_preview_mm').value = 3 * (3 * edge + 4 / Math.sqrt(3));
+      saveDesignerState();
       updateBendingFixtureSummary();
       if (payload) render();
     });
@@ -3002,8 +3034,8 @@ def surface_preview_html() -> str:
     document.getElementById('applyTensilePreset').addEventListener('click', () => {
       document.getElementById('surface_parameter_mode').value = 'tensile_centered_wave_count';
       document.getElementById('amplitude_mm').value = 1.5;
-      document.getElementById('wave_count_x').value = 1.5;
-      document.getElementById('wave_count_y').value = 1.5;
+      document.getElementById('wave_count_x').value = 2.5;
+      document.getElementById('wave_count_y').value = 0.5;
       document.getElementById('inspection_enabled').checked = false;
       document.getElementById('align_load_line').checked = false;
       syncSurfaceParameterControls();
@@ -3014,8 +3046,16 @@ def surface_preview_html() -> str:
       updateConformalDesignSummary();
       scheduleRefresh();
     });
+    document.getElementById('continuous_course_phase').addEventListener('change', () => {
+      saveDesignerState();
+      invalidateLatticePreview();
+      updateBendingFixtureSummary();
+      updateLatticeLengthSummary();
+      if (payload) render();
+    });
     ['grip_end_length_mm', 'wall_width_mm', 'base_cell_size_mm', 'orientation_angle_deg', 'honeycomb_align_x_mm', 'honeycomb_align_y_mm'].forEach((id) => document.getElementById(id).addEventListener('input', () => {
       invalidateLatticePreview();
+      updateBendingFixtureSummary();
       updateLatticeLengthSummary();
       if (payload) render();
     }));
@@ -3109,14 +3149,13 @@ def surface_preview_html() -> str:
       render();
     });
     document.getElementById('reset').addEventListener('click', () => {
-      const defaults = { part_length_mm: 150, part_width_mm: 50, part_height_mm: 10, specimen_variant: 'tensile', grip_end_length_mm: 25, curvature_x_enabled: true, curvature_y_enabled: true, surface_parameter_mode: 'tensile_centered_wave_count', amplitude_mm: 1.5, wave_count_x: 1.5, wave_count_y: 1.5, wavelength_x_mm: 100, wavelength_y_mm: 33.333, phase_x_pi: 1, phase_y_pi: 1, z_reference_mm: 0, inspection_enabled: false, check_x_mm: 75, check_y_mm: 25, wall_width_mm: 2, base_cell_size_mm: 10, orientation_angle_deg: 0, honeycomb_align_x: false, honeycomb_align_x_mm: 75, honeycomb_align_y: false, honeycomb_align_y_mm: 25, surface_start_layer: 2, transition_step_count: 9, transition_step_policy: 'auto_to_midplane', samples_x: 49, samples_y: 49, boundary_mode: 'clip', random_seed: 0, samples: 49, surfaceZScale: 5, sectionZScale: 3, previewMode: 'surface' };
+      const defaults = { part_length_mm: 150, part_width_mm: 60, part_height_mm: 8, specimen_variant: 'bending', grip_end_length_mm: 25, curvature_x_enabled: true, curvature_y_enabled: true, surface_parameter_mode: 'tensile_centered_wave_count', amplitude_mm: 1.5, wave_count_x: 2.5, wave_count_y: 0.5, wavelength_x_mm: 60, wavelength_y_mm: 120, phase_x_pi: 0, phase_y_pi: 0, z_reference_mm: 0, inspection_enabled: false, check_x_mm: 75, check_y_mm: 30, wall_width_mm: 2, base_cell_size_mm: 10, orientation_angle_deg: 0, continuous_course_phase: 'bending_zigzag_midline', bending_span_preview_mm: 3 * (30 + 4 / Math.sqrt(3)), honeycomb_align_x: false, honeycomb_align_x_mm: 75, honeycomb_align_y: false, honeycomb_align_y_mm: 30, surface_start_layer: 3, transition_step_count: 6, transition_step_policy: 'auto_to_midplane', samples_x: 49, samples_y: 49, boundary_mode: 'clip', random_seed: 0, samples: 49, surfaceZScale: 5, sectionZScale: 3, previewMode: 'surface' };
       Object.entries(defaults).forEach(([id, value]) => {
         const element = document.getElementById(id);
         if (element.type === 'checkbox') element.checked = value;
         else element.value = value;
       });
       document.getElementById('align_load_line').checked = false;
-      document.getElementById('bending_span_preview_mm').value = 100;
       syncSurfaceParameterControls();
       syncTransitionStepInput({ restoreAutomatic: true });
       syncSpecimenVariantControls();

@@ -75,6 +75,12 @@ def build_continuous_course_plan(spec: ConformalLatticeSpec) -> ContinuousCourse
 
     anchor_x = (bounds[0] + bounds[2]) * 0.5
     anchor_y = (bounds[1] + bounds[3]) * 0.5
+    # Explicit opt-in: old JSON files retain their centred phase.  A quarter
+    # column shift puts the bending load line through the inclined rail
+    # midpoints, not the paired horizontal rails.  Shift the parent before
+    # clipping; translating already-clipped fragments would lose edge paths.
+    if spec.lattice.get("continuous_course_phase", "centered") == "bending_zigzag_midline":
+        anchor_x -= (3.0 * edge + 2.0 * _TOW_WIDTH_MM / math.sqrt(3.0)) / 4.0
     parent_bounds = (
         anchor_x - _PARENT_HALF_SPAN_MM,
         anchor_y - _PARENT_HALF_SPAN_MM,

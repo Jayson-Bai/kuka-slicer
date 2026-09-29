@@ -457,7 +457,7 @@ def test_main_ui_height_guided_conformal_export_keeps_7mm_physical_extent(tmp_pa
         assert float(np.max(core["z"][resin_print])) == pytest.approx(6.75, abs=2e-3)
 
 
-def test_main_ui_double_sine_without_fiber_uses_fiber_aware_16_layer_mapping(tmp_path: Path):
+def test_main_ui_double_sine_without_fiber_ignores_old_height_override(tmp_path: Path):
     config = conformal_lattice_config_payload(
         {
             "part_length_mm": ["40"],
@@ -473,16 +473,20 @@ def test_main_ui_double_sine_without_fiber_uses_fiber_aware_16_layer_mapping(tmp
             "samples_y": ["11"],
         }
     )
-    reference_height = config["fiber_aware_resin_only_height_plan"]["fiber_enabled_reference_height_mm"]
-    assert reference_height == pytest.approx(7.95)
+    # An old saved export must not silently change the user's 7 mm target.
+    reference_height = 7.95
+    config["fiber_aware_resin_only_height_plan"] = {
+        "format": "fiber_aware_resin_only_height_plan_v1",
+        "fiber_enabled_reference_height_mm": reference_height,
+    }
     run = run_conformal_lattice_pipeline(
         config,
         physical_layer_height_mm=0.5,
         resin_only_reference_height_mm=float(reference_height),
         extrusion=ExtrusionVolumeModel(1.0, 1.0),
     )
-    assert len(run.layer_embedding.node_positions_xyz) == 16
-    assert run.layer_embedding.report["physical_stack_plan"]["planned_final_height_mm"] == pytest.approx(8.0)
+    assert len(run.layer_embedding.node_positions_xyz) == 14
+    assert run.layer_embedding.report["physical_stack_plan"]["planned_final_height_mm"] == pytest.approx(7.0)
     # The authored JSON still defines where curvature starts: physical layers
     # one and two remain flat, and the third is the first curved layer.
     alpha = run.layer_embedding.report["alpha_by_layer"]
@@ -503,13 +507,13 @@ def test_main_ui_double_sine_without_fiber_uses_fiber_aware_16_layer_mapping(tmp
         ),
     )
 
-    assert result["layers"] == 16
-    assert result["nominal_final_height_mm"] == pytest.approx(8.0)
-    assert result["height_plan"]["target_final_height_mm"] == pytest.approx(7.95)
-    assert result["height_plan"]["planned_final_height_mm"] == pytest.approx(8.0)
+    assert result["layers"] == 14
+    assert result["nominal_final_height_mm"] == pytest.approx(7.0)
+    assert result["height_plan"]["target_final_height_mm"] == pytest.approx(7.0)
+    assert result["height_plan"]["planned_final_height_mm"] == pytest.approx(7.0)
 
 
-def test_main_ui_fiber_disabled_uses_designer_fiber_aware_resin_only_height_plan(tmp_path: Path):
+def test_main_ui_planar_fiber_disabled_uses_requested_final_height(tmp_path: Path):
     config = planar_lattice_config_payload(
         {
             "part_length_mm": ["40"],
@@ -534,21 +538,19 @@ def test_main_ui_fiber_disabled_uses_designer_fiber_aware_resin_only_height_plan
         ),
     )
 
-    assert result["layers"] == 16
-    assert result["nominal_final_height_mm"] == pytest.approx(8.0)
+    assert result["layers"] == 14
+    assert result["nominal_final_height_mm"] == pytest.approx(7.0)
     assert result["fiber_reinforcement"]["enabled"] is False
     assert result["height_plan"] == {
-        "target_final_height_mm": pytest.approx(7.95),
-        "planned_final_height_mm": pytest.approx(8.0),
-        "height_error_mm": pytest.approx(0.05),
-        "design_final_height_mm": pytest.approx(7.0),
-        "resin_layer_count": 16,
+        "target_final_height_mm": pytest.approx(7.0),
+        "planned_final_height_mm": pytest.approx(7.0),
+        "height_error_mm": pytest.approx(0.0),
+        "resin_layer_count": 14,
         "resin_layer_height_mm": pytest.approx(0.5),
         "fiber_enabled": False,
         "fiber_layer_count": 0,
         "fiber_layer_indices": [],
         "resin_z_preplanned_for_fiber": False,
-        "resin_only_plan_source": "design_json_fiber_aware_resin_only_v1",
     }
     job_dir = tmp_path / result["download_url"].split("/")[-2]
     with np.load(job_dir / "planar_honeycomb_core.npz", allow_pickle=False) as core:
@@ -557,10 +559,10 @@ def test_main_ui_fiber_disabled_uses_designer_fiber_aware_resin_only_height_plan
             & (core["tool_id"] == 2)
             & (core["move_type"] == 1)
         )
-        assert float(np.max(core["z"][resin_print])) == pytest.approx(7.75, abs=2e-3)
+        assert float(np.max(core["z"][resin_print])) == pytest.approx(6.75, abs=2e-3)
 
 
-def test_main_ui_planar_fiber_enabled_keeps_legacy_post_path_height_behavior(tmp_path: Path):
+def test_main_ui_planar_fiber_enabled_budgets_lift_inside_target_height(tmp_path: Path):
     config = planar_lattice_config_payload(
         {
             "part_length_mm": ["40"],
@@ -585,9 +587,11 @@ def test_main_ui_planar_fiber_enabled_keeps_legacy_post_path_height_behavior(tmp
         ),
     )
 
-    assert result["layers"] == 14
-    assert result["nominal_final_height_mm"] == pytest.approx(7.95)
-    assert result["fiber_reinforcement"]["automatic_resin_z_raise"] is True
+    assert result["layers"] == 12
+    assert result["nominal_final_height_mm"] == pytest.approx(7.0)
+    assert result["height_plan"]["fiber_layer_count"] == 10
+    assert result["fiber_reinforcement"]["automatic_resin_z_raise"] is False
+    assert result["fiber_reinforcement"]["post_fiber_resin_extrusion_height"]["enabled"] is False
 
 
 def test_bending_continuous_courses_and_fiber_use_the_full_rectangle_without_grips():

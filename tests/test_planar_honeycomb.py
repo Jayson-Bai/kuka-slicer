@@ -57,7 +57,7 @@ def test_planar_export_keeps_lattice_and_part_but_omits_double_sine_parameters()
     assert spec.source_provider == "planar"
 
 
-def test_planar_export_records_fiber_aware_resin_only_height_plan():
+def test_planar_export_records_shared_target_height_reference_plan():
     config = planar_lattice_config_payload(
         {
             "part_length_mm": ["40"],
@@ -68,20 +68,15 @@ def test_planar_export_records_fiber_aware_resin_only_height_plan():
         }
     )
 
-    plan = config["fiber_aware_resin_only_height_plan"]
-    assert plan == {
-        "format": "fiber_aware_resin_only_height_plan_v1",
-        "reference_resin_layer_height_mm": 0.5,
-        "reference_fiber_layer_height_mm": 0.1,
-        # Fourteen 0.5 mm resin layers have twelve selected flat interfaces:
-        # 6.75 + 12 * 0.1 = 7.95 mm at the last raised resin centre-line.
-        "fiber_enabled_reference_height_mm": pytest.approx(7.95),
-        "reference_fiber_layer_count": 12,
-        "reference_fiber_schedule_source": "flat_resin_interlayer_policy_v2",
-        "resin_only_nearest_full_height_mm": 8.0,
-        "resin_only_reference_layer_count": 16,
-        "rounding": "nearest_complete_resin_layer_stack",
-    }
+    assert "fiber_aware_resin_only_height_plan" not in config
+    plan = config["target_height_reference_plan"]
+    assert plan["format"] == "target_height_reference_plan_v1"
+    assert plan["target_final_height_mm"] == 7.0
+    assert plan["resin_only"]["resin_layer_count"] == 14
+    assert plan["resin_only"]["planned_final_height_mm"] == 7.0
+    assert plan["fiber_enabled"]["resin_layer_count"] == 12
+    assert plan["fiber_enabled"]["fiber_layer_count"] == 10
+    assert plan["fiber_enabled"]["planned_final_height_mm"] == pytest.approx(7.0)
 
 
 def test_planar_pipeline_reuses_lattice_paths_with_flat_layers_and_flat_orientation():
@@ -256,8 +251,12 @@ def test_main_ui_processes_planar_json_through_core_with_optional_fiber(tmp_path
     assert result["fiber_reinforcement"]["layer_interface_source"] == (
         "flat_resin_interlayer_policy_v2"
     )
-    assert result["fiber_reinforcement"]["after_resin_physical_layers"] == [2, 3]
-    assert result["fiber_reinforcement"]["resin_layer_indices"] == [1, 2]
+    # Three 0.25 mm resin layers plus one 0.1 mm fiber interface (0.85)
+    # are nearer the requested 1 mm than four plus two interfaces (1.2).
+    assert result["layers"] == 3
+    assert result["nominal_final_height_mm"] == pytest.approx(0.85)
+    assert result["fiber_reinforcement"]["after_resin_physical_layers"] == [2, 2]
+    assert result["fiber_reinforcement"]["resin_layer_indices"] == [1]
     assert any(layer["fiber_paths"] for layer in result["preview"]["layers"])
     first_layer = next(layer for layer in result["preview"]["layers"] if layer["index"] == 0)
     second_layer = next(layer for layer in result["preview"]["layers"] if layer["index"] == 1)

@@ -150,6 +150,11 @@ def load_conformal_lattice_spec(data: bytes | str | Mapping[str, object]) -> Con
         )
     _validate_load_line_alignment(lattice.get("load_line_alignment"), part)
     _validate_honeycomb_feature_alignment(lattice.get("honeycomb_feature_alignment"), part)
+    course_phase = lattice.get("continuous_course_phase", "centered")
+    if course_phase not in ("centered", "bending_zigzag_midline"):
+        raise ValueError("lattice.continuous_course_phase must be centered or bending_zigzag_midline")
+    if course_phase == "bending_zigzag_midline" and part.get("specimen_variant") != "bending":
+        raise ValueError("bending_zigzag_midline requires a bending specimen")
     if part:
         bead_count = lattice.get("wall_bead_count")
         if not isinstance(bead_count, int) or isinstance(bead_count, bool) or bead_count < 1:
@@ -407,6 +412,15 @@ def _validate_rectangular_part(part: Mapping[str, object], manufacturing: Mappin
         raise ValueError("bending part.specimen_variant must not define symmetric_grip_end_length_mm")
     if specimen_variant == "tensile" and not has_grip:
         raise ValueError("tensile part.specimen_variant requires symmetric_grip_end_length_mm")
+    fixture = part.get("bending_fixture")
+    if fixture is not None:
+        if specimen_variant != "bending" or not isinstance(fixture, Mapping):
+            raise ValueError("part.bending_fixture requires a bending specimen and an object")
+        span = _positive(fixture.get("span_mm"), "part.bending_fixture.span_mm")
+        if span >= float(part["length_mm"]):
+            raise ValueError("part.bending_fixture.span_mm must be less than part.length_mm")
+        if fixture.get("mode") != "symmetric_three_point_y_lines":
+            raise ValueError("part.bending_fixture.mode must be symmetric_three_point_y_lines")
 
     # This is deliberately a geometric partition only.  Process choices such
     # as hatch pitch and E calibration stay in the slicer/Core process preset,

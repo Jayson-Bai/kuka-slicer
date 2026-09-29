@@ -54,6 +54,7 @@ class ContinuousCourseFiberSettings:
     layer_interface_source: str = "design_json_symmetric_nonzero_curvature"
     resin_z_preplanned_for_fiber: bool = False
     planned_resin_layer_indices: tuple[int, ...] = ()
+    compensate_fiber_gap_extrusion: bool = True
 
 
 def derive_symmetric_curvature_fiber_interfaces(
@@ -477,7 +478,7 @@ def apply_continuous_course_fiber_strategy(
         source_job,
         selected_layers=selected_layers,
         fiber_layer_height_mm=float(fiber_layer_height_mm),
-        enabled=settings.resin_z_preplanned_for_fiber,
+        enabled=settings.resin_z_preplanned_for_fiber and settings.compensate_fiber_gap_extrusion,
     )
     resin_roles_root = source_job.meta.get("path_roles", {}).get("R", {})
     for layer_index, paths in fiber_route_specs:

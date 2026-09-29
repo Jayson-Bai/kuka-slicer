@@ -56,6 +56,7 @@ def test_continuous_course_preview_anchors_nine_mm_cells_and_routes_fibre_throug
         if (begin < 0 || end < 0) throw new Error('continuous-course preview seam not found');
         const buildPreview = (edgeLength) => new Function('edgeLength', `
           const values = { base_cell_size_mm: edgeLength, wall_width_mm: 2 };
+          const document = { getElementById: () => ({ value: 'tensile' }) };
           const positiveNumber = (id) => values[id] ?? null;
           const honeycombActiveXBounds = () => [25, 125];
           const payload = { coordinate_system: { xy_bounds_mm: [0, 0, 150, 50] } };
@@ -694,8 +695,8 @@ def test_surface_preview_html_has_an_independent_surface_api_and_controls():
     assert 'fetch(`/api/surface?' in html
     assert 'id="surface_parameter_mode"' in html
     assert 'id="specimen_variant"' in html
-    assert 'value="tensile" selected>拉伸版' in html
-    assert 'value="bending">弯曲版' in html
+    assert 'value="tensile">拉伸版' in html
+    assert 'value="bending" selected>弯曲版' in html
     assert '弯曲版：全长蜂窝工作段' not in html
     assert 'value="tensile_centered_wave_count" selected' in html
     assert 'id="wave_count_x"' in html
@@ -746,7 +747,7 @@ def test_surface_preview_html_has_an_independent_surface_api_and_controls():
     assert 'id="latticeLengthSummary"' in html
     assert 'function updateLatticeLengthSummary' in html
     assert '当前平面连续路径：' in html
-    assert '一个完整黄色孔洞中心固定在蜂窝工作区中心' in html
+    assert '蜂窝相位控制孔洞相对加载线的位置' in html
     assert 'function appendProjectedClippedPore' in html
     assert '红线为 2 mm 连续纤维的中心线预览' in html
     assert '夹持分界树脂带内侧截断' in html
@@ -762,7 +763,7 @@ def test_surface_preview_html_has_an_independent_surface_api_and_controls():
     assert 'id="bending_span_preview_mm"' in html
     assert 'id="restoreBendingSpanPreview"' in html
     assert 'function drawBendingFixtureOverlay' in html
-    assert '不会改变蜂窝相位、曲面相位、路径、零件尺寸或任何导出 JSON 字段' in html
+    assert '蜂窝相位会改变预览及实际连续路径，曲面相位不变' in html
     assert 'id="transition_step_count"' in html
     assert 'id="transition_step_policy" type="hidden" value="auto_to_midplane"' in html
     assert 'id="restoreAutomaticTransition"' in html
@@ -799,7 +800,7 @@ def test_surface_preview_html_has_an_independent_surface_api_and_controls():
     assert 'id="honeycomb_align_x_mm"' in html
     assert 'id="honeycomb_align_y_mm"' in html
     assert 'centreHoneycombAlignment' in html
-    assert '一个完整黄色孔洞中心固定在蜂窝工作区中心' in html
+    assert '蜂窝相位控制孔洞相对加载线的位置' in html
     assert 'id="phase_origin_x_mm"' not in html
     assert '自动避让' in html
     assert 'id="surface_start_layer"' in html
