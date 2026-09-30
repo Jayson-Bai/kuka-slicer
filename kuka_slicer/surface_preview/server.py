@@ -31,6 +31,7 @@ MAX_PREVIEW_SAMPLES = 120
 MAX_CONFORMAL_SAMPLES = 512
 MAX_STL_BYTES = 64 * 1024 * 1024
 MAX_DESIGNER_STATE_BYTES = 32 * 1024
+DESIGNER_STATE_SCHEMA_VERSION = 2
 CONFORMAL_MAPPING_REFERENCE_LAYER_HEIGHT_MM = 0.5
 CONFORMAL_MAPPING_REFERENCE_FIBER_LAYER_HEIGHT_MM = 0.1
 SURFACE_PREVIEW_API_VERSION = "surface_preview_v2"
@@ -40,7 +41,7 @@ def _designer_state_path() -> Path:
     """Return the per-user, persistent design-state location."""
 
     root = Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
-    return root / "KukaSlicer" / "conformal_designer_state_v1.json"
+    return root / "KukaSlicer" / f"conformal_designer_state_v{DESIGNER_STATE_SCHEMA_VERSION}.json"
 
 
 def _load_designer_state(state_path: Path) -> dict[str, str | bool]:
@@ -1253,7 +1254,11 @@ def surface_preview_html() -> str:
     const surfaceZScale = document.getElementById('surfaceZScale');
     const sectionZScale = document.getElementById('sectionZScale');
     const previewTitle = document.getElementById('previewTitle');
-    const designerStateKey = 'kuka-slicer.conformal-designer-state.v1';
+    // Version this key with the per-user state file.  The v2 reference
+    // defaults intentionally select the bending specimen and its authored
+    // honeycomb phase; an older machine-local v1 state must not silently
+    // restore the former tensile defaults over them after a Git update.
+    const designerStateKey = 'kuka-slicer.conformal-designer-state.v2';
     const latticePreviewLimit = 1600;
     const persistedInputIds = [...new Set([
       ...surfaceIds,

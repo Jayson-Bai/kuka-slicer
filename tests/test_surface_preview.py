@@ -6,6 +6,7 @@ import shutil
 import struct
 import subprocess
 import textwrap
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -13,6 +14,7 @@ import pytest
 from kuka_slicer.surface_preview.model import DoubleSineSurface
 from kuka_slicer.conformal_lattice.contracts import load_conformal_lattice_spec
 from kuka_slicer.surface_preview.server import (
+    _designer_state_path,
     _load_designer_state,
     _save_designer_state,
     conformal_lattice_config_payload,
@@ -257,6 +259,21 @@ def test_designer_state_persists_across_preview_server_restarts(tmp_path):
     _save_designer_state(state_path, state)
 
     assert _load_designer_state(state_path) == state
+
+
+def test_designer_state_schema_refreshes_cross_platform_reference_defaults(monkeypatch, tmp_path):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+
+    assert _designer_state_path() == (
+        tmp_path / "KukaSlicer" / "conformal_designer_state_v2.json"
+    )
+    monkeypatch.delenv("LOCALAPPDATA")
+    assert _designer_state_path() == (
+        Path.home() / "KukaSlicer" / "conformal_designer_state_v2.json"
+    )
+    html = surface_preview_html()
+    assert "kuka-slicer.conformal-designer-state.v2" in html
+    assert "kuka-slicer.conformal-designer-state.v1" not in html
 
 
 def test_double_sine_surface_matches_the_documented_height_field():
@@ -772,7 +789,7 @@ def test_surface_preview_html_has_an_independent_surface_api_and_controls():
     assert 'Z=0 基准面' in html
     assert 'α=1 完整曲率层（物理 Z）' in html
     assert 'function surfaceLighting' in html
-    assert "const designerStateKey = 'kuka-slicer.conformal-designer-state.v1';" in html
+    assert "const designerStateKey = 'kuka-slicer.conformal-designer-state.v2';" in html
     assert 'function saveDesignerState()' in html
     assert 'function restoreDesignerState()' in html
     assert "fetch('/api/designer-state'" in html
