@@ -13,6 +13,7 @@ from typing import Mapping
 import numpy as np
 
 from .contracts import ConformalLatticeSpec
+from .course_optimizer import BoundaryRouter, optimize_block
 from .layer_embedding import LayerEmbedding
 from .path_bridge import ConformalLatticePathGraph, _with_kuka_surface_orientation
 from ..external_npz import ExternalSourceJob, MaterialPaths, TravelPaths
@@ -387,10 +388,12 @@ def apply_continuous_course_fiber_strategy(
 
     if any(group.material == "F" for group in source_job.material_paths):
         raise ValueError("conformal source job already contains F material paths")
+    course_orders: dict[int, list[tuple[int, bool]]] = {}
     resin_paths_per_layer = _replace_honeycomb_resin_with_continuous_courses(
         source_job,
         graph=graph,
         course_paths_by_layer=course_paths_by_layer,
+        course_orders=course_orders,
     )
     if not settings.enabled:
         height = _height_guided_final_height(source_job)
@@ -457,11 +460,14 @@ def apply_continuous_course_fiber_strategy(
             (path, profile, "conformal_continuous_course_fragment")
             for path, profile in zip(paths, profiles)
         ]
-        lower, middle, upper = _continuous_course_sequence(
-            course_records,
-            current_xy=np.asarray([work_bounds[0], work_bounds[1]], dtype=np.float64),
-        )
-        ordered_records = [*lower, *middle, *upper]
+        # The same visit/direction plan owns both materials. Re-render fiber
+        # E and its local Z lift, rather than borrowing resin extrusion values.
+        ordered_records = []
+        for index, reverse in course_orders[layer_index]:
+            path, profile, role = course_records[index]
+            if reverse:
+                path, profile = _reverse_deposition_path(path, profile)
+            ordered_records.append((path, profile, role))
         paths = [path for path, _profile, _role in ordered_records]
         profiles = [profile for _path, profile, _role in ordered_records]
         fiber_route_specs.append((layer_index, paths))
@@ -496,16 +502,11 @@ def apply_continuous_course_fiber_strategy(
         ]
         if not boundary_sources:
             raise ValueError("continuous fiber travel planner is missing embedded perimeter/partition paths")
+        router = _continuous_boundary_router(
+            work_bounds, boundary_sources, z_offset_mm=float(fiber_layer_height_mm),
+        )
         connectors = [
-            _boundary_aware_travel(
-                paths[index - 1][-1],
-                paths[index][0],
-                bounds=work_bounds,
-                boundary_sources=boundary_sources,
-                # Resin has already been lifted for earlier fiber interfaces;
-                # the fiber itself is exactly one fiber-layer above it.
-                z_offset_mm=float(fiber_layer_height_mm),
-            )
+            router.route(paths[index - 1][-1], paths[index][0])
             for index in range(1, len(paths))
         ]
         travel_group = next((group for group in source_job.travel_paths if int(group.layer_index) == layer_index), None)
@@ -1168,27 +1169,40 @@ def _boundary_aware_travel(
     boundary_sources: list[np.ndarray],
     z_offset_mm: float = 0.0,
 ) -> np.ndarray:
-    """Return the shortest rectangle-boundary route; never a through-pore chord."""
-    if start.shape[0] != 6 or end.shape[0] != 6:
-        raise ValueError("continuous-course travel requires XYZABC deposition endpoints")
-    choices: list[tuple[float, bool, float, float, np.ndarray, np.ndarray]] = []
-    left, lower, right, upper = bounds
-    perimeter = 2.0 * ((right - left) + (upper - lower))
-    for start_parameter, start_xy in _boundary_candidates(start[:2], bounds):
-        for end_parameter, end_xy in _boundary_candidates(end[:2], bounds):
-            forward_distance = (end_parameter - start_parameter) % perimeter
-            reverse_distance = (start_parameter - end_parameter) % perimeter
-            approach = float(np.linalg.norm(start[:2] - start_xy) + np.linalg.norm(end[:2] - end_xy))
-            choices.append((approach + forward_distance, True, start_parameter, end_parameter, start_xy, end_xy))
-            choices.append((approach + reverse_distance, False, start_parameter, end_parameter, start_xy, end_xy))
-    _cost, forward, start_parameter, end_parameter, _start_xy, _end_xy = min(choices, key=lambda choice: choice[0])
-    route_xy = [start[:2], *_perimeter_route(start_parameter, end_parameter, bounds, forward), end[:2]]
-    points: list[np.ndarray] = []
-    for index, xy in enumerate(route_xy):
-        pose = start.copy() if index == 0 else end.copy() if index == len(route_xy) - 1 else _boundary_pose_at_xy(xy, boundary_sources, z_offset_mm=z_offset_mm)
-        if not points or float(np.linalg.norm(pose[:3] - points[-1][:3])) > 1e-8:
-            points.append(pose)
-    return np.asarray(points, dtype=np.float64)
+    """Return the shortest verified boundary route with its surface samples."""
+    return _continuous_boundary_router(bounds, boundary_sources, z_offset_mm=z_offset_mm).route(start, end)
+
+
+def _continuous_boundary_router(bounds, boundary_sources, *, z_offset_mm=0.0):
+    return BoundaryRouter(
+        bounds,
+        boundary_sources,
+        lambda xy: _boundary_pose_at_xy(xy, boundary_sources, z_offset_mm=z_offset_mm),
+    )
+
+
+def _optimize_continuous_records(records, router):
+    """Keep process anchors; optimize only contiguous honeycomb course blocks."""
+    result, reports = [], []
+    start = 0
+    while start < len(records):
+        if records[start][2] != "conformal_continuous_course_fragment":
+            result.append(records[start])
+            start += 1
+            continue
+        end = start + 1
+        while end < len(records) and records[end][2] == "conformal_continuous_course_fragment":
+            end += 1
+        block = records[start:end]
+        visits, report = optimize_block([record[0] for record in block], router)
+        for index, reverse in visits:
+            path, profile, role = block[index]
+            if reverse:
+                path, profile = _reverse_deposition_path(path, profile)
+            result.append((path, profile, role))
+        reports.append(report)
+        start = end
+    return result, reports
 
 
 def _replace_honeycomb_resin_with_continuous_courses(
@@ -1196,6 +1210,7 @@ def _replace_honeycomb_resin_with_continuous_courses(
     *,
     graph: ConformalLatticePathGraph,
     course_paths_by_layer: tuple[tuple[tuple[np.ndarray, np.ndarray], ...], ...],
+    course_orders: dict[int, list[tuple[int, bool]]] | None = None,
 ) -> int:
     """Replace only central legacy walls; preserve contour and grip materials."""
 
@@ -1214,6 +1229,7 @@ def _replace_honeycomb_resin_with_continuous_courses(
     if not isinstance(motion_order, dict):
         raise ValueError("conformal source job motion_order metadata must be an object")
     expected_count: int | None = None
+    optimization_reports = {}
     for group in source_job.material_paths:
         if group.material != "R":
             continue
@@ -1245,13 +1261,23 @@ def _replace_honeycomb_resin_with_continuous_courses(
         if not boundary_sources:
             raise ValueError("continuous-course travel planner is missing embedded perimeter/partition paths")
         work_bounds = _continuous_work_bounds(graph)
+        router = _continuous_boundary_router(work_bounds, boundary_sources)
+        ordered, reports = _optimize_continuous_records(ordered, router)
+        optimization_reports[str(group.layer_index)] = reports
+        if course_orders is not None:
+            # Geometry remains byte-identical, possibly reversed. The lookup
+            # carries source identities without changing the SourceJob schema.
+            identities = {}
+            for index, path in enumerate(paths):
+                identities[path.tobytes()] = (index, False)
+                identities[path[::-1].tobytes()] = (index, True)
+            course_orders[int(group.layer_index)] = [
+                identities[path.tobytes()]
+                for path, _profile, role in ordered
+                if role == "conformal_continuous_course_fragment"
+            ]
         travels = [
-            _boundary_aware_travel(
-                ordered[index - 1][0][-1],
-                ordered[index][0][0],
-                bounds=work_bounds,
-                boundary_sources=boundary_sources,
-            )
+            router.route(ordered[index - 1][0][-1], ordered[index][0][0])
             for index in range(1, len(ordered))
         ]
         expected_count = len(paths) if expected_count is None else expected_count
@@ -1270,6 +1296,10 @@ def _replace_honeycomb_resin_with_continuous_courses(
             )
         ]
     source_job.travel_paths = travel_groups
+    source_job.meta["course_travel_optimization"] = {
+        "scope": "same-layer course blocks; fixed process anchors; shared resin/fiber visits",
+        "layers": optimization_reports,
+    }
     bridge = source_job.meta.get("conformal_lattice_path_bridge")
     if isinstance(bridge, dict):
         bridge["path_order"] = "preview continuous courses embedded per physical layer"
