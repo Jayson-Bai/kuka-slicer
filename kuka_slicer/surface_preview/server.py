@@ -10,7 +10,7 @@ import subprocess
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import numpy as np
 
@@ -20,6 +20,7 @@ from ..conformal_lattice.contracts import (
     generated_surface_source_sha256,
     load_conformal_lattice_spec,
 )
+from ..download_naming import honeycomb_download_filename
 from .model import DoubleSineSurface
 from .stl_domain import STLProjectionDomain, stl_projection_domain_from_bytes
 
@@ -848,7 +849,11 @@ class SurfacePreviewHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(
                 config,
-                attachment_name="conformal_lattice_spec_v1.json",
+                attachment_name=honeycomb_download_filename(
+                    config["source_surface"], config["lattice"],
+                    extension=".json",
+                    include_outer_contour=bool(config["lattice"].get("print_outer_contour_fiber", False)),
+                ),
             )
             return
         if parsed.path == "/api/export-planar-lattice-config":
@@ -860,7 +865,11 @@ class SurfacePreviewHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(
                 config,
-                attachment_name="planar_honeycomb_spec_v1.json",
+                attachment_name=honeycomb_download_filename(
+                    config["source_surface"], config["lattice"],
+                    extension=".json",
+                    include_outer_contour=bool(config["lattice"].get("print_outer_contour_fiber", False)),
+                ),
             )
             return
         self.send_error(HTTPStatus.NOT_FOUND, "Not found")
@@ -945,7 +954,13 @@ class SurfacePreviewHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         if attachment_name:
-            self.send_header("Content-Disposition", f'attachment; filename="{attachment_name}"')
+            # HTTP headers use Latin-1; RFC 5987 carries the Chinese name.
+            encoded_name = quote(attachment_name, safe="")
+            fallback_name = attachment_name if attachment_name.isascii() else "honeycomb.json"
+            self.send_header(
+                "Content-Disposition",
+                f"attachment; filename=\"{fallback_name}\"; filename*=UTF-8''{encoded_name}",
+            )
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
         self.wfile.write(encoded)
@@ -3084,7 +3099,7 @@ def surface_preview_html() -> str:
       // already expired. The server sets Content-Disposition: attachment.
       const link = document.createElement('a');
       link.href = url;
-      link.download = fileName;
+      link.download = fileName || '';
       link.style.display = 'none';
       document.body.appendChild(link);
       link.click();
@@ -3094,7 +3109,6 @@ def surface_preview_html() -> str:
     exportConformalConfigButton.addEventListener('click', () => {
       downloadAttachment(
         `/api/export-conformal-lattice-config?${conformalParameters().toString()}`,
-        'conformal_lattice_spec_v1.json',
       );
       statusEl.className = 'status';
       statusEl.textContent = '正在下载连续路径设计 JSON…';
@@ -3102,7 +3116,6 @@ def surface_preview_html() -> str:
     exportPlanarConfigButton.addEventListener('click', () => {
       downloadAttachment(
         `/api/export-planar-lattice-config?${conformalParameters().toString()}`,
-        'planar_honeycomb_spec_v1.json',
       );
       statusEl.className = 'status';
       statusEl.textContent = '正在下载平面蜂窝结构 JSON…';

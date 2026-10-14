@@ -32,6 +32,7 @@ from .external_npz import (
     write_external_source_npz,
 )
 from .cpu_limiter import limit_slicer_task
+from .download_naming import honeycomb_download_filename
 from .conformal_lattice.contracts import load_conformal_lattice_spec
 from .fiber_interlayers import (
     DEFAULT_INITIAL_RESIN_ONLY_LAYERS,
@@ -314,12 +315,15 @@ def _materialize_core_download(
     *,
     is_surface: bool,
     honeycomb_cell_size_mm: float | None,
+    filename: str | None = None,
 ) -> Path:
     """Expose the Core artifact under the stable, user-facing filename."""
 
-    target = job_dir / _core_download_filename(
-        is_surface=is_surface,
-        honeycomb_cell_size_mm=honeycomb_cell_size_mm,
+    target = job_dir / (
+        filename or _core_download_filename(
+            is_surface=is_surface,
+            honeycomb_cell_size_mm=honeycomb_cell_size_mm,
+        )
     )
     if target != download_path:
         shutil.copyfile(download_path, target)
@@ -2408,8 +2412,18 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         download_path = _materialize_core_download(
             download_path,
             job_dir,
-            is_surface=True,
+            is_surface=not is_planar,
             honeycomb_cell_size_mm=float(spec.lattice["base_cell_size_mm"]),
+            filename=honeycomb_download_filename(
+                spec.source_surface,
+                spec.lattice,
+                material="纤维" if conformal_fiber_enabled else "树脂",
+                extension=download_path.suffix,
+                include_outer_contour=(
+                    conformal_fiber_enabled
+                    and bool(spec.lattice.get("print_outer_contour_fiber", False))
+                ),
+            ),
         )
         path_count = sum(len(group.paths) for group in conformal_source_job.material_paths)
         result: dict[str, object] = {
