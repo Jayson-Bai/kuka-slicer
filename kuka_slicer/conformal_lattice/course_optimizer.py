@@ -1,7 +1,8 @@
 """Private course ordering and travel on the established safe boundary network.
 
-No new deposited geometry or Core commands are created here. The first and
-last course of each process block stay fixed, including their directions.
+No new deposited geometry or Core commands are created here. Production
+blocks enter at the nearest corner-adjacent course endpoint, then optimize
+the remaining visits including the connection to the next process record.
 """
 
 from __future__ import annotations
@@ -140,30 +141,35 @@ def _cost(order, costs):
 
 
 @lru_cache(maxsize=16)
-def _solve_cached(count, cost_bytes):
+def _solve_cached(count, cost_bytes, first_state=0, exit_bytes=None, fixed_last=True):
     costs = np.frombuffer(cost_bytes, dtype=np.float64).reshape(2 * count, 2 * count)
-    baseline = tuple(2 * i for i in range(count))
-    free = count - 2
-    if free <= 0:
+    exits = np.zeros(2 * count) if exit_bytes is None else np.frombuffer(exit_bytes, dtype=np.float64)
+    last = (2 * (count - 1),) if fixed_last and count > 1 else ()
+    free_indices = [i for i in range(count) if i != first_state // 2 and 2 * i not in last]
+    baseline = (first_state, *(2 * i for i in free_indices), *last)
+    free = len(free_indices)
+    def total(order):
+        return _cost(order, costs) + exits[order[-1]]
+    if free == 0:
         return baseline, True
     if free > _MAX_FREE_COURSES:
         # A bounded fallback must not claim proof of optimality. Preserve the
         # original route unless an actual-cost nearest-neighbour tour improves it.
-        order, remaining = [0], set(range(1, count - 1))
+        order, remaining = [first_state], set(free_indices)
         while remaining:
             next_state = min((2 * i + d for i in remaining for d in (0, 1)), key=lambda s: (costs[order[-1], s], s))
             order.append(next_state)
             remaining.remove(next_state // 2)
-        order.append(2 * (count - 1))
-        return (tuple(order) if _cost(order, costs) < _cost(baseline, costs) - 1e-9 else baseline), False
+        order.extend(last)
+        return (tuple(order) if total(order) < total(baseline) - 1e-9 else baseline), False
     # Held-Karp over (visited courses, last course, last direction). A reversed
     # state changes endpoints only; the deposited stroke is never re-sampled.
-    states = np.arange(2, 2 * (count - 1))
+    states = np.asarray([2 * i + d for i in free_indices for d in (0, 1)])
     size = 1 << free
     dp = np.full((size, 2 * free), math.inf)
     parent = np.full((size, 2 * free), -1, dtype=np.int16)
     for i in range(free):
-        dp[1 << i, 2 * i:2 * i + 2] = costs[0, 2 * i + 2:2 * i + 4]
+        dp[1 << i, 2 * i:2 * i + 2] = costs[first_state, states[2 * i:2 * i + 2]]
     for mask in range(1, size):
         remaining = (size - 1) ^ mask
         while remaining:
@@ -179,24 +185,30 @@ def _solve_cached(count, cost_bytes):
                 if candidate[direction] < dp[next_mask, destination]:
                     dp[next_mask, destination] = candidate[direction]
                     parent[next_mask, destination] = predecessors[direction]
-    final = dp[-1] + costs[states, 2 * (count - 1)]
+    final = dp[-1] + (costs[states, last[0]] + exits[last[0]] if last else exits[states])
     state, mask = int(np.argmin(final)), size - 1
-    order = [2 * (count - 1)]
+    order = list(last)
     while mask:
-        order.append(state + 2)
+        order.append(int(states[state]))
         previous = int(parent[mask, state])
         mask ^= 1 << (state // 2)
         state = previous
-    order.append(0)
+    order.append(first_state)
     order.reverse()
     # Retain established tie ordering and avoid floating-point-only changes.
-    return (tuple(order) if _cost(order, costs) < _cost(baseline, costs) - 1e-9 else baseline), True
+    return (tuple(order) if total(order) < total(baseline) - 1e-9 else baseline), True
 
 
-def optimize_block(paths, router):
-    """Return exact visits with fixed first/last strokes up to 20 courses."""
+def optimize_block(paths, router, *, entry=None, exit=None):
+    """Optimize safe travel; an explicit entry enables side-boundary starts.
+
+    The entry requirement precedes travel minimization: find the endpoints
+    nearest the four boundary corners, then choose the one nearest the actual
+    entry by safe 3-D route length. All other visits/directions and the exit are
+    optimized. Without an entry, retain the legacy fixed-anchor contract.
+    """
     count = len(paths)
-    if count < 2:
+    if count == 0:
         return [(i, False) for i in range(count)], {"optimal": True, "before_mm": 0., "after_mm": 0.}
     costs = np.full((2 * count, 2 * count), math.inf)
     for i, first in enumerate(paths):
@@ -206,12 +218,36 @@ def optimize_block(paths, router):
             for a in (0, 1):
                 for b in (0, 1):
                     costs[2 * i + a, 2 * j + b] = route_length(router.route(first[0 if a else -1], second[-1 if b else 0]))
-    order, exact = _solve_cached(count, costs.tobytes())
+    entries, exits = np.zeros(2 * count), np.zeros(2 * count)
+    for i, path in enumerate(paths):
+        for direction in (0, 1):
+            if entry is not None:
+                entries[2 * i + direction] = route_length(router.route(entry, path[-1 if direction else 0]))
+            if exit is not None:
+                exits[2 * i + direction] = route_length(router.route(path[0 if direction else -1], exit))
+    first_state = 0
+    if entry is not None:
+        left, lower, right, upper = router.bounds
+        candidates = set()
+        for corner_xy in ((left, lower), (right, lower), (right, upper), (left, upper)):
+            corner = router.pose_at(np.asarray(corner_xy))
+            distances = np.asarray([
+                route_length(router.route(corner, p[-1 if d else 0]))
+                for p in paths for d in (0, 1)
+            ])
+            candidates.update(np.flatnonzero(distances <= distances.min() + _EPS).tolist())
+        first_state = min(candidates, key=lambda state: (entries[state], state))
+    order, exact = _solve_cached(count, costs.tobytes(), first_state, exits.tobytes(), entry is None)
+    def total(visits):
+        return entries[visits[0]] + _cost(visits, costs) + exits[visits[-1]]
     return [(state // 2, bool(state % 2)) for state in order], {
         "optimal": exact,
         "method": "exact_dynamic_programming" if exact else "bounded_nearest_neighbour",
-        "constraints": "fixed first/last course and direction; safe boundary network",
+        "constraints": ("nearest reachable corner-adjacent endpoint; safe boundary network; process exit included"
+                        if entry is not None else "fixed first/last course and direction; safe boundary network"),
         "course_count": count,
-        "before_mm": float(_cost(tuple(2 * i for i in range(count)), costs)),
-        "after_mm": float(_cost(order, costs)),
+        "before_mm": float(total(tuple(2 * i for i in range(count)))),
+        "after_mm": float(total(order)),
+        "entry_mm": float(entries[order[0]]),
+        "exit_mm": float(exits[order[-1]]),
     }

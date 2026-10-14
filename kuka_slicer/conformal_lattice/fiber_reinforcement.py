@@ -1052,12 +1052,35 @@ def _continuous_work_bounds(graph: ConformalLatticePathGraph) -> tuple[float, fl
     return grip, 0.0, length - grip, width
 
 
+def _corner_start_outer_record(record):
+    """Rotate a rectangular closed contour to its lower-left authored corner.
+
+    Keep every XYZABC sample and its segment extrusion. This is local to
+    continuous honeycomb; the shared mesh and other slicing paths are untouched.
+    """
+    path, profile, role = record
+    if len(path) < 4 or not np.allclose(path[0], path[-1], rtol=0.0, atol=1e-8):
+        raise ValueError("honeycomb outer contour must be a closed XYZABC path")
+    vertices = path[:-1]
+    corner = vertices[:, :2].min(axis=0)
+    matches = np.flatnonzero(np.all(np.isclose(vertices[:, :2], corner, rtol=0.0, atol=1e-7), axis=1))
+    if not len(matches):
+        raise ValueError("honeycomb outer contour is missing its lower-left corner")
+    start = int(matches[0])
+    if start == 0:
+        return record
+    rotated = np.concatenate((vertices[start:], vertices[:start], vertices[start:start + 1]))
+    increments = np.diff(profile)
+    rotated_e = np.r_[profile[0], profile[0] + np.cumsum(np.r_[increments[start:], increments[:start]])]
+    return rotated, rotated_e, role
+
+
 def _order_resin_records_for_continuous_courses(
     retained: list[tuple[np.ndarray, np.ndarray, str]],
     courses: list[tuple[np.ndarray, np.ndarray, str]],
 ) -> list[tuple[np.ndarray, np.ndarray, str]]:
     """Preserve walls/grips while visiting course fragments without long diagonals."""
-    outer = [record for record in retained if record[2] == "conformal_outer_boundary"]
+    outer = [_corner_start_outer_record(record) for record in retained if record[2] == "conformal_outer_boundary"]
     partitions = [record for record in retained if record[2] == "conformal_partition_wall"]
     grips = [record for record in retained if record[2] == "conformal_grip_zigzag_x_one_stroke"]
     known = {id(record) for record in [*outer, *partitions, *grips]}
@@ -1182,7 +1205,7 @@ def _continuous_boundary_router(bounds, boundary_sources, *, z_offset_mm=0.0):
 
 
 def _optimize_continuous_records(records, router):
-    """Keep process anchors; optimize only contiguous honeycomb course blocks."""
+    """Keep non-course records; optimize honeycomb entry, visits and exit."""
     result, reports = [], []
     start = 0
     while start < len(records):
@@ -1194,7 +1217,9 @@ def _optimize_continuous_records(records, router):
         while end < len(records) and records[end][2] == "conformal_continuous_course_fragment":
             end += 1
         block = records[start:end]
-        visits, report = optimize_block([record[0] for record in block], router)
+        entry = result[-1][0][-1] if result else router.pose_at(np.asarray(router.bounds[:2]))
+        exit = records[end][0][0] if end < len(records) else None
+        visits, report = optimize_block([record[0] for record in block], router, entry=entry, exit=exit)
         for index, reverse in visits:
             path, profile, role = block[index]
             if reverse:
@@ -1297,7 +1322,7 @@ def _replace_honeycomb_resin_with_continuous_courses(
         ]
     source_job.travel_paths = travel_groups
     source_job.meta["course_travel_optimization"] = {
-        "scope": "same-layer course blocks; fixed process anchors; shared resin/fiber visits",
+        "scope": "same-layer course blocks; side-boundary entry; preserved non-course records; shared resin/fiber visits",
         "layers": optimization_reports,
     }
     bridge = source_job.meta.get("conformal_lattice_path_bridge")
