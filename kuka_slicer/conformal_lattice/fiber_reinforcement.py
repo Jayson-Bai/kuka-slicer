@@ -56,6 +56,7 @@ class ContinuousCourseFiberSettings:
     resin_z_preplanned_for_fiber: bool = False
     planned_resin_layer_indices: tuple[int, ...] = ()
     compensate_fiber_gap_extrusion: bool = True
+    print_outer_contour_fiber: bool = False
 
 
 def derive_symmetric_curvature_fiber_interfaces(
@@ -446,15 +447,13 @@ def apply_continuous_course_fiber_strategy(
     total_length_mm = 0.0
     work_bounds = _continuous_work_bounds(graph)
     fiber_route_specs: list[tuple[int, list[np.ndarray]]] = []
+    fiber_path_roles: dict[str, list[str]] = {}
     fiber_travel_indexes: dict[str, list[int]] = {}
     for layer_index in selected_layers:
         layer_courses = _courses_for_layer(course_paths_by_layer, layer_index)
-        prior_fibers = sum(previous < layer_index for previous in selected_layers)
-        z_offset = (
-            float(fiber_layer_height_mm)
-            if settings.resin_z_preplanned_for_fiber
-            else (prior_fibers + 1) * float(fiber_layer_height_mm)
-        )
+        # Courses already carry the matching resin surface Z. Apply only the
+        # local fiber lift, independent of all earlier fiber interfaces.
+        z_offset = float(fiber_layer_height_mm)
         paths, profiles, length_mm = _render_continuous_courses(layer_courses, float(fiber_e_per_mm), z_offset)
         course_records = [
             (path, profile, "conformal_continuous_course_fragment")
@@ -468,18 +467,35 @@ def apply_continuous_course_fiber_strategy(
             if reverse:
                 path, profile = _reverse_deposition_path(path, profile)
             ordered_records.append((path, profile, role))
+        if settings.print_outer_contour_fiber:
+            # Reuse the actual resin perimeter, including its authored seam,
+            # direction, surface samples and ABC. Never join it to a course.
+            resin_roles = source_job.meta["path_roles"]["R"][str(layer_index)]
+            resin_group = next(
+                group for group in source_job.material_paths
+                if group.material == "R" and int(group.layer_index) == layer_index
+            )
+            outlines = [
+                path for path, role in zip(resin_group.paths, resin_roles)
+                if role == "conformal_outer_boundary"
+            ]
+            if len(outlines) != 1:
+                raise ValueError("outer contour fiber requires exactly one resin perimeter per fiber layer")
+            outline = np.array(outlines[0], dtype=np.float64, copy=True)
+            if len(outline) < 4 or not np.allclose(outline[0], outline[-1], rtol=0.0, atol=1e-8):
+                raise ValueError("outer contour fiber requires a closed resin perimeter")
+            outline[:, 2] += z_offset
+            lengths = np.linalg.norm(np.diff(outline[:, :3], axis=0), axis=1)
+            profile = np.concatenate(([0.0], np.cumsum(lengths * float(fiber_e_per_mm))))
+            ordered_records.insert(0, (outline, profile, "conformal_outer_boundary"))
+            length_mm += float(np.sum(lengths))
         paths = [path for path, _profile, _role in ordered_records]
         profiles = [profile for _path, profile, _role in ordered_records]
+        fiber_path_roles[str(layer_index)] = [role for _path, _profile, role in ordered_records]
         fiber_route_specs.append((layer_index, paths))
         fiber_groups.append(MaterialPaths(layer_index, "F", paths, profiles))
         total_length_mm += length_mm
 
-    if not settings.resin_z_preplanned_for_fiber:
-        _raise_resin_and_travel_z_after_fiber_interfaces(
-            source_job,
-            selected_layers=selected_layers,
-            fiber_layer_height_mm=float(fiber_layer_height_mm),
-        )
     post_fiber_resin_extrusion = _apply_post_fiber_resin_extrusion_height(
         source_job,
         selected_layers=selected_layers,
@@ -526,17 +542,15 @@ def apply_continuous_course_fiber_strategy(
     if not isinstance(fiber_roles, dict):
         raise ValueError("continuous fiber strategy requires fiber path roles to be an object")
     for layer_index, paths in fiber_route_specs:
-        fiber_roles[str(layer_index)] = [
-            "conformal_continuous_course_fragment"
-        ] * len(paths)
+        fiber_roles[str(layer_index)] = fiber_path_roles[str(layer_index)]
     source_job.meta["fiber_travel_path_indexes"] = fiber_travel_indexes
     motion_order = source_job.meta.get("motion_order")
     if isinstance(motion_order, dict):
-        for layer_index in selected_layers:
+        for layer_index, paths in fiber_route_specs:
             records = motion_order.setdefault(str(layer_index), [])
             if not isinstance(records, list):
                 raise ValueError("continuous fiber travel planner requires list motion-order records")
-            for fiber_index in range(resin_paths_per_layer):
+            for fiber_index in range(len(paths)):
                 if fiber_index:
                     records.append({"kind": "fiber_travel", "index": fiber_travel_indexes[str(layer_index)][fiber_index - 1]})
                 records.append({"kind": "fiber_deposit", "index": fiber_index})
@@ -545,12 +559,14 @@ def apply_continuous_course_fiber_strategy(
         "mode": "continuous_course_network_v1",
         "configured_in": "main_ui_runtime",
         "layer_interface_source": settings.layer_interface_source,
+        "print_outer_contour_fiber": settings.print_outer_contour_fiber,
         "active_resin_layer_indices": list(selected_layers),
         "course_semantics": "every rectangle-clipped continuous-course fragment is an independent resin/F path with normal Core travel/cut boundaries",
         "planar_skeleton_then_surface_embedding": True,
     }
     final_height = _height_guided_final_height(source_job)
-    nominal_resin_height = final_height - len(selected_layers) * float(fiber_layer_height_mm)
+    nominal_resin_height = final_height
+    fiber_paths_per_layer = resin_paths_per_layer + int(settings.print_outer_contour_fiber)
     report = {
         "enabled": True,
         "reserved": False,
@@ -559,13 +575,15 @@ def apply_continuous_course_fiber_strategy(
         "after_resin_physical_layers": [settings.first_after_resin_layer_physical, settings.last_after_resin_layer_physical],
         "layer_interface_source": settings.layer_interface_source,
         "resin_layer_indices": list(selected_layers),
-        "paths_per_fiber_layer": resin_paths_per_layer,
-        "total_fiber_path_count": resin_paths_per_layer * len(selected_layers),
+        "paths_per_fiber_layer": fiber_paths_per_layer,
+        "total_fiber_path_count": fiber_paths_per_layer * len(selected_layers),
+        "print_outer_contour_fiber": settings.print_outer_contour_fiber,
+        "outer_contour_fiber_path_count": int(settings.print_outer_contour_fiber) * len(selected_layers),
         "resin_honeycomb_paths_per_layer": resin_paths_per_layer,
         "total_resin_honeycomb_path_count": resin_paths_per_layer * len(resin_layer_indices),
         "total_fiber_length_mm": total_length_mm,
         "fiber_layer_height_mm": float(fiber_layer_height_mm),
-        "automatic_resin_z_raise": not settings.resin_z_preplanned_for_fiber,
+        "automatic_resin_z_raise": False,
         "resin_z_preplanned_for_fiber": bool(settings.resin_z_preplanned_for_fiber),
         "post_fiber_resin_extrusion_height": post_fiber_resin_extrusion,
         "nominal_resin_stack_height_mm": nominal_resin_height,
@@ -579,7 +597,7 @@ def apply_continuous_course_fiber_strategy(
         enabled=True,
         reserved=False,
         resin_layer_indices=selected_layers,
-        paths_per_layer=resin_paths_per_layer,
+        paths_per_layer=fiber_paths_per_layer,
         fiber_layer_height_mm=float(fiber_layer_height_mm),
         nominal_final_height_mm=final_height,
         total_path_count=int(report["total_fiber_path_count"]),

@@ -1126,20 +1126,27 @@ def normalize_job_xy_origin(
     target_xy: tuple[float, float] = (0.0, 0.0),
     reference_material: str | None = None,
     reference_point: str = "min",
+    reference_xy: tuple[float, float] | None = None,
 ) -> tuple[float, float]:
     """Translate all paths so a material reference point reaches ``target_xy``.
 
     ``min`` retains the historical lower-left behavior.  Core jobs can use
     ``center`` for parts whose local origin is their XY center, so the UI
     position is measured from the print-plane origin rather than a bounding
-    box corner.
+    box corner.  ``reference_xy`` overrides the path-derived reference with
+    a model-space origin, so Brim/raft geometry cannot move the part center.
     """
 
     bounds = _job_xy_bounds(job, material=reference_material)
     if bounds is None:
         return (0.0, 0.0)
     min_x, min_y, max_x, max_y = bounds
-    if reference_point == "center":
+    if reference_xy is not None:
+        reference_x, reference_y = map(float, reference_xy)
+        if not math.isfinite(reference_x) or not math.isfinite(reference_y):
+            raise ValueError("reference_xy must contain finite coordinates")
+        reference_point = "explicit"
+    elif reference_point == "center":
         reference_x = (min_x + max_x) * 0.5
         reference_y = (min_y + max_y) * 0.5
     elif reference_point == "min":

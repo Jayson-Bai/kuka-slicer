@@ -752,42 +752,26 @@ def _physical_layer_schedule(
             if spec.layer_embedding.get("transition_step_policy", "auto_to_midplane") == "manual"
             else None
         )
-        candidate_limit = max(1, int(math.ceil(final_height / nominal_height)))
-        candidates: list[tuple[float, float, int, tuple[int, ...]]] = []
-        for candidate_count in range(1, candidate_limit + 1):
-            try:
-                if spec.source_provider == "planar":
-                    selected = plan_flat_resin_interlayers(range(candidate_count)).after_resin_layer_indices
-                    if not selected:
-                        continue
-                else:
-                    alpha = _symmetric_alphas(
-                        candidate_count,
-                        surface_start_layer=surface_start,
-                        transition_step_count=transition_steps,
-                    )
-                    _first, _last, selected = symmetric_curvature_fiber_schedule(alpha)
-            except ValueError:
-                continue
-            actual_height = candidate_count * nominal_height + len(selected) * fiber_height
-            candidates.append((abs(actual_height - final_height), actual_height, candidate_count, selected))
-        if not candidates:
+        # Choose the resin grid exactly as for a resin-only part. Fiber is
+        # covered by subsequent resin; it neither consumes height budget nor
+        # translates later resin centres. Select interfaces only afterward.
+        count = nearest_resin_layer_count(final_height, nominal_height)
+        if spec.source_provider == "planar":
+            selected_layers = plan_flat_resin_interlayers(range(count)).after_resin_layer_indices
+        else:
+            alpha = _symmetric_alphas(
+                count,
+                surface_start_layer=surface_start,
+                transition_step_count=transition_steps,
+            )
+            _first, _last, selected_layers = symmetric_curvature_fiber_schedule(alpha)
+        if not selected_layers:
             raise ValueError("target final height cannot accommodate the authored continuous-fiber schedule")
-        # On an exact tie retain the lower physical stack, then the thinner
-        # resin stack. Both rules avoid silently exceeding the requested part.
-        _error, actual_height, count, selected_layers = min(
-            candidates,
-            key=lambda candidate: (round(candidate[0], 12), candidate[1], candidate[2]),
-        )
+        actual_height = count * nominal_height
         if requested_count is not None and requested_count != count:
             raise ValueError("logical_layer_count must match the height-guided continuous-fiber stack plan")
         resin_centres = (np.arange(count, dtype=np.float64) + 0.5) * nominal_height
-        prior_fiber_count = np.asarray(
-            [sum(previous < layer_index for previous in selected_layers) for layer_index in range(count)],
-            dtype=np.float64,
-        )
-        centres = resin_centres + prior_fiber_count * fiber_height
-        return count, centres, {
+        return count, resin_centres, {
             "target_final_height_mm": final_height,
             "planned_final_height_mm": actual_height,
             "height_error_mm": actual_height - final_height,
@@ -797,6 +781,8 @@ def _physical_layer_schedule(
             "fiber_layer_height_mm": fiber_height,
             "fiber_layer_indices": list(selected_layers),
             "fiber_layer_count": len(selected_layers),
+            # Compatibility flag: the source already owns its final resin Z.
+            # It does not mean that fiber thickness has been added to resin.
             "resin_z_preplanned_for_fiber": True,
         }
 

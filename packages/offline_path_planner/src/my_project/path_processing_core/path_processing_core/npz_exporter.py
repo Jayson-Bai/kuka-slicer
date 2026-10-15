@@ -1433,6 +1433,12 @@ def export_npz(
             # exact polyline and give the sampler one continuous time profile
             # instead of independently stopping on every short source edge.
             gc_list = [_make_polyline_gc(work_buffer, " | travel_polyline")]
+        elif work_buffer and work_buffer[0].subtype == "FIBER_PRINT":
+            # Fiber geometry is authored by the input path (including JSON).
+            # Preserve every source vertex and its order. Core owns the
+            # continuous timing and 4 ms sampling, but must not fit or blend
+            # the fiber stroke, regardless of resin spline settings.
+            gc_list = [_make_polyline_gc(work_buffer, " | fiber_source_polyline")]
         elif work_buffer and work_buffer[0].source_path_id is not None:
             # Every externally imported MaterialPath is an authored continuous
             # deposition stroke.  Its interior is still Core geometry.  Do not

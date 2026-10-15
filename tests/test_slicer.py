@@ -153,7 +153,7 @@ def test_fiber_template_z_is_offset_from_resin_layer_z():
     fiber_paths_by_layer = expand_fiber_template_for_resin_layers(job, template_paths)
 
     resin_z_values = [group.paths[0][0, 2] for group in job.material_paths]
-    assert np.allclose(resin_z_values, [0.5, 1.0, 1.6])
+    assert np.allclose(resin_z_values, [0.5, 1.0, 1.5])
     assert sorted(fiber_paths_by_layer) == [1]
     assert np.allclose(
         [fiber_paths_by_layer[layer_index][0][0][2] for layer_index in sorted(fiber_paths_by_layer)],
@@ -186,12 +186,12 @@ def test_brim_layer_skips_fiber_and_keeps_following_resin_fiber_schedule():
 
     assert np.allclose(
         [group.paths[0][0, 2] for group in job.material_paths],
-        [0.4, 0.9, 1.5, 2.1],
+        [0.4, 0.9, 1.4, 1.9],
     )
     assert sorted(fiber_paths_by_layer) == [1, 2]
     assert np.allclose(
         [fiber_paths_by_layer[index][0][0][2] for index in (1, 2)],
-        [1.0, 1.6],
+        [1.0, 1.5],
     )
     assert job.meta["slicing"]["fiber_initial_resin_only_layer_count"] == 1
     assert job.meta["slicing"]["fiber_first_part_layer_has_brim"] is True
@@ -227,11 +227,11 @@ def test_fiber_z_offset_keeps_prusa_travel_aligned_with_resin_layer():
 
     assert np.allclose(
         [group.paths[0][0, 2] for group in job.material_paths if group.material == "R"],
-        [0.4, 0.9, 1.5, 2.1],
+        [0.4, 0.9, 1.4, 1.9],
     )
     assert np.allclose(
         [group.paths[0][0, 2] for group in job.travel_paths],
-        [0.4, 0.9, 1.5, 2.1],
+        [0.4, 0.9, 1.4, 1.9],
     )
 
 
@@ -251,7 +251,7 @@ def test_first_layer_height_carries_into_the_fiber_resin_schedule():
     fiber_paths_by_layer = expand_fiber_template_for_resin_layers(job, template_paths)
 
     resin_z_values = [group.paths[0][0, 2] for group in job.material_paths]
-    assert np.allclose(resin_z_values, [0.3, 0.8, 1.4])
+    assert np.allclose(resin_z_values, [0.3, 0.8, 1.3])
     assert np.allclose(
         [fiber_paths_by_layer[layer_index][0][0][2] for layer_index in sorted(fiber_paths_by_layer)],
         [0.9],
@@ -279,7 +279,7 @@ def test_fiber_template_skips_prusa_raft_layers():
     assert np.allclose(job.material_paths[0].paths[0][:, 2], 0.5)
     assert np.allclose(job.material_paths[1].paths[0][:, 2], 1.0)
     assert np.allclose(job.material_paths[2].paths[0][:, 2], 1.5)
-    assert np.allclose(job.material_paths[3].paths[0][:, 2], 2.1)
+    assert np.allclose(job.material_paths[3].paths[0][:, 2], 2.0)
     assert sorted(fiber_paths_by_layer) == [2]
     assert np.allclose(fiber_paths_by_layer[2][0][0][2], 1.6)
 
@@ -401,12 +401,12 @@ def test_fiber_json_loads_canonical_one_record_per_path_format(tmp_path):
     ]
 
 
-def test_project_default_fiber_json_aligns_to_resin_before_ui_placement(tmp_path):
+def test_centered_fiber_json_uses_explicit_stl_center_before_ui_placement(tmp_path):
     json_path = tmp_path / "project_default_fiber.json"
     json_path.write_text(
         """
         {
-          "coordinate_system": "project_default",
+          "coordinate_system": "part_center_xy",
           "paths": [[[-2.0, -1.0], [2.0, 1.0]]]
         }
         """,
@@ -423,12 +423,12 @@ def test_project_default_fiber_json_aligns_to_resin_before_ui_placement(tmp_path
         ]
     )
 
-    aligned = align_fiber_template_paths_to_resin(job, template_paths)
+    aligned = align_fiber_template_paths_to_resin(job, template_paths, part_center_xy=(25.0, 40.0))
 
     assert aligned == [[[23.0, 39.0, 0.0], [27.0, 41.0, 0.0]]]
     assert job.meta["fiber_coordinate_alignment"] == {
-        "source_coordinate_system": "project_default",
-        "reference": "resin_xy_bounds_center",
+        "source_coordinate_system": "part_center_xy",
+        "reference": "oriented_stl_xy_bounds_center",
         "translation_x_mm": 25.0,
         "translation_y_mm": 40.0,
     }

@@ -31,8 +31,8 @@ _RESIN_GCODE_TOOL = 1
 _FIBER_GCODE_TOOL = 0
 _EPS = 1e-9
 _PRIMELINE_ORDER = -1000000
-_RESIN_LAYER_END_TRAVEL_MM = 20.0
-_RESIN_LAYER_END_TRAVEL_RAW = "external_npz_resin_layer_end_travel"
+_RESIN_LAYER_END_WIPE_MM = 5.0
+_RESIN_LAYER_END_WIPE_RAW = "external_npz_resin_layer_end_wipe"
 
 
 def source_job_to_parsed_commands(job: SourceJob, params: ProcessParams) -> ParsedCommandList:
@@ -107,12 +107,6 @@ def source_job_to_parsed_commands(job: SourceJob, params: ProcessParams) -> Pars
     for layer in job.layers:
         resin_path_count = len(layer.resin_paths)
         resin_path_number = 0
-        resin_layer_center_xy = _layer_resin_xy_center(layer.resin_paths)
-        if resin_layer_center_xy is not None:
-            resin_layer_center_xy = (
-                resin_layer_center_xy[0] - source_min_x + float(params.start_x_mm),
-                resin_layer_center_xy[1] - source_min_y + float(params.start_y_mm),
-            )
         fiber_path_count = len(layer.fiber_paths)
         fiber_path_number = 0
 
@@ -495,33 +489,27 @@ def source_job_to_parsed_commands(job: SourceJob, params: ProcessParams) -> Pars
                 commands.append(boundary)
                 line += 1
             current_e = 0.0
-            if (
-                is_last_resin_in_layer
-                and resin_layer_center_xy is not None
-                and not source_travel_mode
-            ):
-                travel_target = _resin_layer_end_travel_target(
-                    current_pose,
-                    resin_layer_center_xy,
-                    fallback_start=source_positions[-2],
-                )
-                commands.append(
-                    MoveCommand(
-                        type="TRAVEL",
-                        cmd="G0",
-                        start_pos=current_pose,
-                        pos=travel_target,
-                        e_val=0.0,
-                        delta_e=0.0,
-                        feedrate=destination_travel_feed_mm_s * 60.0,
-                        line=line,
-                        layer=layer.index,
-                        subtype="TRAVEL",
-                        raw=_RESIN_LAYER_END_TRAVEL_RAW,
+            if is_last_resin_in_layer and fiber_path_count:
+                for wipe_target in _resin_layer_end_wipe_targets(source_positions):
+                    start_pose = current_pose
+                    assert start_pose is not None
+                    commands.append(
+                        MoveCommand(
+                            type="TRAVEL",
+                            cmd="G0",
+                            start_pos=start_pose,
+                            pos=wipe_target,
+                            e_val=0.0,
+                            delta_e=0.0,
+                            feedrate=destination_travel_feed_mm_s * 60.0,
+                            line=line,
+                            layer=layer.index,
+                            subtype="TRAVEL",
+                            raw=_RESIN_LAYER_END_WIPE_RAW,
+                        )
                     )
-                )
-                line += 1
-                current_pose = travel_target
+                    line += 1
+                    current_pose = wipe_target
             if is_resin_source_path:
                 resin_path_number += 1
             if is_fiber:
@@ -950,60 +938,34 @@ def _job_source_xy_min(job: SourceJob) -> tuple[float, float]:
     return (0.0 if min_x is None else min_x, 0.0 if min_y is None else min_y)
 
 
-def _layer_resin_xy_center(
-    resin_paths: list[MaterialPath],
-) -> tuple[float, float] | None:
-    """Return the XY bounding-box center for source resin geometry in one layer."""
-    min_x: float | None = None
-    max_x: float | None = None
-    min_y: float | None = None
-    max_y: float | None = None
-    for material_path in resin_paths:
-        points = np.asarray(material_path.points)
-        if points.size == 0:
+def _resin_layer_end_wipe_targets(source_positions: list[Position]) -> list[Position]:
+    """Retrace at most 5 mm of the final deposited resin stroke."""
+    remaining = _RESIN_LAYER_END_WIPE_MM
+    targets: list[Position] = []
+    current = source_positions[-1]
+    for previous in reversed(source_positions[:-1]):
+        segment_length = _distance(current, previous)
+        if segment_length <= _EPS:
             continue
-        path_min_x = float(np.min(points[:, 0]))
-        path_max_x = float(np.max(points[:, 0]))
-        path_min_y = float(np.min(points[:, 1]))
-        path_max_y = float(np.max(points[:, 1]))
-        min_x = path_min_x if min_x is None else min(min_x, path_min_x)
-        max_x = path_max_x if max_x is None else max(max_x, path_max_x)
-        min_y = path_min_y if min_y is None else min(min_y, path_min_y)
-        max_y = path_max_y if max_y is None else max(max_y, path_max_y)
-    if min_x is None or max_x is None or min_y is None or max_y is None:
-        return None
-    return ((min_x + max_x) * 0.5, (min_y + max_y) * 0.5)
-
-
-def _resin_layer_end_travel_target(
-    end_pose: Position,
-    layer_center_xy: tuple[float, float],
-    *,
-    fallback_start: Position,
-) -> Position:
-    """Move 20 mm away from the layer center without changing Z or orientation."""
-    dx = end_pose.x - layer_center_xy[0]
-    dy = end_pose.y - layer_center_xy[1]
-    xy_norm = math.hypot(dx, dy)
-    if xy_norm <= _EPS:
-        # A center endpoint has no radial direction; retain deterministic outward
-        # motion by falling back to the final printed segment direction.
-        dx = end_pose.x - fallback_start.x
-        dy = end_pose.y - fallback_start.y
-        xy_norm = math.hypot(dx, dy)
-    if xy_norm <= _EPS:
-        dx = 1.0
-        dy = 0.0
-        xy_norm = 1.0
-    scale = _RESIN_LAYER_END_TRAVEL_MM / xy_norm
-    return Position(
-        x=end_pose.x + dx * scale,
-        y=end_pose.y + dy * scale,
-        z=end_pose.z,
-        a=end_pose.a,
-        b=end_pose.b,
-        c=end_pose.c,
-    )
+        if segment_length <= remaining + _EPS:
+            target = previous
+            remaining -= segment_length
+        else:
+            fraction = remaining / segment_length
+            target = Position(
+                x=current.x + (previous.x - current.x) * fraction,
+                y=current.y + (previous.y - current.y) * fraction,
+                z=current.z + (previous.z - current.z) * fraction,
+                a=current.a + (previous.a - current.a) * fraction,
+                b=current.b + (previous.b - current.b) * fraction,
+                c=current.c + (previous.c - current.c) * fraction,
+            )
+            remaining = 0.0
+        targets.append(target)
+        current = target
+        if remaining <= _EPS:
+            break
+    return targets
 
 
 def _offset_source_position(

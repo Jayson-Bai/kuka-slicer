@@ -155,7 +155,7 @@ result -> records / connectors / final_paths / diagnostics / metadata
 |---|---|---:|---|
 | `format` | string | 是 | 固定为 `external_fiber_paths_v1` |
 | `unit` | string | 是 | 固定为 `mm` |
-| `coordinate_system` | string | 是 | 项目统一 XY 坐标系，建议 `project_default` |
+| `coordinate_system` | string | 是 | 建议 `project_default`：切片朝向下的 STL 原始平面坐标，不自动居中；已减去 STL 平面包围盒中心的路径使用 `part_center_xy`。均不预先应用打印平面零件位置或机械头偏置 |
 | `point_columns` | string array | 是 | 当前固定为 `["x", "y"]` |
 | `path_order` | string | 是 | 固定为 `sequence` |
 | `paths` | object array | 是 | 每个元素是一条独立纤维轨迹 |

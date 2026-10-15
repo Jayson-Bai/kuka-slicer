@@ -77,16 +77,15 @@ def test_conformal_design_json_generates_core_output_without_source_npz_round_tr
         progress_callback=lambda value, _message: progress.append(value),
     )
 
-    # With 0.25 mm resin and the design-owned curvature fiber window, the
-    # closest stack to a 1 mm target is 3 resin + 1 fiber = 0.85 mm.
-    assert result["layers"] == 3
+    # Fiber does not consume the 1 mm resin height budget.
+    assert result["layers"] == 4
     assert result["effective_infill_pattern"] == "共形蜂窝连续路径"
     assert result["infill_pattern_execution"] == {"applied": True, "mode": "continuous_course_network_v1"}
     assert result["fiber_reinforcement"]["enabled"] is True
     assert result["fiber_reinforcement"]["reserved"] is False
     assert result["fiber_reinforcement"]["total_fiber_path_count"] > 0
     assert result["fiber_reinforcement"]["automatic_resin_z_raise"] is False
-    assert result["nominal_final_height_mm"] == pytest.approx(0.85)
+    assert result["nominal_final_height_mm"] == pytest.approx(1.0)
     assert any(layer["fiber_paths"] for layer in result["preview"]["layers"])
     assert result["preview"]["preview_source"] == "final_core_npz"
     assert result["preview"]["part_origin"] == pytest.approx([60.0, 85.0], abs=0.02)
@@ -95,15 +94,18 @@ def test_conformal_design_json_generates_core_output_without_source_npz_round_tr
         entry["points"]
         for layer in result["preview"]["layers"]
         for entry in layer["motion_paths"]
-        if entry.get("role") == "final_resin" and entry.get("order") == -1
+        if entry.get("role") == "final_resin"
+        and np.allclose(entry["points"][0][:2], [0.0, 5.0], atol=0.02)
+        and np.allclose(entry["points"][-1][:2], [80.0, 5.0], atol=0.02)
     ]
     assert primeline_preview_paths
     primeline_points = np.asarray(primeline_preview_paths[0], dtype=float)
     np.testing.assert_allclose(
-        primeline_points[:, :3],
+        primeline_points[[0, -1], :3],
         [[0.0, 5.0, primeline_points[0, 2]], [80.0, 5.0, primeline_points[0, 2]]],
         atol=0.02,
     )
+    np.testing.assert_allclose(primeline_points[:, 1], 5.0, atol=0.02)
     preview_travels = [
         entry["points"]
         for layer in result["preview"]["layers"]
@@ -234,7 +236,7 @@ def test_main_ui_continuous_course_fiber_strategy_reaches_final_core_output(tmp_
     assert report["resin_layer_indices"][0] == 1
     assert report["total_fiber_path_count"] > 0
     assert report["automatic_resin_z_raise"] is False
-    assert result["nominal_final_height_mm"] == pytest.approx(2.2)
+    assert result["nominal_final_height_mm"] == pytest.approx(2.0)
     job_dir = tmp_path / result["download_url"].split("/")[-2]
     with np.load(job_dir / "conformal_lattice_core.npz", allow_pickle=False) as core:
         assert core["x"].size > 0
@@ -349,8 +351,8 @@ def test_height_guided_conformal_stack_hits_designer_height_with_and_without_fib
     )
     assert fiber_run.path_graph is not None
     fiber_plan = fiber_run.layer_embedding.report["physical_stack_plan"]
-    assert fiber_plan["resin_layer_count"] == 12
-    assert fiber_plan["fiber_layer_count"] == 10
+    assert fiber_plan["resin_layer_count"] == 14
+    assert fiber_plan["fiber_layer_count"] == 12
     assert fiber_plan["planned_final_height_mm"] == pytest.approx(7.0)
     assert fiber_plan["height_error_mm"] == pytest.approx(0.0)
     assert fiber_run.layer_embedding.report["surface_progress_basis"] == "physical_stack_z_mm"
@@ -382,7 +384,7 @@ def test_height_guided_conformal_stack_hits_designer_height_with_and_without_fib
         "fiber_layer_height_mm": 0.1,
         "effective_resin_extrusion_height_mm": 0.6,
         "e_scale": pytest.approx(1.2),
-        "affected_resin_layer_indices": list(range(2, 12)),
+        "affected_resin_layer_indices": list(range(2, 14)),
     }
     for layer_index, expected_scale in ((1, 1.0), (2, 1.2), (11, 1.2)):
         resin_group = next(
@@ -442,9 +444,9 @@ def test_main_ui_height_guided_conformal_export_keeps_7mm_physical_extent(tmp_pa
         ),
     )
 
-    assert result["layers"] == 12
+    assert result["layers"] == 14
     assert result["nominal_final_height_mm"] == pytest.approx(7.0)
-    assert result["height_plan"]["fiber_layer_count"] == 10
+    assert result["height_plan"]["fiber_layer_count"] == 12
     assert result["height_plan"]["planned_final_height_mm"] == pytest.approx(7.0)
     assert result["fiber_reinforcement"]["automatic_resin_z_raise"] is False
     job_dir = tmp_path / result["download_url"].split("/")[-2]
@@ -562,7 +564,7 @@ def test_main_ui_planar_fiber_disabled_uses_requested_final_height(tmp_path: Pat
         assert float(np.max(core["z"][resin_print])) == pytest.approx(6.75, abs=2e-3)
 
 
-def test_main_ui_planar_fiber_enabled_budgets_lift_inside_target_height(tmp_path: Path):
+def test_main_ui_planar_fiber_enabled_keeps_resin_only_height_grid(tmp_path: Path):
     config = planar_lattice_config_payload(
         {
             "part_length_mm": ["40"],
@@ -587,9 +589,9 @@ def test_main_ui_planar_fiber_enabled_budgets_lift_inside_target_height(tmp_path
         ),
     )
 
-    assert result["layers"] == 12
+    assert result["layers"] == 14
     assert result["nominal_final_height_mm"] == pytest.approx(7.0)
-    assert result["height_plan"]["fiber_layer_count"] == 10
+    assert result["height_plan"]["fiber_layer_count"] == 12
     assert result["fiber_reinforcement"]["automatic_resin_z_raise"] is False
     assert result["fiber_reinforcement"]["post_fiber_resin_extrusion_height"]["enabled"] is False
 
@@ -915,7 +917,7 @@ def test_core_download_bundles_split_parts_and_sidecars(tmp_path: Path):
         assert all(entry.compress_type == zipfile.ZIP_STORED for entry in archive.infolist())
 
 
-def test_ui_uses_pre_core_source_preview_and_exposes_core_export_progress():
+def test_ui_uses_final_core_preview_and_exposes_core_export_progress():
     html = _index_html()
     handler_source = inspect.getsource(importlib.import_module("kuka_slicer.ui_server")._SlicerUiHandler._handle_slice)
     core_defaults = _load_core_print_params()
@@ -924,10 +926,11 @@ def test_ui_uses_pre_core_source_preview_and_exposes_core_export_progress():
     assert "hasOrderedFiber" in html
     assert "points.length >= 1" in html
     assert "path.length === 1" in html
-    assert "送入 Core 前的源 NPZ" in html
-    assert "_preview_payload_from_core_source_job" in handler_source
+    assert "预览：最终导出 NPZ" in html
+    assert "_preview_payload_from_core_source_job" not in handler_source
     assert "_planning_mesh_for_gcode_source(mesh, config)" in handler_source
-    assert "_preview_payload_from_final_core_npz(core_npz_path, config)" not in handler_source
+    assert "_preview_payload_from_final_core_npz(" in handler_source
+    assert "_core_preview_overlay_from_commands" not in handler_source
     assert "commands_callback=capture_core_preview" not in handler_source
     assert 'id="exportProgressBar"' in html
     assert '<div class="exportActionRow">' in html
@@ -1548,3 +1551,34 @@ def test_core_preview_xy_offset_uses_material_frame_minimum():
     core_params = SimpleNamespace(start_x_mm=0.0, start_y_mm=0.0)
 
     assert _core_preview_xy_offset(job, core_params) == (30.0, 10.0)
+
+
+@pytest.mark.parametrize("with_extrusion", [False, True])
+def test_final_preview_material_heights_use_raw_npz_and_exclude_nonprinting_moves(tmp_path, monkeypatch, with_extrusion):
+    output = tmp_path / "heights.npz"
+    # Six independent paths: resin, fiber, travel, zero-E connector,
+    # stationary resin process, and a resin-only layer below the plane.
+    heights = [.4, .404, .4, .5, .51, .5, 10., 20., 10.,
+               30., 31., 30., 40., 40., 40., -2., -2., -2.]
+    x = np.tile([0., 1., 2.], 6)
+    x[12:15] = 0.
+    fields = dict(
+        x=x, y=np.zeros(18), z=heights,
+        tool_id=np.repeat([2, 1, 2, 1, 2, 2], 3),
+        move_type=np.repeat([1, 1, 0, 1 if with_extrusion else 0, 1, 1], 3),
+        path_id=np.repeat(np.arange(6), 3),
+        layer_index=np.repeat([0, 0, 0, 0, 0, 1], 3),
+    )
+    if with_extrusion:
+        fields["e"] = [0., 1., 2., 0., 1., 2., 2., 2., 2.,
+                       2., 2., 2., 0., 1., 2., 0., 1., 2.]
+    np.savez(output, **fields)
+    # Force display simplification to drop the interior extrema. Height
+    # statistics must still use the final NPZ samples, not the displayed ones.
+    monkeypatch.setattr(ui_server, "_error_bounded_preview_indices",
+                        lambda points, **kwargs: np.array([0, len(points)-1]))
+    preview = _preview_payload_from_final_core_npz(output, SliceConfig())
+    assert preview["layers"][0]["material_z_bounds_mm"] == {
+        "resin": [.4, .404], "fiber": [.5, .51],
+    }
+    assert preview["layers"][1]["material_z_bounds_mm"] == {"resin": [-2., -2.]}

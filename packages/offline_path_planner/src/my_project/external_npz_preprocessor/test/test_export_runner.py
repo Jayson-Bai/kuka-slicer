@@ -405,7 +405,7 @@ def _next_src_line_group(src_lines, after_index):
     return list(range(start, end))
 
 
-def test_final_resin_layer_end_travel_is_last_runtime_trajectory_before_auto_abort(
+def test_final_resin_only_layer_has_no_unneeded_end_travel(
     tmp_path,
 ):
     import json
@@ -445,11 +445,10 @@ def test_final_resin_layer_end_travel_is_last_runtime_trajectory_before_auto_abo
         load_source_npz(source, default_abc=params.default_abc),
         params,
     )
-    layer_end_travel = next(
-        cmd
+    assert not any(
+        isinstance(cmd, MoveCommand)
+        and cmd.raw == "external_npz_resin_layer_end_wipe"
         for cmd in commands
-        if isinstance(cmd, MoveCommand)
-        and cmd.raw == "external_npz_resin_layer_end_travel"
     )
 
     output = tmp_path / "out.npz"
@@ -462,21 +461,12 @@ def test_final_resin_layer_end_travel_is_last_runtime_trajectory_before_auto_abo
 
     with np.load(output) as data:
         src_lines = _decoded_src_lines(data)
-        travel_rows = [
-            index
-            for index, src_line in enumerate(src_lines)
-            if src_line == str(layer_end_travel.line)
-        ]
-
-        assert travel_rows
-        assert travel_rows[-1] == len(data["seq"]) - 1
-        assert np.isclose(data["x"][travel_rows[-1]], layer_end_travel.pos.x)
-        assert np.isclose(data["y"][travel_rows[-1]], layer_end_travel.pos.y)
-        assert np.allclose(data["z"][travel_rows], 0.5)
-        assert np.allclose(data["e"][travel_rows], 0.0)
+        assert src_lines
+        assert np.isclose(data["x"][-1], 20.0)
+        assert np.isclose(data["y"][-1], 10.0)
 
 
-def test_resin_layer_end_travel_is_exported_before_tool_change_safe_lift(tmp_path):
+def test_resin_layer_end_wipe_follows_retract_before_tool_change_safe_lift(tmp_path):
     import json
     import numpy as np
 
@@ -484,7 +474,7 @@ def test_resin_layer_end_travel_is_exported_before_tool_change_safe_lift(tmp_pat
     from external_npz_preprocessor.export_runner import convert_external_npz
     from external_npz_preprocessor.process_params import ProcessParams
     from external_npz_preprocessor.source_npz import load_source_npz
-    from path_processing_core.types import MoveCommand, ToolChangeCommand
+    from path_processing_core.types import ExtrudeWait, MoveCommand, ToolChangeCommand
 
     source = tmp_path / "source.npz"
     np.savez(
@@ -518,18 +508,26 @@ def test_resin_layer_end_travel_is_exported_before_tool_change_safe_lift(tmp_pat
         load_source_npz(source, default_abc=params.default_abc),
         params,
     )
-    layer_end_travel = next(
+    layer_end_wipe = next(
         cmd
         for cmd in commands
         if isinstance(cmd, MoveCommand)
-        and cmd.raw == "external_npz_resin_layer_end_travel"
+        and cmd.raw == "external_npz_resin_layer_end_wipe"
     )
-    travel_command_index = commands.index(layer_end_travel)
+    wipe_command_index = commands.index(layer_end_wipe)
+    retract_index = max(
+        index for index, cmd in enumerate(commands[:wipe_command_index])
+        if isinstance(cmd, ExtrudeWait) and cmd.raw == "external_npz_retract"
+    )
     fiber_tool_change = next(
         cmd
-        for cmd in commands[travel_command_index + 1:]
+        for cmd in commands[wipe_command_index + 1:]
         if isinstance(cmd, ToolChangeCommand) and cmd.tool == 0
     )
+    assert retract_index < wipe_command_index
+    assert np.isclose(layer_end_wipe.start_pos.x, 20.0)
+    assert np.isclose(layer_end_wipe.pos.x, 15.0)
+    assert np.isclose(layer_end_wipe.delta_e, 0.0)
 
     output = tmp_path / "out.npz"
     convert_external_npz(
@@ -545,7 +543,7 @@ def test_resin_layer_end_travel_is_exported_before_tool_change_safe_lift(tmp_pat
         travel_rows = [
             index
             for index, src_line in enumerate(src_lines)
-            if src_line == str(layer_end_travel.line)
+            if src_line == str(layer_end_wipe.line)
         ]
         tool_change_rows = [
             index
@@ -556,8 +554,8 @@ def test_resin_layer_end_travel_is_exported_before_tool_change_safe_lift(tmp_pat
         assert travel_rows
         assert tool_change_rows
         assert max(travel_rows) < min(tool_change_rows)
-        assert np.isclose(data["x"][travel_rows[-1]], layer_end_travel.pos.x)
-        assert np.isclose(data["y"][travel_rows[-1]], layer_end_travel.pos.y)
+        assert np.isclose(data["x"][travel_rows[-1]], layer_end_wipe.pos.x)
+        assert np.isclose(data["y"][travel_rows[-1]], layer_end_wipe.pos.y)
         assert np.allclose(data["z"][travel_rows], 0.5)
         assert np.allclose(data["e"][travel_rows], 0.0)
         assert np.isclose(np.max(data["z"][tool_change_rows]), 20.5)

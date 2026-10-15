@@ -65,6 +65,60 @@ def _travel_moves(commands):
     ]
 
 
+@pytest.mark.parametrize("with_source_travel", [False, True])
+def test_resin_layer_end_wipe_retraces_five_mm_after_retract(with_source_travel):
+    source_travels = (
+        [TravelPath(order=0, points=_path("R", [[0, 0, 0.5], [1, 0, 0.5]]).points)]
+        if with_source_travel else []
+    )
+    commands = source_job_to_parsed_commands(
+        _job(
+            resin_paths=[_path("R", [[0, 0, 0.5], [4, 0, 0.5], [4, 3, 0.5]])],
+            fiber_paths=[_path("F", [[8, 1, 0.6], [9, 1, 0.6]])],
+            travel_paths=source_travels,
+        ),
+        ProcessParams(primeline_enabled=False, start_x_mm=0.0, start_y_mm=0.0),
+    )
+    wipes = [
+        cmd for cmd in commands
+        if isinstance(cmd, MoveCommand)
+        and cmd.raw == "external_npz_resin_layer_end_wipe"
+    ]
+    assert [(cmd.start_pos.x, cmd.start_pos.y, cmd.pos.x, cmd.pos.y) for cmd in wipes] == [
+        (pytest.approx(4.0), pytest.approx(3.0), pytest.approx(4.0), pytest.approx(0.0)),
+        (pytest.approx(4.0), pytest.approx(0.0), pytest.approx(2.0), pytest.approx(0.0)),
+    ]
+    assert all(cmd.delta_e == 0.0 for cmd in wipes)
+    retract_index = max(
+        index for index, cmd in enumerate(commands[:commands.index(wipes[0])])
+        if isinstance(cmd, ExtrudeWait) and cmd.raw == "external_npz_retract"
+    )
+    assert retract_index < commands.index(wipes[0])
+    next_move = next(
+        cmd for cmd in commands[commands.index(wipes[-1]) + 1:]
+        if isinstance(cmd, MoveCommand)
+    )
+    assert next_move.start_pos == wipes[-1].pos
+
+
+def test_short_resin_stroke_wipe_stops_at_start_without_zero_length_move():
+    commands = source_job_to_parsed_commands(
+        _job(
+            resin_paths=[_path("R", [[0, 0, 0.5], [0, 0, 0.5], [3, 0, 0.5]])],
+            fiber_paths=[_path("F", [[8, 1, 0.6], [9, 1, 0.6]])],
+        ),
+        ProcessParams(primeline_enabled=False, start_x_mm=0.0, start_y_mm=0.0),
+    )
+    wipes = [
+        cmd for cmd in commands
+        if isinstance(cmd, MoveCommand)
+        and cmd.raw == "external_npz_resin_layer_end_wipe"
+    ]
+    assert len(wipes) == 1
+    assert wipes[0].start_pos.x == pytest.approx(3.0)
+    assert wipes[0].pos.x == pytest.approx(0.0)
+
+
 @pytest.mark.parametrize("feed", [0.0, -1.0, float("nan"), float("inf")])
 def test_rejects_invalid_travel_feed(feed):
     with pytest.raises(ValueError, match="travel_feed_mm_s"):

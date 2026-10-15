@@ -135,6 +135,8 @@ def load_conformal_lattice_spec(data: bytes | str | Mapping[str, object]) -> Con
             raise ValueError("parameterization.anchors must contain two distinct non-negative vertex indices")
 
     lattice = _object(raw, "lattice")
+    if not isinstance(lattice.get("print_outer_contour_fiber", False), bool):
+        raise ValueError("lattice.print_outer_contour_fiber must be a boolean")
     if lattice.get("family") != "triangular_dual_hex":
         raise ValueError("lattice.family must be triangular_dual_hex")
     _positive(lattice.get("wall_width_mm"), "lattice.wall_width_mm")

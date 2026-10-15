@@ -74,8 +74,8 @@ def test_planar_export_records_shared_target_height_reference_plan():
     assert plan["target_final_height_mm"] == 7.0
     assert plan["resin_only"]["resin_layer_count"] == 14
     assert plan["resin_only"]["planned_final_height_mm"] == 7.0
-    assert plan["fiber_enabled"]["resin_layer_count"] == 12
-    assert plan["fiber_enabled"]["fiber_layer_count"] == 10
+    assert plan["fiber_enabled"]["resin_layer_count"] == 14
+    assert plan["fiber_enabled"]["fiber_layer_count"] == 12
     assert plan["fiber_enabled"]["planned_final_height_mm"] == pytest.approx(7.0)
 
 
@@ -239,6 +239,7 @@ def test_main_ui_processes_planar_json_through_core_with_optional_fiber(tmp_path
         request_data=(
             {
                 "core_resin_layer_height": ["0.25"],
+                "core_primeline_enabled": ["false"],
                 "conformal_fiber_enabled": ["true"],
             },
             {"conformal_spec": ("planar_honeycomb.json", json.dumps(config).encode("utf-8"))},
@@ -251,12 +252,11 @@ def test_main_ui_processes_planar_json_through_core_with_optional_fiber(tmp_path
     assert result["fiber_reinforcement"]["layer_interface_source"] == (
         "flat_resin_interlayer_policy_v2"
     )
-    # Three 0.25 mm resin layers plus one 0.1 mm fiber interface (0.85)
-    # are nearer the requested 1 mm than four plus two interfaces (1.2).
-    assert result["layers"] == 3
-    assert result["nominal_final_height_mm"] == pytest.approx(0.85)
-    assert result["fiber_reinforcement"]["after_resin_physical_layers"] == [2, 2]
-    assert result["fiber_reinforcement"]["resin_layer_indices"] == [1]
+    # Fiber does not add to the 1 mm resin height budget.
+    assert result["layers"] == 4
+    assert result["nominal_final_height_mm"] == pytest.approx(1.0)
+    assert result["fiber_reinforcement"]["after_resin_physical_layers"] == [2, 3]
+    assert result["fiber_reinforcement"]["resin_layer_indices"] == [1, 2]
     assert any(layer["fiber_paths"] for layer in result["preview"]["layers"])
     first_layer = next(layer for layer in result["preview"]["layers"] if layer["index"] == 0)
     second_layer = next(layer for layer in result["preview"]["layers"] if layer["index"] == 1)
@@ -273,6 +273,22 @@ def test_main_ui_processes_planar_json_through_core_with_optional_fiber(tmp_path
         np.testing.assert_array_equal(core["a"], 0.0)
         np.testing.assert_array_equal(core["b"], 0.0)
         np.testing.assert_array_equal(core["c"], 0.0)
+        depositing = (
+            np.isin(core["move_type"], [1, 3])
+            & (core["event_flag"] == 0)
+            & (core["core_injection_role"] == 0)
+            & np.r_[False, np.diff(core["e"]) > 0]
+            & np.r_[False, np.hypot(np.diff(core["x"]), np.diff(core["y"])) > 1e-7]
+        )
+        for layer_index in range(4):
+            layer = depositing & (core["layer_index"] == layer_index)
+            resin = layer & (core["tool_id"] == 2)
+            assert resin.any()
+            np.testing.assert_allclose(core["z"][resin], .125 + .25 * layer_index, atol=1e-6)
+            if layer_index in [1, 2]:
+                fiber = layer & (core["tool_id"] == 1)
+                assert fiber.any()
+                np.testing.assert_allclose(core["z"][fiber], .225 + .25 * layer_index, atol=1e-6)
 
 
 def test_main_ui_planar_json_honors_disabled_fiber_toggle(tmp_path: Path):

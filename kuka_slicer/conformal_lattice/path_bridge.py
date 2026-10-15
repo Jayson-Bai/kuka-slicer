@@ -40,7 +40,7 @@ _CONTINUOUS_DEPOSITION_ROLES_BY_MATERIAL = {
         "conformal_grip_zigzag_x_one_stroke",
         "conformal_continuous_course_fragment",
     ),
-    "F": ("conformal_continuous_course_fragment",),
+    "F": ("conformal_continuous_course_fragment", "conformal_outer_boundary"),
 }
 
 # The role travels with each non-honeycomb path so the Core hand-off remains

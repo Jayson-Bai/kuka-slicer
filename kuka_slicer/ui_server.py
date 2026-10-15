@@ -122,6 +122,7 @@ def _conformal_spec_ui_summary(payload: bytes, filename: str) -> dict[str, objec
             "wall_width_mm": float(spec.lattice["wall_width_mm"]),
             "wall_bead_count": int(spec.lattice["wall_bead_count"]),
             "base_cell_size_mm": float(spec.lattice["base_cell_size_mm"]),
+            "print_outer_contour_fiber": spec.lattice.get("print_outer_contour_fiber", False),
         },
         "fiber_reinforcement": {
             "enabled": False,
@@ -460,6 +461,17 @@ def _error_bounded_preview_indices(
     mandatory = np.asarray(mandatory_indices, dtype=np.int64)
     mandatory = mandatory[(mandatory >= 0) & (mandatory < count)]
     selected = set(np.unique(np.r_[0, mandatory, count - 1]).tolist())
+    # A distance-only simplifier can erase collinear backtracking entirely.
+    # Preserve reversals from the final NPZ even when they fit inside the
+    # display tolerance, including turns separated by stationary rows.
+    edges = np.diff(values[:, :3], axis=0)
+    moving = np.flatnonzero(np.linalg.norm(edges, axis=1) > 1e-9)
+    if len(moving) > 1:
+        reversals = np.flatnonzero(
+            np.sum(edges[moving[:-1]] * edges[moving[1:]], axis=1) < 0.0
+        )
+        selected.update((moving[reversals] + 1).tolist())
+        selected.update(moving[reversals + 1].tolist())
     anchors = sorted(selected)
     stack = [(left, right) for left, right in zip(anchors, anchors[1:])]
     quaternions = (
@@ -570,6 +582,13 @@ def _planning_mesh_for_gcode_source(mesh, config: SliceConfig):
     return orient_mesh_for_build_axis(mesh, config.build_axis)
 
 
+def _part_xy_center(mesh, build_axis: str) -> tuple[float, float]:
+    """Use the oriented STL bounds, independent of generated print paths."""
+    points = orient_mesh_for_build_axis(mesh, build_axis).triangles.reshape(-1, 3)
+    center = (points[:, :2].min(axis=0) + points[:, :2].max(axis=0)) * 0.5
+    return float(center[0]), float(center[1])
+
+
 def _preview_payload_from_core_source_job(
     mesh,
     config: SliceConfig,
@@ -633,6 +652,7 @@ def _preview_payload_from_final_core_npz(
     """
 
     entries_by_layer: dict[int, list[dict[str, object]]] = {}
+    material_z_bounds_by_layer: dict[int, dict[str, list[float]]] = {}
     fiber_cut_events_by_layer: dict[int, list[dict[str, object]]] = {}
     bounds = {
         "min_x": None,
@@ -648,11 +668,6 @@ def _preview_payload_from_final_core_npz(
     source_preview_points = 0
     display_preview_points = 0
     order = 0
-    # Candidate runs locate the Primeline that Core placed in the final NPZ.
-    # The preview replaces only that run with the configured canonical path:
-    # from the configured start point along global +X for its fixed length.
-    primeline_candidates: list[tuple[float, int, int, int, np.ndarray]] = []
-
     for path in _final_core_npz_parts(core_npz_path):
         with np.load(path, allow_pickle=False) as data:
             required = {"x", "y", "z", "tool_id", "move_type"}
@@ -765,53 +780,6 @@ def _preview_payload_from_final_core_npz(
             has_tool_orientation = has_tool_orientation or include_abc
             print_codes = _core_move_type_codes(data)
             is_print = np.isin(move_type, list(print_codes))
-            if (
-                primeline_enabled
-                and primeline_origin is not None
-                and float(primeline_length_mm) > 1e-6
-            ):
-                # Do not draw a requested straight line here.  Instead find a
-                # contiguous PRINT run that is already present in the NPZ and
-                # ends at the configured Primeline endpoint.  This preserves
-                # Core's real sampled/smoothed points, even when Core merges
-                # the Primeline and the next source path under one path_id.
-                x0, y0 = (float(primeline_origin[0]), float(primeline_origin[1]))
-                expected_endpoint = np.array(
-                    [x0 + float(primeline_length_mm), y0], dtype=np.float64
-                )
-                candidate_indices = np.flatnonzero(valid & is_print & (tool_id != 1))
-                run_start = 0
-                while run_start < len(candidate_indices):
-                    run_end = run_start + 1
-                    first_index = int(candidate_indices[run_start])
-                    while run_end < len(candidate_indices):
-                        previous = int(candidate_indices[run_end - 1])
-                        current = int(candidate_indices[run_end])
-                        if (
-                            current != previous + 1
-                            or layer[current] != layer[first_index]
-                            or path_id[current] != path_id[first_index]
-                        ):
-                            break
-                        run_end += 1
-                    run = candidate_indices[run_start:run_end]
-                    if len(run) >= 2:
-                        endpoint = np.array([x[run[-1]], y[run[-1]]], dtype=np.float64)
-                        endpoint_error = float(np.linalg.norm(endpoint - expected_endpoint))
-                        if endpoint_error <= 1.0:
-                            columns = [x[run], y[run], z[run]]
-                            if include_abc:
-                                columns.extend((a[run], b[run], c[run]))
-                            primeline_candidates.append(
-                                (
-                                    endpoint_error,
-                                    -len(run),
-                                    int(layer[first_index]),
-                                    int(path_id[first_index]),
-                                    np.column_stack(columns),
-                                )
-                            )
-                    run_start = run_end
             indices = np.flatnonzero(valid)
             start = 0
             while start < len(indices):
@@ -870,6 +838,23 @@ def _preview_payload_from_final_core_npz(
                         if role != "travel" and extrusion is not None
                         else None
                     )
+                    # Measure the exported deposition samples before preview
+                    # simplification. Travel/process lifts must not become a
+                    # material's layer height, and curved layers need a range.
+                    if role != "travel":
+                        height_indices = np.arange(len(segment_indices))
+                        if segment_extrusion is not None:
+                            depositing_edges = np.flatnonzero(np.diff(segment_extrusion) > 1e-12)
+                            height_indices = np.unique(np.r_[depositing_edges, depositing_edges + 1])
+                        if height_indices.size:
+                            heights = z[segment_indices[height_indices]]
+                            material = "fiber" if is_fiber else "resin"
+                            layer_bounds = material_z_bounds_by_layer.setdefault(int(layer[first]), {})
+                            previous_bounds = layer_bounds.get(material, [float("inf"), float("-inf")])
+                            layer_bounds[material] = [
+                                min(previous_bounds[0], float(heights.min())),
+                                max(previous_bounds[1], float(heights.max())),
+                            ]
                     mandatory = _preview_mandatory_indices(
                         path_id[segment_indices],
                         path_end[segment_indices],
@@ -913,87 +898,6 @@ def _preview_payload_from_final_core_npz(
     all_entries = [entry for entries in entries_by_layer.values() for entry in entries]
     if not all_entries:
         raise ValueError("final Core NPZ contains no displayable trajectory rows")
-    if (
-        primeline_enabled
-        and primeline_origin is not None
-        and float(primeline_length_mm) > 1e-6
-    ):
-        candidate_layer = min(entries_by_layer)
-        candidate_path_id: int | None = None
-        z_level = float(bounds["min_z"] or 0.0)
-        if primeline_candidates:
-            _, _, candidate_layer, candidate_path_id, candidate_points = min(
-                primeline_candidates,
-                key=lambda item: (item[0], item[1]),
-            )
-            # The original Core run is already represented as final_resin.
-            # Replace it in the browser payload so it is shown once, with the
-            # configured start coordinate and +X direction.
-            entries_by_layer[candidate_layer] = [
-                entry
-                for entry in entries_by_layer.get(candidate_layer, [])
-                if not (
-                    entry["role"] == "final_resin"
-                    and int(entry["path_id"]) == candidate_path_id
-                )
-            ]
-            z_level = float(candidate_points[-1, 2])
-        x0, y0 = float(primeline_origin[0]), float(primeline_origin[1])
-        primeline_start = [x0, y0, z_level]
-        primeline_end = [x0 + float(primeline_length_mm), y0, z_level]
-        # Preserve the execution order around the first-layer Primeline.
-        # The start travel is explicit because its old Core PRINT run has
-        # been removed from this display payload.
-        if math.hypot(x0, y0) > 1e-6:
-            entries_by_layer.setdefault(candidate_layer, []).append(
-                {
-                    "kind": "travel",
-                    "role": "travel",
-                    "points": [[0.0, 0.0, z_level], primeline_start],
-                    "path_id": -1,
-                    "order": -2,
-                }
-            )
-        entries_by_layer.setdefault(candidate_layer, []).append(
-            {
-                "kind": "deposit",
-                "role": "final_resin",
-                "points": [primeline_start, primeline_end],
-                "path_id": candidate_path_id if candidate_path_id is not None else -1,
-                "order": -1,
-            }
-        )
-        # Core normally supplies the outbound travel after the Primeline.
-        # When that run is absent from an imported final NPZ, add the direct
-        # display travel to the first formal resin path so the preview remains
-        # continuous and has no implied deposited connector.
-        layer_entries = entries_by_layer[candidate_layer]
-        has_outbound_travel = any(
-            entry["role"] == "travel"
-            and len(entry["points"]) >= 2
-            and math.dist(entry["points"][0][:2], primeline_end[:2]) <= 0.25
-            for entry in layer_entries
-        )
-        formal_resin_entries = [
-            entry
-            for entry in layer_entries
-            if entry["role"] == "final_resin" and int(entry["order"]) >= 0
-        ]
-        if not has_outbound_travel and formal_resin_entries:
-            first_formal = min(formal_resin_entries, key=lambda entry: int(entry["order"]))
-            first_formal_start = first_formal["points"][0]
-            layer_entries.append(
-                {
-                    "kind": "travel",
-                    "role": "travel",
-                    "points": [primeline_end, first_formal_start],
-                    "path_id": -1,
-                    "order": int(first_formal["order"]) - 0.5,
-                }
-            )
-        _expand_bounds(bounds, x0, y0, z_level)
-        _expand_bounds(bounds, x0 + float(primeline_length_mm), y0, z_level)
-
     layers = []
     for layer_index in sorted(entries_by_layer):
         entries = entries_by_layer[layer_index]
@@ -1019,6 +923,7 @@ def _preview_payload_from_final_core_npz(
                 "fiber_cut_events": fiber_cut_events_by_layer.get(layer_index, []),
                 "travel_paths": travel_paths,
                 "motion_paths": entries,
+                "material_z_bounds_mm": material_z_bounds_by_layer.get(layer_index, {}),
             }
         )
 
@@ -1956,6 +1861,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         mesh = load_stl(stl_path)
         progress(8, "正在准备 Prusa 路径")
         build_axis = resolve_build_axis(mesh, shared["requested_build_axis"])
+        part_center_xy = _part_xy_center(mesh, build_axis)
         if slicing_kernel == "prusa":
             config = _parse_prusa_slice_config(params, shared, build_axis)
             raft_layers: list[RaftLayerConfig] = []
@@ -2004,6 +1910,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             fiber_template_paths = align_fiber_template_paths_to_resin(
                 job,
                 fiber_template_paths,
+                part_center_xy=part_center_xy,
             )
             fiber_preview_paths = expand_fiber_template_for_resin_layers(
                 job, fiber_template_paths
@@ -2037,6 +1944,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             target_xy=(float(config.start_x_mm), float(config.start_y_mm)),
             reference_material="R",
             reference_point="center",
+            reference_xy=part_center_xy,
         )
         # The Core converter must preserve this already translated print-plane
         # frame.  It is not a source-NPZ frame whose lower-left is remapped.
@@ -2088,10 +1996,6 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
         core_params = _parse_core_process_params(params, process_params_module)
 
         core_npz_path = job_dir / f"{Path(filename).stem}_core.npz"
-        preview_commands = []
-
-        def capture_preview_commands(commands) -> None:
-            preview_commands.extend(commands)
 
         def core_progress(ratio: float) -> None:
             bounded = max(0.0, min(1.0, float(ratio)))
@@ -2107,7 +2011,6 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                 core_params,
                 progress_callback=core_progress,
                 chunk_size=5_000_000,
-                commands_callback=capture_preview_commands,
             )
         else:
             core_stats = export_runner.convert_source_job(
@@ -2117,41 +2020,20 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                 params=core_params,
                 progress_callback=core_progress,
                 chunk_size=5_000_000,
-                commands_callback=capture_preview_commands,
             )
         progress(98, "正在完成系统 NPZ 和时间元数据写入")
-        # The browser is a source-trajectory inspector: it must show the
-        # exact geometry written to the NPZ handed into Core, not Core's
-        # fitted/resampled output.  In particular, a multi-waypoint travel
-        # remains visibly routed around its avoidance vertices while Core
-        # applies one zero-speed-endpoint profile to that complete route.
-        preview = (
-            _preview_payload_from_core_source_job(
-                mesh,
-                config,
-                core_source_job,
-                hide_startup_source_travel=True,
-                hide_initial_prusa_travel=primeline_enabled,
-            )
-            if core_source_job is not None
-            else _preview_payload(
-                mesh,
-                config,
-                job,
-                fiber_preview_paths,
-                hide_startup_source_travel=True,
-                hide_initial_prusa_travel=primeline_enabled,
-            )
+        # Display the exported execution geometry for every slicing branch.
+        # Never overlay source commands on the final sampled trajectory.
+        preview = _preview_payload_from_final_core_npz(
+            core_npz_path,
+            config,
+            primeline_enabled=bool(core_params.primeline_enabled),
+            primeline_origin=(
+                float(core_params.primeline_x_mm),
+                float(core_params.primeline_y_mm),
+            ),
+            primeline_length_mm=float(core_params.primeline_length_mm),
         )
-        if preview_commands:
-            # Primeline and Core travel are generated during command
-            # conversion, so add the exact command geometry to the source
-            # preview.  This keeps the overlay in the same print-plane frame
-            # as the translated part and makes the legend actionable.
-            preview["core_overlay"] = _core_preview_overlay_from_commands(
-                preview_commands,
-                xy_offset=(0.0, 0.0),
-            )
         download_path = _core_output_download_path(core_npz_path)
         download_path = _materialize_core_download(
             download_path,
@@ -2265,8 +2147,8 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
             # conformal paths proceed directly to Core.
             validate_fill_ratio=False,
             fiber_layer_height_mm=float(core_params.fiber.layer_height_mm),
-            # For either geometry, fiber lift is budgeted inside the target
-            # final height, never added after filling it with resin layers.
+            # Plan resin layers independently of fiber. Fiber interfaces are
+            # selected on that grid and get a local Z lift afterward.
             plan_for_continuous_fiber=conformal_fiber_enabled,
         )
         if run.path_graph is None:
@@ -2339,6 +2221,7 @@ class _SlicerUiHandler(BaseHTTPRequestHandler):
                 # Preserve the existing extrusion policies while unifying
                 # height planning; planar resin E is not changed here.
                 compensate_fiber_gap_extrusion=not is_planar,
+                print_outer_contour_fiber=spec.lattice.get("print_outer_contour_fiber", False),
             ),
             fiber_layer_height_mm=float(core_params.fiber.layer_height_mm),
             fiber_e_per_mm=float(core_params.fiber.e_per_mm()),
@@ -3407,44 +3290,33 @@ def load_fiber_template_json(json_path: Path) -> list[list[list[float]]]:
 def align_fiber_template_paths_to_resin(
     job,
     template_paths: list[list[list[float]]],
+    *,
+    part_center_xy: tuple[float, float] | None = None,
 ) -> list[list[list[float]]]:
     """Map declared fiber XY coordinates into the unnormalized resin frame.
 
-    ``project_default`` is the coordinate convention emitted by the fiber
-    planner: (0, 0) is the center of the STL build plane.  Slicer paths retain
-    the STL's local XY translation until the later UI placement step, so map
-    that origin to the resin bounding-box center before fibers are injected.
-    The later normalization then applies the existing UI start/travel offset
-    equally to both materials.
+    ``project_default`` and ``slicer_xy`` preserve the oriented STL coordinates.
+    Only an explicitly centered ``part_center_xy`` template needs translation
+    into that frame.  UI placement subsequently translates both materials once.
     """
 
     coordinate_system = getattr(template_paths, "coordinate_system", None)
-    if coordinate_system is None or coordinate_system == "slicer_xy":
+    if coordinate_system in (None, "project_default", "slicer_xy"):
         return template_paths
-    if coordinate_system != "project_default":
+    if coordinate_system != "part_center_xy":
         raise ValueError(
-            "fiber JSON coordinate_system must be project_default or slicer_xy"
+            "fiber JSON coordinate_system must be project_default, slicer_xy, or part_center_xy"
         )
-
-    resin_paths = [
-        np.asarray(path, dtype=np.float64)
-        for group in job.material_paths
-        if group.material == "R"
-        for path in group.paths
-        if np.asarray(path).size
-    ]
-    if not resin_paths:
-        raise ValueError("cannot align project_default fiber JSON without resin paths")
-    resin_points = np.vstack(resin_paths)
-    translation_x = float((np.min(resin_points[:, 0]) + np.max(resin_points[:, 0])) * 0.5)
-    translation_y = float((np.min(resin_points[:, 1]) + np.max(resin_points[:, 1])) * 0.5)
+    if part_center_xy is None or not np.isfinite(part_center_xy).all():
+        raise ValueError("part_center_xy fiber JSON requires the oriented STL center")
+    translation_x, translation_y = map(float, part_center_xy)
     aligned_paths = [
         [[float(x) + translation_x, float(y) + translation_y, float(z)] for x, y, z in path]
         for path in template_paths
     ]
     job.meta["fiber_coordinate_alignment"] = {
         "source_coordinate_system": coordinate_system,
-        "reference": "resin_xy_bounds_center",
+        "reference": "oriented_stl_xy_bounds_center",
         "translation_x_mm": translation_x,
         "translation_y_mm": translation_y,
     }
@@ -3488,58 +3360,17 @@ def expand_fiber_template_for_resin_layers(
         skip_initial_interfaces=DEFAULT_INITIAL_RESIN_ONLY_LAYERS,
     )
 
-    # The fiber is physically printed between resin layers.  Include its
-    # thickness in the exported Z schedule instead of letting every resin
-    # layer continue to use the original resin-only grid.  Prusa travel paths
-    # are part of the same physical layer geometry: apply the identical shift
-    # below so their endpoints remain continuous with the deposited paths.
+    # Resin owns the layer grid. Fiber is a local lift above its matching
+    # resin layer, never extra thickness accumulated into later layer Z.
     fiber_layer_height = DEFAULT_FIBER_LAYER_HEIGHT_MM
-    z_offset_by_resin_layer: dict[int, float] = {}
-    for group in part_resin_groups:
-        z_offset = (
-            interlayer_schedule.insertion_count_before(group.layer_index)
-            * fiber_layer_height
-        )
-        z_offset_by_resin_layer[int(group.layer_index)] = z_offset
-        if z_offset == 0.0:
-            continue
-        group.paths = [
-            np.asarray(path, dtype=np.float64).copy()
-            for path in group.paths
-        ]
-        for path in group.paths:
-            path[:, 2] += z_offset
-
-    # A travel group is emitted by Prusa in the motion order of its matching
-    # resin layer.  Once a fiber layer has been inserted below that resin
-    # layer, retaining Prusa's original Z would leave an artificial vertical
-    # gap immediately before the next deposited path.  Keep the native XY
-    # route intact and translate only Z by that layer's accumulated fiber
-    # thickness.
-    for group in job.travel_paths:
-        z_offset = z_offset_by_resin_layer.get(int(group.layer_index), 0.0)
-        if z_offset == 0.0:
-            continue
-        group.paths = [
-            np.asarray(path, dtype=np.float64).copy()
-            for path in group.paths
-        ]
-        for path in group.paths:
-            path[:, 2] += z_offset
-
     if isinstance(slicing_metadata, dict) and part_resin_groups:
-        z_max = slicing_metadata.get("z_max")
-        if isinstance(z_max, (int, float)):
-            inserted_fiber_layers = len(interlayer_schedule.after_resin_layer_indices)
-            slicing_metadata["z_max"] = float(z_max) + inserted_fiber_layers * fiber_layer_height
         slicing_metadata["fiber_layer_height_applied_mm"] = fiber_layer_height
         slicing_metadata["fiber_initial_resin_only_layer_count"] = skipped_fiber_layers
         slicing_metadata["fiber_first_part_layer_has_brim"] = first_part_has_brim
         slicing_metadata["fiber_layer_interface_policy"] = interlayer_schedule.source
 
-    # The physical fiber Z accumulates earlier fiber courses.  Routing must
-    # inspect the same unshifted STL section that produced the resin layer,
-    # while the connector itself retains its raised output Z.
+    # Routing uses the resin STL section; fiber connectors retain the local
+    # lift above that section.
     job.meta["fiber_interpath_reference_z_mm"] = {
         str(layer_index): float(z)
         for layer_index, z in fiber_reference_z_by_layer.items()
@@ -5262,6 +5093,16 @@ def _index_html() -> str:
       font-size: 13px;
       color: var(--muted);
     }}
+    .layerHeights {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--space-2) var(--space-4);
+      margin-top: var(--space-2);
+      font-size: 13px;
+      font-variant-numeric: tabular-nums;
+    }}
+    .layerHeights[hidden], .layerHeights [hidden] {{ display: none; }}
+    .layerHeightReference {{ color: var(--muted); }}
     .pathPlaybackControls {{
       min-height: 100%;
       height: 100%;
@@ -5625,6 +5466,11 @@ def _index_html() -> str:
               <input id="layerSlider" type="range" min="0" max="0" value="0" disabled>
               <output id="layerLabel">-</output>
             </div>
+            <output id="layerHeights" class="layerHeights" for="layerSlider" aria-live="polite" hidden title="相对于打印平面 Z=0 的最终打印路径高度。共形或同层存在多个高度时显示范围；不含空移、剪切抬升和零挤出连接。">
+              <span class="layerHeightReference">绝对高度 · 打印平面 Z=0</span>
+              <span id="resinLayerHeight">树脂 —</span>
+              <span id="fiberLayerHeight" hidden></span>
+            </output>
           </div>
           <div id="pathProgressControl">
             <label for="pathProgressSlider">所选路径进度</label>
@@ -6466,9 +6312,10 @@ def _index_html() -> str:
         const part = summary.part;
         const lattice = summary.lattice;
         selectedLatticeDesignLabel = summary.design_label || '蜂窝结构';
-        const fiberText = summary.design_kind === 'planar_honeycomb'
+        let fiberText = summary.design_kind === 'planar_honeycomb'
           ? '；启用纤维时覆盖除顶盖外的树脂层间界面'
           : '；启用纤维时按设计曲率区间自动确定层间界面';
+        if (lattice.print_outer_contour_fiber) fiberText += '；每个含纤维层增加一条独立闭合外轮廓纤维';
         conformalSpecResult.className = 'surfaceCollisionResult ok';
         conformalSpecResult.textContent = `已识别${{selectedLatticeDesignLabel}}模式：${{part.length_mm}} × ${{part.width_mm}} × ${{part.final_height_mm}} mm；${{lattice.wall_width_mm}} mm 墙体（${{lattice.wall_bead_count}} 条 2 mm 沉积道），单元边长 ${{lattice.base_cell_size_mm}} mm${{fiberText}}。实际树脂/纤维层高由当前 Core 工艺参数决定。`;
         selectedConformalSpec = file;
@@ -6711,6 +6558,9 @@ def _index_html() -> str:
     const pathProgressControl = document.getElementById('pathProgressControl');
     const pathProgressSlider = document.getElementById('pathProgressSlider');
     const layerLabel = document.getElementById('layerLabel');
+    const layerHeights = document.getElementById('layerHeights');
+    const resinLayerHeight = document.getElementById('resinLayerHeight');
+    const fiberLayerHeight = document.getElementById('fiberLayerHeight');
     const pathProgressLabel = document.getElementById('pathProgressLabel');
     const pathPlaybackControl = document.getElementById('pathPlaybackControl');
     const playCurrentPathButton = document.getElementById('playCurrentPath');
@@ -7727,11 +7577,9 @@ def _index_html() -> str:
         downloadEl.href = result.download_url;
         downloadEl.textContent = '下载 ' + result.filename;
         downloadEl.className = 'download visible';
-        const previewLabel = result.preview?.preview_source === 'pre_core_source_npz'
-          ? '完成（预览：送入 Core 前的源 NPZ；travel 保留全部避障点，连续段仅在首尾速度为 0）。'
-          : result.preview?.preview_source === 'final_core_npz'
-            ? '完成（预览：最终 Core NPZ）。'
-            : '完成。';
+        const previewLabel = result.preview?.preview_source === 'final_core_npz'
+          ? '完成（预览：最终导出 NPZ）。'
+          : '完成。';
         statusEl.textContent = result.recommendation?.message
           ? previewLabel + result.recommendation.message
           : previewLabel;
@@ -7988,6 +7836,13 @@ def _index_html() -> str:
       updateViewerLabels();
     }}
 
+    function formatMaterialHeight(bounds) {{
+      if (!Array.isArray(bounds) || bounds.length !== 2 || !bounds.every(Number.isFinite)) return '—';
+      const low = (Math.abs(bounds[0]) < 0.0005 ? 0 : bounds[0]).toFixed(3);
+      const high = (Math.abs(bounds[1]) < 0.0005 ? 0 : bounds[1]).toFixed(3);
+      return low === high ? `${{low}} mm` : `${{low}} – ${{high}} mm`;
+    }}
+
     function updateViewerLabels() {{
       const layer = currentLayer();
       const layerCount = previewData?.layers?.length || 0;
@@ -8001,6 +7856,12 @@ def _index_html() -> str:
       layerLabel.textContent = layer
         ? `${{Number(layerSlider.value) + 1}} / ${{layerCount}}${{containsFiber ? ' · 含纤维' : ''}}`
         : '-';
+      layerHeights.hidden = !layer;
+      resinLayerHeight.textContent = `树脂 ${{formatMaterialHeight(layer?.material_z_bounds_mm?.resin)}}`;
+      fiberLayerHeight.hidden = !containsFiber;
+      fiberLayerHeight.textContent = containsFiber
+        ? `纤维 ${{formatMaterialHeight(layer?.material_z_bounds_mm?.fiber)}}`
+        : '';
       pathProgressLabel.textContent = pathCount
         ? `${{pathProgressSlider.value}} / ${{pathCount}}`
         : '-';

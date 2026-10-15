@@ -728,6 +728,7 @@ def _rectangular_lattice_config_payload(
             "wall_bead_count": wall_bead_count,
             "base_cell_size_mm": base_cell_size_mm,
             "boundary_mode": boundary_mode,
+            "print_outer_contour_fiber": _query_bool(params, "print_outer_contour_fiber", False),
             "phase_origin": phase_origin,
             "boundary_phase_policy": "auto_avoid_outer_boundary_coincidence",
             "load_line_alignment": {
@@ -1105,7 +1106,9 @@ def surface_preview_html() -> str:
             <div class="field variantField"><label for="specimen_variant">试件版本</label><select id="specimen_variant" aria-describedby="gripLengthHint"><option value="tensile">拉伸版</option><option value="bending" selected>弯曲版</option></select></div>
             <div class="field" id="gripEndLengthField"><label for="grip_end_length_mm">夹持区 X（mm）</label><input id="grip_end_length_mm" type="number" min="0.001" step="0.5" value="25" aria-describedby="gripLengthHint"></div>
             <div class="field baseCellField"><label for="base_cell_size_mm">六边形边长（mm）</label><input id="base_cell_size_mm" type="number" min="0.001" step="0.01" value="10"></div>
+            <div class="field"><label for="print_outer_contour_fiber">打印外轮廓纤维</label><input id="print_outer_contour_fiber" type="checkbox" aria-describedby="outerContourFiberHint"></div>
           </div>
+          <p class="designSummary" id="outerContourFiberHint">默认关闭。勾选后，曲面预览显示红色外轮廓纤维线；主 UI 开启连续纤维时，每个含纤维层先打印一条独立闭合矩形纤维路径，再打印原有内部路径。</p>
           <!-- Kept only so the still-supported legacy JSON form remains readable while
                the new continuous-course topology is preview-only. -->
           <div hidden aria-hidden="true">
@@ -1196,7 +1199,7 @@ def surface_preview_html() -> str:
           </div>
         <div class="parameterGrid transitionParameterGrid">
           <div class="field"><label for="surface_start_layer">起始曲率层</label><input id="surface_start_layer" type="number" min="2" step="1" value="3"></div>
-          <div class="field"><label for="transition_step_count">完整曲率步数</label><input id="transition_step_count" type="number" min="1" step="1" value="9" aria-describedby="transitionStepHint"></div>
+          <div class="field"><label for="transition_step_count">完整曲率步数</label><input id="transition_step_count" type="number" min="1" step="1" value="6" aria-describedby="transitionStepHint"></div>
           <input id="transition_step_policy" type="hidden" value="auto_to_midplane">
           <button type="button" class="secondary compactAction" id="restoreAutomaticTransition">恢复自动步数</button>
           <details class="advanced">
@@ -1259,7 +1262,7 @@ def surface_preview_html() -> str:
   <script>
     const surfaceIds = ['curvature_x_enabled', 'curvature_y_enabled', 'surface_parameter_mode', 'amplitude_mm', 'wave_count_x', 'wave_count_y', 'wavelength_x_mm', 'wavelength_y_mm', 'phase_x_pi', 'phase_y_pi', 'z_reference_mm', 'inspection_enabled', 'check_x_mm', 'check_y_mm', 'samples'];
     const mappingReferenceLayerHeightMm = 0.5;
-    const conformalDesignIds = ['part_length_mm', 'part_width_mm', 'part_height_mm', 'specimen_variant', 'grip_end_length_mm', 'wall_width_mm', 'base_cell_size_mm', 'orientation_angle_deg', 'surface_start_layer', 'transition_step_count', 'transition_step_policy', 'samples_x', 'samples_y', 'boundary_mode', 'random_seed'];
+    const conformalDesignIds = ['part_length_mm', 'part_width_mm', 'part_height_mm', 'specimen_variant', 'grip_end_length_mm', 'wall_width_mm', 'base_cell_size_mm', 'print_outer_contour_fiber', 'orientation_angle_deg', 'surface_start_layer', 'transition_step_count', 'transition_step_policy', 'samples_x', 'samples_y', 'boundary_mode', 'random_seed'];
     const canvas = document.getElementById('canvas');
     const statusEl = document.getElementById('status');
     const statsEl = document.getElementById('stats');
@@ -2757,6 +2760,28 @@ def surface_preview_html() -> str:
       ctx.restore();
     }
 
+    function drawOuterContourFiberPreview(ctx, layer, zMid, yaw, pitch, scale, cx, cy) {
+      if (!document.getElementById('print_outer_contour_fiber').checked) return;
+      const { x, y } = payload.grid;
+      const lastRow = x.length - 1;
+      const lastCol = x[0].length - 1;
+      // Sample all four outer edges so single-axis/manual surfaces follow
+      // their curved boundary too, instead of joining only four corners.
+      const ring = x[0].map((value, col) => [value, y[0][col]]);
+      for (let row = 1; row <= lastRow; row += 1) ring.push([x[row][lastCol], y[row][lastCol]]);
+      for (let col = lastCol - 1; col >= 0; col -= 1) ring.push([x[lastRow][col], y[lastRow][col]]);
+      for (let row = lastRow - 1; row > 0; row -= 1) ring.push([x[row][0], y[row][0]]);
+      ctx.save();
+      ctx.beginPath();
+      appendProjectedRing(ctx, ring, layer, zMid, yaw, pitch, scale, cx, cy);
+      ctx.strokeStyle = 'rgba(213, 42, 51, .96)';
+      ctx.lineWidth = Math.max(0.9, Math.min(1.8, scale * 0.13));
+      ctx.lineJoin = 'miter';
+      ctx.lineCap = 'butt';
+      ctx.stroke();
+      ctx.restore();
+    }
+
     function renderSolidStack(ctx, width, height) {
       const stack = payload.solid_stack;
       if (!stack) return;
@@ -2892,6 +2917,7 @@ def surface_preview_html() -> str:
       drawProjectionBoundaries(ctx, projection, layer, zMid, yaw, pitch, scale, cx, cy);
       drawSurfaceGuideMesh(ctx, x, y, z, layer, zMid, yaw, pitch, scale, cx, cy);
       drawLatticePreview(ctx, layer, zMid, yaw, pitch, scale, cx, cy);
+      drawOuterContourFiberPreview(ctx, layer, zMid, yaw, pitch, scale, cx, cy);
       drawBendingFixtureOverlay(ctx, layer, zMid, yaw, pitch, scale, cx, cy);
       drawInspectionMarker(ctx, layer, zMid, yaw, pitch, scale, cx, cy);
     }
@@ -2974,6 +3000,9 @@ def surface_preview_html() -> str:
       saveDesignerState();
       updateConformalDesignSummary();
     }));
+    document.getElementById('print_outer_contour_fiber').addEventListener('change', () => {
+      if (payload) render();
+    });
     document.getElementById('align_load_line').addEventListener('change', () => {
       syncLoadLineAlignmentControls();
       saveDesignerState();

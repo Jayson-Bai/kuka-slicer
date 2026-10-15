@@ -17,6 +17,7 @@ import random
 from typing import Iterable
 
 import numpy as np
+from shapely.errors import GEOSException
 from shapely.geometry import LineString, MultiPoint, Polygon
 from shapely.ops import unary_union, voronoi_diagram
 
@@ -1149,23 +1150,163 @@ def solid_geometry_at_z(mesh: Mesh, z: float, tolerance: float):
         if len(points) == 2 and np.linalg.norm(points[0][:2] - points[1][:2]) > tolerance:
             segments.append((points[0][:2], points[1][:2]))
     contours = _stitch_segments(segments, tolerance)
-    rings = [np.asarray(contour, dtype=np.float64) for contour in contours if len(contour) >= 3]
-    polygons = [Polygon(_open_ring(ring)) for ring in rings]
-    polygons = [polygon.buffer(0) if not polygon.is_valid else polygon for polygon in polygons]
-    shells: list[Polygon] = []
-    holes: list[Polygon] = []
-    for polygon in polygons:
-        if any(other.contains(polygon.representative_point()) and other.area > polygon.area for other in polygons):
-            holes.append(polygon)
-        else:
-            shells.append(polygon)
-    result = []
-    for shell in shells:
-        shell_holes = [list(hole.exterior.coords) for hole in holes if shell.contains(hole.representative_point())]
-        result.append(Polygon(shell.exterior.coords, shell_holes))
-    solid = unary_union(result).buffer(0) if result else Polygon()
-    if solid.is_empty:
-        raise ValueError("STL layer has no solid printable honeycomb geometry")
+    try:
+        # A ring can look closed after tolerance bucketing even though short
+        # edges were dropped or unrelated endpoints were joined. Only trust
+        # buckets containing the two numerically coincident shared endpoints.
+        endpoints = defaultdict(list)
+        for segment in segments:
+            for point in segment:
+                endpoints[_point_key(point, tolerance)].append(point)
+        roundoff = 64.0 * np.finfo(np.float64).eps * max(1.0, float(np.max(np.abs(mesh.triangles))))
+        if any(len(points) != 2 or np.linalg.norm(points[0] - points[1]) > roundoff
+               for points in endpoints.values()):
+            raise ValueError("section endpoint buckets contain gaps or ambiguous joins")
+        polygons, parents = _validated_section_rings(contours, tolerance)
+        # The historical assembly handles unnested shells and their holes.
+        # Islands inside holes require explicit containment parity below.
+        if any(parent is not None and parents[parent] is not None for parent in parents):
+            raise ValueError("nested material islands require topology reconstruction")
+        shells = [polygon for polygon, parent in zip(polygons, parents) if parent is None]
+        holes = [polygon for polygon, parent in zip(polygons, parents) if parent is not None]
+        result = []
+        for shell in shells:
+            shell_holes = [list(hole.exterior.coords) for hole in holes if shell.contains(hole.representative_point())]
+            result.append(Polygon(shell.exterior.coords, shell_holes))
+        # Keep the existing output/order for trustworthy legacy sections.
+        if any(not polygon.is_valid for polygon in result):
+            raise ValueError("assembled section is invalid")
+        solid = unary_union(result).buffer(0)
+        if solid.is_empty or not solid.is_valid:
+            raise ValueError("STL layer has no valid solid printable geometry")
+        return solid
+    except (ValueError, GEOSException):
+        # A buffer repair of an artificially closed polyline can erase holes.
+        # Re-intersect the original mesh instead; never patch the broken ring.
+        try:
+            return _reconstruct_section_from_mesh_edges(mesh, z)
+        except (ValueError, GEOSException) as exc:
+            raise ValueError(f"cannot reconstruct a reliable STL section at Z={z:g} mm: {exc}") from exc
+
+
+def _validated_section_rings(contours, closure_tolerance: float):
+    """Reject open/crossing rings and return their immediate containment tree."""
+    polygons = []
+    for contour in contours:
+        if len(contour) < 4 or np.linalg.norm(np.asarray(contour[0]) - contour[-1]) > closure_tolerance:
+            raise ValueError("section contains an open contour")
+        polygon = Polygon(_open_ring(contour))
+        if polygon.is_empty or not polygon.is_valid or polygon.area <= 0.0:
+            raise ValueError("section contains a degenerate or self-intersecting contour")
+        polygons.append(polygon)
+    if not polygons:
+        raise ValueError("STL layer has no closed section contours")
+    containers: list[list[int]] = [[] for _ in polygons]
+    for index, polygon in enumerate(polygons):
+        for other_index in range(index):
+            other = polygons[other_index]
+            if polygon.disjoint(other):
+                continue
+            if not polygon.boundary.disjoint(other.boundary):
+                raise ValueError("section contours intersect or touch ambiguously")
+            if other.contains(polygon):
+                containers[index].append(other_index)
+            elif polygon.contains(other):
+                containers[other_index].append(index)
+            else:
+                raise ValueError("section contours overlap without full containment")
+    parents = [min(items, key=lambda item: polygons[item].area) if items else None for items in containers]
+    return polygons, parents
+
+
+def _reconstruct_section_from_mesh_edges(mesh: Mesh, z: float):
+    """Recover closed rings by shared STL-edge identity, without spatial snaps.
+
+    This fallback retains every nonzero intersection segment, including those
+    shorter than the planning tolerance. Near but distinct mesh edges must not
+    be merged: they may be the two sides of a narrow hole or a real mesh gap.
+    """
+    triangles = np.asarray(mesh.triangles, dtype=np.float64)
+    if not np.isfinite(triangles).all() or not np.isfinite(z):
+        raise ValueError("non-finite mesh coordinates or section height")
+    vertices, indices = np.unique(triangles.reshape(-1, 3), axis=0, return_inverse=True)
+    faces = indices.reshape(-1, 3)
+    # A half-open crossing rule handles a plane through a mesh vertex once.
+    # At the bottom surface take the section on the material's upper side.
+    side = vertices[:, 2] > z if z == float(vertices[:, 2].min()) else vertices[:, 2] < z
+    face_sides = side[faces]
+    crossing_faces = faces[np.any(face_sides, axis=1) & ~np.all(face_sides, axis=1)]
+    points: dict[tuple[int, int], np.ndarray] = {}
+    neighbors: dict[tuple[int, int], list[tuple[int, int]]] = defaultdict(list)
+    edges = set()
+    for face in crossing_faces:
+        nodes = []
+        for start, end in ((0, 1), (1, 2), (2, 0)):
+            first, second = sorted((int(face[start]), int(face[end])))
+            if side[first] == side[second]:
+                continue
+            if vertices[first, 2] == z:
+                key = (first, first)
+            elif vertices[second, 2] == z:
+                key = (second, second)
+            else:
+                key = (first, second)
+            if key not in points:
+                a, b = vertices[key[0]], vertices[key[1]]
+                points[key] = a[:2].copy() if key[0] == key[1] else (
+                    a[:2] + (z - a[2]) / (b[2] - a[2]) * (b[:2] - a[:2])
+                )
+            if key not in nodes:
+                nodes.append(key)
+        if len(nodes) < 2:  # A triangle only touches the plane at one vertex.
+            continue
+        if len(nodes) != 2 or np.array_equal(points[nodes[0]], points[nodes[1]]):
+            raise ValueError("ambiguous or collapsed mesh intersection")
+        edge = tuple(sorted(nodes))
+        if edge in edges:
+            raise ValueError("duplicate mesh intersection edge")
+        edges.add(edge)
+        neighbors[nodes[0]].append(nodes[1])
+        neighbors[nodes[1]].append(nodes[0])
+    if not neighbors or any(len(adjacent) != 2 for adjacent in neighbors.values()):
+        raise ValueError("mesh intersection is open or branched; refusing to bridge gaps")
+    unused = set(neighbors)
+    contours = []
+    while unused:
+        start = min(unused)
+        current, previous = start, None
+        contour = []
+        while True:
+            if current not in unused:
+                raise ValueError("mesh intersection revisits a contour before closure")
+            unused.remove(current)
+            contour.append(points[current])
+            following = next(node for node in neighbors[current] if node != previous)
+            previous, current = current, following
+            if current == start:
+                contour.append(points[start])
+                break
+        contours.append(contour)
+    polygons, parents = _validated_section_rings(contours, 0.0)
+    depths = []
+    for parent in parents:
+        depth = 0
+        while parent is not None:
+            depth += 1
+            parent = parents[parent]
+        depths.append(depth)
+    material = [
+        Polygon(polygon.exterior.coords, [
+            polygons[child].exterior.coords
+            for child, parent in enumerate(parents) if parent == index
+        ])
+        for index, polygon in enumerate(polygons) if depths[index] % 2 == 0
+    ]
+    if any(not polygon.is_valid for polygon in material):
+        raise ValueError("reconstructed shell/hole geometry is invalid")
+    solid = unary_union(material)
+    if solid.is_empty or not solid.is_valid:
+        raise ValueError("reconstructed section is empty or invalid")
     return solid
 
 
