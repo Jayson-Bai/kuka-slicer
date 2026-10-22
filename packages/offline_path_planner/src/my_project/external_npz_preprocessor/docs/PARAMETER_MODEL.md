@@ -50,33 +50,6 @@ resin_e_per_mm = 2.0 * layer_height_mm * extrusion_scale / (pi * (1.75 / 2)^2)
 
 This matches the original G-code test-line allocation: deposited resin volume per path millimeter is converted to 1.75 mm filament length by dividing by the filament cross-section area. Resin line width and filament diameter are fixed in code, so the user-facing controls remain `layer_height_mm` and `extrusion_scale`.
 
-## Resin End Coasting
-
-`resin.coast_distance_mm` is an independent Core export option, expressed in
-millimeters of final sampled 3D path length, not filament E. `0` disables it;
-legacy parameter files default to `0`. The slicer's saved configuration starts
-at the recommended trial value `1.0 mm`; this is not inferred from a measured
-10 mm start deficit and must be checked on the actual material and nozzle.
-
-Core fits and samples each complete resin stroke first, then holds cumulative
-E constant over its last configured distance. It retains the original E profile
-before that cutoff, with no redistribution of removed E. All resin print
-strokes, including Primeline, participate; fiber, travel and stationary waits
-do not. Paths no longer than twice the configured distance are left alone.
-An internal fit partition is not a separate coasting boundary.
-
-Coordinates, orientation, speed planning, 4 ms timestamps and NPZ schema are
-unchanged. Core carries the removed E as a per-tool offset through subsequent
-nominal motion until E reset; prime/retract waits retain their commanded
-distances. Layer-end order is coasting to the original endpoint, retract,
-existing Y wipe, then the existing tool-change sequence. No pressure-advance
-coefficient, new runtime event or automatic prime/retract correction is added.
-
-The browser's existing constant-E edge styling displays the tail. Regenerate
-the Core NPZ after changing this setting: the live upper computer consumes its
-existing cumulative `e` values, and local injection must preserve that plateau
-without applying coasting again.
-
 ## Fiber
 
 Fiber does not expose diameter, printed line width, or a direct `E/mm` field. The active model forces fiber feed to match TCP movement speed by default:

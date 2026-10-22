@@ -1068,15 +1068,16 @@ def test_convert_writes_startup_events_and_tool_reset_order_to_npz(tmp_path):
             "extrude_reset",
             "extrude_reset",
             "cut",
+            "extrude_sync",
             "extrude_reset",
+            "extrude_sync",
             "extrude_reset",
             "extrude_reset",
             "extrude_reset",
         ]
 
         cut_row_idx = events.index("cut")
-        assert data["payload"][cut_row_idx].decode("utf-8").rstrip("\x00") == "1"
-
+        assert data["payload"][cut_row_idx].decode("utf-8").rstrip("\x00") == "1 sync_v1:2"
 
 def test_convert_skips_fiber_startup_events_when_source_has_no_fiber_paths(tmp_path):
     import json
