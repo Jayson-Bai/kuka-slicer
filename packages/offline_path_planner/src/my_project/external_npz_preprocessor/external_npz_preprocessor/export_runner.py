@@ -148,8 +148,8 @@ def convert_external_npz(
     progress_callback=None,
     calibration_path: str | Path = DEFAULT_HEAD_CALIBRATION_PATH,
     cut_lift_mm: float | None = None,
-    cut_wait_s: float | None = None,
-    cut_settle_s: float | None = None,
+    cut_retract_delay_s: float | None = None,
+    cut_travel_delay_s: float | None = None,
     chunk_size: int = 100000,
     commands_callback=None,
     reuse_parallel_workers: bool = False,
@@ -163,8 +163,8 @@ def convert_external_npz(
         progress_callback=progress_callback,
         calibration_path=calibration_path,
         cut_lift_mm=cut_lift_mm,
-        cut_wait_s=cut_wait_s,
-        cut_settle_s=cut_settle_s,
+        cut_retract_delay_s=cut_retract_delay_s,
+        cut_travel_delay_s=cut_travel_delay_s,
         chunk_size=chunk_size,
         commands_callback=commands_callback,
         reuse_parallel_workers=reuse_parallel_workers,
@@ -178,8 +178,8 @@ def convert_gcode(
     progress_callback=None,
     calibration_path: str | Path = DEFAULT_HEAD_CALIBRATION_PATH,
     cut_lift_mm: float | None = None,
-    cut_wait_s: float | None = None,
-    cut_settle_s: float | None = None,
+    cut_retract_delay_s: float | None = None,
+    cut_travel_delay_s: float | None = None,
     chunk_size: int = 100000,
     commands_callback=None,
     fiber_paths_by_layer=None,
@@ -201,8 +201,8 @@ def convert_gcode(
         progress_callback=progress_callback,
         calibration_path=calibration_path,
         cut_lift_mm=cut_lift_mm,
-        cut_wait_s=cut_wait_s,
-        cut_settle_s=cut_settle_s,
+        cut_retract_delay_s=cut_retract_delay_s,
+        cut_travel_delay_s=cut_travel_delay_s,
         chunk_size=chunk_size,
         commands_callback=commands_callback,
     )
@@ -217,8 +217,8 @@ def convert_source_job(
     progress_callback=None,
     calibration_path: str | Path = DEFAULT_HEAD_CALIBRATION_PATH,
     cut_lift_mm: float | None = None,
-    cut_wait_s: float | None = None,
-    cut_settle_s: float | None = None,
+    cut_retract_delay_s: float | None = None,
+    cut_travel_delay_s: float | None = None,
     chunk_size: int = 100000,
     commands_callback=None,
     reuse_parallel_workers: bool = False,
@@ -278,15 +278,14 @@ def convert_source_job(
         "cut_lift_mm": (
             export_params.cut_lift_mm if cut_lift_mm is None else float(cut_lift_mm)
         ),
-        "cut_wait_s": (
-            export_params.cut_wait_s if cut_wait_s is None else float(cut_wait_s)
+        "cut_retract_delay_s": (
+            export_params.cut_retract_delay_s
+            if cut_retract_delay_s is None else float(cut_retract_delay_s)
         ),
-        "cut_settle_s": (
-            export_params.cut_settle_s
-            if cut_settle_s is None else float(cut_settle_s)
+        "cut_travel_delay_s": (
+            export_params.cut_travel_delay_s
+            if cut_travel_delay_s is None else float(cut_travel_delay_s)
         ),
-        "cut_lift_settle_s": export_params.cut_lift_settle_s,
-        "cut_retract_settle_s": export_params.cut_retract_settle_s,
         "external_npz_cut_absolute_e": export_params.external_npz_cut_absolute_e,
         "preserve_source_e_profile": preserve_source_e_profile,
         "collect_detailed_timing": os.environ.get(

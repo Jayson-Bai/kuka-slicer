@@ -69,15 +69,15 @@ def test_convert_uses_shared_head_calibration_offsets(tmp_path, monkeypatch):
         ),
         calibration_path=calibration_path,
         cut_lift_mm=22.0,
-        cut_wait_s=11.0,
-        cut_settle_s=2.5,
+        cut_travel_delay_s=11.0,
+        cut_retract_delay_s=2.5,
     )
 
     assert captured["kwargs"]["tool_offset"] == (2.0, -3.0, 4.0)
     assert captured["kwargs"]["resin_z_print_compensation_mm"] == 1.25
     assert captured["kwargs"]["cut_lift_mm"] == 22.0
-    assert captured["kwargs"]["cut_wait_s"] == 11.0
-    assert captured["kwargs"]["cut_settle_s"] == 2.5
+    assert captured["kwargs"]["cut_travel_delay_s"] == 11.0
+    assert captured["kwargs"]["cut_retract_delay_s"] == 2.5
     assert captured["kwargs"]["default_feed_mm_s"] == 7.0
     assert captured["kwargs"]["max_angular_speed_deg_s"] == 25.0
     assert "fiber_retract_length_mm" not in captured["kwargs"]
@@ -776,7 +776,7 @@ def test_external_cut_uses_timed_resets_to_isolate_lift_and_retract(tmp_path):
         default_feed_mm_s=10.0,
         enable_extrude_wait=True,
         cut_lift_mm=12.5,
-        cut_wait_s=15.0,
+        cut_travel_delay_s=15.0,
         initial_tool_id=1,
         external_npz_cut_absolute_e=True,
     )
@@ -811,10 +811,8 @@ def test_external_cut_uses_timed_resets_to_isolate_lift_and_retract(tmp_path):
         final_anchor = final_cut_reset + 1
         assert np.isclose(data["e"][final_cut_reset], -12.5)
         assert np.isclose(data["e"][final_anchor], 0.0)
-        trailing_wait = list(range(final_anchor + 1, path_reset))
-        assert trailing_wait
-        assert np.allclose(data["z"][trailing_wait], 12.5)
-        assert np.allclose(data["e"][trailing_wait], 0.0)
+        # Delays are anchored between sync barriers and their resets; no
+        # trailing high-hold rows remain after the last reset.
 
 
 def test_fiber_cut_and_ui_actions_use_independent_absolute_e_boundaries(tmp_path):
@@ -871,7 +869,7 @@ def test_fiber_cut_and_ui_actions_use_independent_absolute_e_boundaries(tmp_path
         params,
         calibration_path=calibration_path,
         cut_lift_mm=20.0,
-        cut_wait_s=0.0,
+        cut_travel_delay_s=0.0,
     )
 
     data = np.load(out)
@@ -1176,7 +1174,7 @@ def test_system_npz_embeds_local_injection_catalog_and_row_markers(tmp_path):
         tool_offset=(1.0, 2.0, 3.0),
         tool_change_safe_lift_mm=4.0,
         cut_lift_mm=1.0,
-        cut_wait_s=3.0,
+        cut_travel_delay_s=3.0,
     )
 
     parts = sorted(output.parent.glob("marked_part*.npz"))

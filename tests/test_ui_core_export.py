@@ -1403,25 +1403,25 @@ def test_main_ui_parses_tcp_orientation_speed_into_core_params():
     assert params.max_tcp_orientation_speed_deg_s == pytest.approx(37.5)
 
 
-def test_main_ui_parses_cut_settle_into_core_export_params():
+def test_main_ui_parses_cut_delays_into_core_export_params():
     _ensure_offline_planner_import_paths()
     module = importlib.import_module("external_npz_preprocessor.process_params")
 
     params = _parse_core_process_params(
         {
-            "core_cut_wait": ["15"],
-            "core_cut_settle": ["1.25"],
+            "core_cut_retract_delay": ["0.5"],
+            "core_cut_travel_delay": ["1.25"],
         },
         module,
     )
 
-    assert params.export.cut_wait_s == pytest.approx(15.0)
-    assert params.export.cut_settle_s == pytest.approx(1.25)
+    assert params.export.cut_retract_delay_s == pytest.approx(0.5)
+    assert params.export.cut_travel_delay_s == pytest.approx(1.25)
     html = _index_html()
-    assert 'id="coreCutLiftSettle"' in html
-    assert 'id="coreCutRetractSettle"' in html
-    assert "CUT 回抽前保持 s" in html
-    assert "CUT 回抽后保持 s" in html
+    assert 'id="coreCutRetractDelay"' in html
+    assert 'id="coreCutTravelDelay"' in html
+    assert "剪切完成到回抽延时" in html
+    assert "回抽完成到横移延时" in html
 
 
 def test_offline_slicer_always_exports_a_zero_offset_base_contract():

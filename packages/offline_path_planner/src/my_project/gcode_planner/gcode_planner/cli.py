@@ -68,7 +68,8 @@ def main(argv=None):
         default=0.0,
         help="Resin Z print compensation prepended as a Z travel before formal printing (mm)")
     parser.add_argument("--cut-lift-mm", type=float, default=20.0, help="Cut lift distance (mm)")
-    parser.add_argument("--cut-wait-s", type=float, default=15.0, help="Cut wait time from event trigger (s)")
+    parser.add_argument("--cut-retract-delay-s", type=float, default=0.5, help="Delay from firmware CUT+lift completion to retract start (s)")
+    parser.add_argument("--cut-travel-delay-s", type=float, default=1.0, help="Delay from retract completion to travel start (s)")
     args = parser.parse_args(argv)
 
     input_dir = args.input_gcode_dir or os.path.join(args.data_root, "input_gcode")
@@ -113,7 +114,8 @@ def main(argv=None):
         enable_extrude_wait=True,
         resin_z_print_compensation_mm=args.resin_z_print_compensation_mm,
         cut_lift_mm=args.cut_lift_mm,
-        cut_wait_s=args.cut_wait_s,
+        cut_retract_delay_s=args.cut_retract_delay_s,
+        cut_travel_delay_s=args.cut_travel_delay_s,
     )
     t3 = time.perf_counter()
     print("[信息] 导出完成: %s (npz, chunk<=5000000)" % output_path)

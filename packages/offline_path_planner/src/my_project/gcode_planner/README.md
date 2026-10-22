@@ -52,7 +52,8 @@ ros2 run gcode_planner gcode_planner_npz \
 - `--split-by-layer-type`：按层和打印子类型拆分导出
 - `--plot-layer-xy` / `--plot-stride`：导出分层 XY 预览图
 - `--cut-lift-mm`：纤维 `CUT` 事件后的 Z 向抬升距离，默认 `20.0`
-- `--cut-wait-s`：从 `cut` 事件触发开始计算的剪切等待总时长，默认 `15.0`
+- `--cut-retract-delay-s`：固件剪切完成后到回抽开始的延时，默认 `0.5`
+- `--cut-travel-delay-s`：回抽完成后到横移开始的延时，默认 `1.0`
 
 路径优先级：
 

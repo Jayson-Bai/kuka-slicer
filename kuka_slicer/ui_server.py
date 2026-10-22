@@ -2676,10 +2676,8 @@ def _parse_core_process_params(
         initial_tool_id=_int_param(params, "core_initial_tool", export_defaults.initial_tool_id),
         tool_change_safe_lift_mm=_float_param(params, "core_tool_safe_lift", export_defaults.tool_change_safe_lift_mm),
         cut_lift_mm=_float_param(params, "core_cut_lift", export_defaults.cut_lift_mm),
-        cut_wait_s=_float_param(params, "core_cut_wait", export_defaults.cut_wait_s),
-        cut_settle_s=_float_param(params, "core_cut_settle", export_defaults.cut_settle_s),
-        cut_lift_settle_s=_optional_float_param(params, "core_cut_lift_settle"),
-        cut_retract_settle_s=_optional_float_param(params, "core_cut_retract_settle"),
+        cut_retract_delay_s=_float_param(params, "core_cut_retract_delay", export_defaults.cut_retract_delay_s),
+        cut_travel_delay_s=_float_param(params, "core_cut_travel_delay", export_defaults.cut_travel_delay_s),
         fiber_retract_length_mm=_optional_float_param(params, "core_fiber_retract_override") if "core_fiber_retract_override" in params else export_defaults.fiber_retract_length_mm,
         external_npz_cut_absolute_e=_bool_param(
             params, "core_external_npz_cut_absolute_e", export_defaults.external_npz_cut_absolute_e
@@ -6112,9 +6110,8 @@ def _index_html() -> str:
             <div class="prusaSettingsGrid">
               <div class="fieldGroup"><label for="coreToolSafeLift">换头安全抬升 mm</label><input id="coreToolSafeLift" type="number" min="0" step="0.001" value="20"></div>
               <div class="fieldGroup"><label for="coreCutLift">CUT 抬升 mm</label><input id="coreCutLift" type="number" min="0" step="0.001" value="20"></div>
-              <div class="fieldGroup"><label for="coreCutWait">CUT 等待 s</label><input id="coreCutWait" type="number" min="0" step="0.001" value="15"></div>
-              <div class="fieldGroup"><label for="coreCutLiftSettle">CUT 回抽前保持 s</label><input id="coreCutLiftSettle" type="number" min="0" step="0.001" value="3"></div>
-              <div class="fieldGroup"><label for="coreCutRetractSettle">CUT 回抽后保持 s</label><input id="coreCutRetractSettle" type="number" min="0" step="0.001" value="3"></div>
+              <div class="fieldGroup"><label for="coreCutRetractDelay">剪切完成到回抽延时 s</label><input id="coreCutRetractDelay" type="number" min="0" step="0.001" value="0.5"></div>
+              <div class="fieldGroup"><label for="coreCutTravelDelay">回抽完成到横移延时 s</label><input id="coreCutTravelDelay" type="number" min="0" step="0.001" value="1"></div>
               <div class="fieldGroup"><label for="coreInitialTool">初始工具 ID</label><input id="coreInitialTool" type="number" min="0" step="1" value="2"></div>
               <div class="fieldGroup compactOptions"><label class="checkboxLabel" for="coreEnableExtrudeWait"><input id="coreEnableExtrudeWait" type="checkbox" checked> 启用挤出等待</label></div>
               <div class="fieldGroup compactOptions"><label class="checkboxLabel" for="coreTravelExtrudeOverlap"><input id="coreTravelExtrudeOverlap" type="checkbox" checked> 允许等待叠加到空走</label></div>
@@ -6376,7 +6373,7 @@ def _index_html() -> str:
         'coreCornerRetreatRatio', 'coreSplineMaxError', 'coreSplineMaxAngle',
         'coreSourceMergeDistance', 'coreCornerRetreatMax', 'coreCornerBlendSegments',
         'coreDensity', 'coreDegree', 'coreMaxFitPoints',
-        'coreToolSafeLift', 'coreCutLift', 'coreCutWait', 'coreCutLiftSettle', 'coreCutRetractSettle', 'coreFiberRetractOverride',
+        'coreToolSafeLift', 'coreCutLift', 'coreCutRetractDelay', 'coreCutTravelDelay', 'coreFiberRetractOverride',
         'coreInitialTool'
       ];
       for (const id of coreFieldIds) {{
@@ -6716,7 +6713,8 @@ def _index_html() -> str:
       ['coreMaxFitPoints', 'core_max_fit_points', 'root', 'max_fit_points_per_segment'],
       ['coreToolSafeLift', 'core_tool_safe_lift', 'export', 'tool_change_safe_lift_mm'],
       ['coreCutLift', 'core_cut_lift', 'export', 'cut_lift_mm'],
-      ['coreCutWait', 'core_cut_wait', 'export', 'cut_wait_s'],
+      ['coreCutRetractDelay', 'core_cut_retract_delay', 'export', 'cut_retract_delay_s'],
+      ['coreCutTravelDelay', 'core_cut_travel_delay', 'export', 'cut_travel_delay_s'],
       ['coreFiberRetractOverride', 'core_fiber_retract_override', 'export', 'fiber_retract_length_mm'],
       ['coreInitialTool', 'core_initial_tool', 'export', 'initial_tool_id']
     ];
@@ -7469,7 +7467,7 @@ def _index_html() -> str:
          'coreCornerRetreatRatio', 'coreSplineMaxError', 'coreSplineMaxAngle',
          'coreSourceMergeDistance', 'coreCornerRetreatMax', 'coreCornerBlendSegments',
          'coreDensity', 'coreDegree', 'coreMaxFitPoints',
-         'coreToolSafeLift', 'coreCutLift', 'coreCutWait', 'coreFiberRetractOverride',
+         'coreToolSafeLift', 'coreCutLift', 'coreCutRetractDelay', 'coreCutTravelDelay', 'coreFiberRetractOverride',
          'coreInitialTool'
        ];
        for (const id of coreFieldIds) {{

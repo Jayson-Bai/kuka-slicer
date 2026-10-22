@@ -165,12 +165,12 @@ ExtrudeWait(delta_e=0, raw="external_npz_reset_anchor")
 CUT
 # exporter expands external-NPZ CUT as:
 # cut event -> immediate lift(Z:+L, E:0→+L)
-# -> hold XYZ high and E=+L for cut_settle_s
+# -> extrude_sync(+L) barrier, then hold for cut_retract_delay_s
 # -> reset -> anchor(E=0)
 # -> retract at high pose(E:0→-L)
-# -> hold XYZ high and E=-L for cut_settle_s
+# -> extrude_sync(-L) barrier, then hold for cut_travel_delay_s
 # -> reset -> anchor(E=0)
-# -> hold XYZ high for the remaining cut_wait_s budget
+# -> reset E to 0 for next path
 
 # Last fiber of every fiber-bearing layer, after CUT:
 ResetECommand(raw="external_npz_fiber_layer_retract_reset")
@@ -185,7 +185,7 @@ ExtrudeWait(wait_sec=dt, delta_e=0, raw="external_npz_reset_anchor")
 TRAVEL(E=0)
 ```
 
-其中 `L=cut_lift_mm`。CUT 前先完成一次阻塞式 reset 和 E=0 anchor，随后 CUT 事件仍为非阻塞，RSI 紧接着沿纤维路径末端点的曲面上法向抬升绝对距离 `L`，并同步执行 `E:0→+L`；平面 `ABC=0` 时该方向仍是世界 `+Z`。抬升末端保持 `cut_settle_s` 后 reset，回抽由新基准独立执行 `E:0→-L`，再保持 `cut_settle_s` 后 reset。两个保持段都在高位，且计入原 `cut_wait_s` 总窗口；剩余等待继续保持高位和 `E=0`。若 UI 等待短于完整执行抬升、两段保持和回抽所需的安全时间，则优先完整执行这些动作。`cut_settle_s` 默认 `3.0 s`，可在 Core 导出参数和上位机局部注入参数中分别设置。
+其中 `L=cut_lift_mm`。CUT 前先完成一次阻塞式 reset 和 E=0 anchor，随后 CUT 事件仍为非阻塞，RSI 紧接着沿纤维路径末端点的曲面上法向抬升绝对距离 `L`，并同步执行 `E:0→+L`；平面 `ABC=0` 时该方向仍是世界 `+Z`。抬升到位后 `extrude_sync(+L)` 等待固件回报剪切+抬升完成，随后保持 `cut_retract_delay_s` 再 reset，回抽由新基准独立执行 `E:0→-L`；回抽到位后 `extrude_sync(-L)` 等待固件回报，再保持 `cut_travel_delay_s` 后 reset。`cut_retract_delay_s` 默认 `0.5 s`，`cut_travel_delay_s` 默认 `1.0 s`，可在 Core 导出参数和上位机局部注入参数中分别设置。
 
 CUT 的挤出和固定回抽只受 L 控制，不读取 `fiber.prime_length_mm` 或 `fiber.retract_length_mm`。层末 UI 回抽前的 reset 同时阻断 CUT 向后读取 UI 回抽速度；CUT 固定回抽继续使用默认移动速度，UI 回抽使用自己的 `fiber.retract_speed_mm_s`。
 

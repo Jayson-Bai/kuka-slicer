@@ -71,10 +71,8 @@ class CoreExportParams:
     initial_tool_id: int = 2
     tool_change_safe_lift_mm: float = 20.0
     cut_lift_mm: float = 20.0
-    cut_wait_s: float = 15.0
-    cut_settle_s: float = 3.0
-    cut_lift_settle_s: float | None = None
-    cut_retract_settle_s: float | None = None
+    cut_retract_delay_s: float = 0.5
+    cut_travel_delay_s: float = 1.0
     fiber_retract_length_mm: float | None = None
     external_npz_cut_absolute_e: bool = True
 

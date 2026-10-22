@@ -8,7 +8,7 @@ gcode_planner 的 npz 导出器（分片）.
 
 from __future__ import annotations
 
-from .cut_sync import cut_holds, cut_sync_payload, sync_payload
+from .cut_sync import cut_sync_payload, sync_payload
 
 from dataclasses import dataclass, replace
 from typing import List, Mapping, Optional
@@ -180,10 +180,8 @@ def export_npz(
     initial_tool_id: int = 2,
     tool_change_safe_lift_mm: float = 20.0,
     cut_lift_mm: float = 20.0,
-    cut_wait_s: float = 15.0,
-    cut_settle_s: float = 3.0,
-    cut_lift_settle_s: float | None = None,
-    cut_retract_settle_s: float | None = None,
+    cut_retract_delay_s: float = 0.5,
+    cut_travel_delay_s: float = 1.0,
     fiber_retract_length_mm: float | None = None,
     external_npz_cut_absolute_e: bool = False,
     preserve_source_e_profile: bool = False,
@@ -238,8 +236,6 @@ def export_npz(
     }
 
     last_pose_map = {}
-    cut_lift_settle_s, cut_retract_settle_s = cut_holds(
-        cut_settle_s, cut_lift_settle_s, cut_retract_settle_s)
     current_tool = int(initial_tool_id)  # 1=纤维(T0), 2=树脂(T1)
     seq = 0
     planner = GlobalSplinePlanner()
@@ -381,8 +377,8 @@ def export_npz(
                     "tool_id": scan_tool,
                     "roles": ["cut_event", "cut_action", "cut_post", "post_anchor"],
                     "injectable_parameters": [
-                        "cut_lift_mm", "cut_wait_s", "cut_settle_s",
-                        "cut_lift_settle_s", "cut_retract_settle_s",
+                        "cut_lift_mm",
+                        "cut_retract_delay_s", "cut_travel_delay_s",
                     ],
                 })
                 injection_block_by_command_index[command_index] = block_id
@@ -409,10 +405,8 @@ def export_npz(
             "resin_z_print_compensation_mm": float(resin_z_print_compensation_mm),
             "tool_change_safe_lift_mm": float(tool_change_safe_lift_mm),
             "cut_lift_mm": float(cut_lift_mm),
-            "cut_wait_s": float(cut_wait_s),
-            "cut_settle_s": float(cut_settle_s),
-            "cut_lift_settle_s": cut_lift_settle_s,
-            "cut_retract_settle_s": cut_retract_settle_s,
+            "cut_retract_delay_s": float(cut_retract_delay_s),
+            "cut_travel_delay_s": float(cut_travel_delay_s),
             "cut_sync_version": 1,
             "fiber_retract_length_mm": (
                 None if fiber_retract_length_mm is None else float(fiber_retract_length_mm)
@@ -424,8 +418,7 @@ def export_npz(
             "resin_z_print_compensation_mm",
             "tool_change_safe_lift_mm",
             "cut_lift_mm",
-            "cut_wait_s",
-            "cut_settle_s", "cut_lift_settle_s", "cut_retract_settle_s",
+            "cut_retract_delay_s", "cut_travel_delay_s",
         ],
         "row_marker_fields": {
             "block_id": "core_injection_block_id",
@@ -1741,10 +1734,7 @@ def export_npz(
             # retract 0..-L -> settle -> reset -> remaining high hold.
             # CUT stays nonblocking; putting the first reset before it prevents
             # RSI from advancing to an E=0 anchor before the reset handshake.
-            lift_settle_s = cut_lift_settle_s
-            retract_settle_s = cut_retract_settle_s
             lift_mm = max(0.0, float(cut_lift_mm))
-            wait_s = max(0.0, float(cut_wait_s))
             lift_feedrate = max(float(default_feed_mm_s), 1e-9) * 60.0
             lift_speed = max(_feed_mm_s_from_feedrate(lift_feedrate), 1e-9)
             retract_feedrate = lift_feedrate
@@ -1821,23 +1811,27 @@ def export_npz(
                     lift_gc, layer, subtype, occ, mark_path_end=False
                 )
 
-            _append_extrude_wait(ExtrudeWait(
-                type="EXTRUDE_WAIT",
-                wait_sec=lift_settle_s,
-                delta_e=0.0,
-                feedrate=lift_feedrate,
-                line=cmd.line or 0,
-                layer=layer,
-                subtype=subtype,
-                raw="external_npz_cut_lift_settle",
-            ), layer, subtype, occ, mark_path_end=False)
-
             _emit_event(_PendingEvent(
                 event_type="extrude_sync",
-                payload=sync_payload(current_tool, lift_mm, wait_s),
+                payload=sync_payload(current_tool, lift_mm, 30.0),
                 src_line=cmd.line or 0,
                 tool_id=current_tool,
             ), layer, subtype, occ)
+
+            # retract_delay_s anchors to firmware CUT+lift completion: the
+            # sync above is the hard barrier, this hold only starts after the
+            # firmware reports both done.
+            if cut_retract_delay_s > 1e-9:
+                _append_extrude_wait(ExtrudeWait(
+                    type="EXTRUDE_WAIT",
+                    wait_sec=cut_retract_delay_s,
+                    delta_e=0.0,
+                    feedrate=lift_feedrate,
+                    line=cmd.line or 0,
+                    layer=layer,
+                    subtype=subtype,
+                    raw="external_npz_cut_retract_delay",
+                ), layer, subtype, occ, mark_path_end=False)
 
 
             # The reset at +L makes the equal retract a separate absolute
@@ -1855,47 +1849,28 @@ def export_npz(
                     raw="cut_safety_retract",
                 ), layer, subtype, occ, mark_path_end=False)
 
-            _append_extrude_wait(ExtrudeWait(
-                type="EXTRUDE_WAIT",
-                wait_sec=retract_settle_s,
-                delta_e=0.0,
-                feedrate=retract_feedrate,
-                line=cmd.line or 0,
-                layer=layer,
-                subtype=subtype,
-                raw="external_npz_cut_retract_settle",
-            ), layer, subtype, occ, mark_path_end=False)
-
             _emit_event(_PendingEvent(
                 event_type="extrude_sync",
-                payload=sync_payload(current_tool, -lift_mm, wait_s),
+                payload=sync_payload(current_tool, -lift_mm, 30.0),
                 src_line=cmd.line or 0,
                 tool_id=current_tool,
             ), layer, subtype, occ)
 
-
-            lift_duration_s = lift_mm / lift_speed
-            retract_duration_s = lift_mm / retract_speed
-            remaining_wait_s = max(
-                0.0,
-                wait_s
-                - lift_duration_s
-                - lift_settle_s
-                - retract_duration_s
-                - retract_settle_s,
-            )
-            _append_cut_reset_anchor(mark_path_end=remaining_wait_s <= 1e-9)
-            if remaining_wait_s > 1e-9:
+            # travel_delay_s anchors to firmware retract completion, gating
+            # the move to the next path start.
+            if cut_travel_delay_s > 1e-9:
                 _append_extrude_wait(ExtrudeWait(
                     type="EXTRUDE_WAIT",
-                    wait_sec=remaining_wait_s,
+                    wait_sec=cut_travel_delay_s,
                     delta_e=0.0,
-                    feedrate=lift_feedrate,
+                    feedrate=retract_feedrate,
                     line=cmd.line or 0,
                     layer=layer,
                     subtype=subtype,
-                    raw="cut_wait_remaining",
-                ), layer, subtype, occ, mark_path_end=True)
+                    raw="external_npz_cut_travel_delay",
+                ), layer, subtype, occ, mark_path_end=False)
+
+            _append_cut_reset_anchor(mark_path_end=True)
             if injection_block_id > 0:
                 active_injection_block_id = -1
                 active_injection_role = 0
@@ -1910,7 +1885,9 @@ def export_npz(
         active_injection_role = injection_role_map["cut_action"]
 
         lift_mm = max(0.0, float(cut_lift_mm))
-        wait_s = max(0.0, float(cut_wait_s))
+        # Generic GCode CUT has no sync handshake; the lifted high-hold uses
+        # the travel delay as its pause duration.
+        wait_s = max(0.0, float(cut_travel_delay_s))
         fiber_retract_mm = (
             max(0.0, float(fiber_retract_length_mm))
             if current_tool == 1 and fiber_retract_length_mm is not None else 0.0
@@ -2548,8 +2525,15 @@ def export_npz(
         timing_parent = os.path.dirname(timing_sidecar_path)
         if timing_parent:
             os.makedirs(timing_parent, exist_ok=True)
+        timing_summary = timing.summary()
+        timing_summary["cut_retract_delay_s"] = cut_retract_delay_s
+        timing_summary["cut_travel_delay_s"] = cut_travel_delay_s
+        timing_summary["planned_cut_delay_time_s"] = (
+            (cut_retract_delay_s + cut_travel_delay_s)
+            * int(timing_summary.get("planned_cut_count", 0))
+        )
         with open(timing_sidecar_path, "w", encoding="utf-8") as f:
-            json.dump(timing.summary(), f, ensure_ascii=False, indent=2)
+            json.dump(timing_summary, f, ensure_ascii=False, indent=2)
     except Exception as exc:
         print(f"[Warning] Failed to write timing sidecar json: {exc}")
 

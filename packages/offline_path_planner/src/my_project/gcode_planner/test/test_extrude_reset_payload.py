@@ -425,7 +425,7 @@ def test_cut_event_lifts_with_matched_fiber_feed_and_preserves_next_prime(tmp_pa
         default_feed_mm_s=10.0,
         enable_extrude_wait=True,
         cut_lift_mm=20.0,
-        cut_wait_s=5.0,
+        cut_travel_delay_s=5.0,
         initial_tool_id=1,
     )
 
@@ -520,7 +520,7 @@ def test_curved_fiber_cut_lift_follows_endpoint_surface_normal(
         dt=0.004,
         default_feed_mm_s=10.0,
         cut_lift_mm=lift_mm,
-        cut_wait_s=0.0,
+        cut_travel_delay_s=0.0,
         initial_tool_id=1,
         external_npz_cut_absolute_e=external_absolute_e,
     )
@@ -584,7 +584,7 @@ def test_nonfiber_cut_with_tilted_abc_keeps_world_z_lift(tmp_path):
         dt=0.25,
         default_feed_mm_s=10.0,
         cut_lift_mm=20.0,
-        cut_wait_s=0.0,
+        cut_travel_delay_s=0.0,
         initial_tool_id=2,
     )
 

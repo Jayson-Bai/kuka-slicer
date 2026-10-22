@@ -109,8 +109,8 @@ tool_offset = [fiber_x, fiber_y, fiber_z]
 resin_z_print_compensation_mm
 tool_change_safe_lift_mm
 cut_lift_mm
-cut_wait_s
-cut_settle_s
+cut_retract_delay_s
+cut_travel_delay_s
 ```
 
 ### 5.1 工具偏置 `tool_offset`
@@ -162,16 +162,16 @@ anchor = before_first_effective_print_path
 E reset anchor
 → cut event
 → Z 抬升，同时 E 增加相同长度
-→ 高位保持 cut_settle_s
+→ extrude_sync 完成后保持 cut_retract_delay_s
 → E reset
 → 等量回抽
-→ 高位保持 cut_settle_s
+→ extrude_sync 完成后保持 cut_retract_delay_s
 → E reset
-→ 剩余 cut_wait
+→ reset 后 travel
 → 后续连接 travel
 ```
 
-`cut_settle_s` 分别控制抬升末端和回抽末端的保持时间，默认 `3.0 s`；`cut_wait_s` 是从 `cut` 事件开始计算的总安全窗口，仍控制后续剩余等待。二者改变后，局部采样点数量都可能变化；这时需要重建该 block，并修复其后的全局序号和时间，不允许只修改某几个 Z 值而留下 RSI 断点。
+`cut_retract_delay_s` 控制固件剪切+抬升完成后到回抽开始的延时（默认 `0.5 s`）；`cut_travel_delay_s` 控制回抽完成后到横移开始的延时（默认 `1.0 s`）。二者改变后，局部采样点数量都可能变化；这时需要重建该 block，并修复其后的全局序号和时间，不允许只修改某几个 Z 值而留下 RSI 断点。
 
 ## 6. 局部重建要求
 

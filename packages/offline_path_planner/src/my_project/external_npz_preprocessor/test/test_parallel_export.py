@@ -83,7 +83,7 @@ def test_layer_parallel_export_is_byte_identical_to_serial_export(tmp_path: Path
         "enable_extrude_wait": True,
         "external_npz_cut_absolute_e": True,
         "cut_lift_mm": 1.0,
-        "cut_wait_s": 1.0,
+        "cut_travel_delay_s": 1.0,
     }
 
     export_npz(commands, str(serial), **kwargs)
