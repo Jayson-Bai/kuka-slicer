@@ -10,6 +10,8 @@ from __future__ import annotations
 class RsiTimingAccumulator:
     """Accumulate the planned time represented by exported trajectory rows."""
 
+    _CATEGORIES = ("print", "travel", "wait", "cut")
+
     def __init__(self, dt: float):
         if dt <= 0.0:
             raise ValueError("dt must be > 0")
@@ -17,21 +19,28 @@ class RsiTimingAccumulator:
         self._time_s = 0.0
         self.trajectory_rows = 0
         self.event_rows_ignored = 0
+        self.event_counts = {}
+        self._category_time_s = {name: 0.0 for name in self._CATEGORIES}
         self.segments = []
         self._open_segment = None
 
-    def append_trajectory_time(self) -> float:
+    def append_trajectory_time(self, category: str = "print") -> float:
         """Record one RSI trajectory row and return its cumulative timestamp."""
+        if category not in self._category_time_s:
+            raise ValueError(f"unsupported timing category: {category}")
         value = self._time_s
         if self.trajectory_rows:
             self._time_s += self.dt
+            self._category_time_s[category] += self.dt
             value = self._time_s
         self.trajectory_rows += 1
         return value
 
-    def append_event_time(self) -> float:
+    def append_event_time(self, event_type: str = "") -> float:
         """Return the current timestamp for a non-time-consuming event row."""
         self.event_rows_ignored += 1
+        if event_type:
+            self.event_counts[event_type] = self.event_counts.get(event_type, 0) + 1
         return self._time_s
 
     def trajectory_time(self) -> float:
@@ -73,12 +82,32 @@ class RsiTimingAccumulator:
 
     def summary(self) -> dict:
         """Return JSON-ready timing metadata for the exported NPZ."""
+        tool_changes = (
+            self.event_counts.get("tool_change_cf", 0)
+            + self.event_counts.get("tool_change_resin", 0)
+        )
+        unquantified = sum(
+            self.event_counts.get(name, 0)
+            for name in (
+                "heat_cf", "heat_resin", "fan_cf", "fan_resin",
+                "extrude_reset",
+            )
+        )
         return {
             "format": "rsi_print_timing",
-            "version": 1,
+            "version": 2,
             "sample_period_s": self.dt,
             "total_planned_time_s": self._time_s,
             "trajectory_rows": self.trajectory_rows,
             "event_rows_ignored": self.event_rows_ignored,
+            "trajectory_time_breakdown_s": dict(self._category_time_s),
+            "event_counts": dict(self.event_counts),
+            "planned_print_motion_time_s": self._category_time_s["print"],
+            "planned_travel_time_s": self._category_time_s["travel"],
+            "planned_wait_time_s": self._category_time_s["wait"],
+            "planned_cut_time_s": self._category_time_s["cut"],
+            "planned_cut_count": self.event_counts.get("cut", 0),
+            "planned_tool_change_count": tool_changes,
+            "planned_unquantified_event_count": unquantified,
             "segments": list(self.segments),
         }

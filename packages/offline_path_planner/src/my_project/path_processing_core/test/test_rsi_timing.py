@@ -38,7 +38,7 @@ def test_summary_is_json_serializable_and_reports_total_time():
     summary = timing.summary()
 
     assert summary["format"] == "rsi_print_timing"
-    assert summary["version"] == 1
+    assert summary["version"] == 2
     assert summary["sample_period_s"] == 0.25
     assert summary["total_planned_time_s"] == 0.25
     assert summary["trajectory_rows"] == 2

@@ -155,6 +155,11 @@ def _validated_direct_tool_offset(
     return offset
 
 
+# Firmware CUT physical sequence duration (seconds): K1 descent 7.0,
+# MOS pulse1 1.0, rebound 0.3, MOS pulse2 1.0, K2 rise ~2.0.
+_CUT_FIRMWARE_TIME_S = 11.3
+
+
 def export_npz(
     parsed_commands: ParsedCommandList,
     output_path: str,
@@ -673,6 +678,7 @@ def export_npz(
     active_injection_role = 0
     pending_injection_block_id = -1
     pending_injection_role = 0
+    in_cut_sequence = False
 
     def _finalize_writer(key):
         writer = writers.get(key)
@@ -875,7 +881,12 @@ def export_npz(
             if not has_any:
                 timing.start_segment(path_id=path_id, move_type=gc.type, start_seq=seq)
             has_any = True
-            planned_time_s = timing.append_trajectory_time()
+            timing_category = (
+                "cut" if in_cut_sequence
+                else "print" if gc.type in ("PRINT", "PRINT_FIT")
+                else "travel"
+            )
+            planned_time_s = timing.append_trajectory_time(timing_category)
             row = CsvRow(
                 seq=seq,
                 x=pt.pos.x,
@@ -1620,8 +1631,11 @@ def export_npz(
 
     def _append_extrude_wait(
             cmd: ExtrudeWait, layer: int, subtype: str, occ: int, mark_path_end: bool = True,
-            injection_block_id: int = -1, injection_role: int = 0):
+            injection_block_id: int = -1, injection_role: int = 0,
+            timing_category: Optional[str] = None):
         nonlocal seq, processed_rows, last_pose, last_feedrate_mm_min
+        if timing_category is None:
+            timing_category = "cut" if in_cut_sequence else "wait"
         hold_row = last_pose or CsvRow(
             seq=seq,
             x=0.0,
@@ -1654,7 +1668,7 @@ def export_npz(
         )
         for i in range(1, steps + 1):
             ratio = i / steps
-            planned_time_s = timing.append_trajectory_time()
+            planned_time_s = timing.append_trajectory_time(timing_category)
             row = CsvRow(
                 seq=seq,
                 x=hold_row.x,
@@ -1756,7 +1770,8 @@ def export_npz(
                     layer=layer,
                     subtype=subtype,
                     raw="external_npz_reset_anchor",
-                ), layer, subtype, occ, mark_path_end=mark_path_end)
+                ), layer, subtype, occ, mark_path_end=mark_path_end,
+                timing_category="cut")
 
             _append_cut_reset_anchor()
             active_injection_role = injection_role_map["cut_event"]
@@ -1831,7 +1846,7 @@ def export_npz(
                     layer=layer,
                     subtype=subtype,
                     raw="external_npz_cut_retract_delay",
-                ), layer, subtype, occ, mark_path_end=False)
+                ), layer, subtype, occ, mark_path_end=False, timing_category="cut")
 
 
             # The reset at +L makes the equal retract a separate absolute
@@ -1847,7 +1862,7 @@ def export_npz(
                     layer=layer,
                     subtype=subtype,
                     raw="cut_safety_retract",
-                ), layer, subtype, occ, mark_path_end=False)
+                ), layer, subtype, occ, mark_path_end=False, timing_category="cut")
 
             _emit_event(_PendingEvent(
                 event_type="extrude_sync",
@@ -1868,7 +1883,7 @@ def export_npz(
                     layer=layer,
                     subtype=subtype,
                     raw="external_npz_cut_travel_delay",
-                ), layer, subtype, occ, mark_path_end=False)
+                ), layer, subtype, occ, mark_path_end=False, timing_category="cut")
 
             _append_cut_reset_anchor(mark_path_end=True)
             if injection_block_id > 0:
@@ -1904,7 +1919,7 @@ def export_npz(
                     layer=layer,
                     subtype=subtype,
                     raw="cut_wait",
-                ), layer, subtype, occ, mark_path_end=False)
+                ), layer, subtype, occ, mark_path_end=False, timing_category="cut")
             if total_retract_mm > 1e-9:
                 retract_feedrate = _next_retract_feedrate(command_index)
                 retract_speed = max(_feed_mm_s_from_feedrate(retract_feedrate), 1e-9)
@@ -1917,7 +1932,7 @@ def export_npz(
                     layer=layer,
                     subtype=subtype,
                     raw="cut_safety_retract",
-                ), layer, subtype, occ, mark_path_end=True)
+                ), layer, subtype, occ, mark_path_end=True, timing_category="cut")
             if injection_block_id > 0:
                 active_injection_block_id = -1
                 active_injection_role = 0
@@ -1977,7 +1992,7 @@ def export_npz(
                 layer=layer,
                 subtype=subtype,
                 raw="cut_wait_remaining",
-            ), layer, subtype, occ, mark_path_end=False)
+            ), layer, subtype, occ, mark_path_end=False, timing_category="cut")
 
         retract_feedrate = _next_retract_feedrate(command_index)
         retract_speed = max(_feed_mm_s_from_feedrate(retract_feedrate), 1e-9)
@@ -1990,7 +2005,7 @@ def export_npz(
             layer=layer,
             subtype=subtype,
             raw="cut_safety_retract",
-        ), layer, subtype, occ, mark_path_end=True)
+        ), layer, subtype, occ, mark_path_end=True, timing_category="cut")
         if injection_block_id > 0:
             active_injection_block_id = -1
             active_injection_role = 0
@@ -2019,7 +2034,7 @@ def export_npz(
             trigger_seq=None,
             path_id=_path_id_for(layer, subtype, occ),
         )
-        planned_time_s = timing.append_event_time()
+        planned_time_s = timing.append_event_time(ev.event_type)
         marker_block_id = injection_block_id
         marker_role = injection_role
         if marker_block_id < 0 and active_injection_block_id > 0:
@@ -2309,7 +2324,11 @@ def export_npz(
                 if occ == 0:
                     occ = _ensure_segment(cmd.layer, cmd.subtype)
                 if isinstance(cmd, MCommand) and cmd.code.upper() == "CUT":
-                    _append_cut_sequence(cmd, cmd.layer, cmd.subtype, occ, idx)
+                    in_cut_sequence = True
+                    try:
+                        _append_cut_sequence(cmd, cmd.layer, cmd.subtype, occ, idx)
+                    finally:
+                        in_cut_sequence = False
                 else:
                     ev = _mcommand_to_event(cmd, current_tool)
                     if ev:
@@ -2532,6 +2551,20 @@ def export_npz(
             (cut_retract_delay_s + cut_travel_delay_s)
             * int(timing_summary.get("planned_cut_count", 0))
         )
+        # Firmware physical CUT duration per event (K1 7s + dual MOS
+        # 2.3s + K2 ~2s).  The extrude_sync barriers cover this; it is
+        # additive to the trajectory rows and counted in the total.
+        timing_summary["cut_firmware_time_s"] = _CUT_FIRMWARE_TIME_S
+        timing_summary["planned_cut_firmware_time_s"] = (
+            _CUT_FIRMWARE_TIME_S
+            * int(timing_summary.get("planned_cut_count", 0))
+        )
+        # Legacy PrintTimingPlan/UiStatus fields: keep the same keys but
+        # report the firmware execution time so the displayed/injected
+        # totals match the new anchored-delay semantics.
+        timing_summary["cut_injected_wait_s"] = _CUT_FIRMWARE_TIME_S
+        timing_summary["planned_cut_injected_wait_time_s"] = (
+            timing_summary["planned_cut_firmware_time_s"])
         with open(timing_sidecar_path, "w", encoding="utf-8") as f:
             json.dump(timing_summary, f, ensure_ascii=False, indent=2)
     except Exception as exc:
