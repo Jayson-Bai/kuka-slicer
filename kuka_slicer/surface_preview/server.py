@@ -824,6 +824,20 @@ class SurfacePreviewHandler(BaseHTTPRequestHandler):
                 return
             self._send_json({"ok": True, **payload})
             return
+        if parsed.path == "/api/material-estimate":
+            try:
+                from ..conformal_lattice.material_estimate import estimate_material
+                params = parse_qs(parsed.query)
+                config = conformal_lattice_config_payload(params)
+                result = estimate_material(
+                    config,
+                    fiber_enabled=_query_bool(params, "material_fiber_enabled", True),
+                )
+            except (ValueError, TypeError, RuntimeError, OSError) as exc:
+                self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json({"ok": True, **result})
+            return
         if parsed.path == "/api/designer-state":
             self._send_json({"ok": True, "state": _load_designer_state(self.server.designer_state_path)})
             return
@@ -1045,7 +1059,19 @@ def surface_preview_html() -> str:
     .tipText + strong { display: block; margin-top: 10px; }
     .tipBubble .designSummary { margin-bottom: 0; box-shadow: none; }
     .subsectionLabel { margin: 9px 0 6px; padding-top: 8px; border-top: 1px solid #e6ecf4; color: #526074; font-size: 12px; font-weight: 600; }
-    .actionBar { display: flex; align-items: center; gap: 10px; margin-top: 10px; padding: 8px 10px; }
+    .materialBar { margin-top: 10px; padding: 12px 14px; background: linear-gradient(120deg, #f2f8ff 0%, #eef3fb 100%); border-color: #cfe0f2; }
+    .materialHeading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .materialHeading h2 { margin: 0; font-size: 14px; letter-spacing: .01em; }
+    .materialToggle { display: flex; align-items: center; gap: 7px; color: #40516a; font-size: 12px; white-space: nowrap; }
+    .materialToggle input { margin: 0; }
+    .materialSegmented { display: inline-flex; border: 1px solid #bdcadb; border-radius: 8px; overflow: hidden; background: #fff; }
+    .materialSegmented button { width: auto; min-width: 64px; min-height: 28px; margin: 0; padding: 3px 10px; border-radius: 0; background: #fff; color: #40516a; font: 600 12px inherit; }
+    .materialSegmented button + button { border-left: 1px solid #dbe3ef; }
+    .materialSegmented button.active { background: #126fd1; color: #fff; }
+    .materialValue { margin-top: 9px; font-size: 15px; line-height: 1.5; color: #142238; font-weight: 600; font-variant-numeric: tabular-nums; }
+    .materialValue.error { color: #b42318; font-weight: 500; }
+    .materialNote { margin: 7px 0 0; color: #66758b; font-size: 11.5px; line-height: 1.45; }
+    .actionBar { display: flex; align-items: center; gap: 10px; padding: 8px 10px; }
     .actionHeading { display: flex; align-items: center; gap: 8px; min-width: max-content; }
     .actionHeading h2 { margin: 0; font-size: 14px; }
     .exportActions { display: flex; justify-content: flex-end; gap: 7px; margin-left: auto; }
@@ -1232,6 +1258,18 @@ def surface_preview_html() -> str:
             <button type="button" class="secondary" id="reset">恢复示例参数</button>
           </div>
         </section>
+        <section class="panel materialBar" id="materialBar">
+          <div class="materialHeading">
+            <h2>材料用量</h2>
+            <div class="materialSegmented" role="group" aria-label="材料计算构型">
+              <button type="button" id="materialKindPlanar" class="active">平面件</button>
+              <button type="button" id="materialKindConformal">曲面件</button>
+            </div>
+            <label class="materialToggle"><input id="material_fiber_enabled" type="checkbox" checked> 包含纤维层</label>
+          </div>
+          <div id="materialEstimate" class="materialValue" role="status" aria-live="polite" aria-atomic="true">用料计算准备中…</div>
+          <p class="materialNote">按路径长度实时理论计算（树脂=长度×2 mm 宽×层高×倍率；纤维=长度×倍率），不对齐 NPZ。仅零件本体，不含裙边、预挤出、回抽及切丝损耗。</p>
+        </section>
       </form>
       <section class="panel preview">
         <div class="previewChrome">
@@ -1351,6 +1389,7 @@ def surface_preview_html() -> str:
     }
 
     function saveDesignerState() {
+      scheduleMaterialEstimate();
       const state = currentDesignerState();
       designerStateDirty = true;
       try {
@@ -2946,8 +2985,92 @@ def surface_preview_html() -> str:
       }));
     }
 
+    let materialTimer = null;
+    let materialRevision = 0;
+    let materialBusy = false;
+    let materialPending = false;
+    function scheduleMaterialEstimate() {
+      materialRevision++;
+      materialPending = true;
+      clearTimeout(materialTimer);
+      document.getElementById('materialEstimate').textContent = '参数已更新，正在计算用料…';
+      materialTimer = setTimeout(refreshMaterialEstimate, 450);
+    }
+    function syncMaterialKindButtons() {
+      const planar = document.getElementById('materialKindPlanar');
+      const conformal = document.getElementById('materialKindConformal');
+      const conformalActive = !planar.classList.contains('active');
+      const xInput = document.getElementById('curvature_x_enabled');
+      const yInput = document.getElementById('curvature_y_enabled');
+      xInput.checked = !conformalActive;
+      yInput.checked = !conformalActive;
+      planar.classList.toggle('active', !conformalActive);
+      conformal.classList.toggle('active', conformalActive);
+    }
+    async function refreshMaterialEstimate() {
+      if (materialBusy) return;
+      materialBusy = true;
+      materialPending = false;
+      const revision = materialRevision;
+      const element = document.getElementById('materialEstimate');
+      try {
+        const query = conformalParameters();
+        const conformal = !document.getElementById('materialKindPlanar').classList.contains('active');
+        query.set('curvature_x_enabled', String(!conformal));
+        query.set('curvature_y_enabled', String(!conformal));
+        query.set('material_fiber_enabled', String(document.getElementById('material_fiber_enabled').checked));
+        const response = await fetch(`/api/material-estimate?${query.toString()}`);
+        const result = await response.json();
+        if (revision !== materialRevision) return;
+        if (!response.ok || !result.ok) throw new Error(result.error || '用料计算失败');
+        element.className = 'materialValue';
+        element.textContent = `${result.design_label}（路径理论量）：理论树脂 ${(result.R.volume_mm3 / 1000).toFixed(3)} cm³（1.75 mm 丝材 ${(result.R.feed_mm / 1000).toFixed(3)} m）；纤维 ${(result.F.feed_mm / 1000).toFixed(3)} m。树脂 ${result.R.layer_count} 层，纤维 ${result.F.layer_count} 层。`;
+        element.title = `参数来源：${result.core_params_source}；校验码：${result.core_params_sha256}`;
+      } catch (error) {
+        if (revision === materialRevision) {
+          element.className = 'materialValue error';
+          element.textContent = `用料未更新：${error.message}`;
+        }
+      } finally {
+        materialBusy = false;
+        if (materialPending) materialTimer = setTimeout(refreshMaterialEstimate, 450);
+      }
+    }
+    document.getElementById('materialKindPlanar').addEventListener('click', () => {
+      if (!document.getElementById('materialKindPlanar').classList.contains('active')) {
+        document.getElementById('materialKindPlanar').classList.add('active');
+        document.getElementById('materialKindConformal').classList.remove('active');
+        document.getElementById('curvature_x_enabled').checked = false;
+        document.getElementById('curvature_y_enabled').checked = false;
+        saveDesignerState();
+        scheduleRefresh();
+        scheduleMaterialEstimate();
+      }
+    });
+    document.getElementById('materialKindConformal').addEventListener('click', () => {
+      if (!document.getElementById('materialKindConformal').classList.contains('active')) {
+        document.getElementById('materialKindConformal').classList.add('active');
+        document.getElementById('materialKindPlanar').classList.remove('active');
+        document.getElementById('curvature_x_enabled').checked = true;
+        document.getElementById('curvature_y_enabled').checked = true;
+        saveDesignerState();
+        scheduleRefresh();
+        scheduleMaterialEstimate();
+      }
+    });
+    ['curvature_x_enabled', 'curvature_y_enabled'].forEach((id) => {
+      document.getElementById(id).addEventListener('change', () => {
+        const conformal = document.getElementById('curvature_x_enabled').checked || document.getElementById('curvature_y_enabled').checked;
+        document.getElementById('materialKindPlanar').classList.toggle('active', !conformal);
+        document.getElementById('materialKindConformal').classList.toggle('active', conformal);
+      });
+    });
+    document.getElementById('material_fiber_enabled').addEventListener('change', scheduleMaterialEstimate);
+    window.addEventListener('focus', scheduleMaterialEstimate);
+
     async function refresh() {
       const sequence = ++queued;
+      scheduleMaterialEstimate();
       statusEl.className = 'status';
       statusEl.textContent = '正在更新曲面…';
       try {
@@ -3223,6 +3346,7 @@ def surface_preview_html() -> str:
       document.getElementById('honeycomb_align_x').checked = false;
       document.getElementById('honeycomb_align_y').checked = false;
       syncSurfaceParameterControls();
+      syncMaterialKindButtons();
       syncTransitionStepInput();
       syncSpecimenVariantControls();
       syncInspectionPointControls();
