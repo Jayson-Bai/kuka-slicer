@@ -1821,13 +1821,6 @@ def export_npz(
                     lift_gc, layer, subtype, occ, mark_path_end=False
                 )
 
-            _emit_event(_PendingEvent(
-                event_type="extrude_sync",
-                payload=sync_payload(current_tool, lift_mm, wait_s),
-                src_line=cmd.line or 0,
-                tool_id=current_tool,
-            ), layer, subtype, occ)
-
             _append_extrude_wait(ExtrudeWait(
                 type="EXTRUDE_WAIT",
                 wait_sec=lift_settle_s,
@@ -1838,6 +1831,14 @@ def export_npz(
                 subtype=subtype,
                 raw="external_npz_cut_lift_settle",
             ), layer, subtype, occ, mark_path_end=False)
+
+            _emit_event(_PendingEvent(
+                event_type="extrude_sync",
+                payload=sync_payload(current_tool, lift_mm, wait_s),
+                src_line=cmd.line or 0,
+                tool_id=current_tool,
+            ), layer, subtype, occ)
+
 
             # The reset at +L makes the equal retract a separate absolute
             # interval 0..-L instead of allowing it to inherit lift E.
@@ -1854,13 +1855,6 @@ def export_npz(
                     raw="cut_safety_retract",
                 ), layer, subtype, occ, mark_path_end=False)
 
-            _emit_event(_PendingEvent(
-                event_type="extrude_sync",
-                payload=sync_payload(current_tool, -lift_mm, wait_s),
-                src_line=cmd.line or 0,
-                tool_id=current_tool,
-            ), layer, subtype, occ)
-
             _append_extrude_wait(ExtrudeWait(
                 type="EXTRUDE_WAIT",
                 wait_sec=retract_settle_s,
@@ -1871,6 +1865,14 @@ def export_npz(
                 subtype=subtype,
                 raw="external_npz_cut_retract_settle",
             ), layer, subtype, occ, mark_path_end=False)
+
+            _emit_event(_PendingEvent(
+                event_type="extrude_sync",
+                payload=sync_payload(current_tool, -lift_mm, wait_s),
+                src_line=cmd.line or 0,
+                tool_id=current_tool,
+            ), layer, subtype, occ)
+
 
             lift_duration_s = lift_mm / lift_speed
             retract_duration_s = lift_mm / retract_speed
