@@ -408,6 +408,8 @@ def source_job_to_parsed_commands(job: SourceJob, params: ProcessParams) -> Pars
                     line,
                     layer.index,
                     subtype,
+                    length_mm=(params.resin.layer_start_prime_mm
+                               if is_resin_source_path and resin_path_number == 0 else None),
                 ):
                     commands.append(wait)
                     current_e += wait.delta_e
@@ -473,7 +475,10 @@ def source_job_to_parsed_commands(job: SourceJob, params: ProcessParams) -> Pars
                         line += 1
 
             if material_path.material != "F":
-                for wait in _path_retract_waits(material_path.material, params, line, layer.index, subtype):
+                for wait in _path_retract_waits(
+                    material_path.material, params, line, layer.index, subtype,
+                    length_mm=params.resin.layer_end_retract_mm if is_last_resin_in_layer else None,
+                ):
                     commands.append(wait)
                     current_e += wait.delta_e
                     line += 1
@@ -712,20 +717,22 @@ def _path_prime_waits(
     line: int,
     layer: int,
     subtype: str,
+    *,
+    length_mm: float | None = None,
 ) -> list[ExtrudeWait]:
     process = _process_params_for_material(material, params)
     prime = _make_extrude_wait(
-        delta_e=float(process.prime_length_mm),
+        delta_e=float(process.prime_length_mm if length_mm is None else length_mm),
         speed_mm_s=float(process.prime_speed_mm_s),
         line=line,
         layer=layer,
         subtype=subtype,
         raw="external_npz_prime",
     )
-    if prime is None:
+    if prime is None and (length_mm is None or process.prime_length_mm <= 0.0):
         return []
 
-    waits = [prime]
+    waits = [prime] if prime is not None else []
     settle_s = float(params.prime_settle_s)
     if settle_s > 0.0:
         waits.append(
@@ -733,7 +740,7 @@ def _path_prime_waits(
                 type="EXTRUDE_WAIT",
                 wait_sec=settle_s,
                 delta_e=0.0,
-                feedrate=prime.feedrate,
+                feedrate=float(process.prime_speed_mm_s) * 60.0,
                 line=line + 1,
                 layer=layer,
                 subtype=subtype,
@@ -799,10 +806,11 @@ def _path_retract_waits(
     subtype: str,
     *,
     raw: str = "external_npz_retract",
+    length_mm: float | None = None,
 ) -> list[ExtrudeWait]:
     process = _process_params_for_material(material, params)
     retract = _make_extrude_wait(
-        delta_e=-float(process.retract_length_mm),
+        delta_e=-float(process.retract_length_mm if length_mm is None else length_mm),
         speed_mm_s=float(process.retract_speed_mm_s),
         line=line,
         layer=layer,

@@ -2647,6 +2647,14 @@ def _parse_core_process_params(
         prime_speed_mm_s=_float_param(params, "core_resin_prime_speed", resin_defaults.prime_speed_mm_s),
         retract_length_mm=_float_param(params, "core_resin_retract_length", resin_defaults.retract_length_mm),
         retract_speed_mm_s=_float_param(params, "core_resin_retract_speed", resin_defaults.retract_speed_mm_s),
+        layer_start_prime_mm=(
+            _optional_float_param(params, "core_resin_layer_start_prime")
+            if "core_resin_layer_start_prime" in params else resin_defaults.layer_start_prime_mm
+        ),
+        layer_end_retract_mm=(
+            _optional_float_param(params, "core_resin_layer_end_retract")
+            if "core_resin_layer_end_retract" in params else resin_defaults.layer_end_retract_mm
+        ),
         e_per_mm_override=_optional_float_param(params, "core_resin_e_override"),
     )
     fiber = module.FiberProcessParams(
@@ -6000,7 +6008,10 @@ def _index_html() -> str:
                 <div class="fieldGroup"><label for="coreResinPrimeSpeed">预挤出速度 mm/s</label><input id="coreResinPrimeSpeed" type="number" min="0.001" step="0.001" value="15"></div>
                 <div class="fieldGroup"><label for="coreResinRetractLength">回抽长度 mm</label><input id="coreResinRetractLength" type="number" min="0" step="0.001" value="15"></div>
                 <div class="fieldGroup"><label for="coreResinRetractSpeed">回抽速度 mm/s</label><input id="coreResinRetractSpeed" type="number" min="0.001" step="0.001" value="30"></div>
+                <div class="fieldGroup"><label for="coreResinLayerStartPrime">每层实体首条预挤出 mm E</label><input id="coreResinLayerStartPrime" type="number" min="0" step="0.001" placeholder="沿用常规预挤出长度"></div>
+                <div class="fieldGroup"><label for="coreResinLayerEndRetract">每层实体末条回抽 mm E</label><input id="coreResinLayerEndRetract" type="number" min="0" step="0.001" placeholder="沿用常规回抽长度"></div>
               </div>
+              <p class="notice">以上两项仅覆盖每层实体第一条树脂路径前的预挤出、最后一条树脂路径后的回抽，不含 Primeline；留空沿用常规长度，0 取消该处挤出动作，速度沿用常规参数。</p>
             </div>
           </section>
 
@@ -6362,6 +6373,7 @@ def _index_html() -> str:
         'coreResinLayerHeight', 'coreResinExtrusionScale', 'coreResinFeed',
         'coreResinFirstLayerFeed', 'coreResinTemp', 'coreResinPrimeLength',
         'coreResinPrimeSpeed', 'coreResinRetractLength', 'coreResinRetractSpeed',
+        'coreResinLayerStartPrime', 'coreResinLayerEndRetract',
         'coreResinEOverride', 'coreFiberLayerHeight', 'coreFiberExtrusionScale',
         'coreFiberFeed', 'coreFiberFirstLayerFeed', 'coreFiberTemp',
         'coreFiberPrimeLength', 'coreFiberPrimeSpeed', 'coreFiberRetractLength',
@@ -6678,6 +6690,8 @@ def _index_html() -> str:
       ['coreResinPrimeSpeed', 'core_resin_prime_speed', 'resin', 'prime_speed_mm_s'],
       ['coreResinRetractLength', 'core_resin_retract_length', 'resin', 'retract_length_mm'],
       ['coreResinRetractSpeed', 'core_resin_retract_speed', 'resin', 'retract_speed_mm_s'],
+      ['coreResinLayerStartPrime', 'core_resin_layer_start_prime', 'resin', 'layer_start_prime_mm'],
+      ['coreResinLayerEndRetract', 'core_resin_layer_end_retract', 'resin', 'layer_end_retract_mm'],
       ['coreResinEOverride', 'core_resin_e_override', 'resin', 'e_per_mm_override'],
       ['coreFiberLayerHeight', 'core_fiber_layer_height', 'fiber', 'layer_height_mm'],
       ['coreFiberExtrusionScale', 'core_fiber_extrusion_scale', 'fiber', 'extrusion_scale'],
@@ -7456,6 +7470,7 @@ def _index_html() -> str:
          'coreResinLayerHeight', 'coreResinExtrusionScale', 'coreResinFeed',
          'coreResinFirstLayerFeed', 'coreResinTemp', 'coreResinPrimeLength',
          'coreResinPrimeSpeed', 'coreResinRetractLength', 'coreResinRetractSpeed',
+         'coreResinLayerStartPrime', 'coreResinLayerEndRetract',
          'coreResinEOverride', 'coreFiberLayerHeight', 'coreFiberExtrusionScale',
          'coreFiberFeed', 'coreFiberFirstLayerFeed', 'coreFiberTemp',
          'coreFiberPrimeLength', 'coreFiberPrimeSpeed', 'coreFiberRetractLength',
