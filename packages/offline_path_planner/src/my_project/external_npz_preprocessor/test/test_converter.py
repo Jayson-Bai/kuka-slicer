@@ -66,7 +66,7 @@ def _travel_moves(commands):
 
 
 @pytest.mark.parametrize("with_source_travel", [False, True])
-def test_resin_layer_end_wipe_retraces_five_mm_after_retract(with_source_travel):
+def test_resin_layer_end_wipe_moves_five_mm_toward_nearest_y_boundary_after_retract(with_source_travel):
     source_travels = (
         [TravelPath(order=0, points=_path("R", [[0, 0, 0.5], [1, 0, 0.5]]).points)]
         if with_source_travel else []
@@ -85,8 +85,7 @@ def test_resin_layer_end_wipe_retraces_five_mm_after_retract(with_source_travel)
         and cmd.raw == "external_npz_resin_layer_end_wipe"
     ]
     assert [(cmd.start_pos.x, cmd.start_pos.y, cmd.pos.x, cmd.pos.y) for cmd in wipes] == [
-        (pytest.approx(4.0), pytest.approx(3.0), pytest.approx(4.0), pytest.approx(0.0)),
-        (pytest.approx(4.0), pytest.approx(0.0), pytest.approx(2.0), pytest.approx(0.0)),
+        (pytest.approx(4.0), pytest.approx(3.0), pytest.approx(4.0), pytest.approx(8.0)),
     ]
     assert all(cmd.delta_e == 0.0 for cmd in wipes)
     retract_index = max(
@@ -101,7 +100,7 @@ def test_resin_layer_end_wipe_retraces_five_mm_after_retract(with_source_travel)
     assert next_move.start_pos == wipes[-1].pos
 
 
-def test_short_resin_stroke_wipe_stops_at_start_without_zero_length_move():
+def test_short_resin_stroke_still_wipes_full_five_mm_in_y():
     commands = source_job_to_parsed_commands(
         _job(
             resin_paths=[_path("R", [[0, 0, 0.5], [0, 0, 0.5], [3, 0, 0.5]])],
@@ -116,7 +115,23 @@ def test_short_resin_stroke_wipe_stops_at_start_without_zero_length_move():
     ]
     assert len(wipes) == 1
     assert wipes[0].start_pos.x == pytest.approx(3.0)
-    assert wipes[0].pos.x == pytest.approx(0.0)
+    assert wipes[0].pos.x == pytest.approx(3.0)
+    assert wipes[0].pos.y - wipes[0].start_pos.y == pytest.approx(5.0)
+
+
+@pytest.mark.parametrize("end_y,expected_delta", [(0, -5), (20, 5), (10, 5)])
+def test_y_wipe_uses_whole_layer_bounds_and_preserves_endpoint_z_and_abc(end_y, expected_delta):
+    commands = source_job_to_parsed_commands(
+        _job(resin_paths=[
+            _path("R", [[0, 0, 0.5, 0, 0, 0], [2, 20, 0.5, 0, 0, 0]]),
+            _path("R", [[4, 11, 0.6, 1, 2, 3], [6, end_y, 0.9, 4, 5, 6]]),
+        ], fiber_paths=[_path("F", [[8, 1, 1], [9, 1, 1]])]),
+        ProcessParams(primeline_enabled=True),
+    )
+    wipe = next(cmd for cmd in commands if getattr(cmd, "raw", "") == "external_npz_resin_layer_end_wipe")
+    assert wipe.pos.y - wipe.start_pos.y == pytest.approx(expected_delta)
+    for name in ("x", "z", "a", "b", "c"):
+        assert getattr(wipe.pos, name) == getattr(wipe.start_pos, name)
 
 
 @pytest.mark.parametrize("feed", [0.0, -1.0, float("nan"), float("inf")])

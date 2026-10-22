@@ -85,7 +85,9 @@ def test_invalid_reference_settings_rejected(overrides, match):
         conformal_lattice_config_payload(baseline(**overrides))
 
 
-def test_preview_matches_exported_continuous_geometry():
+@pytest.mark.parametrize("edge", [8, 10, 12])
+@pytest.mark.parametrize("phase", ["centered", "bending_zigzag_midline"])
+def test_preview_matches_exported_continuous_geometry(edge, phase):
     node = shutil.which("node")
     if node is None:
         pytest.skip("Node.js is needed to execute the actual preview function")
@@ -105,9 +107,13 @@ def test_preview_matches_exported_continuous_geometry():
     console.log(JSON.stringify({ anchor: plan.latticeAnchorMm,
       paths: plan.courses.flatMap((c) => c.fragments) }));
     """
+    script = script.replace("base_cell_size_mm: 10", f"base_cell_size_mm: {edge}")
+    script = script.replace("'bending_zigzag_midline'", json.dumps(phase))
     result = subprocess.run([node, "-e", script], input=surface_preview_html(), text=True, encoding="utf-8", capture_output=True, check=True)
     preview = json.loads(result.stdout)
-    plan = build_continuous_course_plan(load_conformal_lattice_spec(conformal_lattice_config_payload(baseline())))
+    plan = build_continuous_course_plan(load_conformal_lattice_spec(conformal_lattice_config_payload(
+        baseline(base_cell_size_mm=edge, continuous_course_phase=phase)
+    )))
     assert preview["anchor"] == pytest.approx(plan.lattice_anchor_mm)
     # Both implementations emit the same clipped polylines in course order.
     for browser_path, exported_path in zip(preview["paths"], plan.paths_xy, strict=True):

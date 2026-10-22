@@ -2360,22 +2360,21 @@ def surface_preview_html() -> str:
         .sort((first, second) => first - second);
       mainRows.slice(1).forEach((upperRow, index) => {
         const lowerRow = mainRows[index];
-        const lowerCenterY = recordsByRow.get(lowerRow)[0].center[1];
-        const upperCenterY = recordsByRow.get(upperRow)[0].center[1];
-        const gapLowerY = lowerCenterY + hexHalfHeight;
-        const gapUpperY = upperCenterY - hexHalfHeight;
-        if (gapLowerY < poreClipBounds[1] - 1e-7 || gapUpperY > poreClipBounds[3] + 1e-7) return;
+        // Clip first: an opening outside the contour inset may still own
+        // supported boundary fragments. Match the manufacturing planner.
         const lowerPoints = analyticRowCourse(lowerRow + 0.5, 'lower');
         const upperPoints = analyticRowCourse(lowerRow + 0.5, 'upper');
-        courses.push({
+        const lowerFragments = clippedCourseFragments(lowerPoints);
+        const upperFragments = clippedCourseFragments(upperPoints);
+        if (lowerFragments.length) courses.push({
           points: lowerPoints,
-          fragments: clippedCourseFragments(lowerPoints),
+          fragments: lowerFragments,
           railOffsetsMm: [0],
           opening: { lowerRow, upperRow, lane: 'lower', capacity: 2 },
         });
-        courses.push({
+        if (upperFragments.length) courses.push({
           points: upperPoints,
-          fragments: clippedCourseFragments(upperPoints),
+          fragments: upperFragments,
           railOffsetsMm: [0],
           opening: { lowerRow, upperRow, lane: 'upper', capacity: 2 },
         });

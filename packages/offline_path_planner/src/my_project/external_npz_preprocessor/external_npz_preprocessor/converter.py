@@ -490,7 +490,10 @@ def source_job_to_parsed_commands(job: SourceJob, params: ProcessParams) -> Pars
                 line += 1
             current_e = 0.0
             if is_last_resin_in_layer and fiber_path_count:
-                for wipe_target in _resin_layer_end_wipe_targets(source_positions):
+                layer_y = np.concatenate([path.points[:, 1] for path in layer.resin_paths])
+                y_offset = float(params.start_y_mm) - source_min_y
+                y_bounds = (float(layer_y.min()) + y_offset, float(layer_y.max()) + y_offset)
+                for wipe_target in _resin_layer_end_wipe_targets(source_positions, y_bounds):
                     start_pose = current_pose
                     assert start_pose is not None
                     commands.append(
@@ -938,34 +941,14 @@ def _job_source_xy_min(job: SourceJob) -> tuple[float, float]:
     return (0.0 if min_x is None else min_x, 0.0 if min_y is None else min_y)
 
 
-def _resin_layer_end_wipe_targets(source_positions: list[Position]) -> list[Position]:
-    """Retrace at most 5 mm of the final deposited resin stroke."""
-    remaining = _RESIN_LAYER_END_WIPE_MM
-    targets: list[Position] = []
-    current = source_positions[-1]
-    for previous in reversed(source_positions[:-1]):
-        segment_length = _distance(current, previous)
-        if segment_length <= _EPS:
-            continue
-        if segment_length <= remaining + _EPS:
-            target = previous
-            remaining -= segment_length
-        else:
-            fraction = remaining / segment_length
-            target = Position(
-                x=current.x + (previous.x - current.x) * fraction,
-                y=current.y + (previous.y - current.y) * fraction,
-                z=current.z + (previous.z - current.z) * fraction,
-                a=current.a + (previous.a - current.a) * fraction,
-                b=current.b + (previous.b - current.b) * fraction,
-                c=current.c + (previous.c - current.c) * fraction,
-            )
-            remaining = 0.0
-        targets.append(target)
-        current = target
-        if remaining <= _EPS:
-            break
-    return targets
+def _resin_layer_end_wipe_targets(
+    source_positions: list[Position], y_bounds: tuple[float, float],
+) -> list[Position]:
+    """Move exactly 5 mm toward the nearer layer Y boundary; a tie uses +Y."""
+    end = source_positions[-1]
+    low, high = y_bounds
+    direction = -1.0 if abs(end.y - low) < abs(high - end.y) else 1.0
+    return [replace(end, y=end.y + direction * _RESIN_LAYER_END_WIPE_MM)]
 
 
 def _offset_source_position(

@@ -277,7 +277,9 @@ def test_production_continuous_courses_replace_only_legacy_honeycomb_and_keep_gr
     )
     assert run.path_graph is not None
     assert run.continuous_course_plan is not None
-    assert len(run.continuous_course_plan.paths_xy) == 6
+    # Six through-courses plus twelve supported boundary fragments. Openings
+    # outside the inset must not discard printable parts of their rails.
+    assert len(run.continuous_course_plan.paths_xy) == 18
     assert run.continuous_course_plan.course_bounds_mm == pytest.approx((25.0, 0.0, 125.0, 50.0))
     assert run.continuous_course_plan.row_pitch_mm - np.sqrt(3.0) * 6.0 == pytest.approx(4.0)
     assert all(np.all(np.diff(path[:, 0]) >= -1e-9) for path in run.continuous_course_plan.paths_xy)
@@ -292,7 +294,7 @@ def test_production_continuous_courses_replace_only_legacy_honeycomb_and_keep_gr
         fiber_e_per_mm=1.0,
     )
 
-    assert result.paths_per_layer == 6
+    assert result.paths_per_layer == 18
     first_layer_travel = next(group for group in source_job.travel_paths if group.layer_index == 0)
     resin = next(group for group in source_job.material_paths if group.material == "R" and group.layer_index == 0)
     # Every independent deposition path now receives an explicit route.  The
@@ -305,23 +307,26 @@ def test_production_continuous_courses_replace_only_legacy_honeycomb_and_keep_gr
             assert not (25.0 + 1e-7 < midpoint[0] < 125.0 - 1e-7 and 1e-7 < midpoint[1] < 50.0 - 1e-7)
     roles = source_job.meta["path_roles"]["R"]["0"]
     assert "conformal_honeycomb_macro_partition" not in roles
-    assert roles.count("conformal_continuous_course_fragment") == 6
+    assert roles.count("conformal_continuous_course_fragment") == 18
     assert "conformal_outer_boundary" in roles
     assert roles.count("conformal_partition_wall") == 2
     assert roles.count("conformal_grip_zigzag_x_one_stroke") == 2
     resin = next(group for group in source_job.material_paths if group.material == "R" and group.layer_index == 0)
     courses = [path for path, role in zip(resin.paths, roles) if role == "conformal_continuous_course_fragment"]
-    assert len(courses) == 6
-    # Serpentine ordering may reverse independent courses to avoid a diagonal
-    # inter-course Travel; their geometric endpoints remain the same sides.
-    assert all({round(float(path[0, 0]), 6), round(float(path[-1, 0]), 6)} == {25.0, 125.0} for path in courses)
+    assert len(courses) == 18
+    # Through-courses retain their original endpoints; added fragments land
+    # on the work boundary and remain independent material paths.
+    assert sum({round(float(path[0, 0]), 6), round(float(path[-1, 0]), 6)} == {25.0, 125.0} for path in courses) == 6
+    assert all(any(np.isclose(point[0], x) for x in (25.0, 125.0))
+               or any(np.isclose(point[1], y) for y in (0.0, 50.0))
+               for path in courses for point in path[[0, -1]])
     assert all(abs(np.diff(path[:, 0])).max() > 0.0 for path in courses)
     selected_layer = result.resin_layer_indices[0]
     selected_roles = source_job.meta["path_roles"]["R"][str(selected_layer)]
     selected_resin = next(group for group in source_job.material_paths if group.material == "R" and group.layer_index == selected_layer)
     selected_courses = [path for path, role in zip(selected_resin.paths, selected_roles) if role == "conformal_continuous_course_fragment"]
     fiber = next(group for group in source_job.material_paths if group.material == "F" and group.layer_index == selected_layer)
-    assert len(fiber.paths) == len(selected_courses) == 6
+    assert len(fiber.paths) == len(selected_courses) == 18
     for resin_path, fiber_path in zip(selected_courses, fiber.paths):
         np.testing.assert_allclose(resin_path[:, :2], fiber_path[:, :2])
 
@@ -1396,6 +1401,27 @@ def test_main_ui_parses_tcp_orientation_speed_into_core_params():
     )
 
     assert params.max_tcp_orientation_speed_deg_s == pytest.approx(37.5)
+
+
+def test_main_ui_parses_cut_settle_into_core_export_params():
+    _ensure_offline_planner_import_paths()
+    module = importlib.import_module("external_npz_preprocessor.process_params")
+
+    params = _parse_core_process_params(
+        {
+            "core_cut_wait": ["15"],
+            "core_cut_settle": ["1.25"],
+        },
+        module,
+    )
+
+    assert params.export.cut_wait_s == pytest.approx(15.0)
+    assert params.export.cut_settle_s == pytest.approx(1.25)
+    html = _index_html()
+    assert 'id="coreCutLiftSettle"' in html
+    assert 'id="coreCutRetractSettle"' in html
+    assert "CUT 回抽前保持 s" in html
+    assert "CUT 回抽后保持 s" in html
 
 
 def test_offline_slicer_always_exports_a_zero_offset_base_contract():

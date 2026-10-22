@@ -780,13 +780,21 @@ def _preview_payload_from_final_core_npz(
             has_tool_orientation = has_tool_orientation or include_abc
             print_codes = _core_move_type_codes(data)
             is_print = np.isin(move_type, list(print_codes))
+            wipe_codes = {
+                int(value) for key, value in zip(
+                    data["core_injection_role_vocab_keys"], data["core_injection_role_vocab_vals"],
+                ) if (key.decode() if isinstance(key, bytes) else str(key)) == "resin_layer_end_wipe"
+            } if "core_injection_role_vocab_keys" in data.files else set()
+            is_wipe = (np.isin(data["core_injection_role"], list(wipe_codes)) & ~is_print
+                       if wipe_codes and "core_injection_role" in data.files else np.zeros(count, dtype=bool))
             indices = np.flatnonzero(valid)
             start = 0
             while start < len(indices):
                 first = int(indices[start])
                 is_fiber = bool(is_print[first] and tool_id[first] == 1)
                 is_resin = bool(is_print[first] and not is_fiber)
-                role = "fiber" if is_fiber else "final_resin" if is_resin else "travel"
+                role = "fiber" if is_fiber else "final_resin" if is_resin else "resin_wipe" if is_wipe[first] else "travel"
+                is_travel = not (is_fiber or is_resin)
                 end = start + 1
                 while end < len(indices):
                     previous = int(indices[end - 1])
@@ -796,6 +804,7 @@ def _preview_payload_from_final_core_npz(
                     current_role = (
                         "fiber" if current_is_fiber
                         else "final_resin" if current_is_resin
+                        else "resin_wipe" if is_wipe[current]
                         else "travel"
                     )
                     same_path = path_id[current] == path_id[first]
@@ -821,7 +830,7 @@ def _preview_payload_from_final_core_npz(
                     end += 1
 
                 segment_indices = indices[start:end]
-                is_stationary_process = role != "travel" and bool(
+                is_stationary_process = not is_travel and bool(
                     np.ptp(x[segment_indices]) <= 1e-9
                     and np.ptp(y[segment_indices]) <= 1e-9
                     and np.ptp(z[segment_indices]) <= 1e-9
@@ -831,17 +840,17 @@ def _preview_payload_from_final_core_npz(
                     point_columns.extend((a[segment_indices], b[segment_indices], c[segment_indices]))
                 point_array = np.column_stack(point_columns)
                 if len(point_array) and not is_stationary_process:
-                    if role != "travel" and float(np.ptp(z[segment_indices])) > 1e-7:
+                    if not is_travel and float(np.ptp(z[segment_indices])) > 1e-7:
                         has_curved_deposition = True
                     segment_extrusion = (
                         extrusion[segment_indices]
-                        if role != "travel" and extrusion is not None
+                        if not is_travel and extrusion is not None
                         else None
                     )
                     # Measure the exported deposition samples before preview
                     # simplification. Travel/process lifts must not become a
                     # material's layer height, and curved layers need a range.
-                    if role != "travel":
+                    if not is_travel:
                         height_indices = np.arange(len(segment_indices))
                         if segment_extrusion is not None:
                             depositing_edges = np.flatnonzero(np.diff(segment_extrusion) > 1e-12)
@@ -878,12 +887,12 @@ def _preview_payload_from_final_core_npz(
                             source_extrusion,
                             max_points=_FINAL_CORE_PREVIEW_MAX_POINTS,
                         )
-                        if role != "travel"
+                        if not is_travel
                         else [(points, None)]
                     )
                     for chunk_points, chunk_extrusion in chunks:
                         entry: dict[str, object] = {
-                            "kind": "deposit" if role != "travel" else "travel",
+                            "kind": "travel" if is_travel else "deposit",
                             "role": role,
                             "points": chunk_points,
                             "path_id": int(path_id[first]),
@@ -913,7 +922,7 @@ def _preview_payload_from_final_core_npz(
             entry["points"] for entry in entries if entry["role"] == "fiber"
         ]
         travel_paths = [
-            entry["points"] for entry in entries if entry["role"] == "travel"
+            entry["points"] for entry in entries if entry["role"] in {"travel", "resin_wipe"}
         ]
         layers.append(
             {
@@ -1089,7 +1098,7 @@ def _core_preview_overlay_from_commands(
                         "order": sequence_order,
                     }
                 )
-        elif raw in {"external_npz_travel", "external_npz_layer_lift"}:
+        elif raw in {"external_npz_travel", "external_npz_layer_lift", "external_npz_resin_layer_end_wipe"}:
             points = [
                 _preview_position(getattr(command, "start_pos"), xy_offset),
                 _preview_position(getattr(command, "pos"), xy_offset),
@@ -1099,7 +1108,7 @@ def _core_preview_overlay_from_commands(
                 role = "layer_lift"
             else:
                 core_travel_paths.append({"layer": layer, "points": points})
-                role = "core_travel"
+                role = "resin_wipe" if raw == "external_npz_resin_layer_end_wipe" else "core_travel"
             sequence.append(
                 {
                     "layer": layer,

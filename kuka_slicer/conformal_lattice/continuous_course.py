@@ -51,8 +51,9 @@ def build_continuous_course_plan(spec: ConformalLatticeSpec) -> ContinuousCourse
 
     A complete horizontal opening supplies two directed rails.  Each rail runs
     on one analytic half-pore support, so every inclined 2 mm channel has one
-    owner.  We only retain openings whose yellow horizontal boundaries fit
-    inside the contour inset, exactly matching the visible-preview rule.
+    owner.  Clip every parent rail before testing fragment support: an
+    opening outside the contour inset can still supply printable boundary
+    fragments inside the working region.
     """
 
     if not spec.part:
@@ -117,13 +118,6 @@ def build_continuous_course_plan(spec: ConformalLatticeSpec) -> ContinuousCourse
 
     paths: list[np.ndarray] = []
     for lower_row in range(row_min, row_max):
-        upper_row = lower_row + 1
-        lower_centre_y = row_origin + lower_row * row_pitch
-        upper_centre_y = row_origin + upper_row * row_pitch
-        gap_lower_y = lower_centre_y + half_height
-        gap_upper_y = upper_centre_y - half_height
-        if gap_lower_y < pore_bounds[1] - _EPSILON or gap_upper_y > pore_bounds[3] + _EPSILON:
-            continue
         interleaved_row = lower_row + 0.5
         for side in ("lower", "upper"):
             fragments = _clip_polyline_to_bounds(half_pore(interleaved_row, side), bounds)
@@ -132,9 +126,8 @@ def build_continuous_course_plan(spec: ConformalLatticeSpec) -> ContinuousCourse
                 # A rectangle corner can graze just the final diagonal of a
                 # parent route.  That sub-millimetre tip is neither a complete
                 # horizontal opening nor a usable one-tow channel.  Keep only
-                # fragments containing a finite horizontal support; this
-                # yields the intended three upper and three lower boundary
-                # courses for the reference layout, rather than four tips.
+                # fragments containing a finite horizontal support, including
+                # those supplied by parent openings outside the part.
                 if _has_horizontal_channel_support(simplified):
                     paths.append(simplified)
     if not paths:
