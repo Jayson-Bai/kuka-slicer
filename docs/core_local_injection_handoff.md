@@ -1,6 +1,6 @@
 # 上位机侧 Core NPZ 局部注入交接文档
 
-版本：`core_npz_local_injection_v1`  
+版本：`core_npz_local_injection_v2`
 适用分支：`merged_core`  
 目标：上位机现场修改机械参数时，只对最终 Core NPZ 的局部区域进行注入，不重新执行 Prusa 切片，也不重新运行完整 Core。
 
@@ -96,6 +96,7 @@ with np.load(path, allow_pickle=False) as data:
 | 6 | `cut_post` | CUT 后的连接 travel |
 | 7 | `post_anchor` | 下一条有效打印路径的首个锚点行 |
 | 8 | `resin_z_compensation` | 树脂 Z 补偿 travel 行 |
+| 9 | `tool_change_bridge` | 换头事件高位到下一路径起点的单段连接 travel |
 
 每个分块 NPZ 都包含相同的 manifest 和 role vocabulary；行 marker 只对应本分块中的行，但 block ID 和 `seq` 是全局的。
 
@@ -109,6 +110,7 @@ resin_z_print_compensation_mm
 tool_change_safe_lift_mm
 cut_lift_mm
 cut_wait_s
+cut_settle_s
 ```
 
 ### 5.1 工具偏置 `tool_offset`
@@ -138,7 +140,17 @@ anchor = before_first_effective_print_path
 
 ### 5.3 安全抬升 `tool_change_safe_lift_mm`
 
-只重建 `tool_change_pre` 区域。不要重新平滑整条打印路径。该区域通常是直线运动，但仍必须使用原 Core 的 `dt` 和七阶参数化采样。
+只重建 `tool_change_pre` 和 `tool_change_bridge` 区域，不要重新平滑整条打印路径。两个方向使用同一顺序：
+
+```text
+树脂层末 wipe（仅树脂换出且 manifest 有 wipe 时）
+→ 按当前姿态旋转后的头偏置做 X/Y 水平转换
+→ 沿 Z 安全抬升
+→ tool-change 事件
+→ 从换头后的高位直接采样一条 bridge 到下一路径打印起点
+```
+
+不得在换头后下降到换头前的末端位置，也不得先回到基础坐标再横移。偏置符号由记录块最终工具决定：切到纤维头使用 `+tool_offset.xy`，切回树脂头使用 `-tool_offset.xy`。这里的水平转换、抬升、事件和 bridge 都必须使用 Core 的 `dt` 与七阶参数化采样。
 
 ### 5.4 CUT 抬升和等待
 
@@ -150,16 +162,16 @@ anchor = before_first_effective_print_path
 E reset anchor
 → cut event
 → Z 抬升，同时 E 增加相同长度
-→ 高位等待
+→ 高位保持 cut_settle_s
 → E reset
 → 等量回抽
-→ 高位等待
+→ 高位保持 cut_settle_s
 → E reset
 → 剩余 cut_wait
 → 后续连接 travel
 ```
 
-`cut_lift_mm` 和 `cut_wait_s` 改变后，局部采样点数量可能变化；这时需要重建该 block，并修复其后的全局序号和时间，不允许只修改某几个 Z 值而留下 RSI 断点。
+`cut_settle_s` 分别控制抬升末端和回抽末端的保持时间，默认 `3.0 s`；`cut_wait_s` 是从 `cut` 事件开始计算的总安全窗口，仍控制后续剩余等待。二者改变后，局部采样点数量都可能变化；这时需要重建该 block，并修复其后的全局序号和时间，不允许只修改某几个 Z 值而留下 RSI 断点。
 
 ## 6. 局部重建要求
 

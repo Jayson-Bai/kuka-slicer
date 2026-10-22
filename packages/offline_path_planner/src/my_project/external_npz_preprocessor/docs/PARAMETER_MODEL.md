@@ -50,6 +50,33 @@ resin_e_per_mm = 2.0 * layer_height_mm * extrusion_scale / (pi * (1.75 / 2)^2)
 
 This matches the original G-code test-line allocation: deposited resin volume per path millimeter is converted to 1.75 mm filament length by dividing by the filament cross-section area. Resin line width and filament diameter are fixed in code, so the user-facing controls remain `layer_height_mm` and `extrusion_scale`.
 
+## Resin End Coasting
+
+`resin.coast_distance_mm` is an independent Core export option, expressed in
+millimeters of final sampled 3D path length, not filament E. `0` disables it;
+legacy parameter files default to `0`. The slicer's saved configuration starts
+at the recommended trial value `1.0 mm`; this is not inferred from a measured
+10 mm start deficit and must be checked on the actual material and nozzle.
+
+Core fits and samples each complete resin stroke first, then holds cumulative
+E constant over its last configured distance. It retains the original E profile
+before that cutoff, with no redistribution of removed E. All resin print
+strokes, including Primeline, participate; fiber, travel and stationary waits
+do not. Paths no longer than twice the configured distance are left alone.
+An internal fit partition is not a separate coasting boundary.
+
+Coordinates, orientation, speed planning, 4 ms timestamps and NPZ schema are
+unchanged. Core carries the removed E as a per-tool offset through subsequent
+nominal motion until E reset; prime/retract waits retain their commanded
+distances. Layer-end order is coasting to the original endpoint, retract,
+existing Y wipe, then the existing tool-change sequence. No pressure-advance
+coefficient, new runtime event or automatic prime/retract correction is added.
+
+The browser's existing constant-E edge styling displays the tail. Regenerate
+the Core NPZ after changing this setting: the live upper computer consumes its
+existing cumulative `e` values, and local injection must preserve that plateau
+without applying coasting again.
+
 ## Fiber
 
 Fiber does not expose diameter, printed line width, or a direct `E/mm` field. The active model forces fiber feed to match TCP movement speed by default:
@@ -78,6 +105,7 @@ This parameter is attached to fiber `GlobalCurveCommand` objects as curve-level 
 - `dt`: sample period forwarded to `npz_exporter`.
 - `cut_lift_mm`: absolute lift distance along the fiber endpoint's upward surface normal after `CUT`; default `20.0`. Flat-print `ABC=0` remains world `+Z`.
 - `cut_wait_s`: total wait time measured from the exported `cut` event trigger; default `15.0`.
+- `cut_settle_s`: terminal hold at the lifted extrusion phase and again after the equal safety retract; default `3.0`. It is exposed in the slicer Core export UI and the upper-computer local-injection UI.
 
 ## Prime and Retract
 
@@ -97,12 +125,12 @@ A one-path fiber layer is both first and last. Layers without fiber emit no fibe
 Every printable path, including the generated primeline and final path, ends at an explicit E boundary:
 
 - Resin: `PRINT -> retract -> external_npz_path_reset -> external_npz_reset_anchor -> optional travel(E=0)`.
-- Non-final fiber in a layer: `PRINT -> pre-CUT reset -> CUT -> lift/feed -> 3 s hold -> reset -> fixed retract -> 3 s hold -> reset -> remaining high hold -> external_npz_path_reset -> external_npz_reset_anchor -> optional travel(E=0)`.
+- Non-final fiber in a layer: `PRINT -> pre-CUT reset -> CUT -> lift/feed -> cut_settle_s hold -> reset -> fixed retract -> cut_settle_s hold -> reset -> remaining high hold -> external_npz_path_reset -> external_npz_reset_anchor -> optional travel(E=0)`.
 - Layer-final fiber: the same isolated CUT sequence, then `reset -> UI retract -> external_npz_path_reset -> external_npz_reset_anchor -> optional travel(E=0)`.
 
-For external-NPZ fiber CUT, the blocking pre-CUT reset establishes E=0 before the nonblocking `cut` event. `cut_lift_mm=L` then produces two reset-isolated absolute-E intervals: surface-normal lift/feed `0→+L`, followed by fixed retract `0→-L`. Each interval holds its terminal E for 3 seconds before reset, so neither phase can be truncated by the next reset or inherit path/UI E.
+For external-NPZ fiber CUT, the blocking pre-CUT reset establishes E=0 before the nonblocking `cut` event. `cut_lift_mm=L` then produces two reset-isolated absolute-E intervals: surface-normal lift/feed `0→+L`, followed by fixed retract `0→-L`. Each interval holds its terminal E for `cut_settle_s` seconds before reset, so neither phase can be truncated by the next reset or inherit path/UI E.
 
-The two 3-second holds and both motions consume the existing `cut_wait_s` budget measured from the `cut` event; XYZ stays at the lifted pose until that total window ends. If the configured window is shorter than the complete safety sequence, completion takes precedence. CUT does not consume `fiber_prime_length_mm=P` or `fiber_retract_length_mm=R`; UI prime remains `0→+P`, UI retract remains `0→-R`, and their configured speeds remain independent.
+The two `cut_settle_s` holds and both motions consume the existing `cut_wait_s` budget measured from the `cut` event; XYZ stays at the lifted pose until that total window ends. If the configured window is shorter than the complete safety sequence, completion takes precedence. CUT does not consume `fiber_prime_length_mm=P` or `fiber_retract_length_mm=R`; UI prime remains `0→+P`, UI retract remains `0→-R`, and their configured speeds remain independent.
 
 The existing tool-change `G92 E0` / `ResetECommand` remains unchanged and is additive to the per-path and phase resets. The reset event is exported at the old E value; only the exact internal `external_npz_reset_anchor` marker makes the following one-`dt` row start at `E=0`. Converter-side `current_e` is then zero, travel remains at `E=0`, and ordinary GCode behavior is unchanged.
 
@@ -133,4 +161,4 @@ tool_offset = (fiber_x_print_compensation_mm,
 resin_z_print_compensation_mm = resin.z_print_compensation_mm
 ```
 
-These values are passed directly to `path_processing_core.npz_exporter.export_npz()`, so tool switching, resin-Z compensation, cut lift/wait expansion, and short-segment polyline sampling stay centralized in the shared exporter logic. The exporter starts from resin tool `2`; before a tool-change event with non-zero head offset, it first lifts `20 mm`, then performs the XYZ offset travel, and only then emits the tool-change event. For an external-NPZ fiber `CUT`, the exporter first establishes the E=0 boundary, emits the nonblocking `cut` event, immediately lifts by `cut_lift_mm` along the endpoint surface normal while feeding the same absolute length, and runs the isolated high-pose retract sequence described above before any downstream travel.
+These values are passed directly to `path_processing_core.npz_exporter.export_npz()`, so tool switching, resin-Z compensation, cut lift/wait/settle expansion, and short-segment polyline sampling stay centralized in the shared exporter logic. The exporter starts from resin tool `2`. If a resin end wipe exists, it completes that wipe first, then applies the rotated head-offset X/Y transition, performs the safe lift, emits the tool-change event, and writes one bridge from the shifted high pose directly to the next path start. The target-fiber direction uses `+tool_offset.xy`; returning to resin uses `-tool_offset.xy`. For an external-NPZ fiber `CUT`, the exporter first establishes the E=0 boundary, emits the nonblocking `cut` event, immediately lifts by `cut_lift_mm` along the endpoint surface normal while feeding the same absolute length, and runs the isolated high-pose retract sequence described above before any downstream travel.

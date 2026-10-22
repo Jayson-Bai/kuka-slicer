@@ -149,6 +149,7 @@ def convert_external_npz(
     calibration_path: str | Path = DEFAULT_HEAD_CALIBRATION_PATH,
     cut_lift_mm: float | None = None,
     cut_wait_s: float | None = None,
+    cut_settle_s: float | None = None,
     chunk_size: int = 100000,
     commands_callback=None,
     reuse_parallel_workers: bool = False,
@@ -163,6 +164,7 @@ def convert_external_npz(
         calibration_path=calibration_path,
         cut_lift_mm=cut_lift_mm,
         cut_wait_s=cut_wait_s,
+        cut_settle_s=cut_settle_s,
         chunk_size=chunk_size,
         commands_callback=commands_callback,
         reuse_parallel_workers=reuse_parallel_workers,
@@ -177,6 +179,7 @@ def convert_gcode(
     calibration_path: str | Path = DEFAULT_HEAD_CALIBRATION_PATH,
     cut_lift_mm: float | None = None,
     cut_wait_s: float | None = None,
+    cut_settle_s: float | None = None,
     chunk_size: int = 100000,
     commands_callback=None,
     fiber_paths_by_layer=None,
@@ -199,6 +202,7 @@ def convert_gcode(
         calibration_path=calibration_path,
         cut_lift_mm=cut_lift_mm,
         cut_wait_s=cut_wait_s,
+        cut_settle_s=cut_settle_s,
         chunk_size=chunk_size,
         commands_callback=commands_callback,
     )
@@ -214,6 +218,7 @@ def convert_source_job(
     calibration_path: str | Path = DEFAULT_HEAD_CALIBRATION_PATH,
     cut_lift_mm: float | None = None,
     cut_wait_s: float | None = None,
+    cut_settle_s: float | None = None,
     chunk_size: int = 100000,
     commands_callback=None,
     reuse_parallel_workers: bool = False,
@@ -276,8 +281,15 @@ def convert_source_job(
         "cut_wait_s": (
             export_params.cut_wait_s if cut_wait_s is None else float(cut_wait_s)
         ),
+        "cut_settle_s": (
+            export_params.cut_settle_s
+            if cut_settle_s is None else float(cut_settle_s)
+        ),
+        "cut_lift_settle_s": export_params.cut_lift_settle_s,
+        "cut_retract_settle_s": export_params.cut_retract_settle_s,
         "external_npz_cut_absolute_e": export_params.external_npz_cut_absolute_e,
         "preserve_source_e_profile": preserve_source_e_profile,
+        "resin_coast_distance_mm": params.resin.coast_distance_mm,
         "collect_detailed_timing": os.environ.get(
             "KUKA_CORE_DETAILED_TIMING", ""
         ).strip().lower() in {"1", "true", "yes", "on"},

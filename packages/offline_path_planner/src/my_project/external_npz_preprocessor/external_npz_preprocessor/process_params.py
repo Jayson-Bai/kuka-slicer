@@ -26,6 +26,17 @@ class ResinProcessParams:
     retract_length_mm: float = 19.0
     retract_speed_mm_s: float = 12.0
     e_per_mm_override: float | None = None
+    layer_start_prime_mm: float | None = field(default=None, kw_only=True)
+    layer_end_retract_mm: float | None = field(default=None, kw_only=True)
+    coast_distance_mm: float = field(default=0.0, kw_only=True)
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(float(self.coast_distance_mm)) or float(self.coast_distance_mm) < 0.0:
+            raise ValueError("resin.coast_distance_mm must be finite and >= 0")
+        for name in ("layer_start_prime_mm", "layer_end_retract_mm"):
+            value = getattr(self, name)
+            if value is not None and (not math.isfinite(float(value)) or float(value) < 0.0):
+                raise ValueError(f"resin.{name} must be finite and >= 0, or None")
 
     def e_per_mm(self) -> float:
         if self.e_per_mm_override is not None:
@@ -72,6 +83,9 @@ class CoreExportParams:
     tool_change_safe_lift_mm: float = 20.0
     cut_lift_mm: float = 20.0
     cut_wait_s: float = 15.0
+    cut_settle_s: float = 3.0
+    cut_lift_settle_s: float | None = None
+    cut_retract_settle_s: float | None = None
     fiber_retract_length_mm: float | None = None
     external_npz_cut_absolute_e: bool = True
 

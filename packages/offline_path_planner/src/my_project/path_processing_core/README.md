@@ -65,7 +65,7 @@ core_injection_role_vocab_vals       uint8 vocabulary values
 `core_npz_local_injection_v2` for a zero-machine-calibration base export. It
 records the export-time values and the
 KUKA A-Z/B-Y/C-X pose-rotated, flat-reference command-compensation contract of
-`tool_offset`, resin-Z compensation, tool-change safe lift, CUT lift/wait,
+`tool_offset`, resin-Z compensation, tool-change safe lift, CUT lift/wait/settle,
 the sample period, and a complete catalog of tool-change/CUT blocks.  The
 per-row marker arrays identify the exact contiguous rows belonging to the
 pre-action, event, action, post-travel, and next-path anchor roles.  The
@@ -104,9 +104,9 @@ exporter 会先按连续同类型、同层、同子类型的 `MoveCommand` 分�
 - 原地预挤出/回抽：通过 `ExtrudeWait` 转成可采样的挤出等待段
 - 纤维剪切：`cut`
 
-`CUT` 命令在 exporter 中统一展开：先在当前纤维路径末端写入 `cut` 事件，再继续导出抬升段。纤维工具按路径末端的 KUKA ABC 相对姿态，将平面打印参考方向 `+Z` 旋转为该点的曲面上法向，并沿该方向抬升；平面姿态 `ABC=0` 时仍为世界坐标 `+Z`。默认 `cut_lift_mm=20.0` 表示法向上的绝对空间距离，抬升过程中 E 也增加同样数值；若抬升耗时短于 `cut_wait_s`，则在高位补足剩余等待；随后在高位做等量安全回抽。非纤维工具仍使用世界 `+Z` 抬升。之后的正式路径回抽、预挤出和 travel 仍按原命令顺序执行，第一段真实运动会从当前高位姿态重新连接。
+`CUT` 命令在 exporter 中统一展开：先在当前纤维路径末端写入 `cut` 事件，再继续导出抬升段。纤维工具按路径末端的 KUKA ABC 相对姿态，将平面打印参考方向 `+Z` 旋转为该点的曲面上法向，并沿该方向抬升；平面姿态 `ABC=0` 时仍为世界坐标 `+Z`。默认 `cut_lift_mm=20.0` 表示法向上的绝对空间距离，抬升过程中 E 也增加同样数值；抬升末端和等量安全回抽末端各保持 `cut_settle_s`，默认 `3.0 s`。两段保持及运动都计入从 CUT 事件开始计算的 `cut_wait_s` 总窗口，窗口不足时优先完整执行安全动作。非纤维工具仍使用世界 `+Z` 抬升。之后的正式路径回抽、预挤出和 travel 仍按原命令顺序执行，第一段真实运动会从当前高位姿态重新连接。
 
-喷头偏置也集中在 exporter 路径中应用。默认初始工具写死为系统树脂工具 `2`。发生工具切换且存在纤维头偏置时，exporter 保持旧顺序：先安全抬升 `20 mm`，再执行喷头 XYZ 偏置补偿 travel，最后写入 `tool_change_cf/tool_change_resin` 事件。preprocessor 和 UI 只负责读取或传入共享偏置参数，不重复实现切换工具时的补偿数学。
+喷头偏置也集中在 exporter 路径中应用。默认初始工具写死为系统树脂工具 `2`。树脂层末 wipe 完成后，按当前姿态旋转头偏置并先做 X/Y 水平转换，再沿 Z 安全抬升，随后写入 `tool_change_cf/tool_change_resin` 事件。事件后从该高位直接生成一条 bridge 到下一路径打印起点，不下降回换头前末端。切到纤维头使用 `+tool_offset.xy`，切回树脂头使用 `-tool_offset.xy`。preprocessor 和 UI 只负责读取或传入共享偏置参数，不重复实现切换工具时的补偿数学。
 
 ## 维护原则
 

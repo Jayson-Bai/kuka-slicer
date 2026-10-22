@@ -76,7 +76,7 @@ tool_change_cf
 tool_change_resin
 ```
 
-实际工具偏置补偿不在 preprocessor 中重复实现，而是通过 `export_npz()` 的 `tool_offset` 参数交给 exporter 处理。exporter 默认初始工具为系统树脂工具 `2`；当发生工具切换且存在偏置时，顺序固定为先安全抬升 `20 mm`，再执行喷头 XYZ 偏置补偿 travel，最后写入 `tool_change_cf/tool_change_resin` 事件。
+实际工具偏置补偿不在 preprocessor 中重复实现，而是通过 `export_npz()` 的 `tool_offset` 参数交给 exporter 处理。exporter 默认初始工具为系统树脂工具 `2`；树脂层末 wipe 完成后，按当前姿态旋转头偏置并先做 X/Y 水平转换，再沿 Z 安全抬升，随后写入 `tool_change_cf/tool_change_resin` 事件。事件后从该高位直接生成一条 bridge 到下一路径打印起点，不下降回换头前末端。切到纤维头使用 `+tool_offset.xy`，切回树脂头使用 `-tool_offset.xy`。
 
 ## 5. 加热和风扇事件
 
@@ -165,10 +165,10 @@ ExtrudeWait(delta_e=0, raw="external_npz_reset_anchor")
 CUT
 # exporter expands external-NPZ CUT as:
 # cut event -> immediate lift(Z:+L, E:0→+L)
-# -> hold XYZ high and E=+L for 3 s
+# -> hold XYZ high and E=+L for cut_settle_s
 # -> reset -> anchor(E=0)
 # -> retract at high pose(E:0→-L)
-# -> hold XYZ high and E=-L for 3 s
+# -> hold XYZ high and E=-L for cut_settle_s
 # -> reset -> anchor(E=0)
 # -> hold XYZ high for the remaining cut_wait_s budget
 
@@ -185,7 +185,7 @@ ExtrudeWait(wait_sec=dt, delta_e=0, raw="external_npz_reset_anchor")
 TRAVEL(E=0)
 ```
 
-其中 `L=cut_lift_mm`。CUT 前先完成一次阻塞式 reset 和 E=0 anchor，随后 CUT 事件仍为非阻塞，RSI 紧接着沿纤维路径末端点的曲面上法向抬升绝对距离 `L`，并同步执行 `E:0→+L`；平面 `ABC=0` 时该方向仍是世界 `+Z`。抬升末端保持 3 秒后 reset，回抽由新基准独立执行 `E:0→-L`，再保持 3 秒后 reset。两个 3 秒保持段都在高位，且计入原 `cut_wait_s` 总窗口；剩余等待继续保持高位和 `E=0`。若 UI 等待短于完整执行抬升、两段保持和回抽所需的安全时间，则优先完整执行这些动作。
+其中 `L=cut_lift_mm`。CUT 前先完成一次阻塞式 reset 和 E=0 anchor，随后 CUT 事件仍为非阻塞，RSI 紧接着沿纤维路径末端点的曲面上法向抬升绝对距离 `L`，并同步执行 `E:0→+L`；平面 `ABC=0` 时该方向仍是世界 `+Z`。抬升末端保持 `cut_settle_s` 后 reset，回抽由新基准独立执行 `E:0→-L`，再保持 `cut_settle_s` 后 reset。两个保持段都在高位，且计入原 `cut_wait_s` 总窗口；剩余等待继续保持高位和 `E=0`。若 UI 等待短于完整执行抬升、两段保持和回抽所需的安全时间，则优先完整执行这些动作。`cut_settle_s` 默认 `3.0 s`，可在 Core 导出参数和上位机局部注入参数中分别设置。
 
 CUT 的挤出和固定回抽只受 L 控制，不读取 `fiber.prime_length_mm` 或 `fiber.retract_length_mm`。层末 UI 回抽前的 reset 同时阻断 CUT 向后读取 UI 回抽速度；CUT 固定回抽继续使用默认移动速度，UI 回抽使用自己的 `fiber.retract_speed_mm_s`。
 

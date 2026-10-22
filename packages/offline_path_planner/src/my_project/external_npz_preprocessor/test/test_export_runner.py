@@ -70,12 +70,14 @@ def test_convert_uses_shared_head_calibration_offsets(tmp_path, monkeypatch):
         calibration_path=calibration_path,
         cut_lift_mm=22.0,
         cut_wait_s=11.0,
+        cut_settle_s=2.5,
     )
 
     assert captured["kwargs"]["tool_offset"] == (2.0, -3.0, 4.0)
     assert captured["kwargs"]["resin_z_print_compensation_mm"] == 1.25
     assert captured["kwargs"]["cut_lift_mm"] == 22.0
     assert captured["kwargs"]["cut_wait_s"] == 11.0
+    assert captured["kwargs"]["cut_settle_s"] == 2.5
     assert captured["kwargs"]["default_feed_mm_s"] == 7.0
     assert captured["kwargs"]["max_angular_speed_deg_s"] == 25.0
     assert "fiber_retract_length_mm" not in captured["kwargs"]
@@ -526,7 +528,8 @@ def test_resin_layer_end_wipe_follows_retract_before_tool_change_safe_lift(tmp_p
     )
     assert retract_index < wipe_command_index
     assert np.isclose(layer_end_wipe.start_pos.x, 20.0)
-    assert np.isclose(layer_end_wipe.pos.x, 15.0)
+    assert np.isclose(layer_end_wipe.pos.x, 20.0)
+    assert np.isclose(layer_end_wipe.pos.y - layer_end_wipe.start_pos.y, 5.0)
     assert np.isclose(layer_end_wipe.delta_e, 0.0)
 
     output = tmp_path / "out.npz"

@@ -2677,6 +2677,9 @@ def _parse_core_process_params(
         tool_change_safe_lift_mm=_float_param(params, "core_tool_safe_lift", export_defaults.tool_change_safe_lift_mm),
         cut_lift_mm=_float_param(params, "core_cut_lift", export_defaults.cut_lift_mm),
         cut_wait_s=_float_param(params, "core_cut_wait", export_defaults.cut_wait_s),
+        cut_settle_s=_float_param(params, "core_cut_settle", export_defaults.cut_settle_s),
+        cut_lift_settle_s=_optional_float_param(params, "core_cut_lift_settle"),
+        cut_retract_settle_s=_optional_float_param(params, "core_cut_retract_settle"),
         fiber_retract_length_mm=_optional_float_param(params, "core_fiber_retract_override") if "core_fiber_retract_override" in params else export_defaults.fiber_retract_length_mm,
         external_npz_cut_absolute_e=_bool_param(
             params, "core_external_npz_cut_absolute_e", export_defaults.external_npz_cut_absolute_e
@@ -5504,7 +5507,7 @@ def _index_html() -> str:
         <label class="legendItem"><input id="showFiberPaths" type="checkbox" checked><span class="swatch fiberSwatch"></span>纤维路径</label>
         <label class="legendItem"><input id="showFiberCutEvents" type="checkbox" checked><span class="swatch fiberCutSwatch"></span>纤维剪切点（CUT）</label>
         <label class="legendItem"><input id="showTravelPaths" type="checkbox" checked><span class="swatch travelSwatch"></span>空移 Travel</label>
-        <label class="legendItem"><input id="showCoreTravelPaths" type="checkbox" checked><span class="swatch coreTravelSwatch"></span>Core 转场空走</label>
+        <label class="legendItem"><input id="showCoreTravelPaths" type="checkbox" checked><span class="swatch coreTravelSwatch"></span>Core 转场空走 / 层末回擦 5 mm</label>
         <span class="legendItem"><span class="swatch originSwatch"></span>打印平面原点 (0, 0)</span>
         <span class="legendItem"><span class="swatch partOriginSwatch"></span>零件原点（形状中心）</span>
       </div>
@@ -6110,6 +6113,8 @@ def _index_html() -> str:
               <div class="fieldGroup"><label for="coreToolSafeLift">换头安全抬升 mm</label><input id="coreToolSafeLift" type="number" min="0" step="0.001" value="20"></div>
               <div class="fieldGroup"><label for="coreCutLift">CUT 抬升 mm</label><input id="coreCutLift" type="number" min="0" step="0.001" value="20"></div>
               <div class="fieldGroup"><label for="coreCutWait">CUT 等待 s</label><input id="coreCutWait" type="number" min="0" step="0.001" value="15"></div>
+              <div class="fieldGroup"><label for="coreCutLiftSettle">CUT 回抽前保持 s</label><input id="coreCutLiftSettle" type="number" min="0" step="0.001" value="3"></div>
+              <div class="fieldGroup"><label for="coreCutRetractSettle">CUT 回抽后保持 s</label><input id="coreCutRetractSettle" type="number" min="0" step="0.001" value="3"></div>
               <div class="fieldGroup"><label for="coreInitialTool">初始工具 ID</label><input id="coreInitialTool" type="number" min="0" step="1" value="2"></div>
               <div class="fieldGroup compactOptions"><label class="checkboxLabel" for="coreEnableExtrudeWait"><input id="coreEnableExtrudeWait" type="checkbox" checked> 启用挤出等待</label></div>
               <div class="fieldGroup compactOptions"><label class="checkboxLabel" for="coreTravelExtrudeOverlap"><input id="coreTravelExtrudeOverlap" type="checkbox" checked> 允许等待叠加到空走</label></div>
@@ -6371,7 +6376,7 @@ def _index_html() -> str:
         'coreCornerRetreatRatio', 'coreSplineMaxError', 'coreSplineMaxAngle',
         'coreSourceMergeDistance', 'coreCornerRetreatMax', 'coreCornerBlendSegments',
         'coreDensity', 'coreDegree', 'coreMaxFitPoints',
-        'coreToolSafeLift', 'coreCutLift', 'coreCutWait', 'coreFiberRetractOverride',
+        'coreToolSafeLift', 'coreCutLift', 'coreCutWait', 'coreCutLiftSettle', 'coreCutRetractSettle', 'coreFiberRetractOverride',
         'coreInitialTool'
       ];
       for (const id of coreFieldIds) {{
