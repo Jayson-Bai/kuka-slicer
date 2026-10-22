@@ -8,6 +8,8 @@ gcode_planner 的 npz 导出器（分片）.
 
 from __future__ import annotations
 
+from .cut_sync import cut_holds, cut_sync_payload, sync_payload
+
 from dataclasses import dataclass, replace
 from typing import List, Mapping, Optional
 import os
@@ -29,6 +31,7 @@ from .types import (
 from .bspline_approximation import GlobalSplinePlanner
 from .polynomial_interpolator import sample_global_curve_iter
 from .rsi_timing import RsiTimingAccumulator
+from .resin_coasting import ResinCoasting, validate_coasting_distance
 
 
 @dataclass(slots=True)
@@ -178,11 +181,15 @@ def export_npz(
     tool_change_safe_lift_mm: float = 20.0,
     cut_lift_mm: float = 20.0,
     cut_wait_s: float = 15.0,
+    cut_settle_s: float = 3.0,
+    cut_lift_settle_s: float | None = None,
+    cut_retract_settle_s: float | None = None,
     fiber_retract_length_mm: float | None = None,
     external_npz_cut_absolute_e: bool = False,
     preserve_source_e_profile: bool = False,
     collect_detailed_timing: bool = False,
     print_job_manifest: Mapping[str, object] | None = None,
+    resin_coast_distance_mm: float = 0.0,
 ) -> dict:
     """
     导出 npz（分片）.
@@ -192,6 +199,8 @@ def export_npz(
     - 速度规划由 sample_global_curve 内部的七阶多项式完成，此处不做额外处理。
     返回耗时统计字典（秒），用于 CLI 打印。
     """
+    resin_coast_distance_mm = validate_coasting_distance(resin_coast_distance_mm)
+    coasting_e_offsets: dict[int, float] = {}
     tool_offset = _validated_direct_tool_offset(
         parsed_commands,
         tool_offset,
@@ -229,6 +238,8 @@ def export_npz(
     }
 
     last_pose_map = {}
+    cut_lift_settle_s, cut_retract_settle_s = cut_holds(
+        cut_settle_s, cut_lift_settle_s, cut_retract_settle_s)
     current_tool = int(initial_tool_id)  # 1=纤维(T0), 2=树脂(T1)
     seq = 0
     planner = GlobalSplinePlanner()
@@ -241,6 +252,10 @@ def export_npz(
     last_pose: Optional[CsvRow] = None
     last_feedrate_mm_min: Optional[float] = None
     resin_z_offset: float = 0.0
+    # The tool-change event is a handshake row, not a Cartesian destination.
+    # Keep the lifted event pose until the first post-change motion and turn
+    # that motion into one continuous bridge to the target tool's path pose.
+    pending_tool_change_bridge = None
     short_travel_min_ramp_s = 0.08
 
     def _command_layer(cmd) -> int:
@@ -286,6 +301,7 @@ def export_npz(
         "tool_change_cf": 6,
         "tool_change_resin": 7,
         "cut": 8,
+        "extrude_sync": 9,
     }
     injection_role_map = {
         "none": 0,
@@ -297,6 +313,8 @@ def export_npz(
         "cut_post": 6,
         "post_anchor": 7,
         "resin_z_compensation": 8,
+        "tool_change_bridge": 9,
+        "resin_layer_end_wipe": 12,
     }
     move_type_keys = np.array(list(move_type_map.keys()), dtype="S32")
     move_type_vals = np.array(list(move_type_map.values()), dtype=np.uint8)
@@ -338,6 +356,7 @@ def export_npz(
                     "roles": [
                         "tool_change_pre",
                         "tool_change_event",
+                        "tool_change_bridge",
                         "tool_change_post",
                         "post_anchor",
                     ],
@@ -361,7 +380,10 @@ def export_npz(
                     "subtype": str(getattr(command, "subtype", "UNKNOWN") or "UNKNOWN"),
                     "tool_id": scan_tool,
                     "roles": ["cut_event", "cut_action", "cut_post", "post_anchor"],
-                    "injectable_parameters": ["cut_lift_mm", "cut_wait_s"],
+                    "injectable_parameters": [
+                        "cut_lift_mm", "cut_wait_s", "cut_settle_s",
+                        "cut_lift_settle_s", "cut_retract_settle_s",
+                    ],
                 })
                 injection_block_by_command_index[command_index] = block_id
 
@@ -388,6 +410,10 @@ def export_npz(
             "tool_change_safe_lift_mm": float(tool_change_safe_lift_mm),
             "cut_lift_mm": float(cut_lift_mm),
             "cut_wait_s": float(cut_wait_s),
+            "cut_settle_s": float(cut_settle_s),
+            "cut_lift_settle_s": cut_lift_settle_s,
+            "cut_retract_settle_s": cut_retract_settle_s,
+            "cut_sync_version": 1,
             "fiber_retract_length_mm": (
                 None if fiber_retract_length_mm is None else float(fiber_retract_length_mm)
             ),
@@ -399,6 +425,7 @@ def export_npz(
             "tool_change_safe_lift_mm",
             "cut_lift_mm",
             "cut_wait_s",
+            "cut_settle_s", "cut_lift_settle_s", "cut_retract_settle_s",
         ],
         "row_marker_fields": {
             "block_id": "core_injection_block_id",
@@ -754,10 +781,29 @@ def export_npz(
         xs.append(row.x)
         ys.append(row.y)
 
+    def _write_sampled_rows(rows, layer, subtype, occ):
+        nonlocal processed_rows, last_pose
+        writer = _writer_for(layer, subtype, occ)
+        for row in rows:
+            writer.add(row)
+            _record_flat_preview_point(layer, row)
+            processed_rows += 1
+            _maybe_yield()
+            last_pose_map[(layer, subtype)] = row
+            last_pose = row
+
+    def _finish_coasting(coasting, layer, subtype, occ):
+        _write_sampled_rows(coasting.finish(), layer, subtype, occ)
+        coasting_e_offsets[current_tool] = (
+            coasting_e_offsets.get(current_tool, 0.0) + coasting.removed_e
+        )
+        _mark_path_end(layer, subtype, occ)
+
     def _append_sample(
             gc: GlobalCurveCommand, layer: int, subtype: str, occ: int, mark_path_end: bool = True,
-            injection_block_id: int = -1, injection_role: int = 0):
-        nonlocal seq, last_feedrate_mm_min, processed_rows, last_pose_map, last_pose
+            injection_block_id: int = -1, injection_role: int = 0,
+            coasting=None, nominal_e_offset: float = 0.0):
+        nonlocal seq, last_feedrate_mm_min
         nonlocal pending_injection_block_id, pending_injection_role
         t0 = time.perf_counter()
         sample_profile = (
@@ -845,7 +891,7 @@ def export_npz(
                 a=pt.pos.a,
                 b=pt.pos.b,
                 c=pt.pos.c,
-                e=pt.e,
+                e=pt.e - nominal_e_offset,
                 tool_id=current_tool,
                 move_type=gc.type,
                 src_line=src_lines,
@@ -882,6 +928,16 @@ def export_npz(
                 for row in sampled_rows:
                     row.injection_block_id = marker_block_id
                     row.injection_role = marker_role
+            original_moves = gc.original_moves or []
+            # Preserve this process boundary in the final-row preview without
+            # changing its geometry, timing, or extrusion sampling.
+            if gc.type.startswith("TRAVEL") and (
+                (original_moves and all(move.raw == "external_npz_resin_layer_end_wipe"
+                                        for move in original_moves))
+                or (gc.raw or "").split(" |", 1)[0] == "external_npz_resin_layer_end_wipe"
+            ):
+                for row in sampled_rows:
+                    row.injection_role = injection_role_map["resin_layer_end_wipe"]
             timing.finish_segment(
                 t_acc_s=t_acc_value,
                 t_flat_s=max(
@@ -891,15 +947,14 @@ def export_npz(
                 t_dec_s=t_dec_value,
                 end_seq=sampled_rows[-1].seq,
             )
-            writer = _writer_for(layer, subtype, occ)
-            for row in sampled_rows:
-                writer.add(row)
-                _record_flat_preview_point(layer, row)
-                processed_rows += 1
-                _maybe_yield()
-                last_pose_map[(layer, subtype)] = row
-                last_pose = row
-            if mark_path_end:
+            if coasting is None:
+                _write_sampled_rows(sampled_rows, layer, subtype, occ)
+            else:
+                _write_sampled_rows(
+                    (ready for row in sampled_rows for ready in coasting.push(row)),
+                    layer, subtype, occ,
+                )
+            if mark_path_end and coasting is None:
                 _mark_path_end(layer, subtype, occ)
         timings["sample_s"] += time.perf_counter() - t0
         if sample_profile is not None:
@@ -1512,8 +1567,18 @@ def export_npz(
         layer = buffer[0].layer if buffer else 0
         subtype = buffer[0].subtype if buffer else "UNKNOWN"
         occ = current_occ if current_occ is not None else _ensure_segment(layer, subtype)
+        coasting = ResinCoasting(resin_coast_distance_mm) if (
+            resin_coast_distance_mm > 0.0 and current_tool == 2
+            and buffer[0].type in ("PRINT", "PRINT_FIT")
+            and all(move.delta_e >= 0.0 for move in buffer)
+        ) else None
         for idx, gc in enumerate(gc_list):
-            _append_sample(gc, layer, subtype, occ, mark_path_end=(idx == len(gc_list) - 1))
+            _append_sample(
+                gc, layer, subtype, occ, mark_path_end=(idx == len(gc_list) - 1),
+                coasting=coasting, nominal_e_offset=coasting_e_offsets.get(current_tool, 0.0),
+            )
+        if coasting is not None:
+            _finish_coasting(coasting, layer, subtype, occ)
         buffer = []
         current_type = None
         current_layer = None
@@ -1676,7 +1741,8 @@ def export_npz(
             # retract 0..-L -> settle -> reset -> remaining high hold.
             # CUT stays nonblocking; putting the first reset before it prevents
             # RSI from advancing to an E=0 anchor before the reset handshake.
-            settle_s = 3.0
+            lift_settle_s = cut_lift_settle_s
+            retract_settle_s = cut_retract_settle_s
             lift_mm = max(0.0, float(cut_lift_mm))
             wait_s = max(0.0, float(cut_wait_s))
             lift_feedrate = max(float(default_feed_mm_s), 1e-9) * 60.0
@@ -1704,7 +1770,10 @@ def export_npz(
 
             _append_cut_reset_anchor()
             active_injection_role = injection_role_map["cut_event"]
-            _emit_event(ev, layer, subtype, occ)
+            _emit_event(
+                replace(
+                    ev, payload=cut_sync_payload(ev.payload, expected_syncs=2)),
+                layer, subtype, occ)
             active_injection_role = injection_role_map["cut_action"]
 
             if lift_mm > 1e-9:
@@ -1752,9 +1821,16 @@ def export_npz(
                     lift_gc, layer, subtype, occ, mark_path_end=False
                 )
 
+            _emit_event(_PendingEvent(
+                event_type="extrude_sync",
+                payload=sync_payload(current_tool, lift_mm, wait_s),
+                src_line=cmd.line or 0,
+                tool_id=current_tool,
+            ), layer, subtype, occ)
+
             _append_extrude_wait(ExtrudeWait(
                 type="EXTRUDE_WAIT",
-                wait_sec=settle_s,
+                wait_sec=lift_settle_s,
                 delta_e=0.0,
                 feedrate=lift_feedrate,
                 line=cmd.line or 0,
@@ -1778,9 +1854,16 @@ def export_npz(
                     raw="cut_safety_retract",
                 ), layer, subtype, occ, mark_path_end=False)
 
+            _emit_event(_PendingEvent(
+                event_type="extrude_sync",
+                payload=sync_payload(current_tool, -lift_mm, wait_s),
+                src_line=cmd.line or 0,
+                tool_id=current_tool,
+            ), layer, subtype, occ)
+
             _append_extrude_wait(ExtrudeWait(
                 type="EXTRUDE_WAIT",
-                wait_sec=settle_s,
+                wait_sec=retract_settle_s,
                 delta_e=0.0,
                 feedrate=retract_feedrate,
                 line=cmd.line or 0,
@@ -1795,9 +1878,9 @@ def export_npz(
                 0.0,
                 wait_s
                 - lift_duration_s
-                - settle_s
+                - lift_settle_s
                 - retract_duration_s
-                - settle_s,
+                - retract_settle_s,
             )
             _append_cut_reset_anchor(mark_path_end=remaining_wait_s <= 1e-9)
             if remaining_wait_s > 1e-9:
@@ -1994,6 +2077,51 @@ def export_npz(
     if enable_extrude_wait and enable_travel_extrude_overlap:
         parsed_commands = _overlap_extrude_waits_on_travel(parsed_commands)
 
+    def _append_pending_tool_change_bridge(
+            next_pose, layer: int, subtype: str, occ: int, line: int,
+            *, mark_path_end: bool = False):
+        nonlocal pending_tool_change_bridge, last_pose
+        pending = pending_tool_change_bridge
+        if pending is None:
+            return
+        pending_tool_change_bridge = None
+        if last_pose is None:
+            return
+        start_p = Position(
+            last_pose.x, last_pose.y, last_pose.z,
+            last_pose.a, last_pose.b, last_pose.c,
+        )
+        end_p = Position(
+            next_pose.x, next_pose.y, next_pose.z,
+            next_pose.a, next_pose.b, next_pose.c,
+        )
+        if all(abs(a - b) <= 1e-9 for a, b in zip(
+                (start_p.x, start_p.y, start_p.z, start_p.a, start_p.b, start_p.c),
+                (end_p.x, end_p.y, end_p.z, end_p.a, end_p.b, end_p.c))):
+            return
+        bridge_gc = GlobalCurveCommand(
+            type="TRAVEL",
+            cmd="SPLINE",
+            start_pos=start_p,
+            control_points=[end_p, end_p, end_p],
+            e_val=last_pose.e,
+            delta_e=0.0,
+            feedrate=default_feed_mm_s * 60.0,
+            line=line,
+            raw="tool_change_post_bridge",
+            constraints=[],
+            original_moves=[],
+        )
+        _append_sample(
+            bridge_gc,
+            layer,
+            subtype,
+            occ,
+            mark_path_end=mark_path_end,
+            injection_block_id=int(pending["block_id"]),
+            injection_role=injection_role_map["tool_change_bridge"],
+        )
+
     total_cmds = len(parsed_commands)
 
     def _is_external_npz_start_xy_travel(cmd) -> bool:
@@ -2069,72 +2197,89 @@ def export_npz(
                     occ = _ensure_segment(cmd.layer, cmd.subtype)
 
                 if mapped_tool != current_tool:
-                    # ---- 偏置补偿：在 tool_change 事件前注入安全抬升和 TRAVEL 段 ----
-                    ox, oy, oz = tool_offset
-                    has_offset = abs(ox) > 1e-9 or abs(oy) > 1e-9 or abs(oz) > 1e-9
-                    if has_offset:
-                        last_row = last_pose
-                        if last_row is not None:
-                            from .types import Position as _Pos
-                            start_p = _Pos(last_row.x, last_row.y, last_row.z,
-                                           last_row.a, last_row.b, last_row.c)
-                            safe_lift = max(0.0, float(tool_change_safe_lift_mm))
-                            offset_start_p = start_p
-                            if safe_lift > 1e-9:
-                                lifted_p = _Pos(last_row.x, last_row.y, last_row.z + safe_lift,
-                                                last_row.a, last_row.b, last_row.c)
-                                lift_gc = GlobalCurveCommand(
-                                    type="TRAVEL",
-                                    cmd="SPLINE",
-                                    start_pos=start_p,
-                                    control_points=[lifted_p, lifted_p, lifted_p],
-                                    e_val=last_row.e,
-                                    delta_e=0.0,
-                                    feedrate=default_feed_mm_s * 60.0,
-                                    line=cmd.line,
-                                    raw="tool_change_safe_lift",
-                                    constraints=[],
-                                    original_moves=[],
-                                )
-                                _append_sample(
-                                    lift_gc,
-                                    cmd.layer,
-                                    cmd.subtype,
-                                    occ,
-                                    injection_block_id=injection_block_id,
-                                    injection_role=injection_role_map["tool_change_pre"],
-                                )
-                                offset_start_p = lifted_p
-                            if mapped_tool == 1:
-                                end_p = _Pos(offset_start_p.x + ox, offset_start_p.y + oy,
-                                             offset_start_p.z + oz,
-                                             offset_start_p.a, offset_start_p.b, offset_start_p.c)
-                            else:
-                                end_p = _Pos(offset_start_p.x - ox, offset_start_p.y - oy,
-                                             offset_start_p.z - oz,
-                                             offset_start_p.a, offset_start_p.b, offset_start_p.c)
-                            offset_gc = GlobalCurveCommand(
+                    # Move horizontally into the target head frame before
+                    # lifting.  The post-event bridge then starts from this
+                    # high pose and ends directly at the next path start.
+                    last_row = last_pose
+                    if last_row is not None:
+                        start_p = Position(
+                            last_row.x, last_row.y, last_row.z,
+                            last_row.a, last_row.b, last_row.c,
+                        )
+                        safe_lift = max(0.0, float(tool_change_safe_lift_mm))
+                        sign = 1.0 if mapped_tool == 1 else -1.0
+                        horizontal_p = Position(
+                            last_row.x + sign * float(tool_offset[0]),
+                            last_row.y + sign * float(tool_offset[1]),
+                            last_row.z,
+                            last_row.a,
+                            last_row.b,
+                            last_row.c,
+                        )
+                        if any(
+                            abs(a - b) > 1e-9
+                            for a, b in zip(
+                                (start_p.x, start_p.y, start_p.z),
+                                (horizontal_p.x, horizontal_p.y, horizontal_p.z),
+                            )
+                        ):
+                            horizontal_gc = GlobalCurveCommand(
                                 type="TRAVEL",
                                 cmd="SPLINE",
-                                start_pos=offset_start_p,
-                                control_points=[end_p, end_p, end_p],
+                                start_pos=start_p,
+                                control_points=[
+                                    horizontal_p,
+                                    horizontal_p,
+                                    horizontal_p,
+                                ],
                                 e_val=last_row.e,
                                 delta_e=0.0,
                                 feedrate=default_feed_mm_s * 60.0,
                                 line=cmd.line,
-                                raw="fallback_linear",
+                                raw="tool_change_pre_offset",
                                 constraints=[],
                                 original_moves=[],
                             )
                             _append_sample(
-                                offset_gc,
+                                horizontal_gc,
                                 cmd.layer,
                                 cmd.subtype,
                                 occ,
+                                mark_path_end=False,
                                 injection_block_id=injection_block_id,
                                 injection_role=injection_role_map["tool_change_pre"],
                             )
-                    # ---- 偏置补偿结束 ----
+                        if safe_lift > 1e-9:
+                            lifted_p = Position(
+                                horizontal_p.x,
+                                horizontal_p.y,
+                                horizontal_p.z + safe_lift,
+                                horizontal_p.a,
+                                horizontal_p.b,
+                                horizontal_p.c,
+                            )
+                            lift_gc = GlobalCurveCommand(
+                                type="TRAVEL",
+                                cmd="SPLINE",
+                                start_pos=horizontal_p,
+                                control_points=[lifted_p, lifted_p, lifted_p],
+                                e_val=last_row.e,
+                                delta_e=0.0,
+                                feedrate=default_feed_mm_s * 60.0,
+                                line=cmd.line,
+                                raw="tool_change_safe_lift",
+                                constraints=[],
+                                original_moves=[],
+                            )
+                            _append_sample(
+                                lift_gc,
+                                cmd.layer,
+                                cmd.subtype,
+                                occ,
+                                mark_path_end=False,
+                                injection_block_id=injection_block_id,
+                                injection_role=injection_role_map["tool_change_pre"],
+                            )
 
                     current_tool = mapped_tool
                     _emit_event(_PendingEvent(
@@ -2148,7 +2293,11 @@ def export_npz(
                     if injection_block_id > 0:
                         pending_injection_block_id = injection_block_id
                         pending_injection_role = injection_role_map["tool_change_post"]
+                        pending_tool_change_bridge = {
+                            "block_id": injection_block_id,
+                        }
             elif isinstance(cmd, ResetECommand):
+                coasting_e_offsets[current_tool] = 0.0
                 if last_pose is None and cmd.pose is not None:
                     last_pose = CsvRow(
                         seq=seq,
@@ -2204,6 +2353,54 @@ def export_npz(
         if isinstance(cmd, MoveCommand):
             if cmd.is_pure_state_change:
                 continue
+            if (
+                pending_tool_change_bridge is not None
+                and last_pose is not None
+                and cmd.type == "TRAVEL"
+                and abs(float(cmd.delta_e)) <= 1e-12
+            ):
+                # Consume the first post-change travel.  Its destination is
+                # already expressed in the new tool's frame by the global
+                # transform above, so one bridge can go directly there.
+                flush_moves()
+                occ = _ensure_segment(cmd.layer, cmd.subtype)
+                target_pos = cmd.pos
+                if (
+                    delay_resin_z_compensation
+                    and not resin_z_compensation_appended
+                    and _is_external_npz_start_xy_travel(cmd)
+                ):
+                    _append_resin_z_print_compensation(cmd.layer, cmd.line)
+                    if abs(float(resin_z_print_compensation_mm)) > 1e-9:
+                        target_pos = Position(
+                            target_pos.x,
+                            target_pos.y,
+                            target_pos.z + float(resin_z_print_compensation_mm),
+                            target_pos.a,
+                            target_pos.b,
+                            target_pos.c,
+                        )
+                _append_pending_tool_change_bridge(
+                    target_pos,
+                    cmd.layer,
+                    cmd.subtype,
+                    occ,
+                    cmd.line,
+                    mark_path_end=True,
+                )
+                continue
+            if pending_tool_change_bridge is not None and last_pose is not None:
+                # If a non-travel is the first post-change motion, finish at
+                # its start and let the original command continue from there.
+                flush_moves()
+                occ = _ensure_segment(cmd.layer, cmd.subtype)
+                _append_pending_tool_change_bridge(
+                    cmd.start_pos,
+                    cmd.layer,
+                    cmd.subtype,
+                    occ,
+                    cmd.line,
+                )
             if buffer:
                 previous = buffer[-1].pos
                 if (
@@ -2264,7 +2461,24 @@ def export_npz(
             occ = occ_counters.get((layer, subtype), 0)
             if occ == 0:
                 occ = _ensure_segment(layer, subtype)
-            _append_sample(cmd, layer, subtype, occ)
+            if pending_tool_change_bridge is not None and last_pose is not None:
+                _append_pending_tool_change_bridge(
+                    cmd.start_pos,
+                    layer,
+                    subtype,
+                    occ,
+                    cmd.line,
+                )
+            coasting = ResinCoasting(resin_coast_distance_mm) if (
+                resin_coast_distance_mm > 0.0 and current_tool == 2
+                and cmd.type in ("PRINT", "PRINT_FIT") and cmd.delta_e >= 0.0
+            ) else None
+            _append_sample(
+                cmd, layer, subtype, occ, coasting=coasting,
+                nominal_e_offset=coasting_e_offsets.get(current_tool, 0.0),
+            )
+            if coasting is not None:
+                _finish_coasting(coasting, layer, subtype, occ)
             continue
 
     # 文件末尾冲掉残余 Move 段
@@ -2468,6 +2682,7 @@ def _npz_exporter(output_path: str, rows: List[CsvRow], chunk_size: int) -> None
         "tool_change_cf": 6,
         "tool_change_resin": 7,
         "cut": 8,
+        "extrude_sync": 9,
     }
     # 使用定长字节串，便于 C++ 侧 cnpy 读取
     move_type_keys = np.array(list(move_type_map.keys()), dtype="S32")
