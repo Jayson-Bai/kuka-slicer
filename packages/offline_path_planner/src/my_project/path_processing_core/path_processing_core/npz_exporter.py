@@ -193,6 +193,7 @@ def export_npz(
     collect_detailed_timing: bool = False,
     print_job_manifest: Mapping[str, object] | None = None,
     resin_coast_distance_mm: float = 0.0,
+    resin_layer_last_coast_distance_mm: float | None = None,
 ) -> dict:
     """
     导出 npz（分片）.
@@ -203,6 +204,11 @@ def export_npz(
     返回耗时统计字典（秒），用于 CLI 打印。
     """
     resin_coast_distance_mm = validate_coasting_distance(resin_coast_distance_mm)
+    resin_layer_last_coast_distance_mm = (
+        resin_coast_distance_mm
+        if resin_layer_last_coast_distance_mm is None
+        else validate_coasting_distance(resin_layer_last_coast_distance_mm)
+    )
     coasting_e_offsets: dict[int, float] = {}
     tool_offset = _validated_direct_tool_offset(
         parsed_commands,
@@ -417,6 +423,7 @@ def export_npz(
                 None if fiber_retract_length_mm is None else float(fiber_retract_length_mm)
             ),
             "resin_coast_distance_mm": float(resin_coast_distance_mm),
+            "resin_layer_last_coast_distance_mm": float(resin_layer_last_coast_distance_mm),
             "default_feed_mm_s": float(default_feed_mm_s),
         },
         "overrideable_parameters": [
@@ -1572,8 +1579,13 @@ def export_npz(
         layer = buffer[0].layer if buffer else 0
         subtype = buffer[0].subtype if buffer else "UNKNOWN"
         occ = current_occ if current_occ is not None else _ensure_segment(layer, subtype)
-        coasting = ResinCoasting(resin_coast_distance_mm) if (
-            resin_coast_distance_mm > 0.0 and current_tool == 2
+        coast_distance = (
+            resin_layer_last_coast_distance_mm
+            if buffer[0].raw == "external_npz_resin_layer_last_print"
+            else resin_coast_distance_mm
+        )
+        coasting = ResinCoasting(coast_distance) if (
+            coast_distance > 0.0 and current_tool == 2
             and buffer[0].type in ("PRINT", "PRINT_FIT")
             and all(move.delta_e >= 0.0 for move in buffer)
         ) else None
@@ -2468,8 +2480,13 @@ def export_npz(
                     occ,
                     cmd.line,
                 )
-            coasting = ResinCoasting(resin_coast_distance_mm) if (
-                resin_coast_distance_mm > 0.0 and current_tool == 2
+            coast_distance = (
+                resin_layer_last_coast_distance_mm
+                if cmd.raw == "external_npz_resin_layer_last_print"
+                else resin_coast_distance_mm
+            )
+            coasting = ResinCoasting(coast_distance) if (
+                coast_distance > 0.0 and current_tool == 2
                 and cmd.type in ("PRINT", "PRINT_FIT") and cmd.delta_e >= 0.0
             ) else None
             _append_sample(

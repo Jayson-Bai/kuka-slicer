@@ -16,7 +16,8 @@
       "e_per_mm_override": null,
       "layer_start_prime_mm": 32.0,
       "layer_end_retract_mm": 25.0,
-      "coast_distance_mm": 7.0
+      "coast_distance_mm": 5.0,
+      "layer_last_coast_distance_mm": 7.0
     },
     "fiber": {
       "layer_height_mm": 0.1,

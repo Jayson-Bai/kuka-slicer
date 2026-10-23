@@ -28,11 +28,14 @@ class ResinProcessParams:
     e_per_mm_override: float | None = None
     layer_start_prime_mm: float | None = field(default=None, kw_only=True)
     layer_end_retract_mm: float | None = field(default=None, kw_only=True)
-    coast_distance_mm: float = field(default=7.0, kw_only=True)
+    coast_distance_mm: float = field(default=5.0, kw_only=True)
+    layer_last_coast_distance_mm: float = field(default=7.0, kw_only=True)
 
     def __post_init__(self) -> None:
         if not math.isfinite(float(self.coast_distance_mm)) or float(self.coast_distance_mm) < 0.0:
             raise ValueError("resin.coast_distance_mm must be finite and >= 0")
+        if not math.isfinite(float(self.layer_last_coast_distance_mm)) or float(self.layer_last_coast_distance_mm) < 0.0:
+            raise ValueError("resin.layer_last_coast_distance_mm must be finite and >= 0")
         for name in ("layer_start_prime_mm", "layer_end_retract_mm"):
             value = getattr(self, name)
             if value is not None and (not math.isfinite(float(value)) or float(value) < 0.0):
