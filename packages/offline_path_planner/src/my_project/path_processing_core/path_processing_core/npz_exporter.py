@@ -1576,7 +1576,6 @@ def export_npz(
             resin_coast_distance_mm > 0.0 and current_tool == 2
             and buffer[0].type in ("PRINT", "PRINT_FIT")
             and all(move.delta_e >= 0.0 for move in buffer)
-            and buffer[0].raw == "external_npz_resin_layer_last_print"
         ) else None
         for idx, gc in enumerate(gc_list):
             _append_sample(
@@ -2472,7 +2471,6 @@ def export_npz(
             coasting = ResinCoasting(resin_coast_distance_mm) if (
                 resin_coast_distance_mm > 0.0 and current_tool == 2
                 and cmd.type in ("PRINT", "PRINT_FIT") and cmd.delta_e >= 0.0
-                and cmd.raw == "external_npz_resin_layer_last_print"
             ) else None
             _append_sample(
                 cmd, layer, subtype, occ, coasting=coasting,
