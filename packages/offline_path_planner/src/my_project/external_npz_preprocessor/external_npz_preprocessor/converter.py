@@ -211,6 +211,36 @@ def source_job_to_parsed_commands(job: SourceJob, params: ProcessParams) -> Pars
                 and not skip_prusa_initial_travel
                 else None
             )
+            # Emit the tool change before the approach travel so Core lifts at
+            # the previous path end, switches heads at the safe height, then
+            # replaces the first post-change travel with one high bridge.  The
+            # source travel below only supplies the bridge destination.
+            if current_tool != tool:
+                commands.append(
+                    ToolChangeCommand(
+                        type="TOOL_CHANGE",
+                        tool=tool,
+                        line=line,
+                        layer=layer.index,
+                        subtype=subtype,
+                        raw=f"T{tool}",
+                    )
+                )
+                line += 1
+                commands.append(
+                    ResetECommand(
+                        type="RESET_E",
+                        val=0.0,
+                        line=line,
+                        layer=layer.index,
+                        subtype=subtype,
+                        raw="G92 E0",
+                        pose=first_pose,
+                    )
+                )
+                line += 1
+                current_tool = tool
+                current_e = 0.0
             if source_travel is not None:
                 line, current_pose = _append_source_travel_path(
                     commands,
@@ -242,32 +272,6 @@ def source_job_to_parsed_commands(job: SourceJob, params: ProcessParams) -> Pars
                 )
                 initial_travel_added = True
                 current_pose = first_pose
-            if current_tool != tool:
-                commands.append(
-                    ToolChangeCommand(
-                        type="TOOL_CHANGE",
-                        tool=tool,
-                        line=line,
-                        layer=layer.index,
-                        subtype=subtype,
-                        raw=f"T{tool}",
-                    )
-                )
-                line += 1
-                commands.append(
-                    ResetECommand(
-                        type="RESET_E",
-                        val=0.0,
-                        line=line,
-                        layer=layer.index,
-                        subtype=subtype,
-                        raw="G92 E0",
-                        pose=first_pose,
-                    )
-                )
-                line += 1
-                current_tool = tool
-                current_e = 0.0
 
             fiber_travel = (
                 _source_travel_for_fiber_path(job, layer, fiber_path_number)
