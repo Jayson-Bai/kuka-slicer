@@ -15,7 +15,8 @@
       "retract_speed_mm_s": 12.0,
       "e_per_mm_override": null,
       "layer_start_prime_mm": 32.0,
-      "layer_end_retract_mm": 25.0
+      "layer_end_retract_mm": 25.0,
+      "coast_distance_mm": 7.0
     },
     "fiber": {
       "layer_height_mm": 0.1,

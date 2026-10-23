@@ -288,6 +288,7 @@ def convert_source_job(
         ),
         "external_npz_cut_absolute_e": export_params.external_npz_cut_absolute_e,
         "preserve_source_e_profile": preserve_source_e_profile,
+        "resin_coast_distance_mm": params.resin.coast_distance_mm,
         "collect_detailed_timing": os.environ.get(
             "KUKA_CORE_DETAILED_TIMING", ""
         ).strip().lower() in {"1", "true", "yes", "on"},

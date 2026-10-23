@@ -430,6 +430,9 @@ def source_job_to_parsed_commands(job: SourceJob, params: ProcessParams) -> Pars
                 subtype=subtype,
                 source_path_id=source_path_id,
             )
+            if is_last_resin_in_layer:
+                for move in print_moves:
+                    move.raw = "external_npz_resin_layer_last_print"
             # Print paths deliberately remain MoveCommand sequences.  Core is
             # the sole owner of corner handling, density refinement and global
             # B-spline fitting; wrapping them as an upstream POLYLINE would
