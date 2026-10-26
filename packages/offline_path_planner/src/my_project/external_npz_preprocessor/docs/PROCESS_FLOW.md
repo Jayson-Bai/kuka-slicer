@@ -185,7 +185,7 @@ ExtrudeWait(wait_sec=dt, delta_e=0, raw="external_npz_reset_anchor")
 TRAVEL(E=0)
 ```
 
-其中 `L=cut_lift_mm`。CUT 前先完成一次阻塞式 reset 和 E=0 anchor，随后 CUT 事件仍为非阻塞，RSI 紧接着沿纤维路径末端点的曲面上法向抬升绝对距离 `L`，并同步执行 `E:0→+L`；平面 `ABC=0` 时该方向仍是世界 `+Z`。抬升到位后 `extrude_sync(+L)` 等待固件回报剪切+抬升完成，随后保持 `cut_retract_delay_s` 再 reset，回抽由新基准独立执行 `E:0→-L`；回抽到位后 `extrude_sync(-L)` 等待固件回报，再保持 `cut_travel_delay_s` 后 reset。`cut_retract_delay_s` 默认 `0.5 s`，`cut_travel_delay_s` 默认 `1.0 s`，可在 Core 导出参数和上位机局部注入参数中分别设置。
+其中 `L=cut_lift_mm`。CUT 前先完成一次阻塞式 reset 和 E=0 anchor，随后 CUT 事件仍为非阻塞，RSI 紧接着从纤维路径末端位姿沿世界 `+Z` 抬升绝对距离 `L`，保持 X/Y 不变，并在抬升过程中同步将 ABC 旋转到平面参考姿态 `0,0,0`，同时执行 `E:0→+L`。抬升到位后 `extrude_sync(+L)` 等待固件回报剪切+抬升完成，随后保持 `cut_retract_delay_s` 再 reset，回抽由新基准独立执行 `E:0→-L`；回抽到位后 `extrude_sync(-L)` 等待固件回报，再保持 `cut_travel_delay_s` 后 reset。`cut_retract_delay_s` 默认 `0.5 s`，`cut_travel_delay_s` 默认 `1.0 s`，可在 Core 导出参数和上位机局部注入参数中分别设置。
 
 CUT 的挤出和固定回抽只受 L 控制，不读取 `fiber.prime_length_mm` 或 `fiber.retract_length_mm`。层末 UI 回抽前的 reset 同时阻断 CUT 向后读取 UI 回抽速度；CUT 固定回抽继续使用默认移动速度，UI 回抽使用自己的 `fiber.retract_speed_mm_s`。
 

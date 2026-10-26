@@ -67,41 +67,17 @@ def _cut_lift_end_position(
     hold_row: CsvRow,
     lift_mm: float,
     *,
-    follow_surface_normal: bool,
+    align_flat_reference: bool,
 ) -> Position:
-    """Build a cut-lift endpoint without changing the held TCP orientation.
-
-    Surface ABC values are KUKA relative corrections using
-    ``Rz(A) @ Ry(B) @ Rx(C)``.  In the calibrated flat-print reference pose,
-    world ``+Z`` is the upward lift direction, so rotating that reference axis
-    by the endpoint correction recovers the upward surface normal.  The
-    direction is normalized to keep ``lift_mm`` an absolute spatial distance.
-    """
-
-    if follow_surface_normal:
-        a = math.radians(float(hold_row.a))
-        b = math.radians(float(hold_row.b))
-        c = math.radians(float(hold_row.c))
-        cos_a, sin_a = math.cos(a), math.sin(a)
-        cos_b, sin_b = math.cos(b), math.sin(b)
-        cos_c, sin_c = math.cos(c), math.sin(c)
-        nx = cos_a * sin_b * cos_c + sin_a * sin_c
-        ny = sin_a * sin_b * cos_c - cos_a * sin_c
-        nz = cos_b * cos_c
-        magnitude = math.sqrt(nx * nx + ny * ny + nz * nz)
-        if not math.isfinite(magnitude) or magnitude <= 1e-12:
-            raise ValueError("invalid KUKA ABC orientation for fiber cut lift")
-        nx, ny, nz = nx / magnitude, ny / magnitude, nz / magnitude
-    else:
-        nx, ny, nz = 0.0, 0.0, 1.0
+    """Lift at fixed X/Y while the fiber pose returns to the flat reference."""
 
     return Position(
-        hold_row.x + lift_mm * nx,
-        hold_row.y + lift_mm * ny,
-        hold_row.z + lift_mm * nz,
-        hold_row.a,
-        hold_row.b,
-        hold_row.c,
+        hold_row.x,
+        hold_row.y,
+        hold_row.z + lift_mm,
+        0.0 if align_flat_reference else hold_row.a,
+        0.0 if align_flat_reference else hold_row.b,
+        0.0 if align_flat_reference else hold_row.c,
     )
 
 
@@ -1820,7 +1796,7 @@ def export_npz(
                 end_p = _cut_lift_end_position(
                     hold_row,
                     lift_mm,
-                    follow_surface_normal=True,
+                    align_flat_reference=True,
                 )
                 lift_gc = GlobalCurveCommand(
                     type="TRAVEL",
@@ -1906,8 +1882,8 @@ def export_npz(
                 pending_injection_role = injection_role_map["cut_post"]
             return
 
-        # Generic GCode keeps its existing E/timing behavior.  Fiber CUT lifts
-        # follow the endpoint surface normal; other tools retain world +Z.
+        # Generic GCode keeps its existing E/timing behavior. Fiber CUT lifts
+        # return to the flat pose while moving in world +Z.
         active_injection_role = injection_role_map["cut_event"]
         _emit_event(ev, layer, subtype, occ)
         active_injection_role = injection_role_map["cut_action"]
@@ -1975,7 +1951,7 @@ def export_npz(
         end_p = _cut_lift_end_position(
             hold_row,
             lift_mm,
-            follow_surface_normal=current_tool == 1,
+            align_flat_reference=current_tool == 1,
         )
         lift_feedrate = max(float(default_feed_mm_s), 1e-9) * 60.0
         lift_gc = GlobalCurveCommand(

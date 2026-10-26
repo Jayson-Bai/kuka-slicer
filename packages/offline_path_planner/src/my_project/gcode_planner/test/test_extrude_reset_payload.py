@@ -482,7 +482,7 @@ def test_cut_event_lifts_with_matched_fiber_feed_and_preserves_next_prime(tmp_pa
 
 
 @pytest.mark.parametrize("external_absolute_e", [False, True])
-def test_curved_fiber_cut_lift_follows_endpoint_surface_normal(
+def test_curved_fiber_cut_lifts_in_world_z_while_rotating_to_flat(
     tmp_path, external_absolute_e
 ):
     out = tmp_path / f"curved_cut_lift_{external_absolute_e}.npz"
@@ -541,12 +541,20 @@ def test_curved_fiber_cut_lift_follows_endpoint_surface_normal(
         distances = np.linalg.norm(displacements, axis=1)
         high_idx = int(np.argmax(distances))
 
-        expected_normal = np.array([0.5, 0.0, np.sqrt(3.0) / 2.0])
-        assert np.allclose(displacements[high_idx], lift_mm * expected_normal, atol=1e-5)
+        assert np.allclose(displacements[high_idx], [0.0, 0.0, lift_mm], atol=1e-5)
         assert np.isclose(distances[high_idx], lift_mm, atol=1e-5)
-        assert np.allclose(data["a"][cut_rows], endpoint.a)
-        assert np.allclose(data["b"][cut_rows], endpoint.b)
-        assert np.allclose(data["c"][cut_rows], endpoint.c)
+        lift_rows = cut_rows[:high_idx + 1]
+        assert np.allclose(data["x"][lift_rows], endpoint.x, atol=1e-5)
+        assert np.allclose(data["y"][lift_rows], endpoint.y, atol=1e-5)
+        assert np.all(np.diff(data["z"][lift_rows]) >= -1e-5)
+        assert np.isclose(data["b"][lift_rows[0]], endpoint.b, atol=1e-5)
+        assert np.isclose(data["b"][lift_rows[-1]], 0.0, atol=1e-5)
+        assert np.any(
+            (data["z"][lift_rows] > endpoint.z + 1e-5)
+            & (data["z"][lift_rows] < endpoint.z + lift_mm - 1e-5)
+            & (data["b"][lift_rows] > 1e-5)
+            & (data["b"][lift_rows] < endpoint.b - 1e-5)
+        )
 
 
 def test_nonfiber_cut_with_tilted_abc_keeps_world_z_lift(tmp_path):
